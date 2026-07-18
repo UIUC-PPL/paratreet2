@@ -1,0 +1,223 @@
+module paratreet {
+  include "CoreFunctions.h";
+  include "Configuration.h";
+  include "CkArrayIndexKey.h";
+  include "BoundingBox.h";
+  include "Splitter.h";
+  include "Node.h";
+  include "ProxyHolders.h";
+  class CProxy_Reader;
+  class CProxy_TreeSpec;
+  include "MultiData.h";
+
+  include "Decomposition.h";
+  PUPable SfcDecomposition;
+  PUPable OctDecomposition;
+  PUPable BinaryOctDecomposition;
+  PUPable KdDecomposition;
+  PUPable LongestDimDecomposition;
+
+  readonly CProxy_Reader readers;
+  readonly CProxy_TreeSpec treespec;
+  readonly CProxy_ThreadStateHolder thread_state_holder;
+  readonly int n_readers;
+
+  namespace paratreet {
+    initproc void __registerMain(void);
+  }
+
+  message ParticleMsg {
+    Particle particles[];
+  };
+
+  template <typename Data>
+#ifdef GROUP_CACHE
+  group CacheManager {
+#else
+  nodegroup CacheManager {
+#endif
+    entry CacheManager();
+    entry void initialize(const CkCallback&);
+    entry void requestNodes(std::pair<Key, int>);
+    entry void recvStarterPack(std::pair<Key, SpatialNode<Data>> pack [n], int n, CkCallback);
+    entry void addCache(MultiData<Data>);
+    entry void restoreData(std::pair<Key, SpatialNode<Data>>);
+    entry void receiveSubtree(MultiData<Data>, PPHolder<Data>);
+    template <typename Visitor>
+    entry void startPrefetch(DPHolder<Data>, CkCallback);
+    entry void startParentPrefetch(DPHolder<Data>, CkCallback);
+    entry void destroy(bool);
+    entry void resetCachedParticles(PPHolder<Data>);
+    entry void receiveParticleUpdates(std::vector<Particle>);
+  };
+
+  template <typename Data>
+  group Resumer {
+    entry Resumer();
+    entry void process(Key);
+    entry void reset();
+  };
+
+  group ThreadStateHolder {
+    entry ThreadStateHolder();
+    entry void setUniverse(BoundingBox b);
+    entry void collectAndResetStats(CkCallback cb);
+    entry void collectMetaData(const CkCallback & cb);
+    template <typename Data>
+    entry void applyAccumulatedOpposingEffects(PPHolder<Data>);
+  };
+
+  group Writer {
+    entry Writer(std::string of, int n_particles);
+    entry void receive(std::vector<Particle> particles, Real time, int iter);
+    entry void write(CkCallback cb);
+  }
+
+  group TipsyWriter {
+    entry TipsyWriter(std::string of, BoundingBox box);
+    entry void receive(std::vector<Particle> particles, Real time, int iter);
+    entry void write(int prefix_count, CkCallback cb);
+  }
+
+  #ifdef FOF
+  template <typename Data>
+  group LocalCalcs {
+    entry LocalCalcs();
+    entry LocalCalcs(CProxy_LocalNodeCalcs<Data> localNodeCalcs);
+    entry void doPhase0(const CkCallback& cb);
+  };
+
+  template <typename Data>
+  nodegroup LocalNodeCalcs {
+    entry LocalNodeCalcs();
+  };
+
+  #endif
+
+  template <typename Data>
+  array [1d] Partition {
+    entry Partition(int, CProxy_CacheManager<Data>, CProxy_Resumer<Data>, TCHolder<Data>, CProxy_Driver<Data>, bool);
+    template <typename Visitor> entry void startDown(Visitor v);
+    template <typename Visitor> entry void startBasicDown(Visitor v);
+    template <typename Visitor> entry void startUpAndDown(Visitor v);
+    entry void interact(const CkCallback&);
+    entry void goDown(size_t travIdx);
+    entry void resumeAfterPause(size_t travIdx);
+    entry void receiveLeaves(std::vector<Key>, Key, int, TPHolder<Data>);
+#ifdef FOF
+    entry void passUnionFindLib(CProxy_UnionFindLib ufl);
+#endif
+    entry void makeLeaves(int);
+    entry void destroy();
+    entry void reset();
+    entry void kick(Real, CkCallback cb);
+    entry void perturb(Real, CkCallback cb);
+    entry void rebuild(BoundingBox, TPHolder<Data>, bool);
+    entry void output(CProxy_Writer, int, CkCallback);
+    entry void output(CProxy_TipsyWriter, int, CkCallback);
+    entry void callPerLeafFn(CkReference<paratreet::PerLeafAble<Data>>, const CkCallback&);
+    entry void deleteParticleOfOrder(int order);
+    entry void pauseForLB();
+    entry void requestParticleUpdates(int cm_index, std::vector<Key> pKeys);
+    entry void applyOpposingEffects(std::vector<std::pair<Key, std::pair<Vector3D<Real>, Real>>> effects);
+    
+    // FoF functions
+    #ifdef FOF
+    entry void depositBucketPointers(CProxy_LocalCalcs<Data> lc_proxy, CProxy_LocalNodeCalcs<Data> lnc_proxy, const CkCallback& cb);
+    entry void initializeLibVertices(const CkCallback &cb);
+    entry void propagateVertexIDRanges(const CkCallback &cb);
+    entry void validateVertexIDRanges(const CkCallback &cb);
+    entry void getConnectedComponents(const CkCallback& cb);
+    entry void resetUnionRequestCounter(const CkCallback& cb);
+    entry void reportUnionRequestCount(const CkCallback& cb);
+    #endif
+  }
+
+  template <typename Data>
+  array [1d] Subtree {
+    entry Subtree(const CkCallback&, int, int, int, TCHolder<Data>, CProxy_Resumer<Data>, CProxy_CacheManager<Data>, DPHolder<Data>, bool);
+    entry void receive(ParticleMsg*);
+    entry void buildTree(CProxy_Partition<Data>, CkCallback);
+    entry void requestNodes(Key, int);
+    entry void requestCopy(int, PPHolder<Data>);
+    entry void destroy();
+    entry void reset();
+    entry void sendLeaves(CProxy_Partition<Data>);
+    template <typename Visitor> entry void startDual(Visitor v);
+    entry void goDown(size_t travIdx);
+    entry void checkParticlesChanged(const CkCallback&);
+    entry void collectMetaData(const CkCallback & cb);
+    entry void pauseForLB();
+  }
+
+  template <typename Data>
+  array [Key] TreeCanopy {
+    entry TreeCanopy();
+    entry void reset();
+    entry [createhere] void recvProxies(TPHolder<Data>, int, CProxy_CacheManager<Data>, DPHolder<Data>);
+    entry void recvData(SpatialNode<Data>, int);
+    entry void requestData (int);
+  };
+
+  template <typename Data>
+  chare Driver {
+    entry Driver(CProxy_CacheManager<Data>, CProxy_Resumer<Data>, CProxy_TreeCanopy<Data>);
+    entry [threaded] void init(CkCallback cb, CkReference<paratreet::Configuration>);
+    entry [threaded] void run(CkCallback cb);
+    entry [reductiontarget] void countInts(unsigned long long intrn_counts [4]);
+    entry [reductiontarget] void reportTime();
+    entry void recvTC(std::pair<Key, SpatialNode<Data>>);
+    entry void loadCache(CkCallback);
+    entry void partitionLocation(int, int);
+    template <typename Visitor>
+    entry void prefetch(Data, int, CkCallback);
+    entry void request(Key request_list [list_size], int list_size, int, CkCallback);
+  }
+
+  group Reader {
+    entry Reader();
+    entry void load(std::string, const CkCallback&);
+    entry void setSoft(const double dSoft, const CkCallback&);
+    entry void computeUniverseBoundingBox(const CkCallback&);
+    entry void assignKeys(BoundingBox, const CkCallback&);
+    template <typename Data>
+    entry void request(CProxy_Subtree<Data>, int, int);
+    entry void countAssignments(const std::vector<GenericSplitter>&, bool, const CkCallback&, bool);
+    entry void doSplit(const std::vector<GenericSplitter>&, bool, const CkCallback&);
+    entry void getAllSfcKeys(const CkCallback&);
+    entry void getAllPositions(const CkCallback&);
+    entry void pickSamples(const int, const CkCallback&);
+    entry void prepMessages(const std::vector<Key>&, const CkCallback&);
+    entry void redistribute();
+    entry void receive(ParticleMsg*);
+    entry void localSort(const CkCallback&);
+    entry void checkSort(const Key, const CkCallback&);
+    template <typename Data>
+    entry void flush(int, CProxy_Subtree<Data>);
+    template <typename Data>
+    entry void assignPartitions(int, CProxy_Partition<Data>);
+  };
+
+  group TreeSpec {
+    entry TreeSpec(void);
+    entry void reset();
+    entry void receiveConfiguration(const CkCallback&, CkPointer<paratreet::Configuration>);
+    entry void receiveDecomposition(const CkCallback&, CkPointer<Decomposition>, bool);
+    entry [local] Decomposition* getSubtreeDecomposition();
+    entry [local] Decomposition* getPartitionDecomposition();
+  }
+
+  group DecompArrayMap : CkArrayMap {
+    entry DecompArrayMap(CkPointer<Decomposition>, int, int);
+  };
+
+  group CollocateMap : CkArrayMap {
+    entry CollocateMap(CkPointer<Decomposition>, const std::vector<int>&);
+  };
+
+  mainchare MainChare {
+    entry [nokeep] MainChare(CkArgMsg* m);
+    entry [threaded] void run();
+  };
+
+};
