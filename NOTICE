@@ -1,0 +1,25 @@
+ParaTreeT2
+
+Copyright (c) 2026 Parallel Programming Laboratory, University of Illinois
+Urbana-Champaign.
+
+Licensed under the Apache License, Version 2.0 with LLVM Exceptions
+(see LICENSE).
+
+This work is based on ParaTreeT (https://github.com/paratreet/paratreet),
+the Parallel Tree Toolkit for particle methods in Charm++. ParaTreeT2
+extends and streamlines ParaTreeT; substantial portions of its design and
+code originate there. ParaTreeT was written primarily by Joseph Hutter,
+with contributions from Jaemin Choi, Ritvik Rao, Johnny Chen, Justin
+Szaday, Yuchen Pang, Karthik Senthil, Simeng Liu, Thomas Quinn, Adrian
+Plenefisch, Ajay Tatachar, Sai Krishna Bollam, Orion Lawlor, and others,
+at the Parallel Programming Laboratory (University of Illinois) and
+collaborating institutions.
+
+Particle file-format readers and space-filling-curve utilities derive from
+the N-BodyShop "utility" library (https://github.com/N-BodyShop/utility),
+which retains its own license and copyright.
+
+ParaTreeT2 is built on the Charm++ parallel programming system
+(https://charm.cs.illinois.edu), developed at the University of Illinois
+and Charmworks, Inc.

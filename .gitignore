@@ -1,0 +1,6 @@
+*.o
+*.a
+*.decl.h
+*.def.h
+charmrun
+.DS_Store
