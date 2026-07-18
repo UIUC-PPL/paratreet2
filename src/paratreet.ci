@@ -88,11 +88,12 @@ module paratreet {
     entry FoFPhase1Node();
     entry void reset(const CkCallback&);
     entry void merge(const CkCallback&);
+    entry void fragmentHistogram(const CkCallback&);
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
-  // (phaseB), relabel through the merge map, and a collect helper for
-  // validation.
+  // (phaseB), relabel through the merge map, per-tip fragment counting
+  // (countFragments), and a collect helper for validation.
   template <typename Data>
   group FoFPhase1 {
     entry FoFPhase1(CProxy_FoFPhase1Node<Data>);
@@ -100,6 +101,7 @@ module paratreet {
     entry void phaseA(double b2, const CkCallback&);
     entry void phaseB(double b2, const CkCallback&);
     entry void relabel(const CkCallback&);
+    entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);
   };
 

@@ -49,7 +49,14 @@ distributed union-find (UF_2) later runs over tips, never particles.
 - v1 uses **global reductions** between sub-phases (correctness first).
   The design note's "no global barrier" (§2.1) concerns the phase 1 -> 3
   transition at scale; revisit after §8 measurements.
-- Periodic boundary images are **out of scope for v1**.
+- Periodic boundary images are **out of scope for v1**, deferred without
+  prejudice: the walk predicate is a function of two boxes, so images are
+  the same dual walks with a +/-L offset applied to one side (the old
+  code's 27-image pattern), added as an offset loop over the pair
+  enumeration in phase 1 and the boundary walk in phase 3, pruned
+  immediately away from box faces. Constraint on current code: keep the
+  dual-walk helpers offset-parameterizable (take the pair of boxes /
+  an offset vector, don't bake in identity).
 - Linking length `b` is passed at the API call, not baked into
   Configuration; tests derive it from the universe box
   (`b = 0.2 * (V/N)^(1/3)`) or take a flag.
@@ -63,8 +70,24 @@ gathered particles (canonicalized by min particle order per component).
 Multi-process runs produce partial tips by design; they are validated
 later, in the phase-3 test.
 
-## After phase 1
+## After phase 1 (completing design-note step 1)
 
-`upwardPass` with an FoF `Data` type annotates `min_frag`/`max_frag`
-per node from `group_number`. Ordering constraint (already documented):
-phase 1 + upwardPass must complete before the traversal's cache loading.
+- **FragData** (`src/FoFData.h`): the FoF node payload — `box` plus
+  `min_frag`/`max_frag` over the particles' `group_number` (empty-safe
+  identity values; `+=` merges). Build-time values are garbage (tips not
+  yet assigned) and are never read; `upwardPass` after phase 1 computes
+  the real annotations. `uniform(node) := min_frag == max_frag` is the
+  hereditary predicate phase 3 prunes on.
+- **Fragment-size histogram** (design note §6.3e, giant-fragment
+  detection): after relabel, each PE counts its own particles per
+  process-tip; the nodegroup merges to exact per-fragment sizes (tips
+  are process-local, so per-process totals are exact), then contributes
+  log2-binned counts + max size + fragment count via reduction to an
+  app callback.
+- Validation: leaf-level annotation assertions through a traversal
+  (cache-shipped leaves included), mirroring examples/annotate; and on
+  single-process runs, fragment count and max size must match the
+  serial O(n^2) reference.
+
+Ordering constraint (already documented): phase 1 + upwardPass must
+complete before the traversal's cache loading ships internal-node data.

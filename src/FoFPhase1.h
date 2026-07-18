@@ -30,6 +30,8 @@
 // Driving sequence (from a [threaded] context; see paratreet::runFoFPhase1):
 //   fof_node.reset -> fof.reset -> subtrees.registerFoF -> fof.phaseA
 //   -> fof.phaseB -> fof_node.merge -> fof.relabel
+// Optionally after relabel (see paratreet::runFoFFragmentHistogram):
+//   fof.countFragments -> fof_node.fragmentHistogram
 //
 // Lifetime contract: the Particle blocks registered by Subtree::registerFoF
 // (Subtree::particles.data()) are stable from the end of tree build until the
@@ -43,6 +45,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -80,6 +84,15 @@ struct FoFParticleRecord {
   int pad = 0;
 };
 
+// Result of the fragment-size histogram (design note §6.3e, giant-fragment
+// detection), reduced over all processes. Fragment sizes are exact: tips are
+// process-local, so each process knows its fragments' full sizes.
+struct FoFFragmentHistogram {
+  long bins[64];    // bins[k] = #fragments with floor(log2(size)) == k
+  long n_fragments; // total fragment (process-tip) count
+  long max_size;    // largest fragment size
+};
+
 } // namespace paratreet
 
 // Per-process side of phase 1: collects the per-PE subtree registry (for
@@ -99,6 +112,7 @@ public:
   std::map<int, std::vector<SubtreeRef>> pe_subtrees;
   std::vector<std::pair<long, long>> edges; // cross-PE (tip, tip) edges
   std::unordered_map<long, long> tip_map;   // PE-tip -> process-tip
+  std::unordered_map<long, long> frag_counts; // process-tip -> exact size
 
   FoFPhase1Node() {}
 
@@ -115,11 +129,47 @@ public:
     edges.insert(edges.end(), es.begin(), es.end());
   }
 
+  // Called synchronously by same-process group branches during
+  // countFragments; hence the lock. Tips are process-local, so the merged
+  // per-PE counts are exact fragment sizes.
+  void submitFragCounts(const std::unordered_map<long, long>& counts) {
+    std::lock_guard<std::mutex> g(lock);
+    for (auto& kv : counts) frag_counts[kv.first] += kv.second;
+  }
+
   void reset(const CkCallback& cb) {
     pe_subtrees.clear();
     edges.clear();
     tip_map.clear();
+    frag_counts.clear();
     this->contribute(cb);
+  }
+
+  // Fragment-size histogram, step 2 of 2 (see paratreet::FoFFragmentHistogram
+  // and design note §6.3e). One execution per process (nodegroup broadcast),
+  // after the countFragments barrier: log2-bin the exact fragment sizes and
+  // contribute a tuple reduction to cb — [0] long bins[64] (sum),
+  // [1] long n_fragments (sum), [2] long max_size (max).
+  void fragmentHistogram(const CkCallback& cb) {
+    long bins[64] = {0};
+    long n_fragments = 0;
+    long max_size = 0;
+    for (auto& kv : frag_counts) {
+      long size = kv.second;
+      int bin = 0; // floor(log2(size)); size >= 1 always
+      while (bin < 63 && (1L << (bin + 1)) <= size) bin++;
+      bins[bin]++;
+      n_fragments++;
+      if (size > max_size) max_size = size;
+    }
+    CkReduction::tupleElement tupleRedn[] = {
+      CkReduction::tupleElement(sizeof(bins), bins, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &n_fragments, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &max_size, CkReduction::max_long)
+    };
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 3);
+    msg->setCallback(cb);
+    this->contribute(msg);
   }
 
   // One execution per process (nodegroup broadcast): serial union-find over
@@ -262,6 +312,18 @@ public:
     this->contribute(cb);
   }
 
+  // Fragment-size histogram, step 1 of 2 (run after relabel): count this
+  // PE's registered particles per process-tip and hand the counts to the
+  // process-wide FoFPhase1Node (synchronous local-branch call, like
+  // submitEdges, so the counts are complete when the barrier fires).
+  void countFragments(const CkCallback& cb) {
+    std::unordered_map<long, long> counts;
+    for (auto& s : subtrees)
+      for (int i = 0; i < s.n; i++) counts[s.parts[i].group_number]++;
+    node_proxy.ckLocalBranch()->submitFragCounts(counts);
+    this->contribute(cb);
+  }
+
   // Validation/debugging helper: concat-reduce (position, tip, order) for
   // every particle registered on this PE.
   void collect(const CkCallback& cb) {
@@ -393,6 +455,29 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
   fof.phaseB(b2, CkCallbackResumeThread());
   fof_node.merge(CkCallbackResumeThread());
   fof.relabel(CkCallbackResumeThread());
+}
+
+// Convenience driver for the fragment-size histogram. Run after
+// runFoFPhase1, under the same threaded-context and particle-lifetime
+// requirements; blocks and returns the global histogram.
+template <typename Data>
+FoFFragmentHistogram runFoFFragmentHistogram(CProxy_FoFPhase1<Data> fof,
+                                             CProxy_FoFPhase1Node<Data> fof_node) {
+  fof.countFragments(CkCallbackResumeThread());
+  void* result = nullptr;
+  fof_node.fragmentHistogram(CkCallbackResumeThread(result));
+  CkReductionMsg* msg = (CkReductionMsg*)result;
+  CkReduction::tupleElement* elems = nullptr;
+  int n_elems = 0;
+  msg->toTuple(&elems, &n_elems);
+  CkEnforce(n_elems == 3);
+  FoFFragmentHistogram h;
+  std::memcpy(h.bins, elems[0].data, sizeof(h.bins));
+  h.n_fragments = *(const long*)elems[1].data;
+  h.max_size = *(const long*)elems[2].data;
+  delete[] elems;
+  delete msg;
+  return h;
 }
 
 } // namespace paratreet
