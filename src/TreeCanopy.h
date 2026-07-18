@@ -52,6 +52,10 @@ void TreeCanopy<Data>::recvProxies(TPHolder<Data> tp_holder, int tp_index_,
 
 template <typename Data>
 void TreeCanopy<Data>::recvData(SpatialNode<Data> child, int branch_factor) {
+  // Starting a fresh accumulation round: clear data left from the
+  // previous round (initial build or a later upwardPass), which was
+  // never reset and would otherwise double-accumulate
+  if (recv_count == 0) my_sn.data = Data();
   // Accumulate data received from Subtree or children TreeCanopies
   my_sn.data += child.data;
   my_sn.depth = child.depth - 1;

@@ -30,7 +30,13 @@ Two constraints of the FoF design that ParaTreeT cannot satisfy without a break:
 
 ## Deliberately restructured
 
-- `Data` gains an explicit "upward pass" API callable between traversals.
+- `Data` gains an explicit "upward pass" API callable between traversals —
+  **implemented**: `Subtree::upwardPass(cb)` recomputes node Data bottom-up
+  over the built tree and re-propagates to the TreeCanopy;
+  `Subtree::callPerLeafFn(fn, cb)` mutates the subtree-side particle copies
+  (the ones the cache ships to traversals). Tested by `examples/annotate`.
+  Contract: run mutation + upwardPass *before* the traversal's cache
+  loading; cached node copies from earlier rounds are not invalidated.
 - Visitor `open()` may consult mutable process-level state.
 - The union-find coupling changes shape entirely: two-level UF. UF_1 is serial
   per-process over particles (freezes at end of phase 1); the existing

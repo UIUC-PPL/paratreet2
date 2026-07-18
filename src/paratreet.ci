@@ -121,6 +121,8 @@ module paratreet {
     entry void goDown(size_t travIdx);
     entry void checkParticlesChanged(const CkCallback&);
     entry void collectMetaData(const CkCallback & cb);
+    entry void callPerLeafFn(CkReference<paratreet::PerLeafAble<Data>>, const CkCallback&);
+    entry void upwardPass(const CkCallback&);
     entry void pauseForLB();
   }
 

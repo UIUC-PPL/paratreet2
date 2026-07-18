@@ -73,6 +73,9 @@ public:
   void output(CProxy_Writer w, CkCallback cb);
   void pup(PUP::er& p);
   void collectMetaData(const CkCallback & cb);
+  void callPerLeafFn(paratreet::PerLeafAble<Data>&, const CkCallback&);
+  void upwardPass(const CkCallback&);
+  void recomputeData(Node<Data>*);
   void addNodeToFlatSubtree(Node<Data>* node);
   void pauseForLB(){
     //CkPrintf("[ST %d]  pause for LB on PE %d\n", this->thisIndex, CkMyPe());
@@ -404,6 +407,47 @@ void Subtree<Data>::populateTree() {
       if (parent->wait_count == 0) going_up.push(parent);
     }
   }
+}
+
+// Recompute node Data bottom-up over the already-built local tree, then
+// re-propagate the subtree root's Data to the TreeCanopy above. For use
+// after a phase that modifies per-particle state (e.g. FoF fragment
+// assignment): the tree structure is unchanged, only annotations refresh.
+// Contract: run this before any traversal that reads the new annotations
+// issues remote fetches; cached copies shipped in earlier traversals are
+// not invalidated by this pass.
+template <typename Data>
+void Subtree<Data>::upwardPass(const CkCallback& cb) {
+  recomputeData(local_root);
+  auto branch_factor = paratreet::getConfiguration().branchFactor();
+  Key tc_key = tp_key / branch_factor;
+  if (tc_key > 0) tc_proxy[tc_key].recvData(*local_root, branch_factor);
+  this->contribute(cb);
+}
+
+template <typename Data>
+void Subtree<Data>::recomputeData(Node<Data>* node) {
+  if (node->isLeaf()) {
+    node->data = Data(node->particles(), node->n_particles, node->depth);
+    return;
+  }
+  node->data = Data();
+  for (int i = 0; i < node->n_children; i++) {
+    Node<Data>* child = node->getChild(i);
+    recomputeData(child);
+    node->data += child->data;
+  }
+}
+
+// Subtree-side analogue of Partition::callPerLeafFn: applies fn to the
+// subtree's own particle copies (the ones traversals fetch through the
+// cache), not the partition copies. The Partition* argument is null.
+template <typename Data>
+void Subtree<Data>::callPerLeafFn(paratreet::PerLeafAble<Data>& fn, const CkCallback& cb) {
+  for (auto && leaf : leaves) {
+    fn(*leaf, nullptr);
+  }
+  this->contribute(cb);
 }
 
 template <typename Data>
