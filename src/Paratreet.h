@@ -14,6 +14,7 @@
 #include "ThreadStateHolder.h"
 #include "Subtree.h"
 #include "Partition.h"
+#include "FoFPhase1.h"
 #include "Configuration.h"
 
 #include "paratreet.decl.h"
@@ -134,6 +135,8 @@ namespace paratreet {
             CkIndex_Subtree<T>::__register(__makeName("Subtree"), sizeof(Subtree<T>));
             CkIndex_TreeCanopy<T>::__register(__makeName("TreeCanopy"), sizeof(TreeCanopy<T>));
             CkIndex_Driver<T>::__register(__makeName("Driver"), sizeof(Driver<T>));
+            CkIndex_FoFPhase1<T>::__register(__makeName("FoFPhase1"), sizeof(FoFPhase1<T>));
+            CkIndex_FoFPhase1Node<T>::__register(__makeName("FoFPhase1Node"), sizeof(FoFPhase1Node<T>));
 
             CkIndex_Reader::idx_request<T>( static_cast<void (Reader::*)(const CProxy_Subtree<T> &, int, int)>(NULL));
             CkIndex_Reader::idx_flush<T>( static_cast<void (Reader::*)(int, const CProxy_Subtree<T> &)>(NULL));

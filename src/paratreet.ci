@@ -80,6 +80,29 @@ module paratreet {
   }
 
 
+  // FoF phase 1 (see src/FoFPhase1.h and design/phase1.md).
+  // Per-process side: subtree registry for phaseB pair enumeration, boundary
+  // edge collection, and the PE-tip -> process-tip merge map.
+  template <typename Data>
+  nodegroup FoFPhase1Node {
+    entry FoFPhase1Node();
+    entry void reset(const CkCallback&);
+    entry void merge(const CkCallback&);
+  };
+
+  // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
+  // (phaseB), relabel through the merge map, and a collect helper for
+  // validation.
+  template <typename Data>
+  group FoFPhase1 {
+    entry FoFPhase1(CProxy_FoFPhase1Node<Data>);
+    entry void reset(const CkCallback&);
+    entry void phaseA(double b2, const CkCallback&);
+    entry void phaseB(double b2, const CkCallback&);
+    entry void relabel(const CkCallback&);
+    entry void collect(const CkCallback&);
+  };
+
   template <typename Data>
   array [1d] Partition {
     entry Partition(int, CProxy_CacheManager<Data>, CProxy_Resumer<Data>, TCHolder<Data>, CProxy_Driver<Data>, bool);
@@ -123,6 +146,7 @@ module paratreet {
     entry void collectMetaData(const CkCallback & cb);
     entry void callPerLeafFn(CkReference<paratreet::PerLeafAble<Data>>, const CkCallback&);
     entry void upwardPass(const CkCallback&);
+    entry void registerFoF(CProxy_FoFPhase1<Data>, const CkCallback&);
     entry void pauseForLB();
   }
 

@@ -13,6 +13,7 @@
 #include "Resumer.h"
 #include "Driver.h"
 #include "OrientedBox.h"
+#include "FoFPhase1.h"
 
 #include <cstring>
 #include <queue>
@@ -75,6 +76,7 @@ public:
   void collectMetaData(const CkCallback & cb);
   void callPerLeafFn(paratreet::PerLeafAble<Data>&, const CkCallback&);
   void upwardPass(const CkCallback&);
+  void registerFoF(CProxy_FoFPhase1<Data>, const CkCallback&);
   void recomputeData(Node<Data>*);
   void addNodeToFlatSubtree(Node<Data>* node);
   void pauseForLB(){
@@ -437,6 +439,19 @@ void Subtree<Data>::recomputeData(Node<Data>* node) {
     recomputeData(child);
     node->data += child->data;
   }
+}
+
+// Register this subtree's local tree and particle block with the FoF phase-1
+// group branch on this PE. The registered block (particles.data()) is stable
+// from the end of tree build until the next rebuild/reset; the whole phase-1
+// sequence must run inside that window.
+template <typename Data>
+void Subtree<Data>::registerFoF(CProxy_FoFPhase1<Data> fof, const CkCallback& cb) {
+  if (local_root != nullptr && !particles.empty()) {
+    fof.ckLocalBranch()->registerSubtree(local_root, particles.data(),
+                                         (int)particles.size());
+  }
+  this->contribute(cb);
 }
 
 // Subtree-side analogue of Partition::callPerLeafFn: applies fn to the
