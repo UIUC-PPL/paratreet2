@@ -79,20 +79,6 @@ module paratreet {
     entry void write(int prefix_count, CkCallback cb);
   }
 
-  #ifdef FOF
-  template <typename Data>
-  group LocalCalcs {
-    entry LocalCalcs();
-    entry LocalCalcs(CProxy_LocalNodeCalcs<Data> localNodeCalcs);
-    entry void doPhase0(const CkCallback& cb);
-  };
-
-  template <typename Data>
-  nodegroup LocalNodeCalcs {
-    entry LocalNodeCalcs();
-  };
-
-  #endif
 
   template <typename Data>
   array [1d] Partition {
@@ -104,9 +90,6 @@ module paratreet {
     entry void goDown(size_t travIdx);
     entry void resumeAfterPause(size_t travIdx);
     entry void receiveLeaves(std::vector<Key>, Key, int, TPHolder<Data>);
-#ifdef FOF
-    entry void passUnionFindLib(CProxy_UnionFindLib ufl);
-#endif
     entry void makeLeaves(int);
     entry void destroy();
     entry void reset();
@@ -122,15 +105,6 @@ module paratreet {
     entry void applyOpposingEffects(std::vector<std::pair<Key, std::pair<Vector3D<Real>, Real>>> effects);
     
     // FoF functions
-    #ifdef FOF
-    entry void depositBucketPointers(CProxy_LocalCalcs<Data> lc_proxy, CProxy_LocalNodeCalcs<Data> lnc_proxy, const CkCallback& cb);
-    entry void initializeLibVertices(const CkCallback &cb);
-    entry void propagateVertexIDRanges(const CkCallback &cb);
-    entry void validateVertexIDRanges(const CkCallback &cb);
-    entry void getConnectedComponents(const CkCallback& cb);
-    entry void resetUnionRequestCounter(const CkCallback& cb);
-    entry void reportUnionRequestCount(const CkCallback& cb);
-    #endif
   }
 
   template <typename Data>

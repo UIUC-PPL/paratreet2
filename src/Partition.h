@@ -12,19 +12,11 @@
 #include "ThreadStateHolder.h"
 #include "paratreet.decl.h"
 #include "LBCommon.h"
-#ifdef FOF
-#include "unionFindLib.h"
-#include "LocalCalcs.h"
-#include "FoFHooks.h"
-#endif
 
 CkpvExtern(int, _lb_obj_index);
 extern CProxy_TreeSpec treespec;
 extern CProxy_Reader readers;
 extern CProxy_ThreadStateHolder thread_state_holder;
-#ifdef FOF
-extern CProxy_UnionFindLib libProxy;
-#endif
 
 using namespace LBCommon;
 
@@ -42,9 +34,6 @@ struct Partition : public CBase_Partition<Data> {
 
   std::map<int, std::vector<Key>> lookup_leaf_keys;
 
-#ifdef FOF
-  unionFindVertex *libVertices;
-#endif
 
   CProxy_TreeCanopy<Data> tc_proxy;
   CProxy_CacheManager<Data> cm_proxy;
@@ -56,9 +45,6 @@ struct Partition : public CBase_Partition<Data> {
   Partition(int, CProxy_CacheManager<Data>, CProxy_Resumer<Data>, TCHolder<Data>, CProxy_Driver<Data> driver, bool);
   Partition(CkMigrateMessage * msg){delete msg;};
 
-#ifdef FOF
-  void passUnionFindLib(CProxy_UnionFindLib ufl);
-#endif
 
   template<typename Visitor> void startDown(Visitor v);
   template<typename Visitor> void startBasicDown(Visitor v);
@@ -120,9 +106,6 @@ struct Partition : public CBase_Partition<Data> {
   void getConnectedComponents(const CkCallback& cb);
   void resetUnionRequestCounter(const CkCallback& cb);
   void reportUnionRequestCount(const CkCallback& cb);
-#ifdef FOF
-  void depositBucketPointers(CProxy_LocalCalcs<Data> lc_proxy, CProxy_LocalNodeCalcs<Data> lnc_proxy, const CkCallback& cb);
-#endif
 
   Real time_advanced = 0;
   int iter = 1;
@@ -178,13 +161,6 @@ void Partition<Data>::initLocalBranches() {
   cm_local->r_proxy = r_proxy;
 }
 
-#ifdef FOF
-template <typename Data>
-void Partition<Data>::passUnionFindLib(CProxy_UnionFindLib ufl)
-{
-  libProxy = ufl;
-}
-#endif
 
 template <typename Data>
 template <typename Visitor>
@@ -192,30 +168,13 @@ void Partition<Data>::startDown(Visitor v)
 {
   initLocalBranches();
   traversers.emplace_back(new TransposedDownTraverser<Data, Visitor>(v, traversers.size(), leaves, *this));
-#ifdef FOF
-  if (paratreet::fof_register_traverser)
-    paratreet::fof_register_traverser(traversers.back().get(),
-                                      this->thisIndex,
-                                      traversers.size() - 1);
-#endif
   startNewTraverser();
 }
 
 template <typename Data>
 void Partition<Data>::resumeAfterPause(size_t travIdx)
 {
-#ifdef FOF
-  if (paratreet::fof_on_resume)
-    paratreet::fof_on_resume(traversers[travIdx].get(), this->thisIndex, travIdx);
-  // If helpers are collectively working on this traverser's queue, skip:
-  // the source PE re-triggers resumeAfterPause after the parallel phase ends.
-  if (traversers[travIdx]->parallel_phase_active) return;
-#endif
   traversers[travIdx]->resumeAfterPause();
-#ifdef FOF
-  if (paratreet::fof_update_traversal_work)
-    paratreet::fof_update_traversal_work(traversers[travIdx]->pausedWorkSize());
-#endif
   if (traversers[travIdx]->wantsPause()) {
     this->thisProxy[this->thisIndex].resumeAfterPause(travIdx);
   }
@@ -558,245 +517,5 @@ void Partition<Data>::doOutput(WriterProxy w, int n_total_particles, CkCallback 
 // -------------------
 // Friends-of-Friends (FoF) functions
 // -------------------
-#ifdef FOF
-
-template <typename Data>
-void Partition<Data>::depositBucketPointers(CProxy_LocalCalcs<Data> lc_proxy, CProxy_LocalNodeCalcs<Data> lnc_proxy, const CkCallback& cb) {
-  LocalCalcs<Data>* lc_local = lc_proxy.ckLocalBranch();
-  lc_local->cross_partition_union_count = 0;
-  lc_local->compress_count = 0;
-  int nParticles = 0;
-  for (auto leaf : leaves) {
-    lc_local->depositBucket(leaf);
-    nParticles += leaf->n_particles;
-  }
-  UnionFindLib* lib = libProxy[this->thisIndex].ckLocal();
-  if (lib) {
-    lc_local->depositVertexArray(this->thisIndex, lib->return_vertices(), nParticles);
-    lnc_proxy.ckLocalBranch()->depositVertexArraysNode(this->thisIndex, lib->return_vertices(), nParticles);
-  }
-  this->contribute(cb);
-}
-
-// Per-PE counters for union_request calls.  thread_local gives one instance
-// per PE (each Charm++ PE owns one OS thread in SMP mode).  static gives
-// internal linkage so the definition is safe in this header.
-static thread_local long long fof_union_request_count = 0;
-static thread_local bool fof_count_reported = false;
-
-inline void fof_reset_union_request_counter() {
-  fof_union_request_count = 0;
-  fof_count_reported = false;
-}
-
-inline long long fof_get_union_request_count() {
-  return fof_union_request_count;
-}
-/**
- * @brief Initializes an instance of unionFindLib by reading in all particles
- * stored on this partition. Must be called after partitions are initialized
- * with particles
- * 
- * @param cb the callback that will be invoked when this function finishes
- */
-template <typename Data>
-void Partition<Data>::initializeLibVertices(const CkCallback& cb) {
-  int n_particles_on_partition = 0;
-  std::vector<const Particle*> particles;
-  for (auto && leaf : leaves) {
-    n_particles_on_partition += leaf->n_particles;
-  }
-  libVertices = new unionFindVertex[n_particles_on_partition];
-
-  int particles_so_far = 0;
-  for (auto && leaf : leaves) {
-    for (int i = 0; i < leaf->n_particles; i++) {
-      // encodes chare index and array index into vertexID
-      uint64_t vertexID = encodeChareAndArrayIndex(particles_so_far);
-      leaf->setParticleVertexID(i, vertexID);
-      libVertices[particles_so_far].vertexID = vertexID;
-
-      #ifndef ANCHOR_ALGO
-      libVertices[particles_so_far].parent = -1;
-      #else
-      libVertices[particles_so_far].parent = libVertices[particles_so_far].vertexID;
-      #endif
-      particles_so_far++;
-    }
-  }
-
-  UnionFindLib *libPtr = libProxy[this->thisIndex].ckLocal();
-
-  libPtr->initialize_vertices(libVertices, n_particles_on_partition);
-  libPtr->registerGetLocationFromID(getLocationFromID);
-  this->contribute(cb);
-}
-
-/**
- * @brief Propagates vertex ID ranges from leaf nodes up through the tree hierarchy.
- * This should be called after initializeLibVertices and before any traversals.
- * Each internal node will have its particle_min_index and particle_max_index
- * set to encompass all vertex IDs in its subtree.
- * 
- * @param cb Callback to execute after function finishes executing
- */
-template <typename Data>
-void Partition<Data>::propagateVertexIDRanges(const CkCallback& cb) {
-  // Propagate vertex ID ranges from leaves up through tree_leaves
-  // tree_leaves contains the original tree structure before filtering for this partition
-  std::set<Node<Data>*> processed_roots;
-  
-  #ifdef DEBUG_VERTEX_IDS
-  CkPrintf("Partition %d: Starting vertex ID range propagation for %lu tree leaves\n", 
-           this->thisIndex, tree_leaves.size());
-  #endif
-  
-  for (auto && tree_leaf : tree_leaves) {
-    // Find the root of this tree by going up through parents
-    Node<Data>* current = tree_leaf;
-    Node<Data>* root = current;
-    
-    // Find root node by traversing up parent pointers
-    while (current && current->parent != nullptr) {
-      root = current->parent;
-      current = current->parent;
-    }
-    
-    // Only propagate from this root once (avoid duplicates)
-    if (processed_roots.find(root) == processed_roots.end()) {
-      #ifdef DEBUG_VERTEX_IDS
-      CkPrintf("Partition %d: Propagating from root node %lu\n", 
-               this->thisIndex, root->key);
-      #endif
-      root->propagateVertexIDRanges();
-      processed_roots.insert(root);
-    }
-  }
-  
-  #ifdef DEBUG_VERTEX_IDS
-  CkPrintf("Partition %d: Completed vertex ID range propagation for %lu roots\n", 
-           this->thisIndex, processed_roots.size());
-  #endif
-  
-  this->contribute(cb);
-}
-
-/**
- * @brief Validates that vertex ID ranges are correctly propagated through the tree.
- * Prints information about the ranges for debugging purposes.
- * 
- * @param cb Callback to execute after function finishes executing
- */
-template <typename Data>
-void Partition<Data>::validateVertexIDRanges(const CkCallback& cb) {
-  /* DEBUG: Uncomment to enable range validation output
-  CkPrintf("Partition %d: Vertex ID Range Validation\n", this->thisIndex);
-  CkPrintf("  Tree leaves: %lu, Partition leaves: %lu\n", 
-           tree_leaves.size(), leaves.size());
-  
-  // Check ranges in leaves
-  for (size_t i = 0; i < leaves.size() && i < 5; i++) {  // Limit output to first 5 for brevity
-    auto leaf = leaves[i];
-    CkPrintf("  Leaf %lu: vertex_range [%lu, %lu], order_range [%d, %d], particles: %d\n", 
-             leaf->key, leaf->particle_min_index, leaf->particle_max_index, 
-             leaf->particle_min_order, leaf->particle_max_order, leaf->n_particles);
-  }
-  
-  // Check ranges in some tree nodes by following parents
-  if (!tree_leaves.empty()) {
-    auto sample_leaf = tree_leaves[0];
-    Node<Data>* current = sample_leaf;
-    int level = 0;
-    while (current != nullptr && level < 3) {  // Check up to 3 levels
-      CkPrintf("  Level %d Node %lu: vertex_range [%lu, %lu], order_range [%d, %d], particles: %d, children: %d\n", 
-               level, current->key, current->particle_min_index, 
-               current->particle_max_index, current->particle_min_order,
-               current->particle_max_order, current->n_particles, current->n_children);
-      current = current->parent;
-      level++;
-    }
-  }
-  */
-  
-  this->contribute(cb);
-}
-
-/**
- * @brief given the overall sequential order of the particle on this partition,
- * returns a vertexID encoding the vertex's location (chare and array index)
- * 
- * returns a vertexID that encodes
- * the chare index of the vertex in the 32 most significant bits
- * and the local array index of the vertex in the 32 least significant bits
- * The vertex is stored locally in the myVertices array of unionfind
- * and has index equal to the overall sequential order of the particle
- * on this partition
- * 
- * @param particles_so_far overall sequential order of the particle
- * on this partition
- * 
- * @return uint64_t vertexID encoding location of vertex
- */
-template <typename Data>
-inline uint64_t Partition<Data>::encodeChareAndArrayIndex(int particles_so_far) {
-  
-  uint64_t x = (((uint64_t)this->thisIndex) << 32) | particles_so_far;
-  
-  return x;
-}
-
-/**
- * @brief decodes a vertexID and returns its location (chare and array index)
- * 
- * @param vid the ID of a vertex. Assumes it is of type uint64_t
- * @return std::pair<int, int> 
- */
-// Used with unionFindLib. Given a vertexID, returns the chare index and local array index where the particle (vertex) is stored
-// Assumes parameter vid stores the chare index in the 32 most significant bits and the array index in the 32 least significant bits
-template <typename Data>
-std::pair<int, int> Partition<Data>::getLocationFromID(uint64_t vid) {
-  // decodes chare index and array index from vertexID
-  int chareIdx = (vid >> 32);
-  int arrIdx = vid & 0xffffffff;
-  return std::make_pair(chareIdx, arrIdx);
-}
-
-/**
- * @brief Assigns component (group) number to particles after unions are
- * performed between all particles on this partition
- * 
- * @param cb Callback to execute after function finishes executing
- */
-template <typename Data>
-void Partition<Data>::getConnectedComponents(const CkCallback& cb) {
-  int particles_so_far = 0;
-  for (auto && leaf : leaves) {
-    for (int i = 0; i < leaf->n_particles; i++) {
-      long startingGroupNumberOffset = 1;  // so particles that are not part of a cluster have groupID 0 (currently -1 in unionFind implementation)
-      long groupID = libVertices[particles_so_far].componentNumber + startingGroupNumberOffset;
-      leaf->setParticleGroupNumber(i, groupID);
-      particles_so_far++;
-    }
-  }
-  this->contribute(cb);
-}
-
-template <typename Data>
-void Partition<Data>::resetUnionRequestCounter(const CkCallback& cb) {
-  fof_reset_union_request_counter();
-  this->contribute(cb);
-}
-
-template <typename Data>
-void Partition<Data>::reportUnionRequestCount(const CkCallback& cb) {
-  long long count = 0;
-  if (!fof_count_reported) {
-    fof_count_reported = true;
-    count = fof_union_request_count;
-    CkPrintf("[PE %d] union_request calls: %lld\n", CkMyPe(), count);
-  }
-  this->contribute(sizeof(long long), &count, CkReduction::sum_long, cb);
-}
-#endif // FOF
 
 #endif /* _PARTITION_H_ */

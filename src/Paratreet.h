@@ -14,9 +14,6 @@
 #include "ThreadStateHolder.h"
 #include "Subtree.h"
 #include "Partition.h"
-#ifdef FOF
-#include "LocalCalcs.h"
-#endif
 #include "Configuration.h"
 
 #include "paratreet.decl.h"
@@ -104,7 +101,10 @@ namespace paratreet {
     template<typename T, typename C = DefaultConfiguration>
     class Main : public MainBase {
         static const char* __makeName(const char* ty) {
-            return (std::string(ty) + "<" + std::string(typeid(T).name()) + ">").c_str();
+            // intentionally leaked: Charm++ registration keeps the pointer
+            // for the lifetime of the program, and this runs once per type
+            auto* name = new std::string(std::string(ty) + "<" + typeid(T).name() + ">");
+            return name->c_str();
         }
       public:
         using data_type = T;
@@ -134,10 +134,6 @@ namespace paratreet {
             CkIndex_Subtree<T>::__register(__makeName("Subtree"), sizeof(Subtree<T>));
             CkIndex_TreeCanopy<T>::__register(__makeName("TreeCanopy"), sizeof(TreeCanopy<T>));
             CkIndex_Driver<T>::__register(__makeName("Driver"), sizeof(Driver<T>));
-#ifdef FOF
-            CkIndex_LocalCalcs<T>::__register(__makeName("LocalCalcs"), sizeof(LocalCalcs<T>));
-            CkIndex_LocalNodeCalcs<T>::__register(__makeName("LocalNodeCalcs"), sizeof(LocalNodeCalcs<T>));
-#endif
 
             CkIndex_Reader::idx_request<T>( static_cast<void (Reader::*)(const CProxy_Subtree<T> &, int, int)>(NULL));
             CkIndex_Reader::idx_flush<T>( static_cast<void (Reader::*)(int, const CProxy_Subtree<T> &)>(NULL));

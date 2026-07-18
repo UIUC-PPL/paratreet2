@@ -23,11 +23,6 @@
 #include "Node.h"
 #include "Writer.h"
 #include "Subtree.h"
-#ifdef FOF
-#include "unionFindLib.h"
-#include "LocalCalcs.h"
-#include "FoFHooks.h"
-#endif
 
 extern CProxy_Reader readers;
 extern CProxy_TreeSpec treespec;
@@ -48,11 +43,6 @@ public:
   int n_partitions;
   double start_time;
   std::vector<int> partition_locations;
-#ifdef FOF
-  CProxy_UnionFindLib libProxy;
-  CProxy_LocalCalcs<Data> localCalcs;
-  CProxy_LocalNodeCalcs<Data> localNodeCalcs;
-#endif
 
   Driver(CProxy_CacheManager<Data> cache_manager_, CProxy_Resumer<Data> resumer_, CProxy_TreeCanopy<Data> calculator_) :
     cache_manager(cache_manager_), resumer(resumer_), calculator(calculator_), storage_sorted(false) {}
@@ -70,12 +60,6 @@ public:
     cache_manager.initialize(CkCallbackResumeThread());
     // Useful particle keys
     CkPrintf("* Initialization\n");
-#ifdef FOF
-    localNodeCalcs = CProxy_LocalNodeCalcs<Data>::ckNew();
-    CkPrintf("* Created LocalNodeCalcs nodegroup.\n");
-    localCalcs = CProxy_LocalCalcs<Data>::ckNew(localNodeCalcs);
-    CkPrintf("* Created LocalCalcs group.\n");
-#endif
     decompose(0);
     cb.send();
   }
@@ -196,12 +180,6 @@ public:
     CkPrintf("**Total Decomposition time: %.3lf ms\n",
         (CkWallTimer() - decomp_time) * 1000);
     
-    #ifdef FOF
-    // Initialize UnionFindLib for FoF
-    libProxy = UnionFindLib::unionFindInit(partitions, n_partitions);
-    partitions.passUnionFindLib(libProxy);
-    CkPrintf("Initialized UnionFindLib with %d partitions\n", n_partitions);
-    #endif // FOF
   }
 
   // Core iterative loop of the simulation
@@ -228,13 +206,7 @@ public:
       Real max_velocity = *(Real*)(res[0].data); // avoid max_velocity = 0.0
       Real timestep_size = paratreet::getTimestep(universe, max_velocity);
 
-      #ifdef FOF
-      ProxyPack<Data> proxy_pack (this->thisProxy, subtrees, partitions, cache_manager, libProxy);
-      proxy_pack.localCalcs = localCalcs;
-      proxy_pack.localNodeCalcs = localNodeCalcs;
-      #else
       ProxyPack<Data> proxy_pack (this->thisProxy, subtrees, partitions, cache_manager);
-      #endif // FOF
 
       // Prefetch into cache
       start_time = CkWallTimer();
@@ -244,26 +216,6 @@ public:
       CkPrintf("TreeCanopy cache loading: %.3lf ms\n",
           (CkWallTimer() - start_time) * 1000);
 
-      #ifdef FOF
-      // Populate UnionFindLib Vertices for FoF
-      //if(iter<2)
-      //{
-        partitions.initializeLibVertices(CkCallbackResumeThread());
-        CkPrintf("Initialized %d vertices in UnionFindLib\n", universe.n_particles);
-      //}
-      /*
-      // Propagate vertex ID ranges up the tree hierarchy
-      partitions.propagateVertexIDRanges(CkCallbackResumeThread());
-      CkPrintf("Propagated vertex ID ranges up tree hierarchy\n");
-      
-      // Show some validation output (from first PE only to avoid spam)
-      if (CkMyPe() == 0) {
-        partitions.validateVertexIDRanges(CkCallbackResumeThread());
-      }
-        */
-      // Deposit leaf bucket pointers and vertex arrays into LocalCalcs on each PE.
-      partitions.depositBucketPointers(localCalcs, localNodeCalcs, CkCallbackResumeThread());
-      #endif // FOF
 
       // Perform traversals
       start_time = CkWallTimer();
@@ -271,31 +223,9 @@ public:
       //print traversal start time
       CkPrintf("Starting tree traversal at time %.3f\n", start_time);
 
-      #ifdef FOF
-      if(iter!=0)
-      {
-        /*if(iter<2)*/ proxy_pack.partition.resetUnionRequestCounter(CkCallbackResumeThread());
-        if (paratreet::fof_start_idle_monitor) paratreet::fof_start_idle_monitor();
-        paratreet::traversalFn(universe, proxy_pack, iter);
-        CkWaitQD(); //for paratreet tree traversals
-        libProxy[0].quiesce(CkCallbackResumeThread()); //flush htram buffers and wait for quiescence
-        if (paratreet::fof_stop_idle_monitor) paratreet::fof_stop_idle_monitor();
-        CkPrintf("Tree traversal: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
-        void* count_raw = nullptr;
-        proxy_pack.partition.reportUnionRequestCount(CkCallbackResumeThread(count_raw));
-        if (count_raw) {
-          CkReductionMsg* count_msg = static_cast<CkReductionMsg*>(count_raw);
-          long long global_total = *static_cast<long long*>(count_msg->getData());
-          CkPrintf("[Main] Global total union_request calls: %lld\n", global_total);
-          delete count_msg;
-        }
-      }
-      else CkPrintf("In FoF, we are skipping traversal in iteration 0\n");
-      #else
       paratreet::traversalFn(universe, proxy_pack, iter);
       CkWaitQD();
       CkPrintf("Tree traversal: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
-      #endif // FOF
 
 
       start_time = CkWallTimer();
@@ -321,23 +251,10 @@ public:
           (iter % config.flush_period == config.flush_period - 1);
 
       if (iter + 1 == config.num_iterations) complete_rebuild = false;
-      /*#ifdef FOF
-      // Keep the tree intact between iter=1 (intra-partition) and iter=2 (cross-partition)
-      // so iter=2 can reuse the same tree structure without an expensive rebuild.
-      if (iter == 1) complete_rebuild = false;
-      #endif*/
       CkPrintf("[Meta] n_subtree = %d; timestep_size = %f; numPSParticleCopies = %d; numPSParticleShares = %d; sumPESize = %d; maxPESize = %d, avgPESize = %f; ratio = %f; maxVelocity = %f; rebuild = %s\n", n_subtrees, timestep_size, numParticleCopies, numParticleShares, sumPESize, maxPESize, avgPESize, ratio, max_velocity, (complete_rebuild? "yes" : "no"));
       //End Subtree reduction message parsing
 
-      #ifdef FOF
-      if(iter!=0)
-      {
-        paratreet::postIterationFn(universe, proxy_pack, iter);
-      }
-      else CkPrintf("In FoF, we are skipping postIterationFn in iteration 0\n");
-      #else
       paratreet::postIterationFn(universe, proxy_pack, iter);
-      #endif // FOF
 
 
       CkReductionMsg* result;

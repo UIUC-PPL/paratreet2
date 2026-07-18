@@ -2,9 +2,6 @@
 #define PARATREET_PROXYHOLDERS_H_
 
 #include "paratreet.decl.h"
-#ifdef FOF
-#include "unionFindLib.decl.h"
-#endif
 
 template <typename Data>
 class CProxy_Subtree;
@@ -61,12 +58,6 @@ struct DPHolder {
 template <typename Data>
 class CProxy_CacheManager;
 
-#ifdef FOF
-template <typename Data>
-class CProxy_LocalCalcs;
-template <typename Data>
-class CProxy_LocalNodeCalcs;
-#endif
 
 template <typename Data>
 struct ProxyPack {
@@ -74,14 +65,6 @@ struct ProxyPack {
   CProxy_Subtree<Data> subtree;
   CProxy_Partition<Data> partition;
   CProxy_CacheManager<Data> cache;
-#ifdef FOF
-  CProxy_UnionFindLib libProxy;
-  CProxy_LocalCalcs<Data> localCalcs;
-  CProxy_LocalNodeCalcs<Data> localNodeCalcs;
-
-  ProxyPack(CProxy_Driver<Data> d, CProxy_Subtree<Data> s, CProxy_Partition<Data> p, CProxy_CacheManager<Data> c, CProxy_UnionFindLib u)
-    : driver(d), subtree(s), partition(p), cache(c), libProxy(u) {}
-#endif
   ProxyPack(CProxy_Driver<Data> d, CProxy_Subtree<Data> s, CProxy_Partition<Data> p, CProxy_CacheManager<Data> c)
     : driver(d), subtree(s), partition(p), cache(c) {}
   ProxyPack() {}
@@ -90,11 +73,6 @@ struct ProxyPack {
     p | subtree;
     p | partition;
     p | cache;
-#ifdef FOF
-    p | libProxy;
-    p | localCalcs;
-    p | localNodeCalcs;
-#endif
   }
 };
 
