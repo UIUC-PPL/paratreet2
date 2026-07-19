@@ -36,6 +36,18 @@ class Loadable {
 
   FieldOrigin origin_of(const std::string& name) const;
 
+  // Detach a CLI letter from whatever registered field holds it, freeing
+  // the letter for app-specific parsing (getopt in the app's main); the
+  // field remains settable via its config-file name (-x file). Call from
+  // Main::setDefaults, which runs before Configuration::parse consumes
+  // argv (see PARATREET_REGISTER_MAIN in Paratreet.C).
+  inline void release_arg(const char* arg) {
+    for (auto& field : this->fields_) {
+      const char* a = field->arg();
+      if (a && std::strcmp(a, arg) == 0) field->clear_arg();
+    }
+  }
+
   void load(const char* file);
 
   void parse(int&, char**);

@@ -120,6 +120,27 @@ struct FoFFragmentHistogram {
   long max_size;    // largest fragment size
 };
 
+// Result of the global component-size histogram over the final (post
+// phase-3 relabel) labels, computed WITHOUT gathering particles: each PE
+// contributes its (label, count) pairs and the caller merges (a component
+// spanning k PEs contributes k pairs). Same binning as FoFFragmentHistogram.
+// Used by the fof3 harness's stats mode as the cross-run determinism check.
+struct FoFComponentHistogram {
+  long bins[64];      // bins[k] = #components with floor(log2(size)) == k
+  long n_components;  // total component count
+  long max_size;      // largest component size
+};
+
+// Result of the per-PE memory reduction (CmiMemoryUsage). In SMP builds
+// CmiMemoryUsage reports PROCESS-wide allocation, so every PE of a process
+// contributes the same value; min/avg/max are then over processes in
+// practice. avg = sum / CkNumPes().
+struct FoFMemoryStats {
+  long min_bytes;
+  long max_bytes;
+  double avg_bytes;
+};
+
 } // namespace paratreet
 
 // Per-process side of phase 1: collects the per-PE subtree registry (for
@@ -295,6 +316,8 @@ public:
     seen.clear();
     edge_buf3.clear();
     seen3.clear();
+    t_phaseA = 0.0;
+    t_phaseB = 0.0;
     phase3_emitted = 0;
     p3_negative_prunes = 0;
     p3_positive_prunes = 0;
@@ -310,6 +333,7 @@ public:
   // subtrees (self-pairs included), then full path compression and tip
   // assignment into Particle::group_number.
   void phaseA(double b2, const CkCallback& cb) {
+    double t0 = CkWallTimer();
     b2_ = b2;
     // Offset table: flat index space over this PE's particle blocks.
     int n_local = 0;
@@ -338,6 +362,7 @@ public:
       for (int i = 0; i < s.n; i++)
         s.parts[i].group_number = flat_order[find(s.offset + i)];
 
+    t_phaseA = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
     this->contribute(cb);
   }
 
@@ -347,6 +372,7 @@ public:
   // the nodegroup. No-op when this process has a single PE (non-SMP or
   // one-PE-per-process runs).
   void phaseB(double b2, const CkCallback& cb) {
+    double t0 = CkWallTimer();
     b2_ = b2;
     edge_buf.clear();
     seen.clear();
@@ -365,6 +391,7 @@ public:
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
     edge_buf.clear();
     seen.clear();
+    t_phaseB = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
     this->contribute(cb);
   }
 
@@ -438,6 +465,13 @@ public:
                                   // (unSEEN, distinct tips): §8.3 data
   long p3_peak_edge_buf = 0;      // high-water mark of edge_buf3.size()
 
+  // Per-PE wall time of the phaseA/phaseB entry bodies (load-imbalance
+  // signals; set in the entries above, reset by reset(), reduced min/avg/max
+  // over PEs by phase3Stats). NOT cleared by resetPhase3: phase 1 runs
+  // before the phase-3 reset each iteration.
+  double t_phaseA = 0.0;
+  double t_phaseB = 0.0;
+
   void resetPhase3(const CkCallback& cb) {
     edge_buf3.clear();
     seen3.clear();
@@ -471,19 +505,82 @@ public:
   //     [4] suppression prunes  [5] same-fragment prunes
   //     [6] leaf visits  [7] redundant (both-uniform) descents
   //   element 1 (max over PEs), long: peak edge-buffer size.
+  // Load-imbalance extension (min/avg/max over PEs; avg = sum/CkNumPes at
+  // the consumer):
+  //   element 2 (min over PEs), long[2]: [0] leaf visits [1] edges emitted
+  //   element 3 (max over PEs), long[2]: same layout
+  //   element 4 (sum over PEs), double[2]: [0] phaseA s [1] phaseB s
+  //   element 5 (min over PEs), double[2]: same layout
+  //   element 6 (max over PEs), double[2]: same layout
   void phase3Stats(const CkCallback& cb) {
     long sums[8] = {phase3_emitted, (long)edge_buf3.size(),
                     p3_negative_prunes, p3_positive_prunes,
                     p3_suppression_prunes, p3_same_frag_prunes,
                     p3_leaf_visits, p3_redundant_descents};
     long peak = p3_peak_edge_buf;
+    long per_pe[2] = {p3_leaf_visits, phase3_emitted};
+    double times[2] = {t_phaseA, t_phaseB};
     CkReduction::tupleElement tupleRedn[] = {
       CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
-      CkReduction::tupleElement(sizeof(long), &peak, CkReduction::max_long)
+      CkReduction::tupleElement(sizeof(long), &peak, CkReduction::max_long),
+      CkReduction::tupleElement(sizeof(per_pe), per_pe, CkReduction::min_long),
+      CkReduction::tupleElement(sizeof(per_pe), per_pe, CkReduction::max_long),
+      CkReduction::tupleElement(sizeof(times), times, CkReduction::sum_double),
+      CkReduction::tupleElement(sizeof(times), times, CkReduction::min_double),
+      CkReduction::tupleElement(sizeof(times), times, CkReduction::max_double)
     };
-    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 2);
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 7);
     msg->setCallback(cb);
     this->contribute(msg);
+  }
+
+  // Distributed tip-sentinel check: every registered (Subtree-owned)
+  // particle must hold a valid tip, i.e. a global particle order in
+  // [0, n_total). Phase 1 writes every registered particle, so an
+  // out-of-range value means some copy was never touched. Runs on each PE
+  // over its own particles (no gather), so it stays affordable at any N —
+  // the fof3 harness runs it in both check modes.
+  void verifyTips(long n_total, const CkCallback& cb) {
+    for (auto& s : subtrees) {
+      for (int i = 0; i < s.n; i++) {
+        long tip = s.parts[i].group_number;
+        CkEnforce(tip >= 0 && tip < n_total);
+      }
+    }
+    this->contribute(cb);
+  }
+
+  // Per-PE memory usage (CmiMemoryUsage, bytes), tuple reduction:
+  //   [0] min over PEs (long), [1] sum over PEs (long; avg at the consumer),
+  //   [2] max over PEs (long).
+  // In SMP builds CmiMemoryUsage is process-wide (every PE of a process
+  // reports the same value); see paratreet::FoFMemoryStats.
+  void memoryStats(const CkCallback& cb) {
+    long mem = (long)CmiMemoryUsage();
+    CkReduction::tupleElement tupleRedn[] = {
+      CkReduction::tupleElement(sizeof(long), &mem, CkReduction::min_long),
+      CkReduction::tupleElement(sizeof(long), &mem, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &mem, CkReduction::max_long)
+    };
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 3);
+    msg->setCallback(cb);
+    this->contribute(msg);
+  }
+
+  // Per-PE (label, count) pairs over the registered particles, concat-reduced
+  // to the caller, which merges them into exact global component sizes (a
+  // component spanning k PEs contributes k pairs). Gather volume is one pair
+  // per distinct label per PE — far below the full particle gather on
+  // clustered data (worst case, all-singleton labels, it degrades toward
+  // 16 B/particle; the full record gather is 24 B/particle). Used by the
+  // fof3 harness's stats mode via runFoFComponentHistogram.
+  void collectLabelCounts(const CkCallback& cb) {
+    std::unordered_map<long, long> counts;
+    for (auto& s : subtrees)
+      for (int i = 0; i < s.n; i++) counts[s.parts[i].group_number]++;
+    std::vector<std::pair<long, long>> v(counts.begin(), counts.end());
+    this->contribute(v.size() * sizeof(std::pair<long, long>),
+                     v.data(), CkReduction::concat, cb);
   }
 
   // Owner-writes relabel through the global tip -> root map computed by the
@@ -660,6 +757,68 @@ FoFFragmentHistogram runFoFFragmentHistogram(CProxy_FoFPhase1<Data> fof,
   h.max_size = *(const long*)elems[2].data;
   delete[] elems;
   delete msg;
+  return h;
+}
+
+// Distributed tip-sentinel check (see FoFPhase1::verifyTips). Blocks until
+// every PE has checked its registered particles; a bad tip trips CkEnforce
+// on the owning PE. Same threaded-context requirements as runFoFPhase1.
+template <typename Data>
+void runFoFVerifyTips(CProxy_FoFPhase1<Data> fof, long n_total) {
+  fof.verifyTips(n_total, CkCallbackResumeThread());
+}
+
+// Per-PE memory usage, reduced min/avg/max (see FoFPhase1::memoryStats).
+// Blocks and returns the reduced stats; call from a [threaded] context.
+template <typename Data>
+FoFMemoryStats runFoFMemoryStats(CProxy_FoFPhase1<Data> fof) {
+  void* result = nullptr;
+  fof.memoryStats(CkCallbackResumeThread(result));
+  CkReductionMsg* msg = (CkReductionMsg*)result;
+  CkReduction::tupleElement* elems = nullptr;
+  int n_elems = 0;
+  msg->toTuple(&elems, &n_elems);
+  CkEnforce(n_elems == 3);
+  FoFMemoryStats s;
+  s.min_bytes = *(const long*)elems[0].data;
+  s.avg_bytes = (double)*(const long*)elems[1].data / (double)CkNumPes();
+  s.max_bytes = *(const long*)elems[2].data;
+  delete[] elems;
+  delete msg;
+  return s;
+}
+
+// Global component-size histogram over the final labels WITHOUT a particle
+// gather (see FoFPhase1::collectLabelCounts): concat-gather the per-PE
+// (label, count) pairs to this thread, merge to exact global sizes, and
+// log2-bin them with the same binning as the fragment histogram. Run after
+// the phase-3 relabel (labels must be global); call from a [threaded]
+// context on PE 0. This is the stats-mode determinism observable: for a
+// given input it must be bit-identical across process/PE configurations.
+template <typename Data>
+FoFComponentHistogram runFoFComponentHistogram(CProxy_FoFPhase1<Data> fof) {
+  void* result = nullptr;
+  fof.collectLabelCounts(CkCallbackResumeThread(result));
+  CkReductionMsg* msg = (CkReductionMsg*)result;
+  int n_pairs = msg->getSize() / sizeof(std::pair<long, long>);
+  const auto* pairs = (const std::pair<long, long>*)msg->getData();
+  std::unordered_map<long, long> counts;
+  counts.reserve((size_t)n_pairs);
+  for (int i = 0; i < n_pairs; i++) counts[pairs[i].first] += pairs[i].second;
+  delete msg;
+
+  FoFComponentHistogram h;
+  std::memset(h.bins, 0, sizeof(h.bins));
+  h.n_components = 0;
+  h.max_size = 0;
+  for (auto& kv : counts) {
+    long size = kv.second;
+    int bin = 0; // floor(log2(size)); size >= 1 always
+    while (bin < 63 && (1L << (bin + 1)) <= size) bin++;
+    h.bins[bin]++;
+    h.n_components++;
+    if (size > h.max_size) h.max_size = size;
+  }
   return h;
 }
 

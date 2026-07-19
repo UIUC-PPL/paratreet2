@@ -224,6 +224,14 @@ struct FoFPhase3Result {
   double t_gather;  // flushPhase3Edges concat reduction + phase3Stats
   double t_uf2;     // serial UF_2 + dedup + map construction on PE 0
   double t_relabel; // applyGlobalMap broadcast + relabel barrier
+  // Per-PE load-imbalance signals (min/avg/max over PEs; avg = sum/#PEs).
+  // The phase-1 entry-body times ride along in the phase-3 stats reduction
+  // (FoFPhase1::phase3Stats); leaf_visits/edges_emitted are the walk-side
+  // work distribution, phaseA/phaseB the phase-1 distribution.
+  long leaf_visits_min, leaf_visits_max;   // avg = leaf_visits / #PEs
+  long emitted_min, emitted_max;           // avg = edges_emitted / #PEs
+  double t_phaseA_min, t_phaseA_avg, t_phaseA_max;
+  double t_phaseB_min, t_phaseB_avg, t_phaseB_max;
 };
 
 // Convenience driver for the full phase-3 sequence:
@@ -264,7 +272,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   CkReduction::tupleElement* stats_elems = nullptr;
   int n_stats_elems = 0;
   stats_msg->toTuple(&stats_elems, &n_stats_elems);
-  CkEnforce(n_stats_elems == 2);
+  CkEnforce(n_stats_elems == 7);
   const long* stats = (const long*)stats_elems[0].data;
   FoFPhase3Result r;
   r.edges_emitted = stats[0];
@@ -276,6 +284,21 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   r.leaf_visits = stats[6];
   r.redundant_descents = stats[7];
   r.peak_edge_buf = *(const long*)stats_elems[1].data;
+  // Load-imbalance extension (layout: FoFPhase1::phase3Stats).
+  {
+    const long* mins = (const long*)stats_elems[2].data;
+    const long* maxs = (const long*)stats_elems[3].data;
+    const double* tsum = (const double*)stats_elems[4].data;
+    const double* tmin = (const double*)stats_elems[5].data;
+    const double* tmax = (const double*)stats_elems[6].data;
+    r.leaf_visits_min = mins[0];
+    r.emitted_min = mins[1];
+    r.leaf_visits_max = maxs[0];
+    r.emitted_max = maxs[1];
+    double n_pes = (double)CkNumPes();
+    r.t_phaseA_min = tmin[0]; r.t_phaseA_avg = tsum[0] / n_pes; r.t_phaseA_max = tmax[0];
+    r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];
+  }
   delete[] stats_elems;
   CkEnforce(r.edges_sent == (long)n_edges);
   double t2 = CkWallTimer();

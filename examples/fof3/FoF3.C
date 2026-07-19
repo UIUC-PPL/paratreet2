@@ -29,8 +29,9 @@ using namespace paratreet;
     const BoundingBox& universe = thread_state_holder.ckLocalBranch()->universe;
     double V = universe.box.volume();
     int N = universe.n_particles;
-    fof_b = 0.2 * std::cbrt(V / (double)N);
-    CkPrintf("FoF linking length b = %g (V = %g, N = %d)\n", fof_b, V, N);
+    fof_b = fof_b_factor * std::cbrt(V / (double)N);
+    CkPrintf("FoF linking length b = %g (factor %g, V = %g, N = %d)\n",
+             fof_b, fof_b_factor, V, N);
 
     // Phase 1: register -> phaseA -> phaseB -> merge -> relabel. Tips are
     // process-level fragments afterwards.
@@ -47,8 +48,21 @@ using namespace paratreet;
     // Only now ship the starter pack: every canopy annotation is valid.
     proxy_pack.driver.loadCache(CkCallbackResumeThread());
     double t3 = CkWallTimer();
-    CkPrintf("FOF3 TIME phase1 %.3f s, upwardPass %.3f s, loadCache %.3f s\n",
+    CkPrintf("FOF3STAT time_s: phase1 %.3f upwardPass %.3f loadCache %.3f\n",
              t1 - t0, t2 - t1, t3 - t2);
+  }
+
+  // Shared printer for the final component-count + histogram line: full and
+  // stats mode MUST emit the identical format (and, for a given input, the
+  // identical content — this line is the cross-run determinism observable in
+  // stats mode, compared across configs/runs of the same input).
+  static void printComponentsLine(long n_components, long max_size,
+                                  const long* bins) {
+    CkPrintf("FOF3STAT components: %ld max_size %ld log2_histogram:",
+             n_components, max_size);
+    for (int k = 0; k < 64; k++)
+      if (bins[k] != 0) CkPrintf(" %d:%ld", k, bins[k]);
+    CkPrintf("\n");
   }
 
   // Serial O(n^2) reference FoF over the gathered records. Fills
@@ -219,8 +233,39 @@ using namespace paratreet;
     int N = universe.n_particles;
     double b = fof_b;
     CkEnforce(b > 0.0);
-    CkEnforce(std::fabs(b - 0.2 * std::cbrt(universe.box.volume() / (double)N))
+    CkEnforce(std::fabs(b - fof_b_factor *
+                            std::cbrt(universe.box.volume() / (double)N))
               <= 1e-12 * b);
+
+    // Resolve the correctness-check mode (-c; see README "Testing on a
+    // cluster"). full = gather-to-PE-0 + serial grid reference (exact
+    // partition comparison); stats = no gather, no reference — distributed
+    // checks (tip sentinel, annotation-validity CkEnforce) stay on, and the
+    // component count + histogram line is the cross-run determinism check.
+    bool do_full;
+    const char* mode_name;
+    switch (check_mode) {
+      case CheckMode::Full:  do_full = true;  mode_name = "full";  break;
+      case CheckMode::Stats: do_full = false; mode_name = "stats"; break;
+      default:
+        do_full = (N <= kAutoFullMaxN);
+        mode_name = do_full ? "auto(full)" : "auto(stats)";
+        break;
+    }
+
+    // Self-describing config line: every FOF3STAT block starts with this.
+    CkPrintf("FOF3STAT config: pes %d nodes %d N %d b %.12g b_factor %g "
+             "decomp %s tree %s leafsize %d mode %s iter %d\n",
+             CkNumPes(), CkNumNodes(), N, b, fof_b_factor,
+             paratreet::asString(conf.decomp_type).c_str(),
+             paratreet::asString(conf.tree_type).c_str(),
+             conf.max_particles_per_leaf, mode_name, iter);
+    if (check_mode == CheckMode::Auto && !do_full) {
+      CkPrintf("FOF3STAT warning: N = %d > %d, full verification SKIPPED "
+               "(auto mode fell back to stats); force with -c full, memory "
+               "permitting (gather is ~24 bytes/particle to PE 0)\n",
+               N, kAutoFullMaxN);
+    }
 
     // Leaf-annotation assertions over the full tree (remote sources ship
     // through the CacheManager: first true multi-process exercise of
@@ -241,59 +286,86 @@ using namespace paratreet;
     double tc1 = CkWallTimer();
 
     // Phase-1 fragment (process-tip) histogram — design note §6.3e data;
-    // must run before the phase-3 relabel overwrites the tips.
+    // must run before the phase-3 relabel overwrites the tips. Distributed
+    // (reduction-based), so it runs in both check modes.
     {
       auto h = paratreet::runFoFFragmentHistogram(fof, fof_node);
-      CkPrintf("Phase 1 fragments: %ld, max size %ld; log2 histogram:",
+      CkPrintf("FOF3STAT fragments: %ld max_size %ld log2_histogram:",
                h.n_fragments, h.max_size);
       for (int k = 0; k < 64; k++)
         if (h.bins[k] != 0) CkPrintf(" %d:%ld", k, h.bins[k]);
       CkPrintf("\n");
     }
 
-    // Pre-walk soundness check for the phase-3 edge predicate: every
-    // registered (Subtree-owned) particle must hold a valid tip, i.e. a
-    // global particle order in [0, N). Phase 1 writes every registered
-    // particle, so an out-of-range value would mean the walk reads copies
-    // phase 1 never touched. (Target-side sharing is asserted separately by
+    // Pre-walk soundness check for the phase-3 edge predicate (the tip
+    // sentinel): every registered (Subtree-owned) particle must hold a
+    // valid tip, i.e. a global particle order in [0, N). Phase 1 writes
+    // every registered particle, so an out-of-range value would mean the
+    // walk reads copies phase 1 never touched. Distributed (each PE checks
+    // its own particles, barrier reduction) so it stays on in BOTH modes.
+    // (Target-side sharing is asserted separately by
     // Partition::verifySharedLeaves inside runFoFPhase3.)
     double tg0 = CkWallTimer();
-    {
-      CkReductionMsg* msg = gatherRecords(fof, N, "pre-walk");
-      const auto* recs = (const FoFParticleRecord*)msg->getData();
-      for (int i = 0; i < N; i++) {
-        CkEnforce(recs[i].tip >= 0 && recs[i].tip < N);
-      }
-      delete msg;
-    }
+    paratreet::runFoFVerifyTips(fof, (long)N);
     double tg1 = CkWallTimer();
-    CkPrintf("FOF3 TIME fragcheck %.3f s, pre-walk gather %.3f s\n",
+    CkPrintf("FOF3STAT time_s: fragcheck %.3f tip_sentinel %.3f\n",
              tc1 - tc0, tg1 - tg0);
 
     // Phase 3: cross-process boundary walk + gather-to-one UF_2 + global
     // relabel (see src/FoFPhase3.h).
     FoFPhase3Result pr = paratreet::runFoFPhase3(proxy_pack.partition, fof, b);
-    CkPrintf("Phase 3 edges: emitted %ld, sent %ld (per-PE dedup), "
-             "unique %ld (root dedup), tips remapped %ld\n",
+    CkPrintf("FOF3STAT edges: emitted %ld sent %ld unique %ld tips_remapped %ld\n",
              pr.edges_emitted, pr.edges_sent, pr.edges_unique, pr.tips_remapped);
     // 3a counters (design/step3.md §6). Redundancy ratio = both-uniform
     // descents / unique cross-process pairs (the §8.3/8.4 go/no-go data for
     // 3b's parking). Peak active node pairs is not tracked (the traverser
     // does not expose pair activation cheaply); the edge-buffer high-water
     // mark is the reported memory figure.
-    CkPrintf("Phase 3a prunes: negative %ld, positive %ld, suppression %ld, "
-             "same-frag %ld; leaf visits %ld\n",
+    CkPrintf("FOF3STAT prunes: negative %ld positive %ld suppression %ld "
+             "same_frag %ld leaf_visits %ld\n",
              pr.negative_prunes, pr.positive_prunes, pr.suppression_prunes,
              pr.same_frag_prunes, pr.leaf_visits);
-    CkPrintf("Phase 3a redundancy: %ld both-uniform descents / %ld unique "
-             "pairs = %.3f; peak edge buffer per PE = %ld\n",
+    CkPrintf("FOF3STAT redundancy: both_uniform_descents %ld unique_pairs %ld "
+             "ratio %.3f peak_edge_buf %ld\n",
              pr.redundant_descents, pr.edges_unique,
              pr.edges_unique > 0 ? (double)pr.redundant_descents / pr.edges_unique
                                  : 0.0,
              pr.peak_edge_buf);
-    CkPrintf("FOF3 TIME phase3 walk %.3f s, edge gather %.3f s, UF_2 %.3f s, "
-             "relabel %.3f s\n",
+    CkPrintf("FOF3STAT time_s: phase3_walk %.3f edge_gather %.3f uf2 %.3f "
+             "relabel %.3f\n",
              pr.t_walk, pr.t_gather, pr.t_uf2, pr.t_relabel);
+    // Per-PE load-imbalance signals (min/avg/max over PEs), from the
+    // phase3Stats tuple reduction: phase-1 entry-body times and the walk's
+    // per-PE work distribution. max/avg >> 1 = imbalance.
+    {
+      double n_pes = (double)CkNumPes();
+      CkPrintf("FOF3STAT balance: phaseA_s %.3f/%.3f/%.3f "
+               "phaseB_s %.3f/%.3f/%.3f (min/avg/max over %d PEs)\n",
+               pr.t_phaseA_min, pr.t_phaseA_avg, pr.t_phaseA_max,
+               pr.t_phaseB_min, pr.t_phaseB_avg, pr.t_phaseB_max, CkNumPes());
+      CkPrintf("FOF3STAT balance: leaf_visits %ld/%.1f/%ld "
+               "edges_emitted %ld/%.1f/%ld (min/avg/max over %d PEs)\n",
+               pr.leaf_visits_min, pr.leaf_visits / n_pes, pr.leaf_visits_max,
+               pr.emitted_min, pr.edges_emitted / n_pes, pr.emitted_max,
+               CkNumPes());
+    }
+
+    if (!do_full) {
+      // Stats mode: no particle gather, no serial reference. The component
+      // count + size histogram is still exact — computed from a distributed
+      // (label, count) gather (see FoFPhase1::collectLabelCounts) — and is
+      // the determinism observable: run the same input under two different
+      // process/PE configs and diff the FOF3STAT components lines.
+      double th0 = CkWallTimer();
+      auto h = paratreet::runFoFComponentHistogram(fof);
+      double th1 = CkWallTimer();
+      printComponentsLine(h.n_components, h.max_size, h.bins);
+      CkPrintf("FOF3STAT time_s: component_histogram %.3f\n", th1 - th0);
+      CkPrintf("FOF3 STATS MODE COMPLETE: %ld components "
+               "(full verification not run; determinism check = compare "
+               "FOF3STAT components lines across configs)\n", h.n_components);
+      return;
+    }
 
     // End-to-end check: after UF_2 relabel the labels are global, so the
     // comparison against the serial O(n^2) reference is valid on any number
@@ -317,12 +389,12 @@ using namespace paratreet;
       long n2_components = serialReference(recs, N, b * b, n2_rep);
       CkEnforce(n2_components == serial_components);
       for (int i = 0; i < N; i++) CkEnforce(n2_rep[i] == serial_rep[i]);
-      CkPrintf("FOF3 grid reference cross-validated against O(n^2): "
-               "identical partition, %ld components\n", serial_components);
+      CkPrintf("FOF3STAT crosscheck: grid reference == O(n^2) reference, "
+               "%ld components\n", serial_components);
     }
     double tv3 = CkWallTimer();
-    CkPrintf("FOF3 TIME final gather %.3f s, grid reference %.3f s"
-             " (O(n^2) cross-check %.3f s)\n",
+    CkPrintf("FOF3STAT time_s: final_gather %.3f grid_reference %.3f "
+             "n2_crosscheck %.3f\n",
              tv1 - tv0, tv2 - tv1, tv3 - tv2);
 
     int n_mismatch = 0;
@@ -342,8 +414,9 @@ using namespace paratreet;
     long K = (long)tips_seen.size();
     // Final (global) component-size histogram: log2 bins over the label
     // counts. Input-determined, so it must be identical across every config
-    // of the same input (the determinism cross-check); its tail is the
-    // giant-component diagnostic on near-percolation inputs.
+    // of the same input (the determinism cross-check; stats mode prints the
+    // same line from a distributed gather); its tail is the giant-component
+    // diagnostic on near-percolation inputs.
     {
       long bins[64] = {0};
       long max_size = 0;
@@ -354,11 +427,7 @@ using namespace paratreet;
         bins[bin]++;
         if (size > max_size) max_size = size;
       }
-      CkPrintf("Final components: %ld, max size %ld; log2 histogram:",
-               K, max_size);
-      for (int k = 0; k < 64; k++)
-        if (bins[k] != 0) CkPrintf(" %d:%ld", k, bins[k]);
-      CkPrintf("\n");
+      printComponentsLine(K, max_size, bins);
     }
     delete msg;
 
@@ -372,6 +441,17 @@ using namespace paratreet;
   }
 
   void ExMain::postIterationFn(BoundingBox& universe, ProxyPack<FragData>& proxy_pack, int iter) {
+    // End-of-iteration memory footprint, min/avg/max over PEs (tuple
+    // reduction on the FoFPhase1 branches; CmiMemoryUsage). Limitation: in
+    // SMP builds CmiMemoryUsage reports PROCESS-wide allocation, so every PE
+    // of a process contributes the same value and min/avg/max are effectively
+    // over processes; it is current (not peak) usage, so the walk-time or
+    // gather-time high-water mark can exceed it.
+    auto ms = paratreet::runFoFMemoryStats(fof);
+    CkPrintf("FOF3STAT memory_MB: %.1f/%.1f/%.1f (min/avg/max over %d PEs; "
+             "CmiMemoryUsage, process-wide under SMP)\n",
+             ms.min_bytes / 1e6, ms.avg_bytes / 1e6, ms.max_bytes / 1e6,
+             CkNumPes());
   }
 
   Real ExMain::getTimestep(BoundingBox& universe, Real max_velocity) {

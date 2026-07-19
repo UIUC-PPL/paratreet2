@@ -12,6 +12,7 @@ all: $(TARGET)
 
 OBJECTS = plummer.o tipsyPlummer.o gen_util.o uniform.o
 
+# CXX is make's built-in default (g++); override with `make CXX=...`.
 CPPFLAGS += -I$(STRUCTURES_PATH) -O2 -std=c++11
 
 $(STRUCTURES_PATH)/libTipsy.a: $(STRUCTURES_PATH)/Makefile
@@ -21,25 +22,25 @@ $(STRUCTURES_PATH)/Makefile:
 	cd $(STRUCTURES_PATH); ./configure
 
 plummer.o: plummer.cpp
-	g++ $(CPPFLAGS) -c plummer.cpp
+	$(CXX) $(CPPFLAGS) -c plummer.cpp
 
 tipsyPlummer.o: tipsyPlummer.cpp
-	g++ $(CPPFLAGS) -c tipsyPlummer.cpp
+	$(CXX) $(CPPFLAGS) -c tipsyPlummer.cpp
 
 gen_util.o: gen_util.cpp
-	g++ $(CPPFLAGS) -c gen_util.cpp
+	$(CXX) $(CPPFLAGS) -c gen_util.cpp
 
 uniform.o: uniform.cpp
-	g++ $(CPPFLAGS) -c uniform.cpp
+	$(CXX) $(CPPFLAGS) -c uniform.cpp
 
 plummer: plummer.o gen_util.o
-	g++ $(CPPFLAGS) -o plummer plummer.o gen_util.o
+	$(CXX) $(CPPFLAGS) -o plummer plummer.o gen_util.o
 
 uniform: uniform.o
-	g++ $(CPPFLAGS) -o uniform uniform.o
+	$(CXX) $(CPPFLAGS) -o uniform uniform.o
 
 tipsyPlummer: tipsyPlummer.o $(STRUCTURES_PATH)/libTipsy.a
-	g++ $(CPPFLAGS) -o tipsyPlummer tipsyPlummer.o -lTipsy -L$(STRUCTURES_PATH)
+	$(CXX) $(CPPFLAGS) -o tipsyPlummer tipsyPlummer.o -lTipsy -L$(STRUCTURES_PATH)
 
 clean:
 	rm -rf $(OBJECTS) $(TARGET)

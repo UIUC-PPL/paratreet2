@@ -25,6 +25,9 @@ class GenericField {
       : arg_(nullptr), origin_(FieldOrigin::Unknown) {}
 
   const char* arg(void) const { return this->arg_; }
+  // Detach this field's CLI letter (it stays settable via its config-file
+  // name); see Loadable::release_arg.
+  void clear_arg(void) { this->arg_ = nullptr; }
   const std::string& name(void) const { return this->name_; }
 
   virtual void accept(const char*) {

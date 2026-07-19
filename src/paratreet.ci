@@ -111,6 +111,13 @@ module paratreet {
     entry void flushPhase3Edges(const CkCallback&);
     entry void phase3Stats(const CkCallback&);
     entry void applyGlobalMap(const std::vector<std::pair<long, long> >&, const CkCallback&);
+    // Cluster-assessment entries (see the "Testing on a cluster" section of
+    // the top-level README): distributed tip-sentinel check, per-PE memory
+    // reduction, and the distributed component-histogram gather used by the
+    // fof3 harness's stats mode (no full particle gather).
+    entry void verifyTips(long n_total, const CkCallback&);
+    entry void memoryStats(const CkCallback&);
+    entry void collectLabelCounts(const CkCallback&);
   };
 
   template <typename Data>
