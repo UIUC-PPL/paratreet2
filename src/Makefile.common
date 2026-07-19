@@ -5,7 +5,7 @@ BASE_PATH := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 PARATREET_PATH = $(BASE_PATH)/src
 STRUCTURE_PATH = $(BASE_PATH)/utility/structures
 
-INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I.
+INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I$(PARATREET_PATH)/uf2 -I.
 CHARM_HOME ?= $(HOME)/software/clusterFinding/charm
 
 LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet

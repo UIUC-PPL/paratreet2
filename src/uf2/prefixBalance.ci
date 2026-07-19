@@ -1,0 +1,34 @@
+
+module prefixBalance{
+  array [1D] Prefix {
+    entry Prefix(int nElements);
+
+    entry void passValue(int step, unsigned int incomingValue);
+    entry void startPrefixCalculation(int intsCount, CkCallback cb){
+      serial{
+        nInts = intsCount;
+        value = intsCount;
+      }
+      for(index=0; (1 << index) < numElements; index++){
+        serial "send_value" {
+          targetIndex = thisIndex + (1<<index);
+          if(targetIndex < numElements)
+            thisProxy[targetIndex].passValue(index, value);
+        }
+        if(thisIndex >= (1<<index))
+          when passValue[index](int incoming_index, unsigned int incoming_value) serial{
+            value += incoming_value;
+          }
+      }
+      serial "finished" {
+        int sending_value = 0;
+        if(thisIndex == numElements-1)
+          sending_value = value;
+        contribute(sizeof(int), &sending_value, CkReduction::sum_int,
+          cb
+        );
+      }
+    };
+
+  };
+};
