@@ -292,6 +292,37 @@ assertion is the tripwire for the whole hazard class.
   masqueraded as valid "fragment 0" annotations, which would have
   made the validity CkEnforce vacuous).
 
+## 6b. Scale campaign results (2026-07-19, 100k-16M)
+
+Grid-hash exact reference (O(n)) cross-validated vs O(n^2) at <= 10k,
+then used through 16M. All runs green with exact partition match;
+component count + histogram bit-identical across configs per input.
+
+- 100k Plummer: 33,933 comps (max 26,042). 1M: 333,889 (max 259k).
+  8M: 2,657,656 (max 2.06M). 16M: 5,317,213 (max 4.09M). Plummer
+  shows 2 giant components at every scale (generator mirrors two
+  offset half-models).
+- 100k uniform at b = 0.2 mean spacing: NO giant component (max 3,
+  96.6% singletons) — consistent with continuum percolation
+  (threshold ~0.87 n^-1/3; 0.2 is deep subcritical). A percolation
+  stress test wants b ~ 0.7-0.9 mean spacing; the design note's
+  near-percolation concern applies to clustered cosmological data,
+  not uniform boxes at 0.2.
+- 3b go/no-go CONFIRMED DEFERRED: redundancy 0.27-0.44 extra
+  descents per unique pair at all scales (absolute: 1.5k redundant
+  of ~118M opens at 8M). Suppression itself earns its keep (~7
+  suppressed re-opens per unique pair at 8M); peak edge buffer
+  2,524 edges (~40 KB) — memory bound loose by orders of magnitude.
+- Positive certificate: 0 fires at every scale including 2M-particle
+  fragments. 6a conclusion stands.
+- Perf notes for later (correctness-grade timings, macOS): 8M
+  2p x 2PE full iteration 23 s (walk 14.2 s); 16M +p2 walk 162.9 s —
+  walk grew superlinearly at +p2 (2x data, 1.84x leaf visits,
+  3.4x time): investigate when phase-3 performance work starts.
+  FragCheckVisitor full sweep is quadratic; gated to <= 100k.
+- Peak RSS 5.4 GB at 16M (32 GB machine); 80M correctly out of
+  reach on this hardware.
+
 ## 7. Explicitly deferred past 3b
 
 htram aggregation for edge emission (counters above are already
