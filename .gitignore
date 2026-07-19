@@ -4,8 +4,21 @@
 *.def.h
 charmrun
 .DS_Store
-VisitAll
-Annotate
-FoF1
-FoF3
 __.SYMDEF
+# Example binaries. Patterns are anchored to full paths: bare names like
+# "FoF1" would match the examples/fof1 DIRECTORY on case-insensitive
+# filesystems (core.ignorecase), silently untracking the whole harness.
+examples/searchAlgos/VisitAll
+examples/annotate/Annotate
+examples/fof1/FoF1
+examples/fof3/FoF3
+# Input generators (built binaries) and generated datasets. Raw .dat files
+# are intermediates; tipsy files >= 100 MB (1M+ particles) must never be
+# committed (small ones like 100k ~3.6 MB may be).
+inputgen/plummer
+inputgen/tipsyPlummer
+inputgen/uniform
+inputs/*.dat
+inputs/1m*.tipsy
+inputs/8m*.tipsy
+inputs/16m*.tipsy

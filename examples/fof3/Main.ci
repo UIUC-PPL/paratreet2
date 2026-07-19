@@ -1,0 +1,14 @@
+mainmodule Main {
+    extern module paratreet;
+
+    readonly int peanoKey;
+
+    initnode void initialize(void);
+
+    extern entry void Subtree<FragData> registerFoF(CProxy_FoFPhase1<FragData>, const CkCallback&);
+    extern entry void Subtree<FragData> upwardPass(const CkCallback&);
+    extern entry void Partition<FragData> startDown<FragCheckVisitor> (FragCheckVisitor v);
+    extern entry void Partition<FragData> startDown<FoFEdgeVisitor> (FoFEdgeVisitor v);
+    extern entry void FoFPhase1<FragData> countFragments(const CkCallback&);
+    extern entry void FoFPhase1Node<FragData> fragmentHistogram(const CkCallback&);
+}

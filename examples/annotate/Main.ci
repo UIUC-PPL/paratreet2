@@ -1,0 +1,18 @@
+mainmodule Main {
+    extern module paratreet;
+
+    readonly int peanoKey;
+    readonly CProxy_MinMaxTracker min_max_tracker;
+
+    initnode void initialize(void);
+
+    group MinMaxTracker {
+        entry MinMaxTracker();
+        entry void collect(const CkCallback&);
+        entry void reset(const CkCallback&);
+    }
+
+    extern entry void Partition<MinMaxData> startDown<CheckVisitor> (CheckVisitor v);
+    extern entry void Subtree<MinMaxData> callPerLeafFn(CkReference<paratreet::PerLeafAble<MinMaxData>>, const CkCallback&);
+    extern entry void Subtree<MinMaxData> upwardPass(const CkCallback&);
+}

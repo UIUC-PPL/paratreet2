@@ -218,6 +218,12 @@ struct FoFPhase3Result {
   long leaf_visits;
   long redundant_descents; // both-uniform descents (§8.3 redundancy data)
   long peak_edge_buf;      // max over PEs of the edge-buffer high-water mark
+  // Coarse wall-time brackets (design note §8 measurements; CkWallTimer on
+  // the driving thread):
+  double t_walk;    // startDown broadcast + CkWaitQD (the boundary walk)
+  double t_gather;  // flushPhase3Edges concat reduction + phase3Stats
+  double t_uf2;     // serial UF_2 + dedup + map construction on PE 0
+  double t_relabel; // applyGlobalMap broadcast + relabel barrier
 };
 
 // Convenience driver for the full phase-3 sequence:
@@ -240,8 +246,10 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
 
   // The boundary walk: all Partitions against the global tree. QD covers
   // the traversal including cache fetches and resumptions.
+  double t0 = CkWallTimer();
   partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2));
   CkWaitQD();
+  double t1 = CkWallTimer();
 
   // Gather the per-PE deduplicated buffers to this (PE 0, driver) thread.
   void* result = nullptr;
@@ -270,6 +278,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   r.peak_edge_buf = *(const long*)stats_elems[1].data;
   delete[] stats_elems;
   CkEnforce(r.edges_sent == (long)n_edges);
+  double t2 = CkWallTimer();
 
   // Serial UF_2 over the deduplicated edges; union by min tip so the global
   // root of a component is the smallest tip id = the global particle order
@@ -307,10 +316,16 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
     if (root != kv.first) map_vec.emplace_back(kv.first, root);
   }
   r.tips_remapped = (long)map_vec.size();
+  double t3 = CkWallTimer();
 
   // Broadcast the map; each PE relabels its own registered particles
   // (owner-writes, identity if absent).
   fof.applyGlobalMap(map_vec, CkCallbackResumeThread());
+  double t4 = CkWallTimer();
+  r.t_walk = t1 - t0;
+  r.t_gather = t2 - t1;
+  r.t_uf2 = t3 - t2;
+  r.t_relabel = t4 - t3;
   return r;
 }
 
