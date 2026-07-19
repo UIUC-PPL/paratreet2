@@ -74,6 +74,33 @@ inline Real mindist2(const OrientedBox<Real>& a, const OrientedBox<Real>& b) {
   return d2;
 }
 
+// Component-wise MAXIMUM distance squared between two axis-aligned boxes:
+// the distance between the farthest pair of points, one from each box. Per
+// axis the farthest pair sits at interval endpoints, so the axis term is
+// max(|a.lo - b.hi|, |a.hi - b.lo|); sum the squares over axes.
+// Hand checks (one axis): disjoint A=[0,1], B=[2,3] -> max(|0-3|,|1-2|) = 3
+// (farthest points 0 and 3). Identical A=B=[0,1] -> max(|0-1|,|1-0|) = 1
+// (opposite endpoints). Nested A=[0,4], B=[1,2] -> max(|0-2|,|4-1|) = 3
+// (farthest points 4 and 1). Like mindist2, a pure function of the two
+// boxes, so PBC offsets parameterize it the same way (shift one box).
+inline Real maxdist2(const OrientedBox<Real>& a, const OrientedBox<Real>& b) {
+  Real dx = std::max(std::fabs(a.lesser_corner.x - b.greater_corner.x),
+                     std::fabs(a.greater_corner.x - b.lesser_corner.x));
+  Real dy = std::max(std::fabs(a.lesser_corner.y - b.greater_corner.y),
+                     std::fabs(a.greater_corner.y - b.lesser_corner.y));
+  Real dz = std::max(std::fabs(a.lesser_corner.z - b.greater_corner.z),
+                     std::fabs(a.greater_corner.z - b.lesser_corner.z));
+  return dx * dx + dy * dy + dz * dz;
+}
+
+// Canonical packing of an unordered (tip, tip) pair into a u64 key: min tip
+// in the high 32 bits, max in the low 32 (tips are particle orders, ints).
+// Shared by the phaseB/phase-3 edge dedup and the phase-3a SEEN table.
+inline uint64_t packTipPair(long a, long b) {
+  long lo = std::min(a, b), hi = std::max(a, b);
+  return (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
+}
+
 // Record emitted by FoFPhase1::collect (validation/debugging helper).
 // Uses Real for the position so a serial checker can reproduce the
 // library's distance arithmetic bit-for-bit.
@@ -114,7 +141,38 @@ public:
   std::unordered_map<long, long> tip_map;   // PE-tip -> process-tip
   std::unordered_map<long, long> frag_counts; // process-tip -> exact size
 
+  // Phase-3a SEEN table (design/step3.md §1, §3): process-level set of
+  // packed (g, f) fragment pairs for which an edge has been (or is being)
+  // emitted. Process level is sufficient for suppression because in the
+  // transposed traversal the target fragment f is always process-local, so
+  // every node pair over (g, f) is generated on f's owner process. Guarded
+  // by its own mutex (single mutex is fine for 3a; stripe if contention
+  // shows). Called synchronously from FoFEdgeVisitor via ckLocalBranch.
+  std::mutex seen3_lock;
+  std::unordered_set<uint64_t> seen3_pairs;
+
   FoFPhase1Node() {}
+
+  // Returns true iff this caller won (inserted first). SEEN is only ever
+  // set at the moment an edge is emitted (winner emits), so suppression can
+  // never suppress an unemitted edge.
+  bool trySeenInsert(uint64_t key) {
+    std::lock_guard<std::mutex> g(seen3_lock);
+    return seen3_pairs.insert(key).second;
+  }
+
+  bool seenContains(uint64_t key) {
+    std::lock_guard<std::mutex> g(seen3_lock);
+    return seen3_pairs.count(key) != 0;
+  }
+
+  // Reset with the rest of the phase-3 state (called by every same-process
+  // FoFPhase1 branch during resetPhase3; redundant clears are idempotent
+  // and the reset barrier orders them before the walk).
+  void clearSeen() {
+    std::lock_guard<std::mutex> g(seen3_lock);
+    seen3_pairs.clear();
+  }
 
   // Called synchronously (ckLocalBranch) by same-process group branches
   // during registration; hence the lock.
@@ -142,6 +200,7 @@ public:
     edges.clear();
     tip_map.clear();
     frag_counts.clear();
+    clearSeen();
     this->contribute(cb);
   }
 
@@ -237,6 +296,13 @@ public:
     edge_buf3.clear();
     seen3.clear();
     phase3_emitted = 0;
+    p3_negative_prunes = 0;
+    p3_positive_prunes = 0;
+    p3_suppression_prunes = 0;
+    p3_same_frag_prunes = 0;
+    p3_leaf_visits = 0;
+    p3_redundant_descents = 0;
+    p3_peak_edge_buf = 0;
     this->contribute(cb);
   }
 
@@ -342,12 +408,48 @@ public:
     long lo = std::min(ti, tj), hi = std::max(ti, tj);
     uint64_t key = (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
     if (seen3.insert(key).second) edge_buf3.emplace_back(lo, hi);
+    if ((long)edge_buf3.size() > p3_peak_edge_buf)
+      p3_peak_edge_buf = (long)edge_buf3.size();
   }
+
+  // --- Phase-3a SEEN suppression (design/step3.md §1, §3): synchronous
+  // forwards to the process-level table on FoFPhase1Node. Called via
+  // ckLocalBranch by FoFEdgeVisitor during the traversal.
+  bool trySeenInsert(uint64_t key) {
+    return node_proxy.ckLocalBranch()->trySeenInsert(key);
+  }
+  bool seenContains(uint64_t key) {
+    return node_proxy.ckLocalBranch()->seenContains(key);
+  }
+
+  // Phase-3a per-PE counters (design/step3.md §6), plain members updated
+  // synchronously by FoFEdgeVisitor via ckLocalBranch; reduced by
+  // phase3Stats. Peak simultaneously-active node pairs is NOT tracked: the
+  // traverser does not expose pair activation/retirement cheaply, so only
+  // the edge-buffer high-water mark is reported.
+  long p3_negative_prunes = 0;    // open: mindist2 > b2                [case 1]
+  long p3_positive_prunes = 0;    // open: maxdist2 <= b2 certificate   [case 2]
+  long p3_suppression_prunes = 0; // open/leaf: (g,f) already SEEN      [case 3]
+  long p3_same_frag_prunes = 0;   // open/leaf: both uniform over the SAME tip
+                                  // (no cross-process edge possible; 3a
+                                  // addition, not in the spec's 3-case list)
+  long p3_leaf_visits = 0;        // leaf() invocations
+  long p3_redundant_descents = 0; // opens that descend while both-uniform
+                                  // (unSEEN, distinct tips): §8.3 data
+  long p3_peak_edge_buf = 0;      // high-water mark of edge_buf3.size()
 
   void resetPhase3(const CkCallback& cb) {
     edge_buf3.clear();
     seen3.clear();
     phase3_emitted = 0;
+    p3_negative_prunes = 0;
+    p3_positive_prunes = 0;
+    p3_suppression_prunes = 0;
+    p3_same_frag_prunes = 0;
+    p3_leaf_visits = 0;
+    p3_redundant_descents = 0;
+    p3_peak_edge_buf = 0;
+    node_proxy.ckLocalBranch()->clearSeen();
     this->contribute(cb);
   }
 
@@ -361,12 +463,27 @@ public:
                      edge_buf3.data(), CkReduction::concat, cb);
   }
 
-  // Edge statistics (design note §8.2 first data point): [0] edges emitted
-  // (leaf-pair hits before per-PE dedup), [1] edges sent to the gather
-  // (after per-PE dedup), summed over PEs.
+  // Edge + 3a-counter statistics, a tuple reduction:
+  //   element 0 (sum over PEs), long[8]:
+  //     [0] edges emitted (SEEN wins reaching addPhase3Edge)
+  //     [1] edges sent to the gather (after per-PE dedup)
+  //     [2] negative prunes  [3] positive-certificate prunes
+  //     [4] suppression prunes  [5] same-fragment prunes
+  //     [6] leaf visits  [7] redundant (both-uniform) descents
+  //   element 1 (max over PEs), long: peak edge-buffer size.
   void phase3Stats(const CkCallback& cb) {
-    long counts[2] = {phase3_emitted, (long)edge_buf3.size()};
-    this->contribute(sizeof(counts), counts, CkReduction::sum_long, cb);
+    long sums[8] = {phase3_emitted, (long)edge_buf3.size(),
+                    p3_negative_prunes, p3_positive_prunes,
+                    p3_suppression_prunes, p3_same_frag_prunes,
+                    p3_leaf_visits, p3_redundant_descents};
+    long peak = p3_peak_edge_buf;
+    CkReduction::tupleElement tupleRedn[] = {
+      CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &peak, CkReduction::max_long)
+    };
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 2);
+    msg->setCallback(cb);
+    this->contribute(msg);
   }
 
   // Owner-writes relabel through the global tip -> root map computed by the

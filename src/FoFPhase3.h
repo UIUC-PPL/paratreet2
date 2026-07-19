@@ -11,10 +11,16 @@
 // TransposedDownTraverser), i.e. every Partition's target leaves are walked
 // against the full global tree; remote subtrees are fetched and resumed
 // through the CacheManager/Resumer machinery exactly as in the gravity
-// examples. FoFEdgeVisitor prunes on the Minkowski test
-// mindist(source box, target box) > b (case-1 pruning only, v1) and at
-// leaf x leaf emits a (tip, tip) edge for every particle pair within b whose
-// group_numbers differ.
+// examples. FoFEdgeVisitor (3a, design/step3.md §3) prunes on three
+// certificates: case 1 (negative, mindist(source box, target box) > b),
+// case 2 (positive, both sides uniform and maxdist <= b: emit without
+// descending), and case 3 (suppression: the process-level SEEN table on
+// FoFPhase1Node already holds the (g, f) pair). Leaf x leaf pairs emit one
+// edge per (g, f) per process, gated by the same SEEN table (first witness
+// wins). Because open() now reads min_frag/max_frag on cache-shipped
+// internal nodes, the app MUST sequence phase 1 + upwardPass BEFORE
+// Driver::loadCache ships the starter pack (see examples/fof3); the
+// annotation-validity CkEnforce in the visitor trips otherwise.
 //
 // Correctness of the edge predicate (design discussion, 2026-07-18): after
 // phase 1, any two particles within b of each other that hold DIFFERENT tips
@@ -81,26 +87,115 @@ public:
   }
 
 public:
-  // Case-1 pruning only (v1): open unless the box gap exceeds b. Boxes are
-  // valid on every node type reached here (built from positions, which
-  // phase 1 does not modify); min_frag/max_frag are NOT read, so nodes
-  // shipped into the cache before upwardPass (the loadCache starter pack)
-  // are safe to test.
+  // Annotation validity (design/step3.md §2): every node whose
+  // min_frag/max_frag the visitor consults must carry a post-phase-1
+  // annotation. Build-time annotations are min = max = -1 (group_number is
+  // initialized to -1), so min_frag >= 0 catches cache entries shipped
+  // before phase 1 + upwardPass (the loadCache-ordering hazard); empty
+  // nodes keep the identity values (min > max) and are exempted via
+  // n_particles == 0. CkEnforce, not CkAssert: CMK_OPTIMIZE builds compile
+  // CkAssert out, and this tripwire is the point.
+  static void enforceValidAnnotation(const SpatialNode<FragData>& n) {
+    CkEnforce(n.n_particles == 0 ||
+              (n.data.min_frag <= n.data.max_frag && n.data.min_frag >= 0));
+  }
+
+  // The 3a state machine (design/step3.md §3). States per (g, f) fragment
+  // pair: UNSEEN (absent from the process-level table) | SEEN. Both-uniform
+  // node pairs consult the table; case 2 (positive certificate: every
+  // point pair within b) and leaf witnesses insert-and-emit exactly once
+  // (single winner under the table's mutex). Non-uniform pairs descend
+  // under case-1 pruning as in v1; uniformity is hereditary, so every
+  // descent reaches uniform territory or leaves.
   bool open(const SpatialNode<FragData>& source, SpatialNode<FragData>& target) {
-    return paratreet::mindist2(source.data.box, target.data.box) <= b2;
+    enforceValidAnnotation(source);
+    enforceValidAnnotation(target);
+    auto* branch = fof.ckLocalBranch();
+    // uniform() is false for empty nodes (identity min > max), so
+    // both_uniform implies both sides non-empty; the explicit n_particles
+    // checks below are belt-and-braces for the case-2 certificate.
+    const bool both_uniform = source.data.uniform() && target.data.uniform();
+    if (both_uniform) {
+      long g = source.data.min_frag; // remote/source tip
+      long f = target.data.min_frag; // local/target tip
+      if (g == f) {
+        // Same tip on both sides: tips are process-local, so this is an
+        // intra-process pair phase 1 already unioned; no edge can arise.
+        branch->p3_same_frag_prunes++;
+        return false;
+      }
+      uint64_t key = paratreet::packTipPair(g, f);
+      if (branch->seenContains(key)) {         // case 3: suppression
+        branch->p3_suppression_prunes++;
+        return false;
+      }
+      if (source.n_particles != 0 && target.n_particles != 0 &&
+          paratreet::maxdist2(source.data.box, target.data.box) <= b2) {
+        // Case 2: positive certificate — every particle pair is within b,
+        // and both sides are non-empty, so the edge (g, f) exists. Emit if
+        // we won the insertion race; prune either way.
+        if (branch->trySeenInsert(key)) branch->addPhase3Edge(g, f);
+        branch->p3_positive_prunes++;
+        return false;
+      }
+      // fall through to the case-1 check
+    }
+    if (paratreet::mindist2(source.data.box, target.data.box) > b2) {
+      branch->p3_negative_prunes++;            // case 1: negative prune
+      return false;
+    }
+    // Descend. A both-uniform descent is a (possibly redundant) searcher
+    // for its unSEEN (g, f) — the §8.3 redundancy measurement for 3b.
+    if (both_uniform) branch->p3_redundant_descents++;
+    return true;
   }
 
   void node(const SpatialNode<FragData>& source, SpatialNode<FragData>& target) {}
 
   void leaf(const SpatialNode<FragData>& source, SpatialNode<FragData>& target) {
+    // Both sides' uniform() (hence min/max) are consulted below.
+    enforceValidAnnotation(source);
+    enforceValidAnnotation(target);
     auto* branch = fof.ckLocalBranch();
+    branch->p3_leaf_visits++;
+    if (source.data.uniform() && target.data.uniform()) {
+      // Uniform leaf pair: one (g, f) covers every particle pair, so
+      // resolve it before the O(n*m) loop (the suppression payoff at leaf
+      // level) — and a single witness suffices.
+      long g = source.data.min_frag;
+      long f = target.data.min_frag;
+      if (g == f) {
+        branch->p3_same_frag_prunes++;
+        return;
+      }
+      uint64_t key = paratreet::packTipPair(g, f);
+      if (branch->seenContains(key)) {
+        branch->p3_suppression_prunes++;
+        return;
+      }
+      for (int i = 0; i < source.n_particles; i++) {
+        const Particle& sp = source.particles()[i];
+        for (int j = 0; j < target.n_particles; j++) {
+          const Particle& tp = target.particles()[j];
+          if ((sp.position - tp.position).lengthSquared() > b2) continue;
+          // Witness found: emit only if we won the race.
+          if (branch->trySeenInsert(key)) branch->addPhase3Edge(g, f);
+          return;
+        }
+      }
+      return; // no witness in this leaf pair; other pairs may still find one
+    }
+    // Mixed fragments on at least one side: per particle-pair witness, as
+    // in v1, but SEEN-gated so each (g, f) is emitted once per process.
     for (int i = 0; i < source.n_particles; i++) {
       const Particle& sp = source.particles()[i];
       for (int j = 0; j < target.n_particles; j++) {
         const Particle& tp = target.particles()[j];
         if ((sp.position - tp.position).lengthSquared() > b2) continue;
-        if (sp.group_number == tp.group_number) continue;
-        branch->addPhase3Edge(sp.group_number, tp.group_number);
+        if (sp.group_number == tp.group_number) continue; // same-tip: skip
+        uint64_t key = paratreet::packTipPair(sp.group_number, tp.group_number);
+        if (branch->trySeenInsert(key))
+          branch->addPhase3Edge(sp.group_number, tp.group_number);
       }
     }
   }
@@ -108,13 +203,21 @@ public:
 
 namespace paratreet {
 
-// Result of runFoFPhase3 (edge statistics for design note §8.2, plus the
-// merge-map size).
+// Result of runFoFPhase3 (edge statistics for design note §8.2 and the 3a
+// counters of design/step3.md §6, plus the merge-map size).
 struct FoFPhase3Result {
-  long edges_emitted;  // leaf-pair hits (before per-PE dedup), all PEs
+  long edges_emitted;  // SEEN wins reaching addPhase3Edge, all PEs
   long edges_sent;     // after per-PE dedup = gathered to PE 0
   long edges_unique;   // after the root's second dedup = UF_2 input
   long tips_remapped;  // tips whose global root differs (broadcast map size)
+  // 3a counters, summed over PEs (see FoFPhase1 for definitions):
+  long negative_prunes;
+  long positive_prunes;
+  long suppression_prunes;
+  long same_frag_prunes;
+  long leaf_visits;
+  long redundant_descents; // both-uniform descents (§8.3 redundancy data)
+  long peak_edge_buf;      // max over PEs of the edge-buffer high-water mark
 };
 
 // Convenience driver for the full phase-3 sequence:
@@ -150,11 +253,22 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   void* stats_result = nullptr;
   fof.phase3Stats(CkCallbackResumeThread(stats_result));
   CkReductionMsg* stats_msg = (CkReductionMsg*)stats_result;
-  CkEnforce(stats_msg->getSize() == 2 * sizeof(long));
-  const long* stats = (const long*)stats_msg->getData();
+  CkReduction::tupleElement* stats_elems = nullptr;
+  int n_stats_elems = 0;
+  stats_msg->toTuple(&stats_elems, &n_stats_elems);
+  CkEnforce(n_stats_elems == 2);
+  const long* stats = (const long*)stats_elems[0].data;
   FoFPhase3Result r;
   r.edges_emitted = stats[0];
   r.edges_sent = stats[1];
+  r.negative_prunes = stats[2];
+  r.positive_prunes = stats[3];
+  r.suppression_prunes = stats[4];
+  r.same_frag_prunes = stats[5];
+  r.leaf_visits = stats[6];
+  r.redundant_descents = stats[7];
+  r.peak_edge_buf = *(const long*)stats_elems[1].data;
+  delete[] stats_elems;
   CkEnforce(r.edges_sent == (long)n_edges);
 
   // Serial UF_2 over the deduplicated edges; union by min tip so the global

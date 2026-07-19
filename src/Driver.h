@@ -318,6 +318,10 @@ public:
 
   void recvTC(std::pair<Key, SpatialNode<Data>> param) {
     storage.emplace_back(param);
+    // A later annotation round (Subtree::upwardPass) may re-send canopies
+    // after a loadCache already sorted; force a re-sort (and keep-newest
+    // dedup, see sortStorage) before the next ship.
+    storage_sorted = false;
   }
 
   void loadCache(CkCallback cb) {
@@ -341,7 +345,22 @@ public:
 
   void sortStorage() {
     auto comp = [] (const std::pair<Key, SpatialNode<Data>>& a, const std::pair<Key, SpatialNode<Data>>& b) {return a.first < b.first;};
-    std::sort(storage.begin(), storage.end(), comp);
+    // stable_sort + keep-newest dedup: TreeCanopy re-sends every canopy on
+    // each accumulation round (initial build, then each Subtree::upwardPass),
+    // and recvTC appends, so storage can hold several generations per key.
+    // Later arrivals supersede earlier ones (e.g. post-FoF-phase-1 FragData
+    // vs build-time garbage); an unstable sort would ship an arbitrary
+    // generation. Keep only the last occurrence per key.
+    std::stable_sort(storage.begin(), storage.end(), comp);
+    auto out = storage.begin();
+    for (auto it = storage.begin(); it != storage.end(); ) {
+      auto next = it + 1;
+      while (next != storage.end() && next->first == it->first) it = next++;
+      if (out != it) *out = std::move(*it);
+      ++out;
+      it = next;
+    }
+    storage.erase(out, storage.end());
     storage_sorted = true;
   }
 

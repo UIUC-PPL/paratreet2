@@ -24,7 +24,12 @@ struct Particle {
 
   // FoF: add a field to store component number in UnionFind (groupId)
   // postIterationFn loo
-  long int group_number;
+  // Initialized to -1 ("never labeled") so pre-phase-1 FragData annotations
+  // are deterministically min = max = -1, which the phase-3 visitor's
+  // annotation-validity CkEnforce (min_frag >= 0) rejects; uninitialized
+  // heap memory is often zero, which would masquerade as a valid uniform
+  // fragment 0 and silently break the phase-3 certificates instead.
+  long int group_number = -1;
   uint64_t vertex_id; // vertexID of current particle in unionFindLib
 
   enum class Type : char {

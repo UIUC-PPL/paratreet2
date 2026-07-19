@@ -264,6 +264,34 @@ assertion is the tripwire for the whole hazard class.
   knob that forces the first searcher to skip its witness, and check
   the re-issued search still finds the edge.
 
+## 6a. 3a results (2026-07-19, post-implementation)
+
+- Full 12-run matrix green; serial comparison exact (72/390/3549
+  components). Non-vacuity: premature-SEEN broke 254/1000 labels
+  (FAILED as required); un-reordering tripped the validity CkEnforce
+  on PE 2. Counters deterministic across 5x soak.
+- **Redundancy ratios ~0.32-0.36 extra both-uniform descents per
+  unique pair** (1.0 at 2proc x 1PE 1k, small-number regime). At this
+  scale 3b's parking would eliminate almost nothing; **3b deferred
+  until larger/denser data shows ratios that justify it** (revisit
+  with the 8.3 measurements on realistic inputs).
+- **The positive certificate never fired** (0 across the matrix, and
+  in transient probes at 3.5x and 12.5x b): depth-first descent
+  reaches a leaf witness (which marks SEEN) before any interior pair
+  goes entirely-within-b, and suppression precedes the certificate
+  check. With suppression-first ordering, case 2 can save at most the
+  first descent per pair; its value should be reassessed at high
+  overdensity (design note predicts D = 1e4-1e6 is its regime) rather
+  than assumed. maxdist2 is covered by permanent unit checks in the
+  fof3 harness since the path has no organic coverage.
+- Latent bug fixed in Driver: TreeCanopy re-sends canopies each
+  accumulation round and recvTC appends, so storage holds multiple
+  generations per key; unstable sort shipped an arbitrary one.
+  stable_sort + keep-newest-per-key + re-sort invalidation in recvTC.
+- Particle::group_number now initializes to -1 (zero-filled heap
+  masqueraded as valid "fragment 0" annotations, which would have
+  made the validity CkEnforce vacuous).
+
 ## 7. Explicitly deferred past 3b
 
 htram aggregation for edge emission (counters above are already
