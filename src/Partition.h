@@ -66,6 +66,7 @@ struct Partition : public CBase_Partition<Data> {
   void deleteParticleOfOrder(int order) {particle_delete_order.insert(order);}
   void requestParticleUpdates(int cm_index, std::vector<Key> pKeys);
   void applyOpposingEffects(std::vector<std::pair<Key, Particle::Effect>> effects);
+  void verifySharedLeaves(const CkCallback& cb);
   void pup(PUP::er& p);
   void makeLeaves(int);
   void pauseForLB(){
@@ -517,5 +518,22 @@ void Partition<Data>::doOutput(WriterProxy w, int n_total_particles, CkCallback 
 // -------------------
 // Friends-of-Friends (FoF) functions
 // -------------------
+
+// FoF phase 3 precondition check (see src/FoFPhase3.h): traversal target
+// leaves must be the very Subtree-owned nodes, so that target particles are
+// the copies phase 1 relabeled. With matching decompositions addLeaves()
+// stores the Subtree's leaf pointers directly (no copies), which this
+// asserts by pointer identity. CkEnforce, not CkAssert: the production
+// Charm build is CMK_OPTIMIZE, which compiles CkAssert out.
+template <typename Data>
+void Partition<Data>::verifySharedLeaves(const CkCallback& cb)
+{
+  CkEnforce(matching_decomps);
+  CkEnforce(leaves.size() == tree_leaves.size());
+  for (size_t i = 0; i < leaves.size(); i++) {
+    CkEnforce(leaves[i] == tree_leaves[i]);
+  }
+  this->contribute(cb);
+}
 
 #endif /* _PARTITION_H_ */

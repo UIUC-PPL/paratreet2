@@ -94,6 +94,10 @@ module paratreet {
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
   // (phaseB), relabel through the merge map, per-tip fragment counting
   // (countFragments), and a collect helper for validation.
+  // The phase-3 entries (see src/FoFPhase3.h and design/phase3.md) manage the
+  // cross-PROCESS edge buffer filled by FoFEdgeVisitor during the boundary
+  // walk, gather it to the driver (reduction), and apply the global
+  // tip -> root map computed by the serial UF_2 on PE 0.
   template <typename Data>
   group FoFPhase1 {
     entry FoFPhase1(CProxy_FoFPhase1Node<Data>);
@@ -103,6 +107,10 @@ module paratreet {
     entry void relabel(const CkCallback&);
     entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);
+    entry void resetPhase3(const CkCallback&);
+    entry void flushPhase3Edges(const CkCallback&);
+    entry void phase3Stats(const CkCallback&);
+    entry void applyGlobalMap(const std::vector<std::pair<long, long> >&, const CkCallback&);
   };
 
   template <typename Data>
@@ -128,8 +136,13 @@ module paratreet {
     entry void pauseForLB();
     entry void requestParticleUpdates(int cm_index, std::vector<Key> pKeys);
     entry void applyOpposingEffects(std::vector<std::pair<Key, std::pair<Vector3D<Real>, Real>>> effects);
-    
+
     // FoF functions
+    // Asserts that this Partition's target leaves are the very Subtree-owned
+    // nodes (pointer identity), i.e. traversal targets read the particle
+    // copies FoF phase 1 relabeled. Required by phase 3; holds when Subtree
+    // and Partition decompositions match (see src/FoFPhase3.h).
+    entry void verifySharedLeaves(const CkCallback&);
   }
 
   template <typename Data>

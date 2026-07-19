@@ -234,6 +234,9 @@ public:
     flat_order.clear();
     edge_buf.clear();
     seen.clear();
+    edge_buf3.clear();
+    seen3.clear();
+    phase3_emitted = 0;
     this->contribute(cb);
   }
 
@@ -321,6 +324,65 @@ public:
     for (auto& s : subtrees)
       for (int i = 0; i < s.n; i++) counts[s.parts[i].group_number]++;
     node_proxy.ckLocalBranch()->submitFragCounts(counts);
+    this->contribute(cb);
+  }
+
+  // --- Phase 3 (cross-process boundary walk; see src/FoFPhase3.h and
+  // design/phase3.md). The buffers below are distinct from the phaseB
+  // (cross-PE, same-process) buffers above to avoid any confusion between
+  // the two edge namespaces.
+
+  // Synchronous, non-entry: called via ckLocalBranch by FoFEdgeVisitor::leaf
+  // during the phase-3 traversal. Traversal work for the Partitions homed on
+  // this PE executes on this PE only (Charm++ entry methods of those chares),
+  // so no lock is needed. Tips are particle orders (int), so a pair packs
+  // into 64 bits for the dedup set, exactly as in phaseB.
+  void addPhase3Edge(long ti, long tj) {
+    phase3_emitted++;
+    long lo = std::min(ti, tj), hi = std::max(ti, tj);
+    uint64_t key = (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
+    if (seen3.insert(key).second) edge_buf3.emplace_back(lo, hi);
+  }
+
+  void resetPhase3(const CkCallback& cb) {
+    edge_buf3.clear();
+    seen3.clear();
+    phase3_emitted = 0;
+    this->contribute(cb);
+  }
+
+  // Gather-to-one completion pattern: a concat reduction. Every PE
+  // contributes its (already per-PE-deduplicated) edge buffer as raw bytes;
+  // the reduction tree delivers one message with all edges to the driver's
+  // callback on PE 0. The reduction is the completion detection -- no
+  // message counting, no broadcast/point-to-point ordering hazards.
+  void flushPhase3Edges(const CkCallback& cb) {
+    this->contribute(edge_buf3.size() * sizeof(std::pair<long, long>),
+                     edge_buf3.data(), CkReduction::concat, cb);
+  }
+
+  // Edge statistics (design note §8.2 first data point): [0] edges emitted
+  // (leaf-pair hits before per-PE dedup), [1] edges sent to the gather
+  // (after per-PE dedup), summed over PEs.
+  void phase3Stats(const CkCallback& cb) {
+    long counts[2] = {phase3_emitted, (long)edge_buf3.size()};
+    this->contribute(sizeof(counts), counts, CkReduction::sum_long, cb);
+  }
+
+  // Owner-writes relabel through the global tip -> root map computed by the
+  // serial UF_2 (identity if absent), same pattern as relabel(). Rewrites the
+  // registered Subtree-owned particle blocks; with matching decompositions
+  // the Partition target leaves alias these blocks, so they see the global
+  // labels too.
+  void applyGlobalMap(const std::vector<std::pair<long, long>>& map_vec,
+                      const CkCallback& cb) {
+    std::unordered_map<long, long> tip_map(map_vec.begin(), map_vec.end());
+    for (auto& s : subtrees) {
+      for (int i = 0; i < s.n; i++) {
+        auto it = tip_map.find(s.parts[i].group_number);
+        if (it != tip_map.end()) s.parts[i].group_number = it->second;
+      }
+    }
     this->contribute(cb);
   }
 
@@ -434,6 +496,10 @@ private:
   std::vector<int> flat_order; // flat index -> global particle order
   std::vector<std::pair<long, long>> edge_buf;
   std::unordered_set<uint64_t> seen;
+  // Phase-3 cross-process buffers (kept separate from phaseB's, above).
+  std::vector<std::pair<long, long>> edge_buf3;
+  std::unordered_set<uint64_t> seen3;
+  long phase3_emitted = 0;
   double b2_ = 0.0;
 };
 
