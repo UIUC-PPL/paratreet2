@@ -2,7 +2,7 @@ include Makefile.common
 
 # add -DFOF -DUNIONFIND to build the Friends-of-Friends support (requires the
 # unionfind and htram sibling libraries; see Makefile.common)
-OPTS = -g -Ofast $(INCLUDES) -DDEBUG=0 $(MAKE_OPTS)
+OPTS = -g -Ofast $(INCLUDES) -DDEBUG=0 $(MAKE_OPTS) -DFOF -DUNIONFIND 
 CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 
 OBJS = Paratreet.o Loadable.o Reader.o Writer.o Particle.o BoundingBox.o Decomposition.o Modularization.o TreeSpec.o ThreadStateHolder.o
