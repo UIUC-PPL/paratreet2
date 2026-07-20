@@ -1,4 +1,10 @@
 module paratreet {
+  // Distributed union-find for FoF step 4 (src/uf2, imported from
+  // UIUC-PPL/unionfind; see design/step4.md). Registered here so every
+  // paratreet application carries it; only the FoF phase-3 distributed-UF_2
+  // path instantiates its chares.
+  extern module unionFindLib;
+
   include "CoreFunctions.h";
   include "Configuration.h";
   include "CkArrayIndexKey.h";
@@ -89,6 +95,12 @@ module paratreet {
     entry void reset(const CkCallback&);
     entry void merge(const CkCallback&);
     entry void fragmentHistogram(const CkCallback&);
+    // Step 4 (distributed UF_2, -u dist): builds the owner-encoded tip
+    // namespace (node << 40 | dense_index) from frag_counts (already
+    // populated by countFragments) and the UF_2 vertex array to hand to
+    // UnionFindLib. See src/FoFPhase1.h "Tip encoding" and design/step4.md.
+    // Must run after countFragments, before applyTipEncoding.
+    entry void computeTipEncoding(const CkCallback&);
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
@@ -118,6 +130,25 @@ module paratreet {
     entry void verifyTips(long n_total, const CkCallback&);
     entry void memoryStats(const CkCallback&);
     entry void collectLabelCounts(const CkCallback&);
+    // Distributed UF_2 (step 4; encoded tips required — see design/step4.md).
+    // applyTipEncoding: owner-writes rewrite of this PE's particles' tips
+    // through the node's encode map (built by FoFPhase1Node::computeTipEncoding).
+    entry void applyTipEncoding(const CkCallback&);
+    // initUF2: wire the process-local UnionFindLib element (vertex array
+    // handoff + getLocationFromID registration). Real work happens only on
+    // the node's home PE (CkNodeFirst); other PEs of the process no-op.
+    entry void initUF2(CProxy_UnionFindLib, const CkCallback&);
+    // fireUF2Edges: submit this PE's buffered phase-3 edges (already
+    // encoded-tip pairs) as batched union_request calls.
+    entry void fireUF2Edges(CProxy_UnionFindLib, const CkCallback&);
+    // verifyEncodedTips: CkEnforce that every registered particle's tip
+    // decodes (node bits, dense-index bounds) to this process's own UF_2
+    // vertex array -- the owner-locality invariant the whole scheme depends on.
+    entry void verifyEncodedTips(const CkCallback&);
+    // applyUF2Labels: owner-writes rewrite from encoded tip to the UF_2
+    // library's componentNumber (read back from the node's vertex array,
+    // which UnionFindLib::find_components mutated in place).
+    entry void applyUF2Labels(const CkCallback&);
   };
 
   template <typename Data>

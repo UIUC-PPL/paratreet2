@@ -124,7 +124,7 @@ public:
         branch->p3_same_frag_prunes++;
         return false;
       }
-      uint64_t key = paratreet::packTipPair(g, f);
+      paratreet::TipPairKey key = paratreet::packTipPair(g, f);
       if (branch->seenContains(key)) {         // case 3: suppression
         branch->p3_suppression_prunes++;
         return false;
@@ -168,7 +168,7 @@ public:
         branch->p3_same_frag_prunes++;
         return;
       }
-      uint64_t key = paratreet::packTipPair(g, f);
+      paratreet::TipPairKey key = paratreet::packTipPair(g, f);
       if (branch->seenContains(key)) {
         branch->p3_suppression_prunes++;
         return;
@@ -193,7 +193,7 @@ public:
         const Particle& tp = target.particles()[j];
         if ((sp.position - tp.position).lengthSquared() > b2) continue;
         if (sp.group_number == tp.group_number) continue; // same-tip: skip
-        uint64_t key = paratreet::packTipPair(sp.group_number, tp.group_number);
+        paratreet::TipPairKey key = paratreet::packTipPair(sp.group_number, tp.group_number);
         if (branch->trySeenInsert(key))
           branch->addPhase3Edge(sp.group_number, tp.group_number);
       }
@@ -349,6 +349,111 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   r.t_gather = t2 - t1;
   r.t_uf2 = t3 - t2;
   r.t_relabel = t4 - t3;
+  return r;
+}
+
+// Step 4: distributed UF_2 (-u dist; see design/step4.md and
+// FoFPhase1.h's "Step 4" comment block). Replaces the gather-to-one serial
+// UF_2 above with UnionFindLib driving the union/labeling over the
+// owner-encoded tip namespace. PRECONDITION (unlike runFoFPhase3 above):
+// the caller must already have run, in order, after runFoFPhase1's relabel
+// and BEFORE Subtree::upwardPass/Driver::loadCache:
+//   fof.countFragments(cb) -> fof_node.computeTipEncoding(cb) ->
+//   fof.applyTipEncoding(cb)
+// so every particle copy the phase-3 walk reads (including cache-shipped
+// remote copies) already carries the encoded tip -- FoFEdgeVisitor is used
+// completely unchanged. (examples/fof3/FoF3.C's preTraversalFn does this;
+// see its comment for why the ordering matters, same class of hazard as
+// the loadCache/annotation-validity ordering step 3 fixed.)
+//
+// edges_unique/tips_remapped are not meaningful for this path (no
+// gather-to-one second dedup, no explicit tip->root map) and are left 0;
+// t_uf2 covers initUF2 + fireUF2Edges + CkWaitQD + find_components (the
+// distributed analog of the old serial-map-build bracket), t_relabel covers
+// applyUF2Labels.
+inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
+                                        CProxy_FoFPhase1<FragData> fof,
+                                        CProxy_FoFPhase1Node<FragData> fof_node,
+                                        double linking_length) {
+  auto& config = paratreet::getConfiguration();
+  CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
+  partitions.verifySharedLeaves(CkCallbackResumeThread());
+
+  double b2 = linking_length * linking_length;
+  fof.resetPhase3(CkCallbackResumeThread());
+
+  // The boundary walk: identical to v1/3a. Tips are already encoded (see
+  // precondition above), so the edges FoFEdgeVisitor buffers into edge_buf3
+  // are already UF_2 vertex ids -- no translation needed anywhere below.
+  double t0 = CkWallTimer();
+  partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2));
+  CkWaitQD();
+  double t1 = CkWallTimer();
+
+  void* stats_result = nullptr;
+  fof.phase3Stats(CkCallbackResumeThread(stats_result));
+  CkReductionMsg* stats_msg = (CkReductionMsg*)stats_result;
+  CkReduction::tupleElement* stats_elems = nullptr;
+  int n_stats_elems = 0;
+  stats_msg->toTuple(&stats_elems, &n_stats_elems);
+  CkEnforce(n_stats_elems == 7);
+  const long* stats = (const long*)stats_elems[0].data;
+  FoFPhase3Result r;
+  r.edges_emitted = stats[0];
+  r.edges_sent = stats[1];
+  r.edges_unique = 0;   // not computed on this path (see comment above)
+  r.tips_remapped = 0;  // not computed on this path
+  r.negative_prunes = stats[2];
+  r.positive_prunes = stats[3];
+  r.suppression_prunes = stats[4];
+  r.same_frag_prunes = stats[5];
+  r.leaf_visits = stats[6];
+  r.redundant_descents = stats[7];
+  r.peak_edge_buf = *(const long*)stats_elems[1].data;
+  {
+    const long* mins = (const long*)stats_elems[2].data;
+    const long* maxs = (const long*)stats_elems[3].data;
+    const double* tsum = (const double*)stats_elems[4].data;
+    const double* tmin = (const double*)stats_elems[5].data;
+    const double* tmax = (const double*)stats_elems[6].data;
+    r.leaf_visits_min = mins[0];
+    r.emitted_min = mins[1];
+    r.leaf_visits_max = maxs[0];
+    r.emitted_max = maxs[1];
+    double n_pes = (double)CkNumPes();
+    r.t_phaseA_min = tmin[0]; r.t_phaseA_avg = tsum[0] / n_pes; r.t_phaseA_max = tmax[0];
+    r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];
+  }
+  delete[] stats_elems;
+  delete stats_msg;
+  double t2 = CkWallTimer();
+
+  // One UnionFindLib chare per process (design/step4.md decision 2), placed
+  // via UFNodeMap; created fresh per call (fof3 always runs a single
+  // iteration, so no cross-iteration reuse is needed -- see design/step4.md
+  // deviations).
+  CProxy_UnionFindLib uf_proxy =
+      UnionFindLib::unionFindInitOnePerNode(CkCallbackResumeThread());
+
+  fof.initUF2(uf_proxy, CkCallbackResumeThread());
+  fof.fireUF2Edges(uf_proxy, CkCallbackResumeThread());
+  // Message-driven completion of the union_request cascade: every send
+  // above is entry-method-driven (plain sends, no htram this step), so
+  // RTS-level QD is sound here exactly as the v1 walk's CkWaitQD is
+  // (design/step4.md QD strategy; htram later forces the counter-QD design
+  // of design/step3.md §5, same as it will for the walk).
+  CkWaitQD();
+
+  uf_proxy.find_components(CkCallbackResumeThread());
+  double t3 = CkWallTimer();
+
+  fof.applyUF2Labels(CkCallbackResumeThread());
+  double t4 = CkWallTimer();
+
+  r.t_walk = t1 - t0;
+  r.t_gather = t2 - t1;   // phase3Stats only on this path (no edge gather)
+  r.t_uf2 = t3 - t2;      // initUF2 + fireUF2Edges + QD + find_components
+  r.t_relabel = t4 - t3;  // applyUF2Labels
   return r;
 }
 

@@ -42,6 +42,7 @@
 #include "Node.h"
 #include "Particle.h"
 #include "OrientedBox.h"
+#include "unionFindLib.h"
 
 #include <cmath>
 #include <cstdint>
@@ -56,6 +57,36 @@
 #include <vector>
 
 namespace paratreet {
+
+// Step 4 (distributed UF_2, design/step4.md "Tip encoding"): owner-encoded
+// vertex namespace for UF_2. A process-tip is renumbered to
+// (owning_process << kUF2IdxBits) | dense_index, where dense_index is a
+// per-process-dense enumeration of that process's own fragments (assigned by
+// FoFPhase1Node::computeTipEncoding). Because the encoding happens BEFORE
+// upwardPass/loadCache/the phase-3 walk, every particle copy the walk reads
+// (local or cache-shipped) already carries the encoded value, so
+// FoFEdgeVisitor needs no changes: the (g, f) pairs it emits are already
+// UF_2 vertex ids, and getLocationFromID(vid) below decodes them with no
+// directory lookup (O(1), no communication) -- this is "Option C" from the
+// design decision, chosen over a tip->owner directory (Option A, ~5 MB per
+// 1e-3-density-tip at 16M scale, flagged as a scaling concern there) or a
+// post-hoc dense renumbering round (Option B, unsound: the emitting process
+// cannot learn a remote tip's dense id without a directory anyway).
+// 40 index bits -> up to ~1.1e12 fragments per process (never binding at any
+// realistic scale); the remaining 24 bits address up to ~16M processes.
+constexpr int kUF2IdxBits = 40;
+constexpr uint64_t kUF2IdxMask = (uint64_t(1) << kUF2IdxBits) - 1;
+
+inline uint64_t uf2EncodeTip(int process, long dense_index) {
+  return (uint64_t(uint32_t(process)) << kUF2IdxBits) | (uint64_t(dense_index) & kUF2IdxMask);
+}
+
+// Registered with UnionFindLib::registerGetLocationFromID. Must be a plain
+// function (not a capturing lambda): the library stores it as a raw
+// std::pair<int,int>(*)(uint64_t) function pointer.
+inline std::pair<int, int> uf2LocationFromID(uint64_t vid) {
+  return { int(vid >> kUF2IdxBits), int(vid & kUF2IdxMask) };
+}
 
 // Component-wise gap distance squared between two axis-aligned boxes
 // (0 if they overlap). Space.h has no box-box version of this, so it
@@ -93,12 +124,34 @@ inline Real maxdist2(const OrientedBox<Real>& a, const OrientedBox<Real>& b) {
   return dx * dx + dy * dy + dz * dz;
 }
 
-// Canonical packing of an unordered (tip, tip) pair into a u64 key: min tip
-// in the high 32 bits, max in the low 32 (tips are particle orders, ints).
-// Shared by the phaseB/phase-3 edge dedup and the phase-3a SEEN table.
-inline uint64_t packTipPair(long a, long b) {
-  long lo = std::min(a, b), hi = std::max(a, b);
-  return (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
+// Canonical key for an unordered (tip, tip) pair, used by the phase-3a SEEN
+// table (FoFPhase1Node::seen3_pairs) and FoFPhase1's per-PE SEEN3 dedup
+// (addPhase3Edge). Two uint64_t fields, NOT a single packed 64-bit integer:
+// step 1-3 tips fit in 32 bits (particle orders, < N), so the original
+// packTipPair packed (min << 32 | max) losslessly -- but step 4's
+// owner-encoded UF_2 tips (paratreet::uf2EncodeTip, up to kUF2IdxBits + node
+// bits) can each need close to the full 64 bits, so packing TWO of them into
+// one 64-bit integer would silently truncate and alias distinct pairs onto
+// the same key -- a false-suppression correctness bug (a real edge dropped
+// as "already SEEN"), not just a hash collision. TipPairKey stores both
+// values in full and compares them exactly; only its HASH combines lossily
+// (that's fine: unordered_set resolves same-bucket entries via operator==).
+struct TipPairKey {
+  uint64_t lo, hi;
+  bool operator==(const TipPairKey& o) const { return lo == o.lo && hi == o.hi; }
+};
+struct TipPairKeyHash {
+  size_t operator()(const TipPairKey& k) const {
+    size_t h1 = std::hash<uint64_t>()(k.lo);
+    size_t h2 = std::hash<uint64_t>()(k.hi);
+    // boost::hash_combine shape; collisions only cost a bucket re-check
+    // (operator== above is exact), never correctness.
+    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+  }
+};
+inline TipPairKey packTipPair(long a, long b) {
+  uint64_t ua = uint64_t(a), ub = uint64_t(b);
+  return ua < ub ? TipPairKey{ua, ub} : TipPairKey{ub, ua};
 }
 
 // Record emitted by FoFPhase1::collect (validation/debugging helper).
@@ -162,6 +215,16 @@ public:
   std::unordered_map<long, long> tip_map;   // PE-tip -> process-tip
   std::unordered_map<long, long> frag_counts; // process-tip -> exact size
 
+  // Step 4 (distributed UF_2): built by computeTipEncoding() from
+  // frag_counts (so it must run after countFragments). encode_map maps this
+  // process's own process-tips to their encoded UF_2 vertex ids
+  // (paratreet::uf2EncodeTip); uf2_vertices is the vertex array handed to
+  // UnionFindLib::initialize_vertices by index (dense_index == its position
+  // here) -- UnionFindLib mutates componentNumber/parent/size IN PLACE in
+  // this same storage, so applyUF2Labels reads results straight out of it.
+  std::unordered_map<long, long> encode_map; // process-tip -> encoded tip
+  std::vector<unionFindVertex> uf2_vertices;
+
   // Phase-3a SEEN table (design/step3.md §1, §3): process-level set of
   // packed (g, f) fragment pairs for which an edge has been (or is being)
   // emitted. Process level is sufficient for suppression because in the
@@ -170,19 +233,19 @@ public:
   // by its own mutex (single mutex is fine for 3a; stripe if contention
   // shows). Called synchronously from FoFEdgeVisitor via ckLocalBranch.
   std::mutex seen3_lock;
-  std::unordered_set<uint64_t> seen3_pairs;
+  std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3_pairs;
 
   FoFPhase1Node() {}
 
   // Returns true iff this caller won (inserted first). SEEN is only ever
   // set at the moment an edge is emitted (winner emits), so suppression can
   // never suppress an unemitted edge.
-  bool trySeenInsert(uint64_t key) {
+  bool trySeenInsert(paratreet::TipPairKey key) {
     std::lock_guard<std::mutex> g(seen3_lock);
     return seen3_pairs.insert(key).second;
   }
 
-  bool seenContains(uint64_t key) {
+  bool seenContains(paratreet::TipPairKey key) {
     std::lock_guard<std::mutex> g(seen3_lock);
     return seen3_pairs.count(key) != 0;
   }
@@ -221,7 +284,38 @@ public:
     edges.clear();
     tip_map.clear();
     frag_counts.clear();
+    encode_map.clear();
+    uf2_vertices.clear();
     clearSeen();
+    this->contribute(cb);
+  }
+
+  // Step 4 (distributed UF_2): build the owner-encoded tip namespace from
+  // frag_counts (must run after countFragments has populated it for every
+  // PE of this process). One execution per process (nodegroup broadcast).
+  // Enumeration order (map iteration) only needs to be a bijection per
+  // process -- it does not need to be deterministic across runs: UF_2's
+  // resulting componentNumber values are arbitrary serial ids regardless
+  // (design/step4.md; the harness canonicalizes by min order per label
+  // group, not by raw label value).
+  void computeTipEncoding(const CkCallback& cb) {
+    encode_map.clear();
+    uf2_vertices.clear();
+    uf2_vertices.reserve(frag_counts.size());
+    int my_node = CkMyNode();
+    for (auto& kv : frag_counts) {
+      long dense_index = (long)uf2_vertices.size();
+      uint64_t encoded = paratreet::uf2EncodeTip(my_node, dense_index);
+      encode_map.emplace(kv.first, (long)encoded);
+      unionFindVertex v;
+      v.vertexID = encoded;
+      v.parent = -1;
+      v.process_tip = -1;
+      v.componentNumber = -1;
+      v.componentSize = -1;
+      v.size = kv.second; // fragment size (particle count), not the default 1
+      uf2_vertices.push_back(std::move(v));
+    }
     this->contribute(cb);
   }
 
@@ -420,6 +514,112 @@ public:
     this->contribute(cb);
   }
 
+  // --- Step 4 (distributed UF_2, -u dist; see design/step4.md). Sequence,
+  // driven by paratreet::runFoFPhase3Dist: countFragments (above, builds
+  // frag_counts) -> FoFPhase1Node::computeTipEncoding (builds encode_map +
+  // the UF_2 vertex array) -> applyTipEncoding (below; must run and
+  // complete, as a barrier, BEFORE upwardPass/loadCache/the phase-3 walk,
+  // so every particle copy the walk reads already carries the encoded tip;
+  // see paratreet::uf2EncodeTip's comment) -> [walk emits encoded-tip edges
+  // into edge_buf3 exactly as in v1/3a, no visitor changes needed] ->
+  // initUF2 -> fireUF2Edges -> CkWaitQD -> UnionFindLib::find_components ->
+  // applyUF2Labels.
+
+  // Owner-writes rewrite of this PE's particles' tips through the node's
+  // encode map (identity is never valid here: every registered particle's
+  // tip must appear in frag_counts, hence in encode_map, since
+  // countFragments enumerated exactly these tips on every PE of this
+  // process before computeTipEncoding ran -- CkEnforce catches any
+  // ordering regression).
+  void applyTipEncoding(const CkCallback& cb) {
+    auto& encode_map = node_proxy.ckLocalBranch()->encode_map;
+    for (auto& s : subtrees) {
+      for (int i = 0; i < s.n; i++) {
+        auto it = encode_map.find(s.parts[i].group_number);
+        CkEnforce(it != encode_map.end());
+        s.parts[i].group_number = (long)it->second;
+      }
+    }
+    this->contribute(cb);
+  }
+
+  // Wire the process-local UnionFindLib element: hand off the node's UF_2
+  // vertex array (by pointer -- UnionFindLib mutates it in place, which is
+  // how applyUF2Labels later reads back componentNumber with no additional
+  // communication) and register the O(1) location decoder. Real work runs
+  // only on the node's home PE (CkNodeFirst(CkMyNode())), the PE that hosts
+  // this process's UnionFindLib array element (UFNodeMap placement); other
+  // PEs of the process no-op (barrier still closes via contribute).
+  void initUF2(CProxy_UnionFindLib uf_proxy, const CkCallback& cb) {
+    if (CkMyPe() == CkNodeFirst(CkMyNode())) {
+      auto* nb = node_proxy.ckLocalBranch();
+      UnionFindLib* lib = uf_proxy[CkMyNode()].ckLocal();
+      CkEnforce(lib != nullptr); // must be true on the element's home PE
+      lib->registerGetLocationFromID(&paratreet::uf2LocationFromID);
+      lib->initialize_vertices(nb->uf2_vertices.data(),
+                               (int)nb->uf2_vertices.size());
+    }
+    this->contribute(cb);
+  }
+
+  // Submit this PE's buffered phase-3 edges (already encoded-tip pairs --
+  // the walk emitted them post-encoding) as one batched union_requests
+  // message to this process's UnionFindLib element; the library internally
+  // routes each edge to its actual owner (see union_request/boss_send), so
+  // any element works as the entry point. No-op (no message) if empty.
+  void fireUF2Edges(CProxy_UnionFindLib uf_proxy, const CkCallback& cb) {
+    if (!edge_buf3.empty()) {
+      std::vector<UFEdge> edges;
+      edges.reserve(edge_buf3.size());
+      for (auto& e : edge_buf3) edges.push_back(UFEdge{(uint64_t)e.first, (uint64_t)e.second});
+      uf_proxy[CkMyNode()].union_requests(edges);
+    }
+    this->contribute(cb);
+  }
+
+  // CkEnforce the owner-locality invariant the whole scheme depends on:
+  // every registered particle's (encoded) tip must decode to THIS process
+  // (node bits == CkMyNode()) with a dense index within this process's own
+  // UF_2 vertex array. A violation here means applyTipEncoding ran against
+  // stale/foreign state (ordering bug), not a UF_2 library bug.
+  void verifyEncodedTips(const CkCallback& cb) {
+    auto* nb = node_proxy.ckLocalBranch();
+    long n_vertices = (long)nb->uf2_vertices.size();
+    int my_node = CkMyNode();
+    for (auto& s : subtrees) {
+      for (int i = 0; i < s.n; i++) {
+        uint64_t enc = (uint64_t)s.parts[i].group_number;
+        CkEnforce(int(enc >> paratreet::kUF2IdxBits) == my_node);
+        CkEnforce(long(enc & paratreet::kUF2IdxMask) < n_vertices);
+      }
+    }
+    this->contribute(cb);
+  }
+
+  // Owner-writes rewrite from encoded tip to UnionFindLib's componentNumber,
+  // read directly out of the node's uf2_vertices array (UnionFindLib wrote
+  // componentNumber in place during find_components -- same storage
+  // initUF2 handed it, no gather needed). Final labels are arbitrary
+  // per-run serial ids (find_components' prefix-sum boss numbering), NOT
+  // the "order of the min-order member" convention -u serial produces; the
+  // fof3 harness canonicalizes both by re-deriving min order per label
+  // group from the gathered records, so this is fine (design/step4.md,
+  // decision 3).
+  void applyUF2Labels(const CkCallback& cb) {
+    auto* nb = node_proxy.ckLocalBranch();
+    auto& verts = nb->uf2_vertices;
+    for (auto& s : subtrees) {
+      for (int i = 0; i < s.n; i++) {
+        long idx = s.parts[i].group_number & (long)paratreet::kUF2IdxMask;
+        CkEnforce(idx >= 0 && idx < (long)verts.size());
+        long comp = verts[idx].componentNumber;
+        CkEnforce(comp != -1);
+        s.parts[i].group_number = comp;
+      }
+    }
+    this->contribute(cb);
+  }
+
   // --- Phase 3 (cross-process boundary walk; see src/FoFPhase3.h and
   // design/phase3.md). The buffers below are distinct from the phaseB
   // (cross-PE, same-process) buffers above to avoid any confusion between
@@ -428,13 +628,15 @@ public:
   // Synchronous, non-entry: called via ckLocalBranch by FoFEdgeVisitor::leaf
   // during the phase-3 traversal. Traversal work for the Partitions homed on
   // this PE executes on this PE only (Charm++ entry methods of those chares),
-  // so no lock is needed. Tips are particle orders (int), so a pair packs
-  // into 64 bits for the dedup set, exactly as in phaseB.
+  // so no lock is needed. Tips may be plain particle orders (step 1-3,
+  // < 32 bits) or step-4 owner-encoded UF_2 ids (up to ~64 bits); the pair
+  // key (paratreet::TipPairKey) stores both endpoints in full, so it is
+  // correct either way.
   void addPhase3Edge(long ti, long tj) {
     phase3_emitted++;
     long lo = std::min(ti, tj), hi = std::max(ti, tj);
-    uint64_t key = (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
-    if (seen3.insert(key).second) edge_buf3.emplace_back(lo, hi);
+    if (seen3.insert(paratreet::packTipPair(lo, hi)).second)
+      edge_buf3.emplace_back(lo, hi);
     if ((long)edge_buf3.size() > p3_peak_edge_buf)
       p3_peak_edge_buf = (long)edge_buf3.size();
   }
@@ -442,10 +644,10 @@ public:
   // --- Phase-3a SEEN suppression (design/step3.md §1, §3): synchronous
   // forwards to the process-level table on FoFPhase1Node. Called via
   // ckLocalBranch by FoFEdgeVisitor during the traversal.
-  bool trySeenInsert(uint64_t key) {
+  bool trySeenInsert(paratreet::TipPairKey key) {
     return node_proxy.ckLocalBranch()->trySeenInsert(key);
   }
-  bool seenContains(uint64_t key) {
+  bool seenContains(paratreet::TipPairKey key) {
     return node_proxy.ckLocalBranch()->seenContains(key);
   }
 
@@ -712,7 +914,7 @@ private:
   std::unordered_set<uint64_t> seen;
   // Phase-3 cross-process buffers (kept separate from phaseB's, above).
   std::vector<std::pair<long, long>> edge_buf3;
-  std::unordered_set<uint64_t> seen3;
+  std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;
   long phase3_emitted = 0;
   double b2_ = 0.0;
 };
@@ -766,6 +968,37 @@ FoFFragmentHistogram runFoFFragmentHistogram(CProxy_FoFPhase1<Data> fof,
 template <typename Data>
 void runFoFVerifyTips(CProxy_FoFPhase1<Data> fof, long n_total) {
   fof.verifyTips(n_total, CkCallbackResumeThread());
+}
+
+// Step 4 counterpart of runFoFVerifyTips: checks the owner-encoded UF_2
+// invariant (FoFPhase1::verifyEncodedTips) instead of the [0, n_total)
+// particle-order sentinel, which encoded tips do not satisfy.
+template <typename Data>
+void runFoFVerifyEncodedTips(CProxy_FoFPhase1<Data> fof) {
+  fof.verifyEncodedTips(CkCallbackResumeThread());
+}
+
+// Fragment-size histogram, node-side only: for step 4 (-u dist), frag_counts
+// is already populated by an earlier fof.countFragments() call (before
+// computeTipEncoding, see design/step4.md), so re-invoking countFragments
+// here (as runFoFFragmentHistogram above does) would double-count. Callers
+// on the dist path use this instead.
+template <typename Data>
+FoFFragmentHistogram runFoFFragmentHistogramNode(CProxy_FoFPhase1Node<Data> fof_node) {
+  void* result = nullptr;
+  fof_node.fragmentHistogram(CkCallbackResumeThread(result));
+  CkReductionMsg* msg = (CkReductionMsg*)result;
+  CkReduction::tupleElement* elems = nullptr;
+  int n_elems = 0;
+  msg->toTuple(&elems, &n_elems);
+  CkEnforce(n_elems == 3);
+  FoFFragmentHistogram h;
+  std::memcpy(h.bins, elems[0].data, sizeof(h.bins));
+  h.n_fragments = *(const long*)elems[1].data;
+  h.max_size = *(const long*)elems[2].data;
+  delete[] elems;
+  delete msg;
+  return h;
 }
 
 // Per-PE memory usage, reduced min/avg/max (see FoFPhase1::memoryStats).

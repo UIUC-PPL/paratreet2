@@ -39,6 +39,26 @@ using namespace paratreet;
     paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b);
     double t1 = CkWallTimer();
 
+    // Step 4 (-u dist; design/step4.md "Tip encoding"): renumber tips to
+    // (owning_process << 40) | dense_index BEFORE upwardPass/loadCache, so
+    // every particle copy the phase-3 walk later reads (including
+    // cache-shipped remote copies) already carries the encoded value --
+    // same class of ordering hazard as the loadCache/annotation-validity
+    // fix above, and fixed the same way (do the rewrite before the ship).
+    // countFragments must run first (builds frag_counts, the per-process
+    // tip domain computeTipEncoding enumerates); the later fragment
+    // histogram print in traversalFn reuses this same frag_counts via
+    // runFoFFragmentHistogramNode (NOT runFoFFragmentHistogram, which would
+    // re-invoke countFragments and double-count).
+    double t_encode = 0.0;
+    if (uf2_mode == UF2Mode::Dist) {
+      double te0 = CkWallTimer();
+      fof.countFragments(CkCallbackResumeThread());
+      fof_node.computeTipEncoding(CkCallbackResumeThread());
+      fof.applyTipEncoding(CkCallbackResumeThread());
+      t_encode = CkWallTimer() - te0;
+    }
+
     // Refresh the FragData annotations from the relabeled particles and let
     // canopy propagation (including the re-sends to Driver::recvTC) settle.
     proxy_pack.subtree.upwardPass(CkCallbackResumeThread());
@@ -48,8 +68,8 @@ using namespace paratreet;
     // Only now ship the starter pack: every canopy annotation is valid.
     proxy_pack.driver.loadCache(CkCallbackResumeThread());
     double t3 = CkWallTimer();
-    CkPrintf("FOF3STAT time_s: phase1 %.3f upwardPass %.3f loadCache %.3f\n",
-             t1 - t0, t2 - t1, t3 - t2);
+    CkPrintf("FOF3STAT time_s: phase1 %.3f tip_encode %.3f upwardPass %.3f loadCache %.3f\n",
+             t1 - t0, t_encode, t2 - t1, t3 - t2);
   }
 
   // Shared printer for the final component-count + histogram line: full and
@@ -287,9 +307,14 @@ using namespace paratreet;
 
     // Phase-1 fragment (process-tip) histogram — design note §6.3e data;
     // must run before the phase-3 relabel overwrites the tips. Distributed
-    // (reduction-based), so it runs in both check modes.
+    // (reduction-based), so it runs in both check modes. Dist mode already
+    // ran countFragments in preTraversalFn (before tip encoding), so it
+    // reads frag_counts back directly rather than re-invoking countFragments
+    // (which would double-count against encoded tips -- see preTraversalFn).
     {
-      auto h = paratreet::runFoFFragmentHistogram(fof, fof_node);
+      auto h = uf2_mode == UF2Mode::Dist
+                   ? paratreet::runFoFFragmentHistogramNode(fof_node)
+                   : paratreet::runFoFFragmentHistogram(fof, fof_node);
       CkPrintf("FOF3STAT fragments: %ld max_size %ld log2_histogram:",
                h.n_fragments, h.max_size);
       for (int k = 0; k < 64; k++)
@@ -297,23 +322,27 @@ using namespace paratreet;
       CkPrintf("\n");
     }
 
-    // Pre-walk soundness check for the phase-3 edge predicate (the tip
-    // sentinel): every registered (Subtree-owned) particle must hold a
-    // valid tip, i.e. a global particle order in [0, N). Phase 1 writes
-    // every registered particle, so an out-of-range value would mean the
-    // walk reads copies phase 1 never touched. Distributed (each PE checks
-    // its own particles, barrier reduction) so it stays on in BOTH modes.
-    // (Target-side sharing is asserted separately by
-    // Partition::verifySharedLeaves inside runFoFPhase3.)
+    // Pre-walk soundness check for the phase-3 edge predicate. Serial mode:
+    // the tip sentinel (every registered particle's tip is a global particle
+    // order in [0, N); phase 1 writes every registered particle, so an
+    // out-of-range value means the walk would read copies phase 1 never
+    // touched). Dist mode: the owner-encoded-tip invariant instead (tips are
+    // no longer in [0, N) after preTraversalFn's encoding step; see
+    // FoFPhase1::verifyEncodedTips). Both distributed (barrier reduction),
+    // so they stay on in BOTH check modes. (Target-side sharing is asserted
+    // separately by Partition::verifySharedLeaves inside runFoFPhase3[Dist].)
     double tg0 = CkWallTimer();
-    paratreet::runFoFVerifyTips(fof, (long)N);
+    if (uf2_mode == UF2Mode::Dist) paratreet::runFoFVerifyEncodedTips(fof);
+    else                           paratreet::runFoFVerifyTips(fof, (long)N);
     double tg1 = CkWallTimer();
     CkPrintf("FOF3STAT time_s: fragcheck %.3f tip_sentinel %.3f\n",
              tc1 - tc0, tg1 - tg0);
 
-    // Phase 3: cross-process boundary walk + gather-to-one UF_2 + global
-    // relabel (see src/FoFPhase3.h).
-    FoFPhase3Result pr = paratreet::runFoFPhase3(proxy_pack.partition, fof, b);
+    // Phase 3: cross-process boundary walk + UF_2 (dist: UnionFindLib per
+    // design/step4.md; serial: v1/3a gather-to-one) + global relabel.
+    FoFPhase3Result pr = uf2_mode == UF2Mode::Dist
+        ? paratreet::runFoFPhase3Dist(proxy_pack.partition, fof, fof_node, b)
+        : paratreet::runFoFPhase3(proxy_pack.partition, fof, b);
     CkPrintf("FOF3STAT edges: emitted %ld sent %ld unique %ld tips_remapped %ld\n",
              pr.edges_emitted, pr.edges_sent, pr.edges_unique, pr.tips_remapped);
     // 3a counters (design/step3.md §6). Redundancy ratio = both-uniform
@@ -397,16 +426,35 @@ using namespace paratreet;
              "n2_crosscheck %.3f\n",
              tv1 - tv0, tv2 - tv1, tv3 - tv2);
 
+    // Label-agnostic canonicalization (design/step4.md decision 3): -u dist
+    // final labels are UnionFindLib's arbitrary serial componentNumbers, not
+    // the "order of the min-order member" convention -u serial's gather-to-
+    // one UF_2 produces, so raw label VALUES are not comparable to
+    // serial_rep across modes. Re-derive, from the gathered records
+    // themselves, the canonical representative per label group (min particle
+    // order among all records sharing that label) exactly as fof1's
+    // verifyPhase1 already does, and compare THAT to serial_rep -- correct
+    // and unchanged in behavior for -u serial (there, tip_min_order[label]
+    // trivially equals label itself, since union-by-min already made the
+    // label the min order of its own group).
+    std::unordered_map<long, long> tip_min_order; // final label -> min order
+    for (int i = 0; i < N; i++) {
+      auto it = tip_min_order.find(recs[i].tip);
+      if (it == tip_min_order.end()) tip_min_order.emplace(recs[i].tip, recs[i].order);
+      else if (recs[i].order < it->second) it->second = recs[i].order;
+    }
+
     int n_mismatch = 0;
     std::unordered_map<long, long> tips_seen; // final label -> count
     for (int i = 0; i < N; i++) {
       tips_seen[recs[i].tip]++;
-      if (recs[i].tip != serial_rep[i]) {
+      long canon_rep = tip_min_order[recs[i].tip];
+      if (canon_rep != serial_rep[i]) {
         if (n_mismatch < 5) {
           CkPrintf("FOF3 MISMATCH: particle order %d at (%g, %g, %g): "
-                   "serial rep %ld, phase-3 label %ld\n",
+                   "serial rep %ld, phase-3 canonical rep %ld (label %ld)\n",
                    recs[i].order, (double)recs[i].x, (double)recs[i].y,
-                   (double)recs[i].z, serial_rep[i], recs[i].tip);
+                   (double)recs[i].z, serial_rep[i], canon_rep, recs[i].tip);
         }
         n_mismatch++;
       }
