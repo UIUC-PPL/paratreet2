@@ -323,6 +323,55 @@ component count + histogram bit-identical across configs per input.
 - Peak RSS 5.4 GB at 16M (32 GB machine); 80M correctly out of
   reach on this hardware.
 
+## 6c. Certificate/redundancy stats on REAL cosmological data (2026-07-20)
+
+First run of the step-3a prune counters on clustered/filamentary data
+(LAMBS large-scale-structure subsample,
+paratreet/examples/lambs.00200_subsamp_1M; 6a/6b were synthetic Plummer
++ uniform). 1M, 2 proc x 2 PE, -d oct.
+
+**Redundancy ratio jumps ~50x on clustered data** (the halo-dominated
+regime, design note 3.2):
+
+| 1M, 2px2PE  | negative   | positive | suppression | same_frag | unique pairs | redundancy |
+|-------------|------------|----------|-------------|-----------|--------------|------------|
+| Plummer     | 13,470,648 | 0        | 4,890       | 1,582,921 | 866          | 0.30       |
+| LAMBS       | 11,567,085 | 0        | 1,010       | 1,296,791 | 123          | 16.1       |
+
+LAMBS has FEWER boundary fragment pairs (123 vs 866) but each is ~16x
+"hotter" (16 redundant both-uniform descents per pair vs Plummer's 0.3).
+Few pairs, each hammered. **This re-opens 3b (parking):** deferral was
+right for synthetic (0.3x, nothing to gain), but clustered data shows
+high per-pair redundancy, and absolute redundant work = boundary_pairs x
+ratio grows with process count and resolution. Revisit at higher process
+counts / full resolution. (same_frag = 1.3M confirms dense uniform
+subtrees are ubiquitous — but same-fragment, so pruned instantly, not the
+positive-certificate case.)
+
+**Positive certificate stays dead THROUGH percolation** (b_factor sweep,
+LAMBS 1M, -c stats):
+
+| b_factor | positive | suppression | same_frag | components | max_size          |
+|----------|----------|-------------|-----------|------------|-------------------|
+| 0.2      | 0        | 1,010       | 1,296,791 | 379,884    | 19,350            |
+| 0.3      | 0        | 3,492       | 1,702,742 | 291,504    | 24,880            |
+| 0.5      | 0        | 7,771       | 2,053,333 | 191,682    | 51,408            |
+| 0.7      | 1        | 14,270      | 2,320,675 | 130,016    | 241,479           |
+| 1.0      | 0        | 35,070      | 2,974,377 | 72,167     | 809,181 (81% of N)|
+
+Percolation happens between b=0.5 and 0.7 (max_size 51K -> 241K -> 809K).
+The positive certificate fired EXACTLY ONCE (b=0.7, at the transition), 0
+elsewhere including full percolation. **Case 2 is structurally subsumed by
+suppression (case 3) regardless of density** and could be removed with
+negligible effect, for two reasons: (1) maxdist(A,B) <= b between DIFFERENT
+fragments is near-self-contradictory (whole boxes within b => their
+particles are FoF-linked => same fragment, not two); (2) DFS reaches a
+leaf-level witness (emits edge, marks SEEN) before descending to an
+internal pair small enough for maxdist <= b. The design note's predicted
+D=1e4-1e6 regime for case 2 is not reached by these subsamples, but the
+structural argument holds across the whole physical b range. Suppression
+does all of case 2's work and fires first (grows 1,010 -> 35,070 with b).
+
 ## 7. Explicitly deferred past 3b
 
 htram aggregation for edge emission (counters above are already
