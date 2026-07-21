@@ -53,7 +53,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:")) != -1) {
       switch (c) {
         case 'b':
           fof_b_factor = atof(optarg);
@@ -70,6 +70,11 @@ PARATREET_REGISTER_MAIN(ExMain);
           else if (strcmp(optarg, "serial") == 0) uf2_mode = UF2Mode::Serial;
           else CkAbort("-u requires one of: dist, serial");
           break;
+        case 'm':
+          fof_min_component_size = atoi(optarg);
+          if (fof_min_component_size < 0)
+            CkAbort("-m requires a min component size >= 0");
+          break;
         default:
           CkPrintf("Usage: %s -f <input file> [options]\n", m->argv[0]);
           CkPrintf("App-specific options:\n");
@@ -78,6 +83,9 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t    auto = full if N <= %d, else stats]\n", kAutoFullMaxN);
           CkPrintf("\t-u [UF_2 implementation: dist (default, step 4 distributed\n");
           CkPrintf("\t    UnionFindLib), serial (v1/3a gather-to-one, kept for A/B)]\n");
+          CkPrintf("\t-m [min component size for REPORTING (default 0 = report all);\n");
+          CkPrintf("\t    when >0, also prints a FOF3STAT surviving line for\n");
+          CkPrintf("\t    components with size >= m (a reporting filter only)]\n");
           CkPrintf("Framework options (see src/Configuration.h):\n");
           CkPrintf("\t-f [input file]\n");
           CkPrintf("\t-n [number of treepieces]\n");
@@ -106,6 +114,9 @@ PARATREET_REGISTER_MAIN(ExMain);
              check_mode == CheckMode::Stats ? "stats" : "auto");
     CkPrintf("UF_2 implementation: %s\n",
              uf2_mode == UF2Mode::Dist ? "dist" : "serial");
+    CkPrintf("Min component size for reporting: %d%s\n",
+             fof_min_component_size,
+             fof_min_component_size == 0 ? " (report all)" : "");
 
     // Unit checks for paratreet::maxdist2 (the phase-3a positive
     // certificate). The certificate rarely fires in vivo — DFS leaf

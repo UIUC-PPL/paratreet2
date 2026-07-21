@@ -182,6 +182,15 @@ struct FoFComponentHistogram {
   long bins[64];      // bins[k] = #components with floor(log2(size)) == k
   long n_components;  // total component count
   long max_size;      // largest component size
+  // Step 5 (design/step5-pruning.md): min-component-size REPORTING filter. When
+  // the harness's -m threshold is > 0 these describe only the components with
+  // size >= m (the "surviving" set); they are computed from the SAME merged
+  // per-label counts as the fields above (no second gather). When m == 0 the
+  // surviving_* fields mirror the totals and the harness does not print them.
+  long surviving_bins[64];  // bins over components with size >= m
+  long surviving_count;     // #components with size >= m
+  long surviving_max_size;  // largest surviving component size (0 if none)
+  int min_component_size;   // the m used (0 = no filter)
 };
 
 // Result of the per-PE memory reduction (CmiMemoryUsage). In SMP builds
@@ -1029,7 +1038,8 @@ FoFMemoryStats runFoFMemoryStats(CProxy_FoFPhase1<Data> fof) {
 // context on PE 0. This is the stats-mode determinism observable: for a
 // given input it must be bit-identical across process/PE configurations.
 template <typename Data>
-FoFComponentHistogram runFoFComponentHistogram(CProxy_FoFPhase1<Data> fof) {
+FoFComponentHistogram runFoFComponentHistogram(CProxy_FoFPhase1<Data> fof,
+                                               int min_component_size = 0) {
   void* result = nullptr;
   fof.collectLabelCounts(CkCallbackResumeThread(result));
   CkReductionMsg* msg = (CkReductionMsg*)result;
@@ -1042,8 +1052,12 @@ FoFComponentHistogram runFoFComponentHistogram(CProxy_FoFPhase1<Data> fof) {
 
   FoFComponentHistogram h;
   std::memset(h.bins, 0, sizeof(h.bins));
+  std::memset(h.surviving_bins, 0, sizeof(h.surviving_bins));
   h.n_components = 0;
   h.max_size = 0;
+  h.surviving_count = 0;
+  h.surviving_max_size = 0;
+  h.min_component_size = min_component_size;
   for (auto& kv : counts) {
     long size = kv.second;
     int bin = 0; // floor(log2(size)); size >= 1 always
@@ -1051,6 +1065,13 @@ FoFComponentHistogram runFoFComponentHistogram(CProxy_FoFPhase1<Data> fof) {
     h.bins[bin]++;
     h.n_components++;
     if (size > h.max_size) h.max_size = size;
+    // Reporting filter (step 5): survivors are components with size >= m,
+    // tallied from the same merged counts (no extra gather/reduction).
+    if (size >= (long)min_component_size) {
+      h.surviving_bins[bin]++;
+      h.surviving_count++;
+      if (size > h.surviving_max_size) h.surviving_max_size = size;
+    }
   }
   return h;
 }

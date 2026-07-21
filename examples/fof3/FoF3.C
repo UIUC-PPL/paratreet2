@@ -85,6 +85,21 @@ using namespace paratreet;
     CkPrintf("\n");
   }
 
+  // Step 5 (design/step5-pruning.md): the min-component-size REPORTING line,
+  // printed only when -m > 0. The unpruned components line (above) still
+  // prints too, so both the full and the pruned counts are always visible.
+  // This is a reporting filter: it does not relabel particles or touch the
+  // validated partition/equality checks. Same log2 binning as the components
+  // line, so the two histograms are directly comparable bin-for-bin.
+  static void printSurvivingLine(long surviving_count, int min_size,
+                                 long max_size, const long* bins) {
+    CkPrintf("FOF3STAT surviving: %ld components with size >= %d, max_size %ld "
+             "log2_histogram:", surviving_count, min_size, max_size);
+    for (int k = 0; k < 64; k++)
+      if (bins[k] != 0) CkPrintf(" %d:%ld", k, bins[k]);
+    CkPrintf("\n");
+  }
+
   // Serial O(n^2) reference FoF over the gathered records. Fills
   // serial_rep[i] with the canonical representative of record i's component:
   // the global order of the component's min-order member (union by min order
@@ -386,9 +401,12 @@ using namespace paratreet;
       // the determinism observable: run the same input under two different
       // process/PE configs and diff the FOF3STAT components lines.
       double th0 = CkWallTimer();
-      auto h = paratreet::runFoFComponentHistogram(fof);
+      auto h = paratreet::runFoFComponentHistogram(fof, fof_min_component_size);
       double th1 = CkWallTimer();
       printComponentsLine(h.n_components, h.max_size, h.bins);
+      if (fof_min_component_size > 0)
+        printSurvivingLine(h.surviving_count, fof_min_component_size,
+                           h.surviving_max_size, h.surviving_bins);
       CkPrintf("FOF3STAT time_s: component_histogram %.3f\n", th1 - th0);
       CkPrintf("FOF3 STATS MODE COMPLETE: %ld components "
                "(full verification not run; determinism check = compare "
@@ -468,14 +486,27 @@ using namespace paratreet;
     {
       long bins[64] = {0};
       long max_size = 0;
+      // Step 5 (design/step5-pruning.md): the surviving (size >= m) tallies are
+      // computed from the SAME tips_seen label-count map, so no extra gather.
+      long surv_bins[64] = {0};
+      long surv_max_size = 0;
+      long surv_count = 0;
       for (auto& kv : tips_seen) {
         long size = kv.second;
         int bin = 0;
         while (bin < 63 && (2L << bin) <= size) bin++;
         bins[bin]++;
         if (size > max_size) max_size = size;
+        if (size >= (long)fof_min_component_size) {
+          surv_bins[bin]++;
+          surv_count++;
+          if (size > surv_max_size) surv_max_size = size;
+        }
       }
       printComponentsLine(K, max_size, bins);
+      if (fof_min_component_size > 0)
+        printSurvivingLine(surv_count, fof_min_component_size, surv_max_size,
+                           surv_bins);
     }
     delete msg;
 

@@ -29,11 +29,20 @@ class ExMain: public paratreet::Main<FragData> {
   //   -u <mode>    UF_2 implementation: dist (default) | serial (see
   //                design/step4.md; serial kept for A/B against the
   //                gather-to-one v1/3a path)
+  //   -m <int>     minimum component size (particles) for REPORTING: a
+  //                component "survives" if its size >= m. Default 0 = report
+  //                everything (byte-identical to pre-step-5 output). When m>0
+  //                an extra FOF3STAT surviving line is printed alongside the
+  //                unchanged (unpruned) components line (design/step5-pruning.md).
+  //                This is a reporting FILTER only; it never relabels particles
+  //                or changes the validated partition/equality checks.
   double fof_b_factor = 0.2;
   enum class CheckMode { Auto, Full, Stats };
   CheckMode check_mode = CheckMode::Auto;
   enum class UF2Mode { Dist, Serial };
   UF2Mode uf2_mode = UF2Mode::Dist;
+  // Min component size for reporting (-m); 0 = report everything (default).
+  int fof_min_component_size = 0;
   // Auto-mode gate: full verification gathers ~24 B/particle to PE 0 and
   // runs the serial grid reference there; above this N, auto falls back to
   // stats mode (force with -c full, memory permitting).
