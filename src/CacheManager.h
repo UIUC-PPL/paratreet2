@@ -210,6 +210,7 @@ public:
   void recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack, int n, CkCallback);
   void addCache(MultiData<Data>);
   void receiveSubtree(MultiData<Data>, PPHolder<Data>);
+  void refreshSubtreeCopy(MultiData<Data>);
   void restoreData(std::pair<Key, SpatialNode<Data>>);
   void connect(Node<Data>*);
 
@@ -311,6 +312,40 @@ void CacheManager<Data>::receiveSubtree(MultiData<Data> multidata, PPHolder<Data
   unlockMaps();
   for (auto && partition : copy_out) {
     pp_holder.proxy[partition].makeLeaves(multidata.tp_index);
+  }
+}
+
+// Update a previously copied subtree (shipped via receiveSubtree/requestCopy)
+// in place from a refreshed flat_subtree snapshot: overwrite each cached
+// node's Data annotation and each cached leaf's particle copies, matching by
+// key. The tree structure is unchanged, so cached node/leaf pointers held
+// elsewhere (partition target leaves, local_tps wiring) stay valid. No-op if
+// this CacheManager holds no copy of the subtree. Mirrors addCacheHelper's
+// particle-index walk so particle offsets line up with the shipped nodes.
+template <typename Data>
+void CacheManager<Data>::refreshSubtreeCopy(MultiData<Data> multidata) {
+  auto* nodes = multidata.nodes.data();
+  int n_nodes = multidata.nodes.size();
+  if (n_nodes == 0) return;
+  lockMaps();
+  auto it = local_tps.find(nodes[0].first);
+  Node<Data>* top = (it != local_tps.end()) ? it->second : nullptr;
+  unlockMaps();
+  if (!top) return; // no copy of this subtree lives here
+  Particle* particles = multidata.particles.data();
+  int p_index = 0;
+  for (int j = 0; j < n_nodes; j++) {
+    auto&& key = nodes[j].first;
+    auto&& spatial_node = nodes[j].second;
+    Node<Data>* node = top->getDescendant(key);
+    if (node) {
+      node->data = spatial_node.data; // refreshed annotation
+      // Leaves carry n_particles > -1; refresh their particle copies in place.
+      for (int i = 0; i < spatial_node.n_particles; i++) {
+        node->changeParticle(i, particles[p_index + i]);
+      }
+    }
+    if (spatial_node.n_particles > -1) p_index += spatial_node.n_particles;
   }
 }
 

@@ -49,6 +49,7 @@ module paratreet {
     entry void addCache(MultiData<Data>);
     entry void restoreData(std::pair<Key, SpatialNode<Data>>);
     entry void receiveSubtree(MultiData<Data>, PPHolder<Data>);
+    entry void refreshSubtreeCopy(MultiData<Data>);
     template <typename Visitor>
     entry void startPrefetch(DPHolder<Data>, CkCallback);
     entry void startParentPrefetch(DPHolder<Data>, CkCallback);
@@ -190,6 +191,7 @@ module paratreet {
     entry void buildTree(CProxy_Partition<Data>, CkCallback);
     entry void requestNodes(Key, int);
     entry void requestCopy(int, PPHolder<Data>);
+    entry void refreshCopies(const CkCallback&);
     entry void destroy();
     entry void reset();
     entry void sendLeaves(CProxy_Partition<Data>);

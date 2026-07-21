@@ -40,6 +40,7 @@ public:
   Key tp_key; // Should be a prefix of all particle keys underneath this node
   Node<Data>* local_root; // Root node of this Subtree, TreeCanopies sit above this node
   MultiData<Data> flat_subtree;
+  std::vector<int> copy_requesters; // CacheManager indices that took a flat_subtree copy
 
   CProxy_TreeCanopy<Data> tc_proxy;
   CProxy_CacheManager<Data> cm_proxy;
@@ -68,6 +69,7 @@ public:
   void goDown(size_t travIdx);
   void requestNodes(Key, int);
   void requestCopy(int, PPHolder<Data>);
+  void refreshCopies(const CkCallback&);
   void print(Node<Data>*);
   void destroy();
   void reset();
@@ -284,7 +286,39 @@ void Subtree<Data>::addNodeToFlatSubtree(Node<Data>* node) {
 template <typename Data>
 void Subtree<Data>::requestCopy(int cm_index, PPHolder<Data> pp_holder) {
   if (flat_subtree.nodes.empty()) addNodeToFlatSubtree(local_root);
+  // Record which remote CacheManagers hold a copy of this subtree, so a later
+  // post-build mutation (Subtree::callPerLeafFn) can be pushed to them via
+  // refreshCopies(). flat_subtree is a build-time snapshot shipped here BEFORE
+  // any mutation, so without that push the remote copies stay stale.
+  copy_requesters.push_back(cm_index);
   cm_proxy[cm_index].receiveSubtree(flat_subtree, pp_holder);
+}
+
+// Push this subtree's refreshed state to every remote CacheManager that
+// requested a copy of it. Those copies were shipped as a build-time
+// flat_subtree snapshot (see requestCopy) and are promoted into the remote
+// CacheManager's local_tps/leaf_lookup, so a down-traversal reads them as
+// SOURCE leaves. Work applied after tree build -- a per-leaf mutation
+// (annotate's DensityStampFn, FoF phase-1 relabeling) plus the upwardPass node
+// recompute -- touches only the live nodes/particles here, leaving those
+// remote snapshots stale in BOTH particle data and node annotations. This
+// re-snapshots flat_subtree (mutated particles + post-upwardPass annotations)
+// and ships it so the remote copy is updated in place, by key, structure
+// unchanged. Must run after the mutation/upwardPass and before the traversal
+// that reads the copies. No-op when no remote copies exist (e.g. matching
+// decompositions, where remote source leaves are fetched live via
+// CacheManager::serviceRequest).
+template <typename Data>
+void Subtree<Data>::refreshCopies(const CkCallback& cb) {
+  if (!copy_requesters.empty()) {
+    flat_subtree.particles = particles;   // mutated particle data
+    flat_subtree.nodes.clear();
+    addNodeToFlatSubtree(local_root);     // post-upwardPass node annotations
+    for (int cm_index : copy_requesters) {
+      cm_proxy[cm_index].refreshSubtreeCopy(flat_subtree);
+    }
+  }
+  this->contribute(cb);
 }
 
 template <typename Data>
@@ -482,6 +516,7 @@ template <typename Data>
 void Subtree<Data>::reset() {
   particles.clear();
   flat_subtree.clear();
+  copy_requesters.clear();
 }
 
 template <typename Data>

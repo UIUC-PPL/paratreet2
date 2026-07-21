@@ -27,6 +27,7 @@ Main.o: Main.C Main.h $(VISITORS) $(OTHERS) Main.decl.h
 
 test: all
 	./VisitAll -f $(BASE_PATH)/inputs/1k.tipsy -d sfc +p2
+	./charmrun ++local ./VisitAll -f $(BASE_PATH)/inputs/1k.tipsy -d sfc +p4 ++ppn 2
 
 clean:
 	rm -f *.decl.h *.def.h conv-host *.o VisitAll charmrun

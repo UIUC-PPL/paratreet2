@@ -23,6 +23,9 @@ Main.o: Main.C Main.h $(VISITORS) $(DATA) Main.decl.h
 
 test: all
 	./Annotate -f $(BASE_PATH)/inputs/1k.tipsy -d sfc +p2
+	./Annotate -f $(BASE_PATH)/inputs/1k.tipsy -d oct +p2
+	./charmrun ++local ./Annotate -f $(BASE_PATH)/inputs/1k.tipsy -d sfc +p4 ++ppn 2
+	./charmrun ++local ./Annotate -f $(BASE_PATH)/inputs/1k.tipsy -d oct +p4 ++ppn 2
 
 clean:
 	rm -f *.decl.h *.def.h conv-host *.o Annotate charmrun
