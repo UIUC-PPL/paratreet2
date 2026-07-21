@@ -37,6 +37,33 @@ using namespace paratreet;
     // process-level fragments afterwards. PBC (design/pbc.md): a cubic box
     // period of pbc_period on all axes (0 = open boundaries, the default).
     Vector3D<Real> pbc(pbc_period, pbc_period, pbc_period);
+    if (pbc_period > 0) {
+      // PBC validity (design/minimum-image-vs-27-images.md §7): fail fast at
+      // startup rather than silently produce wrong FoF groups.
+      Vector3D<Real> extent = universe.box.size();
+      Real maxext = std::max(extent.x, std::max(extent.y, extent.z));
+      // (1) period must be the box side, i.e. >= particle extent on every
+      // axis. The universe box is slightly padded (remakeUniverse, ~2e-6), so
+      // allow a small relative tolerance -- enough to accept period == true
+      // box side, far tighter than any real mismatch (e.g. -P 1 on a box of
+      // side 35).
+      if (pbc_period < maxext * (Real)(1.0 - 1e-4)) {
+        CkAbort("PBC: -P period %g is smaller than the particle box extent %g "
+                "(x=%g y=%g z=%g). The period must be the box side (>= the "
+                "extent on every axis); pass the true simulation box side.\n",
+                (double)pbc_period, (double)maxext,
+                (double)extent.x, (double)extent.y, (double)extent.z);
+      }
+      // (2) minimum-image requires b < L/2 (design/minimum-image §4).
+      if (fof_b >= 0.5 * (double)pbc_period) {
+        CkAbort("PBC: linking length b = %g is not < L/2 = %g (period L = %g). "
+                "Minimum-image PBC requires b < L/2; lower -b or check -P.\n",
+                fof_b, 0.5 * (double)pbc_period, (double)pbc_period);
+      }
+      CkPrintf("PBC enabled: period L = %g (box extent %g), b = %g < L/2 = %g\n",
+               (double)pbc_period, (double)maxext, fof_b,
+               0.5 * (double)pbc_period);
+    }
     double t0 = CkWallTimer();
     paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b, pbc);
     double t1 = CkWallTimer();
