@@ -72,9 +72,39 @@ private:
   typename std::list<PoolElem>::iterator curr;
 };
 
+// ============================================================================
+// CONCURRENCY DESIGN -- READ BEFORE ADDING ANY LOCK HERE.
+//
+// The CacheManager is a nodegroup: all worker PEs of a process share ONE
+// branch and run its entry methods concurrently on separate pthreads. Its
+// performance rests on being LOCK-FREE on the hot path -- this is deliberate,
+// not incidental, and must be preserved:
+//   * Concurrent cache fills are lock-free via ATOMIC child-pointer exchange
+//     (Node::children are std::atomic<Node*>, see Node::exchangeChild) plus an
+//     atomic per-PE `requested` bitmask. Multiple PEs grow the cached tree at
+//     once with no mutex.
+//   * Traversals READ node data/particles with NO lock (cached Data is treated
+//     as immutable-after-fill).
+//   * `maps_lock` is the ONLY mutex, and it is intentionally NARROW: it guards
+//     just the top-level registry inserts (local_tps / leaf_lookup), whose
+//     std::map/unordered_map structure is not self-thread-safe. It does NOT
+//     cover the data path.
+//
+// DO NOT "fix" a concurrency concern by widening the lock or adding new locks.
+// It would be self-defeating: a broad lock serializes exactly the concurrent
+// fills/reads that are the point, and -- since readers are lockless -- a mutex
+// on a writer cannot even serialize against them. The correct tools here are
+// (a) narrow atomics for concurrent structural updates, and (b) PHASE
+// SEPARATION for post-build mutation of cached Data (upwardPass,
+// callPerLeafFn/refreshSubtreeCopy): run the mutation in a phase that is
+// quiescence-separated from any traversal that reads it. See the concurrency
+// comments on refreshSubtreeCopy below and design/cache-concurrency.md.
+// ============================================================================
 template <typename Data>
 class CacheManager : public CBase_CacheManager<Data> {
 public:
+  // Narrow structural lock for the registry maps only (local_tps/leaf_lookup);
+  // NOT a data-path lock. See the CONCURRENCY DESIGN note above.
   std::mutex maps_lock;
   Node<Data>* root = nullptr;
   using NodeLookup = std::unordered_map<Key, Node<Data>*>;
