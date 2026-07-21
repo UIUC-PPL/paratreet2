@@ -4,11 +4,14 @@
 BASE_PATH := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 PARATREET_PATH = $(BASE_PATH)/src
 STRUCTURE_PATH = $(BASE_PATH)/utility/structures
+UNION_FIND_DIR = $(BASE_PATH)/../unionfind
+HTRAM_DIR = $(BASE_PATH)/../htram
+PREFIX_LIB_DIR = $(UNION_FIND_DIR)/prefixLib
 
-INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I$(PARATREET_PATH)/uf2 -I.
+INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I$(PARATREET_PATH) -I$(PREFIX_LIB_DIR) -I$(UNION_FIND_DIR) -I$(HTRAM_DIR) -I.
 CHARM_HOME ?= $(HOME)/software/clusterFinding/charm
 
-LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet
+LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet -L$(UNION_FIND_DIR) -lunionFind -L${PREFIX_LIB_DIR} -lprefix -L${HTRAM_DIR} -lhtram_group_unionfind
 
 # XDR library for Tipsy file I/O
 # First check for system RPC XDR library, then fall back to utility/xdr
