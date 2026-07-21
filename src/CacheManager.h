@@ -322,6 +322,19 @@ void CacheManager<Data>::receiveSubtree(MultiData<Data> multidata, PPHolder<Data
 // elsewhere (partition target leaves, local_tps wiring) stay valid. No-op if
 // this CacheManager holds no copy of the subtree. Mirrors addCacheHelper's
 // particle-index walk so particle offsets line up with the shipped nodes.
+//
+// CONCURRENCY CONTRACT: this is a nodegroup shared by all worker PEs, and
+// traversals read node->data/particles WITHOUT a lock (stock ParaTreeT treats
+// cached Data as immutable-after-cache). This method MUTATES that payload, so
+// it is only safe when NO traversal is concurrently reading the affected
+// subtree -- i.e. it must run in a mutation phase that is quiescence-separated
+// from the down-traversal (the same contract Subtree::upwardPass relies on).
+// The maps_lock below guards only the local_tps lookup; it does NOT (and
+// cannot) serialize against lockless readers -- phase separation is the
+// guarantee. Callers: run this before loadCache/startDown with a CkWaitQD in
+// between (see examples/annotate preTraversalFn). Concurrent refreshSubtreeCopy
+// messages on one CM are safe: each touches a disjoint subtree (distinct key
+// range), so no node is written by two of them.
 template <typename Data>
 void CacheManager<Data>::refreshSubtreeCopy(MultiData<Data> multidata) {
   auto* nodes = multidata.nodes.data();

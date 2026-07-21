@@ -304,10 +304,16 @@ void Subtree<Data>::requestCopy(int cm_index, PPHolder<Data> pp_holder) {
 // remote snapshots stale in BOTH particle data and node annotations. This
 // re-snapshots flat_subtree (mutated particles + post-upwardPass annotations)
 // and ships it so the remote copy is updated in place, by key, structure
-// unchanged. Must run after the mutation/upwardPass and before the traversal
-// that reads the copies. No-op when no remote copies exist (e.g. matching
-// decompositions, where remote source leaves are fetched live via
+// unchanged. No-op when no remote copies exist (e.g. matching decompositions,
+// where remote source leaves are fetched live via
 // CacheManager::serviceRequest).
+//
+// CONCURRENCY: refreshSubtreeCopy mutates cached node payload that traversals
+// read locklessly (see its comment in CacheManager.h). The caller MUST run
+// this in a mutation phase quiescence-separated from the down-traversal, and
+// MUST CkWaitQD after it (this method's callback fires when the push messages
+// are SENT, not processed) so the in-place updates land before any traversal
+// read. See examples/annotate preTraversalFn.
 template <typename Data>
 void Subtree<Data>::refreshCopies(const CkCallback& cb) {
   if (!copy_requesters.empty()) {
