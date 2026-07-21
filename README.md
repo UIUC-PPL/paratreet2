@@ -82,13 +82,27 @@ target regime.
   cd utility/structures && ./configure && make    # builds libTipsy.a
   ```
 
+- The distributed union-find (FoF's UF_2) is the sibling
+  [UIUC-PPL/unionfind](https://github.com/UIUC-PPL/unionfind) library
+  (branch `fof_with_aggregation`), checked out **next to** paratreet2
+  (`../unionfind`), plus [htram](https://github.com/UIUC-PPL/htram) at
+  `../htram`. Build unionfind **AGGREGATION-off** (plain sends; htram is
+  linked but dormant — turn it on later with `make` once perf data calls
+  for it):
+
+  ```sh
+  cd ../htram && make                              # -> libhtram_group_unionfind.a
+  cd ../unionfind/prefixLib && make                # -> libprefix.a
+  cd ..     && make AGGREGATION= PROFILE=           # -> libunionFind.a (htram-off)
+  ```
+
 ### Build
 
-In order (the library links `utility/structures/libTipsy.a` into
-`libparatreet.a`):
+In order (the library links `utility/structures/libTipsy.a` and the sibling
+`unionfind` into `libparatreet.a`; build unionfind FIRST, above):
 
 ```sh
-cd src && make                 # -> libparatreet.a
+cd src && make                 # -> libparatreet.a  (links ../unionfind)
 cd ../examples/fof3 && make    # -> FoF3
 cd ../../inputgen && make      # -> plummer, uniform, tipsyPlummer
 ```
