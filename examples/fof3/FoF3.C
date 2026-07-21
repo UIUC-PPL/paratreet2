@@ -34,9 +34,11 @@ using namespace paratreet;
              fof_b, fof_b_factor, V, N);
 
     // Phase 1: register -> phaseA -> phaseB -> merge -> relabel. Tips are
-    // process-level fragments afterwards.
+    // process-level fragments afterwards. PBC (design/pbc.md): a cubic box
+    // period of pbc_period on all axes (0 = open boundaries, the default).
+    Vector3D<Real> pbc(pbc_period, pbc_period, pbc_period);
     double t0 = CkWallTimer();
-    paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b);
+    paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b, pbc);
     double t1 = CkWallTimer();
 
     // Step 4 (-u dist; design/step4.md "Tip encoding"): renumber tips to
@@ -105,6 +107,7 @@ using namespace paratreet;
   // the global order of the component's min-order member (union by min order
   // + full compression). Returns the component count.
   static long serialReference(const FoFParticleRecord* recs, int n, double b2,
+                              const Vector3D<Real>& period,
                               std::vector<long>& serial_rep) {
     std::vector<int> parent(n);
     for (int i = 0; i < n; i++) parent[i] = i;
@@ -120,12 +123,14 @@ using namespace paratreet;
       if (recs[rx].order < recs[ry].order) parent[ry] = rx;
       else                                 parent[rx] = ry;
     };
-    // Reproduce the library's distance arithmetic exactly (Vector3D<Real>).
+    // Reproduce the library's distance arithmetic exactly (Vector3D<Real>);
+    // periodicDistSq with period {0,0,0} is bit-identical to lengthSquared,
+    // and applies minimum-image wraparound when -P is set (design/pbc.md).
     for (int i = 0; i < n; i++) {
       Vector3D<Real> pi(recs[i].x, recs[i].y, recs[i].z);
       for (int j = i + 1; j < n; j++) {
         Vector3D<Real> pj(recs[j].x, recs[j].y, recs[j].z);
-        if ((pi - pj).lengthSquared() <= b2) unite(i, j);
+        if (paratreet::periodicDistSq(pi, pj, period) <= b2) unite(i, j);
       }
     }
     serial_rep.resize(n);
@@ -140,18 +145,28 @@ using namespace paratreet;
 
   // Exact grid-hash serial reference FoF, O(n) at fixed density (the O(n^2)
   // reference above is quadratic and unusable past ~10k). Cells of side
-  // exactly b: a pair within distance b differs by at most 1 cell per axis,
-  // so union-find with pairwise distance tests across each cell's
-  // 27-neighborhood (enumerated as self + 13 "forward" neighbor offsets, so
-  // each cell pair is visited once) reproduces the exact linking graph. The
-  // distance predicate replicates the library's float arithmetic (Real
-  // component subtraction, Real sum of squares, promote to double for the
-  // <= b2 compare) exactly as serialReference does via Vector3D<Real>.
-  // Independence property: consumes only the gathered position/order
-  // records — no library geometry, tree, or hash code. Cross-validated
-  // against the O(n^2) reference at N <= 10k (see traversalFn).
+  // >= b: a pair within distance b differs by at most 1 cell per axis, so
+  // union-find with pairwise distance tests across each cell's 27-neighborhood
+  // (enumerated as self + 13 "forward" neighbor offsets, so each cell pair is
+  // visited once) reproduces the exact linking graph. The distance predicate
+  // replicates the library's float arithmetic (Real component subtraction,
+  // Real sum of squares, promote to double for the <= b2 compare) exactly as
+  // serialReference does, via paratreet::periodicDistSq.
+  //
+  // PBC (design/pbc.md): when period.<axis> > 0 the reference wraps that axis.
+  // We use G = floor(L/b) cells of width w = L/G >= b along that axis (the
+  // standard linked-cell-list-with-PBC trick: cells tile ONE period exactly,
+  // so cell indices wrap modulo G and each cell has a well-defined opposite-
+  // face neighbor). b < L/2 guarantees G >= 2. The distance test itself is
+  // minimum-image (periodicDistSq with the period), so a pair straddling
+  // opposite faces links iff its wrapped distance <= b. With period {0,0,0}
+  // this is bit-identical to the open-boundary reference: inv = 1/b, no wrap,
+  // and periodicDistSq == lengthSquared. Independence property: consumes only
+  // the gathered position/order records. Cross-validated against the O(n^2)
+  // reference at N <= 10k (see traversalFn).
   static long gridReference(const FoFParticleRecord* recs, int n, double b,
-                            double b2, std::vector<long>& serial_rep) {
+                            double b2, const Vector3D<Real>& period,
+                            std::vector<long>& serial_rep) {
     std::vector<int> parent(n);
     for (int i = 0; i < n; i++) parent[i] = i;
     std::function<int(int)> find = [&](int x) {
@@ -167,31 +182,54 @@ using namespace paratreet;
       else                                 parent[rx] = ry;
     };
     auto close = [&](int i, int j) {
-      Real dx = recs[i].x - recs[j].x;
-      Real dy = recs[i].y - recs[j].y;
-      Real dz = recs[i].z - recs[j].z;
-      Real d2 = dx * dx + dy * dy + dz * dz;
-      return (double)d2 <= b2;
+      Vector3D<Real> pi(recs[i].x, recs[i].y, recs[i].z);
+      Vector3D<Real> pj(recs[j].x, recs[j].y, recs[j].z);
+      return (double)paratreet::periodicDistSq(pi, pj, period) <= b2;
     };
 
-    // Bin into cells of side b; pack (ix, iy, iz) into a u64 key, 21 bits
-    // per axis (box extent / b stays far below 2^21 at every target scale).
+    // Per-axis binning: open axes use cells of side b (inv = 1/b, no wrap,
+    // exact open-boundary arithmetic); periodic axes use G = floor(L/b) cells
+    // of width w = L/G (inv = 1/w) that wrap modulo G. G_[axis] == 0 flags an
+    // open axis (no wrap / bounds-check only).
+    const double Ls[3] = {(double)period.x, (double)period.y, (double)period.z};
+    double inv[3];
+    int64_t G[3];
+    for (int a = 0; a < 3; a++) {
+      if (Ls[a] > 0.0) {
+        G[a] = (int64_t)std::floor(Ls[a] / b);
+        CkEnforce(G[a] >= 2); // b < L/2 (design/pbc.md); else PBC ill-defined
+        inv[a] = (double)G[a] / Ls[a]; // = 1 / (L/G)
+      } else {
+        G[a] = 0;
+        inv[a] = 1.0 / b;
+      }
+    }
+
+    // Pack (ix, iy, iz) into a u64 key, 21 bits per axis (cell count / axis
+    // stays far below 2^21 at every target scale).
     double minx = 1e300, miny = 1e300, minz = 1e300;
     for (int i = 0; i < n; i++) {
       minx = std::min(minx, (double)recs[i].x);
       miny = std::min(miny, (double)recs[i].y);
       minz = std::min(minz, (double)recs[i].z);
     }
-    const double inv = 1.0 / b;
+    const double mins[3] = {minx, miny, minz};
     const int64_t axis_max = (int64_t(1) << 21) - 1;
+    // Cell index for value v on axis a: floor((v-min)*inv), wrapped mod G for
+    // periodic axes (origin-agnostic: mod G tolerates any raw index).
+    auto cellIdx = [&](double v, int a) -> int64_t {
+      int64_t k = (int64_t)std::floor((v - mins[a]) * inv[a]);
+      if (G[a] > 0) k = ((k % G[a]) + G[a]) % G[a];
+      return k;
+    };
     auto pack = [&](int64_t ix, int64_t iy, int64_t iz) {
       return (uint64_t(ix) << 42) | (uint64_t(iy) << 21) | uint64_t(iz);
     };
     std::vector<std::pair<uint64_t, int>> cells(n);
     for (int i = 0; i < n; i++) {
-      int64_t ix = (int64_t)std::floor(((double)recs[i].x - minx) * inv);
-      int64_t iy = (int64_t)std::floor(((double)recs[i].y - miny) * inv);
-      int64_t iz = (int64_t)std::floor(((double)recs[i].z - minz) * inv);
+      int64_t ix = cellIdx((double)recs[i].x, 0);
+      int64_t iy = cellIdx((double)recs[i].y, 1);
+      int64_t iz = cellIdx((double)recs[i].z, 2);
       CkEnforce(ix >= 0 && ix <= axis_max && iy >= 0 && iy <= axis_max &&
                 iz >= 0 && iz <= axis_max);
       cells[i] = {pack(ix, iy, iz), i};
@@ -199,7 +237,12 @@ using namespace paratreet;
     std::sort(cells.begin(), cells.end());
 
     // Forward half of the 27-neighborhood: (0,0,1) and the 4 (0,1,*),
-    // 9 (1,*,*) offsets — 13 total; the self cell handles (0,0,0).
+    // 9 (1,*,*) offsets — 13 total; the self cell handles (0,0,0). Offset
+    // dedup is by direction, so it remains valid under wrapping (each
+    // undirected cell pair is still reached once; wrapping only remaps which
+    // index the offset lands on). A neighbor offset on a periodic axis wraps
+    // mod G (so face cells neighbor opposite-face cells); on an open axis it
+    // is bounds-checked as before.
     static const int fwd[13][3] = {
       {0,0,1}, {0,1,-1}, {0,1,0}, {0,1,1},
       {1,-1,-1}, {1,-1,0}, {1,-1,1}, {1,0,-1}, {1,0,0}, {1,0,1},
@@ -207,6 +250,14 @@ using namespace paratreet;
     auto key_lower = [&](uint64_t key) {
       return std::lower_bound(cells.begin(), cells.end(),
                               std::make_pair(key, -1));
+    };
+    // Apply a neighbor offset on one axis: wrap mod G (periodic) or return
+    // the raw index / -1 if out of the open-boundary range.
+    auto neighborIdx = [&](int64_t idx, int off, int a) -> int64_t {
+      int64_t j = idx + off;
+      if (G[a] > 0) return ((j % G[a]) + G[a]) % G[a];
+      if (j < 0 || j > axis_max) return -1;
+      return j;
     };
     for (size_t s = 0; s < cells.size();) {
       uint64_t key = cells[s].first;
@@ -222,10 +273,13 @@ using namespace paratreet;
       int64_t iy = int64_t((key >> 21) & axis_max);
       int64_t iz = int64_t(key & axis_max);
       for (auto& d : fwd) {
-        int64_t jx = ix + d[0], jy = iy + d[1], jz = iz + d[2];
-        if (jx < 0 || jy < 0 || jz < 0 ||
-            jx > axis_max || jy > axis_max || jz > axis_max) continue;
+        int64_t jx = neighborIdx(ix, d[0], 0);
+        int64_t jy = neighborIdx(iy, d[1], 1);
+        int64_t jz = neighborIdx(iz, d[2], 2);
+        if (jx < 0 || jy < 0 || jz < 0) continue; // open-axis out of range
         uint64_t nkey = pack(jx, jy, jz);
+        if (nkey == key) continue; // self (possible only if an axis wrapped
+                                   // back onto itself); within-cell handled it
         for (auto it = key_lower(nkey);
              it != cells.end() && it->first == nkey; ++it)
           for (size_t a = s; a < e; a++)
@@ -289,12 +343,13 @@ using namespace paratreet;
     }
 
     // Self-describing config line: every FOF3STAT block starts with this.
+    // pbc = the cubic box period L (0 = open boundaries; design/pbc.md).
     CkPrintf("FOF3STAT config: pes %d nodes %d N %d b %.12g b_factor %g "
-             "decomp %s tree %s leafsize %d mode %s iter %d\n",
+             "decomp %s tree %s leafsize %d mode %s pbc %g iter %d\n",
              CkNumPes(), CkNumNodes(), N, b, fof_b_factor,
              paratreet::asString(conf.decomp_type).c_str(),
              paratreet::asString(conf.tree_type).c_str(),
-             conf.max_particles_per_leaf, mode_name, iter);
+             conf.max_particles_per_leaf, mode_name, pbc_period, iter);
     if (check_mode == CheckMode::Auto && !do_full) {
       CkPrintf("FOF3STAT warning: N = %d > %d, full verification SKIPPED "
                "(auto mode fell back to stats); force with -c full, memory "
@@ -355,9 +410,10 @@ using namespace paratreet;
 
     // Phase 3: cross-process boundary walk + UF_2 (dist: UnionFindLib per
     // design/step4.md; serial: v1/3a gather-to-one) + global relabel.
+    Vector3D<Real> pbc(pbc_period, pbc_period, pbc_period);
     FoFPhase3Result pr = uf2_mode == UF2Mode::Dist
-        ? paratreet::runFoFPhase3Dist(proxy_pack.partition, fof, fof_node, b)
-        : paratreet::runFoFPhase3(proxy_pack.partition, fof, b);
+        ? paratreet::runFoFPhase3Dist(proxy_pack.partition, fof, fof_node, b, pbc)
+        : paratreet::runFoFPhase3(proxy_pack.partition, fof, b, pbc);
     CkPrintf("FOF3STAT edges: emitted %ld sent %ld unique %ld tips_remapped %ld\n",
              pr.edges_emitted, pr.edges_sent, pr.edges_unique, pr.tips_remapped);
     // 3a counters (design/step3.md §6). Redundancy ratio = both-uniform
@@ -429,11 +485,11 @@ using namespace paratreet;
     // the grid runs — the O(n^2) path stays available behind this size
     // threshold).
     std::vector<long> serial_rep;
-    long serial_components = gridReference(recs, N, b, b * b, serial_rep);
+    long serial_components = gridReference(recs, N, b, b * b, pbc, serial_rep);
     double tv2 = CkWallTimer();
     if (N <= 10000) {
       std::vector<long> n2_rep;
-      long n2_components = serialReference(recs, N, b * b, n2_rep);
+      long n2_components = serialReference(recs, N, b * b, pbc, n2_rep);
       CkEnforce(n2_components == serial_components);
       for (int i = 0; i < N; i++) CkEnforce(n2_rep[i] == serial_rep[i]);
       CkPrintf("FOF3STAT crosscheck: grid reference == O(n^2) reference, "

@@ -105,6 +105,66 @@ inline Real mindist2(const OrientedBox<Real>& a, const OrientedBox<Real>& b) {
   return d2;
 }
 
+// Periodic boundary conditions (design/pbc.md). We keep a SINGLE walk /
+// traversal and make the DISTANCE functions periodic (minimum-image), rather
+// than the 27-image walk old paratreet uses. This is equivalent for FoF
+// because the linking length always satisfies b < L/2, so each particle has
+// at most one image of any other within b (the nearest). period == 0 on an
+// axis means "open" (the periodic branch is a no-op) and must reproduce the
+// existing open-boundary arithmetic bit-for-bit.
+
+// Minimum-image periodic squared distance between two points. Per axis,
+// wrap the coordinate difference into [-period/2, period/2] via
+// d -= period*round(d/period). Origin-agnostic (works for a box centered on
+// any origin, e.g. LAMBS is [-0.5, 0.5]). With period == {0,0,0} this is
+// exactly Vector3D::lengthSquared of (a - b) (dx*dx + dy*dy + dz*dz in the
+// same order), so open-boundary callers are bit-identical.
+inline Real periodicDistSq(const Vector3D<Real>& a, const Vector3D<Real>& b,
+                           const Vector3D<Real>& period) {
+  Real dx = a.x - b.x;
+  Real dy = a.y - b.y;
+  Real dz = a.z - b.z;
+  if (period.x > 0) dx -= period.x * std::round(dx / period.x);
+  if (period.y > 0) dy -= period.y * std::round(dy / period.y);
+  if (period.z > 0) dz -= period.z * std::round(dz / period.z);
+  return dx * dx + dy * dy + dz * dz;
+}
+
+// Periodic per-axis interval gap, squared and summed over axes. For each
+// axis with period p > 0 we take the smallest non-negative gap between
+// intervals [a.lo, a.hi] and [b.lo, b.hi] over b shifted by {-p, 0, +p}; if
+// ANY shift overlaps (gap <= 0) the axis contributes 0. For p == 0 the axis
+// reduces to the existing open-boundary gap (max(a.lo-b.hi, b.lo-a.hi)),
+// making mindist2(a, b, {0,0,0}) bit-identical to the 2-arg mindist2 above.
+//
+// Hand cases (one axis, p = 1, unit box origin-agnostic):
+//  * A=[0.0,0.1], B=[0.0,0.1]: overlap at shift 0 -> gap 0. (identical boxes)
+//  * A=[0.0,0.1], B=[0.85,0.95]: shift 0 gap = 0.85-0.1 = 0.75; shift -p puts
+//    B at [-0.15,-0.05], gap = max(0.0-(-0.05), -0.15-0.1) = 0.05; min = 0.05
+//    -> two boxes near opposite faces of an L=1 box are 0.05 apart under PBC
+//    (they wrap), whereas the open-boundary gap is 0.75. So b >= 0.05 links
+//    them under PBC but not without it — the effect PBC must produce.
+//  * A=[0.0,0.1], B=[0.2,0.3]: shift 0 gap = 0.1; shift +p B=[1.2,1.3] gap
+//    = 1.1; shift -p B=[-0.8,-0.7] gap = 0.7; min = 0.1 (no wrap benefit).
+inline Real mindist2(const OrientedBox<Real>& a, const OrientedBox<Real>& b,
+                     const Vector3D<Real>& period) {
+  auto axisGap = [](Real alo, Real ahi, Real blo, Real bhi, Real p) -> Real {
+    Real g0 = std::max(alo - bhi, blo - ahi); // open-boundary gap
+    if (p <= 0) return g0 > 0 ? g0 : 0;        // exact open behavior
+    Real gp = std::max(alo - (bhi + p), (blo + p) - ahi); // b shifted by +p
+    Real gm = std::max(alo - (bhi - p), (blo - p) - ahi); // b shifted by -p
+    if (g0 <= 0 || gp <= 0 || gm <= 0) return 0; // any shift overlaps
+    return std::min(g0, std::min(gp, gm));       // smallest positive gap
+  };
+  Real gx = axisGap(a.lesser_corner.x, a.greater_corner.x,
+                    b.lesser_corner.x, b.greater_corner.x, period.x);
+  Real gy = axisGap(a.lesser_corner.y, a.greater_corner.y,
+                    b.lesser_corner.y, b.greater_corner.y, period.y);
+  Real gz = axisGap(a.lesser_corner.z, a.greater_corner.z,
+                    b.lesser_corner.z, b.greater_corner.z, period.z);
+  return gx * gx + gy * gy + gz * gz;
+}
+
 // Component-wise MAXIMUM distance squared between two axis-aligned boxes:
 // the distance between the farthest pair of points, one from each box. Per
 // axis the farthest pair sits at interval endpoints, so the axis term is
@@ -409,6 +469,16 @@ public:
   void registerSubtree(Node<Data>* root, Particle* parts, int n) {
     subtrees.push_back(SubtreeRef{root, parts, n, 0});
     node_proxy.ckLocalBranch()->registerSubtree(CkMyPe(), root, parts, n);
+  }
+
+  // Periodic boundary conditions (design/pbc.md): the box period, broadcast
+  // by the app before phaseA. 0 per axis = open boundaries (the periodic
+  // branch is a no-op; period_ defaults to {0,0,0} = exact current behavior).
+  // Persistent like b2_ (not cleared by reset(); the driver re-broadcasts it
+  // each run before phaseA).
+  void setPeriod(Vector3D<Real> period, const CkCallback& cb) {
+    period_ = period;
+    this->contribute(cb);
   }
 
   void reset(const CkCallback& cb) {
@@ -837,7 +907,7 @@ private:
   void walk(Node<Data>* a, Node<Data>* b, const LeafFn& leaf_fn) {
     if (a == nullptr || b == nullptr) return;
     if (a->n_particles == 0 || b->n_particles == 0) return; // empty leaves
-    if (paratreet::mindist2(a->data.box, b->data.box) > b2_) return;
+    if (paratreet::mindist2(a->data.box, b->data.box, period_) > b2_) return;
     if (a->isLeaf() && b->isLeaf()) {
       leaf_fn(a, b);
       return;
@@ -868,12 +938,12 @@ private:
     if (a == b) {
       for (int i = 0; i < a->n_particles; i++)
         for (int j = i + 1; j < a->n_particles; j++)
-          if ((pa[i].position - pa[j].position).lengthSquared() <= b2_)
+          if (paratreet::periodicDistSq(pa[i].position, pa[j].position, period_) <= b2_)
             unite(fa + i, fa + j);
     } else {
       for (int i = 0; i < a->n_particles; i++)
         for (int j = 0; j < b->n_particles; j++)
-          if ((pa[i].position - pb[j].position).lengthSquared() <= b2_)
+          if (paratreet::periodicDistSq(pa[i].position, pb[j].position, period_) <= b2_)
             unite(fa + i, fb + j);
     }
   }
@@ -884,7 +954,7 @@ private:
     const Particle* pb = b->particles();
     for (int i = 0; i < a->n_particles; i++) {
       for (int j = 0; j < b->n_particles; j++) {
-        if ((pa[i].position - pb[j].position).lengthSquared() > b2_) continue;
+        if (paratreet::periodicDistSq(pa[i].position, pb[j].position, period_) > b2_) continue;
         long ti = pa[i].group_number;
         long tj = pb[j].group_number;
         if (ti == tj) continue;
@@ -926,6 +996,8 @@ private:
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;
   long phase3_emitted = 0;
   double b2_ = 0.0;
+  // Box period for PBC (design/pbc.md); {0,0,0} = open (default).
+  Vector3D<Real> period_ = Vector3D<Real>(0, 0, 0);
 };
 
 namespace paratreet {
@@ -937,10 +1009,14 @@ template <typename Data>
 void runFoFPhase1(CProxy_Subtree<Data> subtrees,
                   CProxy_FoFPhase1<Data> fof,
                   CProxy_FoFPhase1Node<Data> fof_node,
-                  double linking_length) {
+                  double linking_length,
+                  Vector3D<Real> period = Vector3D<Real>(0, 0, 0)) {
   double b2 = linking_length * linking_length;
   fof_node.reset(CkCallbackResumeThread());
   fof.reset(CkCallbackResumeThread());
+  // PBC (design/pbc.md): broadcast the box period to every PE branch before
+  // phaseA. Default {0,0,0} = open boundaries (exact current behavior).
+  fof.setPeriod(period, CkCallbackResumeThread());
   subtrees.registerFoF(fof, CkCallbackResumeThread());
   fof.phaseA(b2, CkCallbackResumeThread());
   fof.phaseB(b2, CkCallbackResumeThread());

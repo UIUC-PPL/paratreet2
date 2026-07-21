@@ -115,6 +115,9 @@ module paratreet {
   group FoFPhase1 {
     entry FoFPhase1(CProxy_FoFPhase1Node<Data>);
     entry void reset(const CkCallback&);
+    // Periodic boundary conditions (design/pbc.md): broadcast the box period
+    // (0 per axis = open, the default = exact current behavior) before phaseA.
+    entry void setPeriod(Vector3D<Real> period, const CkCallback&);
     entry void phaseA(double b2, const CkCallback&);
     entry void phaseB(double b2, const CkCallback&);
     entry void relabel(const CkCallback&);

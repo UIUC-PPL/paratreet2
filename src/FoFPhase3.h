@@ -77,13 +77,19 @@ public:
 
   CProxy_FoFPhase1<FragData> fof;
   double b2 = 0.0;
+  // Box period for PBC (design/pbc.md); {0,0,0} = open boundaries (default,
+  // exact current behavior). Pupped into the startDown broadcast.
+  Vector3D<Real> period = Vector3D<Real>(0, 0, 0);
 
   FoFEdgeVisitor() {}
-  FoFEdgeVisitor(CProxy_FoFPhase1<FragData> fof_, double b2_) : fof(fof_), b2(b2_) {}
+  FoFEdgeVisitor(CProxy_FoFPhase1<FragData> fof_, double b2_,
+                 Vector3D<Real> period_ = Vector3D<Real>(0, 0, 0))
+      : fof(fof_), b2(b2_), period(period_) {}
 
   void pup(PUP::er& p) {
     p | fof;
     p | b2;
+    p | period;
   }
 
 public:
@@ -111,6 +117,11 @@ public:
     enforceValidAnnotation(source);
     enforceValidAnnotation(target);
     auto* branch = fof.ckLocalBranch();
+    // PBC (design/pbc.md): under periodic boundaries the "farthest image" is
+    // ill-defined, so the case-2 positive certificate (maxdist2 <= b) is
+    // skipped entirely; the periodic case-1 mindist2 prune + descend + leaf
+    // witnesses do all the work (case 2 never fires in practice anyway).
+    const bool pbc = period.x > 0 || period.y > 0 || period.z > 0;
     // uniform() is false for empty nodes (identity min > max), so
     // both_uniform implies both sides non-empty; the explicit n_particles
     // checks below are belt-and-braces for the case-2 certificate.
@@ -129,18 +140,19 @@ public:
         branch->p3_suppression_prunes++;
         return false;
       }
-      if (source.n_particles != 0 && target.n_particles != 0 &&
+      if (!pbc && source.n_particles != 0 && target.n_particles != 0 &&
           paratreet::maxdist2(source.data.box, target.data.box) <= b2) {
         // Case 2: positive certificate — every particle pair is within b,
         // and both sides are non-empty, so the edge (g, f) exists. Emit if
-        // we won the insertion race; prune either way.
+        // we won the insertion race; prune either way. Skipped under PBC
+        // (maxdist2 is not periodic; see the pbc comment above).
         if (branch->trySeenInsert(key)) branch->addPhase3Edge(g, f);
         branch->p3_positive_prunes++;
         return false;
       }
       // fall through to the case-1 check
     }
-    if (paratreet::mindist2(source.data.box, target.data.box) > b2) {
+    if (paratreet::mindist2(source.data.box, target.data.box, period) > b2) {
       branch->p3_negative_prunes++;            // case 1: negative prune
       return false;
     }
@@ -177,7 +189,7 @@ public:
         const Particle& sp = source.particles()[i];
         for (int j = 0; j < target.n_particles; j++) {
           const Particle& tp = target.particles()[j];
-          if ((sp.position - tp.position).lengthSquared() > b2) continue;
+          if (paratreet::periodicDistSq(sp.position, tp.position, period) > b2) continue;
           // Witness found: emit only if we won the race.
           if (branch->trySeenInsert(key)) branch->addPhase3Edge(g, f);
           return;
@@ -191,7 +203,7 @@ public:
       const Particle& sp = source.particles()[i];
       for (int j = 0; j < target.n_particles; j++) {
         const Particle& tp = target.particles()[j];
-        if ((sp.position - tp.position).lengthSquared() > b2) continue;
+        if (paratreet::periodicDistSq(sp.position, tp.position, period) > b2) continue;
         if (sp.group_number == tp.group_number) continue; // same-tip: skip
         paratreet::TipPairKey key = paratreet::packTipPair(sp.group_number, tp.group_number);
         if (branch->trySeenInsert(key))
@@ -244,7 +256,8 @@ struct FoFPhase3Result {
 // edges); the distributed UF_2 replaces it in step 4.
 inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
                                     CProxy_FoFPhase1<FragData> fof,
-                                    double linking_length) {
+                                    double linking_length,
+                                    Vector3D<Real> period = Vector3D<Real>(0, 0, 0)) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
   partitions.verifySharedLeaves(CkCallbackResumeThread());
@@ -255,7 +268,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   // The boundary walk: all Partitions against the global tree. QD covers
   // the traversal including cache fetches and resumptions.
   double t0 = CkWallTimer();
-  partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2));
+  partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
   CkWaitQD();
   double t1 = CkWallTimer();
 
@@ -374,7 +387,8 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
 inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         CProxy_FoFPhase1<FragData> fof,
                                         CProxy_FoFPhase1Node<FragData> fof_node,
-                                        double linking_length) {
+                                        double linking_length,
+                                        Vector3D<Real> period = Vector3D<Real>(0, 0, 0)) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
   partitions.verifySharedLeaves(CkCallbackResumeThread());
@@ -386,7 +400,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // precondition above), so the edges FoFEdgeVisitor buffers into edge_buf3
   // are already UF_2 vertex ids -- no translation needed anywhere below.
   double t0 = CkWallTimer();
-  partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2));
+  partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
   CkWaitQD();
   double t1 = CkWallTimer();
 

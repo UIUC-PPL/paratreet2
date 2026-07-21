@@ -53,7 +53,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:")) != -1) {
       switch (c) {
         case 'b':
           fof_b_factor = atof(optarg);
@@ -75,6 +75,11 @@ PARATREET_REGISTER_MAIN(ExMain);
           if (fof_min_component_size < 0)
             CkAbort("-m requires a min component size >= 0");
           break;
+        case 'P':
+          // Periodic boundary conditions (design/pbc.md): cubic box period L.
+          pbc_period = atof(optarg);
+          if (!(pbc_period >= 0.0)) CkAbort("-P requires a box period >= 0");
+          break;
         default:
           CkPrintf("Usage: %s -f <input file> [options]\n", m->argv[0]);
           CkPrintf("App-specific options:\n");
@@ -86,6 +91,8 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t-m [min component size for REPORTING (default 0 = report all);\n");
           CkPrintf("\t    when >0, also prints a FOF3STAT surviving line for\n");
           CkPrintf("\t    components with size >= m (a reporting filter only)]\n");
+          CkPrintf("\t-P [periodic box period L (cubic, all axes); default 0 = off\n");
+          CkPrintf("\t    (open boundaries). Minimum-image PBC; requires b < L/2]\n");
           CkPrintf("Framework options (see src/Configuration.h):\n");
           CkPrintf("\t-f [input file]\n");
           CkPrintf("\t-n [number of treepieces]\n");
@@ -117,6 +124,12 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("Min component size for reporting: %d%s\n",
              fof_min_component_size,
              fof_min_component_size == 0 ? " (report all)" : "");
+    // PBC (design/pbc.md). Note: -P (capital) does not collide with any
+    // framework-registered CLI letter (the framework uses lowercase 'p' for
+    // nPartitionsMin and the multi-char 'pbc'/'px'/'py'/'pz'), so no
+    // conf.release_arg("P") is needed in setDefaults; getopt sees it directly.
+    CkPrintf("Periodic box period (PBC): %g%s\n",
+             pbc_period, pbc_period > 0.0 ? "" : " (off; open boundaries)");
 
     // Unit checks for paratreet::maxdist2 (the phase-3a positive
     // certificate). The certificate rarely fires in vivo — DFS leaf

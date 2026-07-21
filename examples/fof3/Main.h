@@ -43,6 +43,11 @@ class ExMain: public paratreet::Main<FragData> {
   UF2Mode uf2_mode = UF2Mode::Dist;
   // Min component size for reporting (-m); 0 = report everything (default).
   int fof_min_component_size = 0;
+  // Periodic boundary conditions (-P <L>; design/pbc.md): cubic box period
+  // applied on all three axes. Default 0 = open boundaries (PBC off, exact
+  // current behavior; the periodic branch is a no-op). Threaded into phase 1
+  // (runFoFPhase1) and phase 3 (the FoFEdgeVisitor) as Vector3D<Real>(L,L,L).
+  Real pbc_period = 0.0;
   // Auto-mode gate: full verification gathers ~24 B/particle to PE 0 and
   // runs the serial grid reference there; above this N, auto falls back to
   // stats mode (force with -c full, memory permitting).
