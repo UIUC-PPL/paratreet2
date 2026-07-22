@@ -327,6 +327,21 @@ public:
     seen3_pairs.clear();
   }
 
+  // Per-PROCESS redundant-descent total (design/step3.md §6d): each of this
+  // process's group branches deposits its per-PE p3_redundant_descents here
+  // post-walk (depositNodeRedundant), so every PE can then read the same
+  // process total for the per-process min/max reduction. Guarded by seen3_lock
+  // (already the phase-3 mutex; deposit is one call per PE, not hot-path).
+  long p3_node_redundant = 0;
+  void clearNodeRedundant() {
+    std::lock_guard<std::mutex> g(seen3_lock);
+    p3_node_redundant = 0;
+  }
+  void addNodeRedundant(long v) {
+    std::lock_guard<std::mutex> g(seen3_lock);
+    p3_node_redundant += v;
+  }
+
   // Called synchronously (ckLocalBranch) by same-process group branches
   // during registration; hence the lock.
   void registerSubtree(int pe, Node<Data>* root, Particle* parts, int n) {
@@ -765,6 +780,7 @@ public:
     p3_redundant_descents = 0;
     p3_peak_edge_buf = 0;
     node_proxy.ckLocalBranch()->clearSeen();
+    node_proxy.ckLocalBranch()->clearNodeRedundant();
     this->contribute(cb);
   }
 
@@ -799,7 +815,14 @@ public:
                     p3_suppression_prunes, p3_same_frag_prunes,
                     p3_leaf_visits, p3_redundant_descents};
     long peak = p3_peak_edge_buf;
-    long per_pe[2] = {p3_leaf_visits, phase3_emitted};
+    // per_pe[0,1] are PER-PE (leaf visits, edges emitted); per_pe[2] is the
+    // PER-PROCESS redundant-descent total (design/step3.md §6d) -- every PE of
+    // a process reads the same deposited value, so min/max over PEs == min/max
+    // over processes (the SMP trick memoryStats relies on). Requires
+    // depositNodeRedundant to have run post-walk; avg-over-processes is
+    // p3_redundant_descents-sum / CkNumNodes() at the consumer.
+    long node_redundant = node_proxy.ckLocalBranch()->p3_node_redundant;
+    long per_pe[3] = {p3_leaf_visits, phase3_emitted, node_redundant};
     double times[2] = {t_phaseA, t_phaseB};
     CkReduction::tupleElement tupleRedn[] = {
       CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
@@ -813,6 +836,17 @@ public:
     CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 7);
     msg->setCallback(cb);
     this->contribute(msg);
+  }
+
+  // Deposit this PE's redundant-descent count into the per-process total
+  // (design/step3.md §6d), then barrier via cb. Called once per PE between the
+  // walk's QD and phase3Stats, so the process total is complete before
+  // phase3Stats reads it. Deposit is a single locked add per PE (not
+  // hot-path). p3_redundant_descents is per-PE; p3_node_redundant is the sum
+  // over the process's PEs.
+  void depositNodeRedundant(const CkCallback& cb) {
+    node_proxy.ckLocalBranch()->addNodeRedundant(p3_redundant_descents);
+    this->contribute(cb);
   }
 
   // Distributed tip-sentinel check: every registered (Subtree-owned)

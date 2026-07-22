@@ -242,6 +242,10 @@ struct FoFPhase3Result {
   // work distribution, phaseA/phaseB the phase-1 distribution.
   long leaf_visits_min, leaf_visits_max;   // avg = leaf_visits / #PEs
   long emitted_min, emitted_max;           // avg = edges_emitted / #PEs
+  // Per-PROCESS redundant-descent skew (design/step3.md §6d): does the
+  // pre-witness redundancy concentrate on a few dense-boundary nodes? avg =
+  // redundant_descents / #processes (CkNumNodes).
+  long redundant_proc_min, redundant_proc_max;
   double t_phaseA_min, t_phaseA_avg, t_phaseA_max;
   double t_phaseB_min, t_phaseB_avg, t_phaseB_max;
 };
@@ -279,6 +283,9 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   int n_edges = msg->getSize() / sizeof(std::pair<long, long>);
   const auto* edges = (const std::pair<long, long>*)msg->getData();
 
+  // Deposit per-PE redundant counts into per-process totals before the stats
+  // reduction reads them (design/step3.md §6d).
+  fof.depositNodeRedundant(CkCallbackResumeThread());
   void* stats_result = nullptr;
   fof.phase3Stats(CkCallbackResumeThread(stats_result));
   CkReductionMsg* stats_msg = (CkReductionMsg*)stats_result;
@@ -306,8 +313,10 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
     const double* tmax = (const double*)stats_elems[6].data;
     r.leaf_visits_min = mins[0];
     r.emitted_min = mins[1];
+    r.redundant_proc_min = mins[2];
     r.leaf_visits_max = maxs[0];
     r.emitted_max = maxs[1];
+    r.redundant_proc_max = maxs[2];
     double n_pes = (double)CkNumPes();
     r.t_phaseA_min = tmin[0]; r.t_phaseA_avg = tsum[0] / n_pes; r.t_phaseA_max = tmax[0];
     r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];
@@ -404,6 +413,10 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   CkWaitQD();
   double t1 = CkWallTimer();
 
+  // Deposit per-PE redundant counts into per-process totals before the stats
+  // reduction reads them (design/step3.md §6d).
+  fof.depositNodeRedundant(CkCallbackResumeThread());
+
   void* stats_result = nullptr;
   fof.phase3Stats(CkCallbackResumeThread(stats_result));
   CkReductionMsg* stats_msg = (CkReductionMsg*)stats_result;
@@ -432,8 +445,10 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     const double* tmax = (const double*)stats_elems[6].data;
     r.leaf_visits_min = mins[0];
     r.emitted_min = mins[1];
+    r.redundant_proc_min = mins[2];
     r.leaf_visits_max = maxs[0];
     r.emitted_max = maxs[1];
+    r.redundant_proc_max = maxs[2];
     double n_pes = (double)CkNumPes();
     r.t_phaseA_min = tmin[0]; r.t_phaseA_avg = tsum[0] / n_pes; r.t_phaseA_max = tmax[0];
     r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];

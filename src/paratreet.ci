@@ -126,6 +126,7 @@ module paratreet {
     entry void resetPhase3(const CkCallback&);
     entry void flushPhase3Edges(const CkCallback&);
     entry void phase3Stats(const CkCallback&);
+    entry void depositNodeRedundant(const CkCallback&);
     entry void applyGlobalMap(const std::vector<std::pair<long, long> >&, const CkCallback&);
     // Cluster-assessment entries (see the "Testing on a cluster" section of
     // the top-level README): distributed tip-sentinel check, per-PE memory

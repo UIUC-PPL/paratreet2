@@ -475,6 +475,14 @@ using namespace paratreet;
                pr.leaf_visits_min, pr.leaf_visits / n_pes, pr.leaf_visits_max,
                pr.emitted_min, pr.edges_emitted / n_pes, pr.emitted_max,
                CkNumPes());
+      // Per-PROCESS redundant-descent skew (design/step3.md §6d): does the
+      // pre-witness redundancy 3b would park concentrate on a few
+      // dense-boundary nodes? avg = total / #processes.
+      CkPrintf("FOF3STAT balance: redundant_descents %ld/%.1f/%ld "
+               "(min/avg/max over %d processes)\n",
+               pr.redundant_proc_min,
+               (double)pr.redundant_descents / (double)CkNumNodes(),
+               pr.redundant_proc_max, CkNumNodes());
     }
 
     if (!do_full) {

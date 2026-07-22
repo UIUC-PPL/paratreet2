@@ -418,6 +418,16 @@ divided by `edges_unique`, which is hard-0 on the `-u dist` path
 divides by `edges_sent` (distinct pairs, populated on both paths); the
 table above uses the corrected ratio.
 
+**Instrumentation for the cluster run:** `FOF3STAT balance:
+redundant_descents min/avg/max over PROCESSES` now reports per-process
+skew (via a post-walk deposit into a per-process accumulator, read back
+through the phase3Stats min/max using the SMP process-wide trick) -- the
+2-4x skew already visible on loopback answers "is redundancy concentrated
+on a few dense-boundary nodes?". `examples/fof3/redundancy_sweep.sh` sweeps
+process (node) count at fixed PEs/process and tabulates redundancy + ratio
++ walk time + the per-process skew; point it at the 80M LAMBS with one
+process per node (`LAUNCH` overridable for the cluster scheduler).
+
 **Go/no-go:** 3b's benefit is real but scales with production concurrency
 and real-network fetch cost; it is not measurable on available hardware.
 Given it is framework surgery, validate on a real multi-node cluster (or a
