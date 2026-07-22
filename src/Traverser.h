@@ -14,8 +14,26 @@
 
 namespace {
 
+// Opt-in node-key delivery (a GENERAL framework capability, not FoF-specific).
+// A visitor that declares `Key trav_source_key, trav_target_key;` members gets
+// the current pair's node keys set before each open()/leaf(); every other
+// visitor (gravity, SPH, annotate, searchAlgos, ...) selects the no-op overload
+// below, which the compiler removes -- zero runtime cost, and the general
+// visitor open()/leaf() SIGNATURE is unchanged. This is how an identity-aware
+// traversal (FoF suppression, range dedup, k-NN) requests node identity without
+// taxing traversals that don't need it. See design/step3.md §6d/§6e.
+template <typename V>
+inline auto maybeSetKeys(V& v, Key s, Key t, int)
+    -> decltype(v.trav_source_key = s, v.trav_target_key = t, void()) {
+  v.trav_source_key = s;
+  v.trav_target_key = t;
+}
+template <typename V>
+inline void maybeSetKeys(V&, Key, Key, long) {}
+
 template <typename Visitor, typename Node, typename StatCollector>
 inline bool doOpen(Visitor& v, Node* source, Node* target, StatCollector* stats) {
+  maybeSetKeys(v, source->key, target->key, 0); // no-op unless v opts in
   auto should_open = v.open(*source, *target);
 #if COUNT_INTERACTIONS
   stats->countOpen(should_open);
@@ -25,6 +43,7 @@ inline bool doOpen(Visitor& v, Node* source, Node* target, StatCollector* stats)
 
 template <typename Visitor, typename Node, typename StatCollector>
 inline void doLeaf(Visitor& v, Node* source, Node* target, StatCollector* stats) {
+  maybeSetKeys(v, source->key, target->key, 0); // no-op unless v opts in
   v.leaf(*source, *target);
 #if COUNT_INTERACTIONS
   stats->countLeafInts(source->n_particles * target->n_particles);

@@ -80,6 +80,13 @@ public:
   // Box period for PBC (design/pbc.md); {0,0,0} = open boundaries (default,
   // exact current behavior). Pupped into the startDown broadcast.
   Vector3D<Real> period = Vector3D<Real>(0, 0, 0);
+  // Opt-in node keys (design/step3.md §6d/§6e): the framework's maybeSetKeys
+  // (Traverser.h) sets these to the current pair's source/target node keys
+  // before each open()/leaf(). Declaring them is what opts this visitor in;
+  // gravity/SPH/annotate don't declare them and are untouched. TRANSIENT
+  // scratch, refilled per call -- deliberately NOT pupped (see pup() below).
+  Key trav_source_key = Key(0);
+  Key trav_target_key = Key(0);
 
   FoFEdgeVisitor() {}
   FoFEdgeVisitor(CProxy_FoFPhase1<FragData> fof_, double b2_,

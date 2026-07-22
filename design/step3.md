@@ -492,6 +492,42 @@ symmetric dual tree (or the existing BasicDownTraverser/a new one) is a
 framework change filed under phase-3 perf. Measure the negative-prune
 reduction before committing.
 
+## 6g. Opt-in node keys threaded to the visitor (2026-07-22)
+
+Landed the framework prerequisite for the exact within-vs-across measurement
+(and for 3b's searcher-identity). It is a GENERAL, opt-in capability, not FoF
+weight on the core (the toolkit-boundary constraint): `maybeSetKeys` in
+Traverser.h (anonymous namespace) sets `v.trav_source_key/trav_target_key`
+before each open()/leaf() IFF the visitor declares those members; a SFINAE
+no-op overload covers every visitor that doesn't (gravity, SPH, annotate,
+searchAlgos), so their open()/leaf() signature and codepath are unchanged and
+zero-cost. Verified: fof3/annotate/searchAlgos all build; FoFEdgeVisitor
+receives valid keys at runtime (e.g. source 0x10a1); regression green.
+
+Consumer (the acquisition-vs-continuation split = distinct-searchers vs
+within-search fan-out) is the NEXT unit, and it has two subtleties I hit while
+scoping it -- record them so the measurement is designed correctly, not rushed:
+
+1. **Concurrency ordering.** recordRedundant funnels from all of a process's
+   partitions/PEs (they descend the same source g-subtree against their own
+   f-leaves), so a deep source node can be recorded before its shallow ancestor
+   arrives from another partition. Any acquisition test that assumes
+   parent-before-child (key-ancestry against a growing set, or "parent key in
+   seen-set") will OVER-count acquisitions under out-of-order arrival.
+
+2. **Remote-node parent reliability.** The clean O(1) test -- "acquisition iff
+   the source node's PARENT is not uniform over the same g" (which also solves
+   3b's self-park WITHOUT key ancestry: a searcher's children have a uniform-g
+   parent = continuation = don't park; a fresh arrival has a mixed parent =
+   acquisition = park) -- needs `source->parent`, which may be null or a local
+   reconstruction for cache-shipped remote subtrees (the majority of descents
+   in the distributed walk). Must verify parent validity on cached nodes before
+   relying on it; keys are always valid, parent pointers may not be.
+
+Note (nice discovery): the parent-uniformity test, if parent is reliable, gives
+3b's searcher-identity rule with NO node keys at all -- reconsider whether 3b
+even needs the key machinery, or just parent frag-data + the IN_FLIGHT table.
+
 ## 7. Explicitly deferred past 3b
 
 htram aggregation for edge emission (counters above are already
