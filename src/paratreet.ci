@@ -96,6 +96,7 @@ module paratreet {
     entry void reset(const CkCallback&);
     entry void merge(const CkCallback&);
     entry void fragmentHistogram(const CkCallback&);
+    entry void redundancyHistogram(const CkCallback&);
     // Step 4 (distributed UF_2, -u dist): builds the owner-encoded tip
     // namespace (node << 40 | dense_index) from frag_counts (already
     // populated by countFragments) and the UF_2 vertex array to hand to

@@ -342,6 +342,50 @@ public:
     p3_node_redundant += v;
   }
 
+  // Per-(g,f) redundant-descent counts (design/step3.md §6e): how CONCENTRATED
+  // is the pre-witness redundancy -- a few hot fragment pairs each hammered, or
+  // many pairs each descended a handful of times? Keyed per process-local pair
+  // (f is process-local; an edge seen from both endpoint processes appears as a
+  // separate entry on each, which is the right granularity: each process's own
+  // redundant work). Own mutex so it does not extend seen3_lock's critical
+  // section on the hot both-uniform open() path.
+  std::mutex redun_lock;
+  std::unordered_map<paratreet::TipPairKey, long, paratreet::TipPairKeyHash> redun_per_pair;
+  void recordRedundant(paratreet::TipPairKey key) {
+    std::lock_guard<std::mutex> g(redun_lock);
+    redun_per_pair[key]++;
+  }
+  void clearRedun() {
+    std::lock_guard<std::mutex> g(redun_lock);
+    redun_per_pair.clear();
+  }
+  // log2 histogram of descents-per-pair (same binning as fragmentHistogram):
+  //   [0] long bins[64] (sum over processes) -- bins[k] = #pairs with
+  //       floor(log2(descents)) == k; [1] long n_pairs (sum); [2] long
+  //       max descents on any single pair (max). Pairs are process-disjoint
+  //       at the counting granularity, so sum across processes is exact.
+  void redundancyHistogram(const CkCallback& cb) {
+    long bins[64] = {0};
+    long n_pairs = 0;
+    long max_per_pair = 0;
+    for (auto& kv : redun_per_pair) {
+      long c = kv.second;
+      int bin = 0; // floor(log2(c)); c >= 1 always
+      while (bin < 63 && (1L << (bin + 1)) <= c) bin++;
+      bins[bin]++;
+      n_pairs++;
+      if (c > max_per_pair) max_per_pair = c;
+    }
+    CkReduction::tupleElement tupleRedn[] = {
+      CkReduction::tupleElement(sizeof(bins), bins, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &n_pairs, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &max_per_pair, CkReduction::max_long)
+    };
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 3);
+    msg->setCallback(cb);
+    this->contribute(msg);
+  }
+
   // Called synchronously (ckLocalBranch) by same-process group branches
   // during registration; hence the lock.
   void registerSubtree(int pe, Node<Data>* root, Particle* parts, int n) {
@@ -744,6 +788,11 @@ public:
   bool seenContains(paratreet::TipPairKey key) {
     return node_proxy.ckLocalBranch()->seenContains(key);
   }
+  // Record one redundant (pre-witness both-uniform) descent over (g,f) for the
+  // per-pair concentration histogram (design/step3.md §6e).
+  void recordRedundant(paratreet::TipPairKey key) {
+    node_proxy.ckLocalBranch()->recordRedundant(key);
+  }
 
   // Phase-3a per-PE counters (design/step3.md §6), plain members updated
   // synchronously by FoFEdgeVisitor via ckLocalBranch; reduced by
@@ -781,6 +830,7 @@ public:
     p3_peak_edge_buf = 0;
     node_proxy.ckLocalBranch()->clearSeen();
     node_proxy.ckLocalBranch()->clearNodeRedundant();
+    node_proxy.ckLocalBranch()->clearRedun();
     this->contribute(cb);
   }
 

@@ -435,6 +435,63 @@ clustered LAMBS run at higher process counts) before committing the
 implementation. The instrumentation now reports the right ratio to drive
 that call.
 
+## 6e. The redundancy is EXTREMELY concentrated in a few pairs (2026-07-22)
+
+Added a per-(g,f) descent-count histogram (`FOF3STAT
+redundancy_concentration`: distinct pairs, max-per-pair, log2 histogram;
+FoFPhase1Node::redundancyHistogram). First loopback result, 1M Plummer,
+4 procs, b_factor 0.8:
+
+```
+distinct_pairs 77  max_per_pair 56823  avg_per_pair 2247
+log2_histogram: 0:38 1:19 2:7 3:1  7:1 8:1 10:4 11:1 13:1 14:2 15:2
+```
+
+**~5 fragment pairs (bins 13-15) hold ~85% of all 173k redundant
+descents; one pair alone drew 56,823.** The other ~64 pairs have 1-7
+descents each (trivial). So the pre-witness redundancy is not spread --
+it is dominated by a tiny number of HOT pairs, almost certainly the giant
+percolating fragment against its few big neighbors (design note §6.3e).
+
+Implication for the go/no-go: whatever mechanism we build -- priority-queue
+descent, IN_FLIGHT parking, OR giant-fragment splitting -- only has to
+handle a handful of pairs to capture the bulk of the win. This makes the
+giant-fragment split (§6.3e) look especially relevant: the hot pairs ARE
+the giant fragments. On the cluster, watch whether distinct_pairs stays
+small and max_per_pair grows with N/processes (the giant fragment gets
+bigger and hotter) -- if so, a targeted fix on the top-k pairs beats a
+general per-descent mechanism.
+
+Honest limit: the histogram shows concentration and magnitude, not the
+within-search-fanout vs across-search-pileup MECHANISM split (that needs
+the source/target node keys the visitor lacks -- the same framework
+blocker as 3b's searcher-identity rule and the dual-tree question in 6f).
+Concentration + per-process skew (§6d) are the cheap signals we can get
+now; the exact split comes with the key-threading.
+
+## 6f. Why the phase-3 walk is not a symmetric dual tree (2026-07-22)
+
+Raised in review: the walk (`startDown` -> `TransposedDownTraverser`) is
+SOURCE-DRIVEN -- it descends the global (source) tree while the target
+side is a FLAT set of local leaves (buckets), not a descended tree
+(Traverser.h recurse(): a source node is tested against each still-active
+target leaf individually). So a target-side INTERNAL node's box is never
+used to prune a whole block of target leaves in one test; each leaf is
+tested against the source node separately. A true dual tree would compare
+(source node, target node) and prune whole target subtrees when their
+boxes are > b apart.
+
+Consequence: the case-1 negative prunes -- which DOMINATE the walk (7-8M
+vs ~10^2-10^5 redundant descents) -- are paid per (source-node,
+target-leaf); a symmetric dual tree would collapse far target subtrees
+into single prunes. So target-side descent is a potentially large phase-3
+performance lever, plausibly bigger than 3b (negative_prunes >>
+both_uniform_descents). It's inherited from ParaTreeT's gravity traverser
+(targets = per-bucket force-evaluation points); switching phase 3 to a
+symmetric dual tree (or the existing BasicDownTraverser/a new one) is a
+framework change filed under phase-3 perf. Measure the negative-prune
+reduction before committing.
+
 ## 7. Explicitly deferred past 3b
 
 htram aggregation for edge emission (counters above are already

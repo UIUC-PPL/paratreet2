@@ -158,7 +158,14 @@ public:
     }
     // Descend. A both-uniform descent is a (possibly redundant) searcher
     // for its unSEEN (g, f) — the §8.3 redundancy measurement for 3b.
-    if (both_uniform) branch->p3_redundant_descents++;
+    if (both_uniform) {
+      branch->p3_redundant_descents++;
+      // Per-(g,f) concentration histogram (design/step3.md §6e). g/f were
+      // scoped to the block above; both sides are uniform here, so min_frag is
+      // the fragment id on each side.
+      branch->recordRedundant(
+          paratreet::packTipPair(source.data.min_frag, target.data.min_frag));
+    }
     return true;
   }
 
@@ -246,6 +253,14 @@ struct FoFPhase3Result {
   // pre-witness redundancy concentrate on a few dense-boundary nodes? avg =
   // redundant_descents / #processes (CkNumNodes).
   long redundant_proc_min, redundant_proc_max;
+  // Per-(g,f) redundant-descent concentration (design/step3.md §6e): log2
+  // histogram of descents-per-pair, #distinct pairs, and the hottest pair.
+  // Shows whether the redundancy is a few hammered pairs or spread thin (the
+  // magnitude/concentration signal; the exact within-search-fanout vs
+  // across-search-pileup split needs node keys, same blocker as 3b itself).
+  long redun_bins[64];       // bins[k] = #pairs with floor(log2(descents))==k
+  long redun_distinct;       // # distinct (process-local) (g,f) pairs
+  long redun_max_per_pair;   // most descents on any single pair
   double t_phaseA_min, t_phaseA_avg, t_phaseA_max;
   double t_phaseB_min, t_phaseB_avg, t_phaseB_max;
 };
@@ -303,6 +318,11 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   r.same_frag_prunes = stats[5];
   r.leaf_visits = stats[6];
   r.redundant_descents = stats[7];
+  // The per-(g,f) histogram is only gathered on the -u dist path (which has
+  // the FoFPhase1Node proxy); zero it here (design/step3.md §6e).
+  memset(r.redun_bins, 0, sizeof(r.redun_bins));
+  r.redun_distinct = 0;
+  r.redun_max_per_pair = 0;
   r.peak_edge_buf = *(const long*)stats_elems[1].data;
   // Load-imbalance extension (layout: FoFPhase1::phase3Stats).
   {
@@ -455,6 +475,23 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   }
   delete[] stats_elems;
   delete stats_msg;
+
+  // Per-(g,f) redundancy concentration histogram (design/step3.md §6e), a
+  // nodegroup reduction over the per-process (g,f)->descent-count maps.
+  {
+    void* hist_result = nullptr;
+    fof_node.redundancyHistogram(CkCallbackResumeThread(hist_result));
+    CkReductionMsg* hmsg = (CkReductionMsg*)hist_result;
+    CkReduction::tupleElement* helems = nullptr;
+    int n_helems = 0;
+    hmsg->toTuple(&helems, &n_helems);
+    CkEnforce(n_helems == 3);
+    memcpy(r.redun_bins, helems[0].data, sizeof(r.redun_bins));
+    r.redun_distinct = *(const long*)helems[1].data;
+    r.redun_max_per_pair = *(const long*)helems[2].data;
+    delete[] helems;
+    delete hmsg;
+  }
   double t2 = CkWallTimer();
 
   // One UnionFindLib chare per process (design/step4.md decision 2), placed

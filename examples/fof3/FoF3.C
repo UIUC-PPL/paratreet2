@@ -483,6 +483,18 @@ using namespace paratreet;
                pr.redundant_proc_min,
                (double)pr.redundant_descents / (double)CkNumNodes(),
                pr.redundant_proc_max, CkNumNodes());
+      // Per-(g,f) redundancy concentration (design/step3.md §6e): how the
+      // pre-witness descents distribute over fragment pairs. Peaked-low =
+      // spread thin; long tail / large max = a few pairs hammered.
+      if (pr.redun_distinct > 0) {
+        CkPrintf("FOF3STAT redundancy_concentration: distinct_pairs %ld "
+                 "max_per_pair %ld avg_per_pair %.1f log2_histogram:",
+                 pr.redun_distinct, pr.redun_max_per_pair,
+                 (double)pr.redundant_descents / (double)pr.redun_distinct);
+        for (int k = 0; k < 64; k++)
+          if (pr.redun_bins[k]) CkPrintf(" %d:%ld", k, pr.redun_bins[k]);
+        CkPrintf("\n");
+      }
     }
 
     if (!do_full) {
