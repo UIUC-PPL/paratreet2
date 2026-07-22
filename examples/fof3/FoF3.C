@@ -454,9 +454,9 @@ using namespace paratreet;
              pr.same_frag_prunes, pr.leaf_visits);
     CkPrintf("FOF3STAT redundancy: both_uniform_descents %ld unique_pairs %ld "
              "ratio %.3f peak_edge_buf %ld\n",
-             pr.redundant_descents, pr.edges_unique,
-             pr.edges_unique > 0 ? (double)pr.redundant_descents / pr.edges_unique
-                                 : 0.0,
+             pr.redundant_descents, pr.edges_sent,
+             pr.edges_sent > 0 ? (double)pr.redundant_descents / pr.edges_sent
+                               : 0.0,
              pr.peak_edge_buf);
     CkPrintf("FOF3STAT time_s: phase3_walk %.3f edge_gather %.3f uf2 %.3f "
              "relabel %.3f\n",

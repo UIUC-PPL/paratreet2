@@ -372,9 +372,68 @@ D=1e4-1e6 regime for case 2 is not reached by these subsamples, but the
 structural argument holds across the whole physical b range. Suppression
 does all of case 2's work and fires first (grows 1,010 -> 35,070 with b).
 
+## 6d. Redundancy is CONCURRENCY-driven; 3b is a framework change (2026-07-22)
+
+Starting 3b, two findings changed the picture.
+
+**(1) The pre-witness redundant descents scale with real PE concurrency,
+not just b.** 3a's SEEN suppression already eliminates the *post-witness*
+redundancy (subsequent node-pairs over a resolved (g,f) prune via
+`suppression`); what 3b uniquely parks is the *pre-witness* window --
+`both_uniform_descents`, the concurrent descents that start before the
+first witness lands. That window grows steeply with how many PEs descend
+simultaneously. 1M Plummer, -u dist, b_factor 0.8, `++local`:
+
+| config            | procs | both_uniform_descents | suppression | ratio  | phase3_walk |
+|-------------------|-------|-----------------------|-------------|--------|-------------|
+| +p4 ++ppn 2       | 2     | 16,621                | 137,055     | 35x    | 0.246 s     |
+| +p8 ++ppn 2       | 4     | 203,975               | 1,295,301   | 174x   | 0.480 s     |
+| +p16 ++ppn 2 (OS) | 8     | 218,488               | 1,841,659   | 139x   | 0.652 s     |
+
+The 2->4 jump is ~12x (a fully-subscribed 8-core box); +p16 is
+oversubscribed (16 PEs on 8 cores) so real concurrency -- and the window
+-- saturate. So the pre-witness window is bounded by *actual concurrent
+PEs*: negligible at low concurrency (2 procs: ~0.2% of walk opens, which
+is why 6b saw "nothing to gain"), but ~1.6% of opens and climbing at full
+subscription, and it would be far larger on a real cluster of thousands of
+concurrent PEs -- each redundant descent also being a *remote* subtree
+fetch there, not a loopback one. This is consistent with 6c's LAMBS 16x
+(clustered + higher effective concurrency) and confirms 3b's payoff is a
+production-scale/real-network effect, NOT demonstrable as wall-time on this
+8-core loopback setup.
+
+**(2) 3b is a framework-level change, not a visitor tweak.** The
+searcher-identity rule (§4) needs node-key ancestry to tell a searcher's
+own descent from a redundant root, but the visitor's `open()` receives
+`SpatialNode`, which carries `depth` but NO Morton `key` (the key lives on
+the `Node`/`NodeWrapper` wrapper, Node.h:237). And §4.1's re-issue
+(`reissuePair(source_key,...)` via Resumer/goDown) plus §5's counter-QD are
+also framework-level. So 3b touches the core traverser/resumer (thread keys
+into the walk, add re-issue, counter-QD) -- a substantial piece, correctly
+anticipated by §4-5 but bigger than "extend the visitor."
+
+**Instrumentation fix (committed):** the `FOF3STAT redundancy ... ratio`
+divided by `edges_unique`, which is hard-0 on the `-u dist` path
+(FoFPhase3.h:418), so it always printed 0.000 on the scaling path. Now
+divides by `edges_sent` (distinct pairs, populated on both paths); the
+table above uses the corrected ratio.
+
+**Go/no-go:** 3b's benefit is real but scales with production concurrency
+and real-network fetch cost; it is not measurable on available hardware.
+Given it is framework surgery, validate on a real multi-node cluster (or a
+clustered LAMBS run at higher process counts) before committing the
+implementation. The instrumentation now reports the right ratio to drive
+that call.
+
 ## 7. Explicitly deferred past 3b
 
 htram aggregation for edge emission (counters above are already
 htram-proof); distributed UF_2 (step 4); giant-fragment splitting;
 PBC; suppression-aware starter-pack contents (ship annotations only
 when valid — cosmetic once ordering is fixed).
+
+Orthogonal to 3b (do not conflate): edge-submission streaming
+(design/edge-submission.md) is submission-side and bounds edge-buffer
+MEMORY; 3b parking is discovery-side and cuts walk COMPUTE (the
+pre-witness redundant descents). Same SEEN table, different resource;
+independent — either, both, or neither.

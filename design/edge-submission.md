@@ -69,6 +69,20 @@ large P the buffer is roughly constant-to-slowly-shrinking in the benign case
 and skew-sensitive in the percolating case. Whether it forces a change is a
 **measurement** question (see below), not a scaling-argument one.
 
+## Orthogonal to 3b parking (do not conflate)
+
+Streaming and 3b parking (design/step3.md §4-6) are distinct and independent:
+- **3b parking** is discovery-side: it prunes redundant node-pair DESCENTS over
+  the same fragment pair -> saves WALK COMPUTE (the 16x redundancy). It does not
+  change the edge set (SEEN already emits one edge per pair), so it does nothing
+  for buffer size.
+- **Streaming** is submission-side: it fires edges to UF_2 as emitted -> bounds
+  the edge-buffer MEMORY. It does not change walk compute.
+Compute vs memory; same SEEN table, different problem. You can have either,
+both, or neither. (The design note calls for both: parking is §4.1, and §6.1
+"send edges immediately" is streaming -- which our current batch submission is
+the one thing that contradicts.)
+
 ## The streaming / interleaved alternative
 
 Fire `union_request`s **as the walk emits edges** (per-emit, or in small
