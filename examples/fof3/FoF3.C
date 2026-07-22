@@ -38,7 +38,7 @@ using namespace paratreet;
     // period of pbc_period on all axes (0 = open boundaries, the default).
     Vector3D<Real> pbc(pbc_period, pbc_period, pbc_period);
     if (pbc_period > 0) {
-      // PBC validity (design/minimum-image-vs-27-images.md §7): fail fast at
+      // PBC validity (design/minimum-image-vs-27-images.md §8): fail fast at
       // startup rather than silently produce wrong FoF groups.
       Vector3D<Real> extent = universe.box.size();
       Real maxext = std::max(extent.x, std::max(extent.y, extent.z));

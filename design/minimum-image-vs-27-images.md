@@ -87,7 +87,53 @@ Particles at `a = 0.02` and `b = 0.97`, linking length `b = 0.1`.
   distance `|0.02 - (-0.03)| = 0.05`. Identical answer, one arithmetic step
   instead of a shifted walk.
 
-## 5. Does FoF actually satisfy b < L/2? (yes, hugely)
+## 5. What minimum-image changes in the tree-walk opening criterion
+
+The dual-tree walk decides, for a node pair `(A, B)`, whether to PRUNE (stop)
+or OPEN (descend into children). The criterion is a box-gap test: prune when
+`mindist2(A.box, B.box) > b*b`, else open. Under PBC that test becomes the
+PERIODIC box gap, `mindist2(A.box, B.box, L)` (the per-axis fold of §3), so the
+opening criterion genuinely changes:
+
+- **Wrap-adjacent pairs now open that previously pruned.** Two boxes near
+  OPPOSITE faces have a direct gap ~L (would prune) but a small wrapped gap
+  (now opens) — exactly the pairs that can hold periodic links, which the walk
+  must descend into. Interior pairs are unchanged: their wrapped images are
+  far, so periodic `mindist2` == plain `mindist2` and they prune identically.
+
+- **Still correct — pruning never drops a real link.** Pruning is safe only if
+  the criterion is a valid LOWER BOUND on the true (periodic) closest
+  point-pair distance. The periodic box gap is that lower bound *provided each
+  box fits within one period* (`period >= box extent`), because then the
+  `{-L,0,+L}` fold captures the nearest image. That is exactly why §8 checks
+  `period >= box extent` at startup: violate it and a box could span more than
+  a period, the fold could miss the nearest image, and the bound could be
+  wrong.
+
+- **Same opening decisions as the 27-image walk.** A pair opens under
+  minimum-image iff SOME offset would open it in the 27-image scheme
+  (`min over v of mindist2(A, B+v) <= b`). The two explore the same pairs and
+  reach the same links; minimum-image just folds the 27 box-shifted walks into
+  one whose distance function already knows the nearest image. As the walk
+  descends, each child sub-box gets its own fold, so if child A1 is nearest to
+  B directly while A2 is nearest to B's +L image, both are handled in the one
+  traversal.
+
+- **Cost: coarse boxes near a face cannot prune.** A box spanning a large
+  fraction of L has a periodic gap ~0 to almost anything (its images tile the
+  domain), so it always opens; the walk descends until sub-boxes are small
+  enough that the wrapped gap exceeds b. That extra descent near the faces is
+  the inherent price of PBC — the same work old FoF pays across its 27 images,
+  here localized to the boundary.
+
+- **The positive certificate (case 2) is disabled under PBC.** In phase 3,
+  open() also has a `maxdist2 <= b*b` "all pairs within b -> guaranteed edge"
+  shortcut. A periodic "farthest image" is ill-defined, and the certificate
+  never fires in practice anyway, so under PBC open() uses only the periodic
+  `mindist2` negative certificate plus SEEN suppression. The pruning stays a
+  clean lower-bound test.
+
+## 6. Does FoF actually satisfy b < L/2? (yes, hugely)
 
 FoF's linking length is `b = 0.2 * mean interparticle spacing`, and the mean
 spacing is `L / N^(1/3)` for `N` particles in the box. So
@@ -97,7 +143,7 @@ percolation tests gives `b = L / N^(1/3) << L/2`. The `b < L/2` condition holds
 by orders of magnitude, always. Minimum-image is not an approximation here — it
 is exact.
 
-## 6. Why we prefer it
+## 7. Why we prefer it
 
 - **Cost.** One walk instead of 27. In phase 3 the boundary walk rides the
   framework traverser; 27 images would mean 27 full traversals (setup, cache
@@ -108,7 +154,7 @@ is exact.
   design/pbc.md): identical to the codes' existing ~0.01% systematic offset at
   moderate `b`, tracking together through percolation.
 
-## 7. The validity constraints (checked at startup)
+## 8. The validity constraints (checked at startup)
 
 Minimum-image (and the box-gap pruning) are exact only when:
 1. `b < L/2` — the argument in §4. If violated, a particle could reach two
