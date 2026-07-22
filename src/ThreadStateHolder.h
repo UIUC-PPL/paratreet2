@@ -29,6 +29,16 @@ public:
     universe = universe_;
   }
 
+  // Unconditional broadcast/reduce no-op, used as a barrier: every group
+  // branch must exist and run this before the reduction completes. Prefer
+  // this over CkWaitQD()/CkStartQD() for startup synchronization -- on this
+  // reconverse runtime, quiescence detection can fail to fire even once the
+  // whole system has genuinely gone idle, hanging forever, whereas a plain
+  // reduction (proven reliable elsewhere in this codebase) always completes.
+  void ping(CkCallback cb) {
+    contribute(cb);
+  }
+
   void reset() {
     n_part_ints = n_node_ints = n_opens = n_closes = 0ull;
     n_partition_particles = n_subtree_particles = 0u;

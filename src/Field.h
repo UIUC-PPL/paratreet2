@@ -24,6 +24,13 @@ class GenericField {
   GenericField(void)
       : arg_(nullptr), origin_(FieldOrigin::Unknown) {}
 
+  // fields_ stores these polymorphically as unique_ptr<GenericField>, so
+  // without a virtual destructor, deleting a Field<T> through its base
+  // pointer deallocates using sizeof(GenericField) instead of the derived
+  // object's actual size -- a sized-deallocation mismatch that corrupts the
+  // heap (glibc's malloc_printerr/double-free).
+  virtual ~GenericField(void) = default;
+
   const char* arg(void) const { return this->arg_; }
   // Detach this field's CLI letter (it stays settable via its config-file
   // name); see Loadable::release_arg.

@@ -68,6 +68,7 @@ module paratreet {
   group ThreadStateHolder {
     entry ThreadStateHolder();
     entry void setUniverse(BoundingBox b);
+    entry void ping(CkCallback cb);
     entry void collectAndResetStats(CkCallback cb);
     entry void collectMetaData(const CkCallback & cb);
     template <typename Data>
@@ -261,7 +262,7 @@ module paratreet {
   group TreeSpec {
     entry TreeSpec(void);
     entry void reset();
-    entry void receiveConfiguration(const CkCallback&, CkPointer<paratreet::Configuration>);
+    entry void receiveConfiguration(const CkCallback&, CkReference<paratreet::Configuration>);
     entry void receiveDecomposition(const CkCallback&, CkPointer<Decomposition>, bool);
     entry [local] Decomposition* getSubtreeDecomposition();
     entry [local] Decomposition* getPartitionDecomposition();

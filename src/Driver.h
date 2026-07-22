@@ -49,11 +49,23 @@ public:
 
   // Performs initial decomposition
   void init(const CkCallback& cb, const paratreet::Configuration& cfg) {
+    // TreeCanopy has no initial elements and relies entirely on demand
+    // creation later during tree traversal, so unlike Subtree/Partition
+    // (whose ckNew() below is synchronized via a completion callback), its
+    // creation in paratreet::initialize() has nothing to wait on. CkWaitQD()
+    // was tried here but hangs on this reconverse runtime even once the
+    // system has genuinely gone idle, so instead force a plain reduction
+    // (thread_state_holder is a readonly Group, broadcast from the same PE
+    // and before this point, so same-source delivery order guarantees its
+    // own creation -- and, before it, TreeCanopy's -- already landed
+    // everywhere by the time every branch replies here).
+    thread_state_holder.ping(CkCallbackResumeThread());
+
     // Ensure all treespecs have been created
     CkPrintf("* Validating tree specifications.\n");
     treespec.receiveConfiguration(
       CkCallbackResumeThread(),
-      const_cast<paratreet::Configuration*>(&cfg)
+      CkReference<paratreet::Configuration>(const_cast<paratreet::Configuration&>(cfg))
     );
     // Then, initialize the cache managers
     CkPrintf("* Initializing cache managers.\n");

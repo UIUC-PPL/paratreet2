@@ -1,8 +1,17 @@
 #include "TreeSpec.h"
 #include "Paratreet.h"
 
-void TreeSpec::receiveConfiguration(const CkCallback& cb, paratreet::Configuration* cfg) {
-  paratreet::setConfiguration(std::shared_ptr<paratreet::Configuration>(cfg));
+void TreeSpec::receiveConfiguration(const CkCallback& cb, paratreet::Configuration& cfg) {
+  // cfg is a CkReference: for a local (same-PE) call this aliases the
+  // caller's own live Configuration (Main::conf) with no ownership transfer,
+  // unlike CkPointer, which -- for local calls specifically -- hands back
+  // the sender's original pointer as if it were a fresh, independently
+  // owned allocation (it previously wasn't, causing a double-free once the
+  // wrongly-"owned" shared_ptr here and the real Main::conf both tried to
+  // free the same object). Clone through PUP::able so what we store really
+  // is our own, independently owned copy.
+  paratreet::setConfiguration(std::shared_ptr<paratreet::Configuration>(
+    static_cast<paratreet::Configuration*>(cfg.clone())));
   CkAssert(this->getTree() && this->getSubtreeDecomposition() && this->getPartitionDecomposition());
   this->contribute(cb);
 }
