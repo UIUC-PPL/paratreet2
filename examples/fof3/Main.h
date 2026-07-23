@@ -41,6 +41,12 @@ class ExMain: public paratreet::Main<FragData> {
   CheckMode check_mode = CheckMode::Auto;
   enum class UF2Mode { Dist, Serial };
   UF2Mode uf2_mode = UF2Mode::Dist;
+  // Phase-3 walk mechanism (-w; design/dual-tree.md): transposed (default,
+  // the validated startDown source-tree-vs-flat-target-leaves walk) or dual
+  // (Subtree::startDual symmetric dual-tree walk -- the design/step3.md 6f
+  // lever; prototype, -u dist only).
+  enum class WalkMode { Transposed, Dual };
+  WalkMode walk_mode = WalkMode::Transposed;
   // Min component size for reporting (-m); 0 = report everything (default).
   int fof_min_component_size = 0;
   // Periodic boundary conditions (-P <L>; design/pbc.md): cubic box period

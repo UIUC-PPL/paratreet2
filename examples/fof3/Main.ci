@@ -9,6 +9,7 @@ mainmodule Main {
     extern entry void Subtree<FragData> upwardPass(const CkCallback&);
     extern entry void Partition<FragData> startDown<FragCheckVisitor> (FragCheckVisitor v);
     extern entry void Partition<FragData> startDown<FoFEdgeVisitor> (FoFEdgeVisitor v);
+    extern entry void Subtree<FragData> startDual<FoFEdgeVisitor> (FoFEdgeVisitor v);
     extern entry void FoFPhase1<FragData> countFragments(const CkCallback&);
     extern entry void FoFPhase1Node<FragData> fragmentHistogram(const CkCallback&);
 }

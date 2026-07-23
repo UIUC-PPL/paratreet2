@@ -168,6 +168,12 @@ template <typename Visitor>
 void Partition<Data>::startDown(Visitor v)
 {
   initLocalBranches();
+  // A prior subtree-driven walk (Subtree::startDual) leaves the per-PE
+  // Resumer routing cache resumes to the subtree proxy; partition-driven
+  // walks must route back to partitions. Latent until an app mixed both
+  // walk types in one run (fof3 -w dual does: dual phase-3 walk, then the
+  // partition-driven FragCheckVisitor pass).
+  r_local->use_subtree = false;
   traversers.emplace_back(new TransposedDownTraverser<Data, Visitor>(v, traversers.size(), leaves, *this));
   startNewTraverser();
 }
