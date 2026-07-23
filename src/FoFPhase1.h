@@ -575,6 +575,7 @@ public:
     }
     uf_parent.resize(n_local);
     std::iota(uf_parent.begin(), uf_parent.end(), 0);
+    cert_rep.clear();
     flat_order.resize(n_local);
     for (auto& s : subtrees)
       for (int i = 0; i < s.n; i++) flat_order[s.offset + i] = s.parts[i].order;
@@ -584,7 +585,13 @@ public:
         const SubtreeRef& sa = subtrees[i];
         const SubtreeRef& sb = subtrees[j];
         walk(sa.root, sb.root,
-             [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); });
+             [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); },
+             [&](Node<Data>* a, Node<Data>* b) {
+               // Positive certificate: each node becomes a memoized fragment
+               // on first touch (certRep); repeat certificates are O(1).
+               int ra = certRep(a, sa);
+               if (a != b) unite(ra, certRep(b, sb));
+             });
       }
     }
 
@@ -608,6 +615,7 @@ public:
     b2_ = b2;
     edge_buf.clear();
     seen.clear();
+    cert_tip.clear();
     auto* nb = node_proxy.ckLocalBranch();
     int my_pe = CkMyPe();
     // pe_subtrees is frozen since the registration barrier: safe to read.
@@ -616,7 +624,20 @@ public:
       for (auto& sa : subtrees) {
         for (auto& sb : kv.second) {
           walk(sa.root, sb.root,
-               [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); });
+               [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
+               [&](Node<Data>* a, Node<Data>* b) {
+                 // Positive certificate over frozen tips, memoized: each
+                 // node star-emits once; the pair contributes one edge
+                 // (a != b always here — the pair spans two PEs).
+                 long ta = certTipRep(a);
+                 long tb = certTipRep(b);
+                 if (ta != tb) {
+                   long lo = std::min(ta, tb), hi = std::max(ta, tb);
+                   uint64_t key =
+                       (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
+                   if (seen.insert(key).second) edge_buf.emplace_back(lo, hi);
+                 }
+               });
         }
       }
     }
@@ -985,13 +1006,37 @@ public:
   }
 
 private:
-  // Dual tree walk over a pair of local trees; prunes on box gap distance.
-  // leaf_fn(a, b) is invoked on leaf x leaf pairs.
-  template <typename LeafFn>
-  void walk(Node<Data>* a, Node<Data>* b, const LeafFn& leaf_fn) {
+  // Dual tree walk over a pair of local trees; prunes on box gap distance
+  // (negative certificate) AND on the positive certificate: if the boxes'
+  // max distance is within b, EVERY cross particle pair is a guaranteed
+  // link (for a == b self pairs: every internal pair — the box diameter),
+  // so cert_fn(a, b) resolves the whole pair in O(n_a + n_b) with no
+  // distance tests and the descent stops. This is design-note §4 case 2
+  // applied intra-process; it is what makes dense regions near-LINEAR
+  // (design/phase1-scaling.md: phaseA cost is pair work ~ density, and in
+  // a core at overdensity D the linking length spans many local spacings,
+  // so whole subtrees certify). Skipped under PBC — maxdist2 is not
+  // periodic (same exclusion as the phase-3 case-2 certificate).
+  // leaf_fn(a, b) is invoked on surviving leaf x leaf pairs.
+  template <typename LeafFn, typename CertFn>
+  void walk(Node<Data>* a, Node<Data>* b, const LeafFn& leaf_fn,
+            const CertFn& cert_fn) {
     if (a == nullptr || b == nullptr) return;
     if (a->n_particles == 0 || b->n_particles == 0) return; // empty leaves
     if (paratreet::mindist2(a->data.box, b->data.box, period_) > b2_) return;
+    const bool pbc = period_.x > 0 || period_.y > 0 || period_.z > 0;
+    // Cheap conservative gate before the full maxdist2 test: per axis the
+    // farthest cross pair spans at least (s_a + s_b)/2, so maxdist2 >=
+    // sum(((s_a+s_b)/2)^2) >= (sum(s_a+s_b))^2 / 12 (Cauchy-Schwarz). If
+    // even that lower bound exceeds b^2 the certificate cannot fire — which
+    // is the common case at subcritical b, where an ungated test costs ~10%
+    // of phaseA for nothing. Never skips a valid certificate.
+    const Real msum = boxMeasure(a) + boxMeasure(b);
+    if (!pbc && msum * msum <= Real(12) * b2_ &&
+        paratreet::maxdist2(a->data.box, b->data.box) <= b2_) {
+      cert_fn(a, b);
+      return;
+    }
     if (a->isLeaf() && b->isLeaf()) {
       leaf_fn(a, b);
       return;
@@ -1001,10 +1046,131 @@ private:
     else if (b->isLeaf()) open_a = true;
     else open_a = boxMeasure(a) >= boxMeasure(b); // open the larger box
     if (open_a) {
-      for (int i = 0; i < a->n_children; i++) walk(a->getChild(i), b, leaf_fn);
+      for (int i = 0; i < a->n_children; i++)
+        walk(a->getChild(i), b, leaf_fn, cert_fn);
     } else {
-      for (int i = 0; i < b->n_children; i++) walk(a, b->getChild(i), leaf_fn);
+      for (int i = 0; i < b->n_children; i++)
+        walk(a, b->getChild(i), leaf_fn, cert_fn);
     }
+  }
+
+  // Flat index (phaseA union-find space) of the first particle under n.
+  // Only called on non-empty nodes, so the descent always terminates at a
+  // non-empty leaf. NOTE: local-tree INTERNAL nodes carry n_particles = -1
+  // BY DESIGN (Node.h: "non-leaves will have this as -1"); the qualifying
+  // test must be != 0 (skip only known-empty EmptyLeafs), not > 0 — with
+  // > 0 a deep dense chain (7 EmptyLeaf + 1 Internal(-1) per level, common
+  // in LAMBS halos) never advances and this loop spins (the 2026-07-23
+  // LAMBS hang). Safe because the build never creates an all-empty
+  // Internal: empty regions are EmptyLeaf(0) children.
+  int firstFlat(Node<Data>* n, const SubtreeRef& s) {
+    while (!n->isLeaf()) {
+      Node<Data>* next = nullptr;
+      for (int i = 0; i < n->n_children; i++) {
+        Node<Data>* c = n->getChild(i);
+        if (c != nullptr && c->n_particles != 0) { next = c; break; }
+      }
+      if (next == nullptr) {
+        // Inconsistent tree: a non-leaf claiming particles but no non-empty
+        // child. Abort loudly rather than spin (LAMBS debug 2026-07-23).
+        CkPrintf("[pe %d] firstFlat STUCK: node key %" PRIx64 " type %d "
+                 "n_particles %d n_children %d children:",
+                 CkMyPe(), (uint64_t)n->key, (int)n->type, n->n_particles,
+                 n->n_children);
+        for (int i = 0; i < n->n_children; i++) {
+          Node<Data>* c = n->getChild(i);
+          if (c == nullptr) CkPrintf(" null");
+          else CkPrintf(" (t%d,n%d)", (int)c->type, c->n_particles);
+        }
+        CkPrintf("\n");
+        CkAbort("firstFlat: no non-empty child under a non-empty non-leaf");
+      }
+      n = next;
+    }
+    return s.offset + int(n->particles() - s.parts);
+  }
+
+  // Positive-certificate action for phaseA: unite every particle under n
+  // into rep. Repeat certificates over an already-merged subtree degrade to
+  // path-compressed finds (~O(1) each).
+  void uniteSubtree(Node<Data>* n, const SubtreeRef& s, int rep) {
+    if (n == nullptr || n->n_particles == 0) return;
+    if (n->isLeaf()) {
+      int f = s.offset + int(n->particles() - s.parts);
+      for (int i = 0; i < n->n_particles; i++) unite(rep, f + i);
+      return;
+    }
+    for (int i = 0; i < n->n_children; i++) uniteSubtree(n->getChild(i), s, rep);
+  }
+
+  // Hierarchical-fragment memo (Kale, 2026-07-23): the first certificate
+  // involving node n star-unifies n's particles ONCE and records the
+  // representative — n has become a "fragment" — so every LATER certificate
+  // involving n is a single unite(rep, rep). Without this, a hot node with
+  // k certified neighbors re-walks its particles k times (measured: the
+  // unmemoized certificate bought only ~10% at 8M b0.8; the pair work in a
+  // dense core is dominated by exactly those repeats). Valid because
+  // certRep is only ever called for a node participating in a certified
+  // pair: all cross pairs are genuine links, so the star through the
+  // partner connects n internally even when n alone is not a clique.
+  // Cleared at the start of each phaseA (node pointers are walk-scoped).
+  std::unordered_map<Node<Data>*, int> cert_rep;
+  int certRep(Node<Data>* n, const SubtreeRef& s) {
+    auto it = cert_rep.find(n);
+    if (it != cert_rep.end()) return it->second;
+    int rep = firstFlat(n, s);
+    uniteSubtree(n, s, rep);
+    cert_rep.emplace(n, rep);
+    return rep;
+  }
+
+  // phaseB memo, same idea as cert_rep: first certificate touching node n
+  // star-emits n's tips once; later certificates emit one (rep, rep) edge.
+  // Cleared at the start of each phaseB.
+  std::unordered_map<Node<Data>*, long> cert_tip;
+  long certTipRep(Node<Data>* n) {
+    auto it = cert_tip.find(n);
+    if (it != cert_tip.end()) return it->second;
+    long rep = firstTip(n);
+    emitSubtreeTips(n, rep);
+    cert_tip.emplace(n, rep);
+    return rep;
+  }
+
+  // Positive-certificate action for phaseB (frozen tips): emit deduplicated
+  // (rep_tip, tip) edges for every particle under n. Correct without any
+  // internal-connectivity assumption: all CROSS pairs are true links, so a
+  // spanning star through rep connects every tip present in a and b.
+  void emitSubtreeTips(Node<Data>* n, long rep_tip) {
+    if (n == nullptr || n->n_particles == 0) return;
+    if (n->isLeaf()) {
+      const Particle* p = n->particles();
+      for (int i = 0; i < n->n_particles; i++) {
+        long t = p[i].group_number;
+        if (t == rep_tip) continue;
+        long lo = std::min(rep_tip, t), hi = std::max(rep_tip, t);
+        uint64_t key = (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
+        if (seen.insert(key).second) edge_buf.emplace_back(lo, hi);
+      }
+      return;
+    }
+    for (int i = 0; i < n->n_children; i++) emitSubtreeTips(n->getChild(i), rep_tip);
+  }
+
+  // First (any) particle tip under n; n non-empty. Same != 0 rule as
+  // firstFlat (internal n_particles is -1 by design).
+  long firstTip(Node<Data>* n) {
+    while (!n->isLeaf()) {
+      Node<Data>* next = nullptr;
+      for (int i = 0; i < n->n_children; i++) {
+        Node<Data>* c = n->getChild(i);
+        if (c != nullptr && c->n_particles != 0) { next = c; break; }
+      }
+      if (next == nullptr)
+        CkAbort("firstTip: no non-empty child under a non-empty non-leaf");
+      n = next;
+    }
+    return n->particles()[0].group_number;
   }
 
   static Real boxMeasure(Node<Data>* n) {

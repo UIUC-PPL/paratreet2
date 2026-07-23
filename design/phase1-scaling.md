@@ -60,3 +60,53 @@ test this directly.
 Note the same density-skew mechanism will apply to tip_encode/upwardPass
 only weakly (they are per-particle, not per-pair); the balance data will
 say whether they need anything.
+
+## Positive certificates in the phase-1 walk (2026-07-23, Kale's proposal)
+
+Kale's review asked: dense regions should be certifiable — apply the
+phase-3 case-2 idea (maxdist <= b => every cross pair links) inside phase
+1, hierarchically ("per-leaf fragments"). Implemented in walk():
+
+- maxdist2(a, b) <= b^2 (a == b self pairs: box diameter) -> resolve the
+  whole pair with NO distance tests and stop the descent. A spanning STAR
+  of unions through one representative (O(n_a + n_b)) is correct without
+  any internal-connectivity assumption: all cross pairs are genuine links,
+  so a's particles connect through b's representative even when a alone is
+  not a clique.
+- MEMOIZED per node (cert_rep / cert_tip): the first certificate touching
+  a node star-unifies it once — the node becomes a fragment — and every
+  later certificate involving it is a single unite(rep, rep). This is the
+  hierarchical-fragment formulation; without it a hot node with k
+  certified partners re-walks its particles k times.
+- Conservative size gate before the maxdist2 test (maxdist2 >=
+  (sum of box measures)^2 / 12), so subcritical regions don't pay for a
+  test that cannot fire. PBC skips certificates (maxdist2 not periodic),
+  same exclusion as phase 3.
+- phaseB analog: star-EMIT deduplicated (rep_tip, tip) edges.
+
+LATENT FRAMEWORK TRAP found by this work (and the cause of a phase-1 spin
+on LAMBS): local-tree INTERNAL nodes carry n_particles = -1 BY DESIGN
+(Node.h "non-leaves will have this as -1"); only leaves have counts, and
+empty regions are EmptyLeaf(0). Any consumer descending by "child with
+particles" must test n_particles != 0, NOT > 0 — with > 0, LAMBS's deep
+dense chains (7 EmptyLeaf + 1 Internal(-1) per level) never advance.
+firstFlat/firstTip now carry the != 0 rule plus a loud CkAbort tripwire
+for genuinely inconsistent trees. Recorded in design/charm-notes.md.
+
+MEASURED (laptop; quiet machine, interleaved A/B): correctness everywhere
+(12-run matrix, 1M b0.2 333,889 / b0.8 41,315 grid-verified, LAMBS 1M
+379,884 grid-verified, PBC runs unchanged). Performance: PARITY at
+laptop-reachable densities — certificates fire heavily (~300k fragments/PE
+at 8M Plummer b0.8; ~150k at LAMBS-1M b0.2) but the certified interior was
+not the dominant cost at these scales; the remaining time is the SHELL
+(mindist <= b < maxdist pairs needing real tests) plus mean-density
+genuine-neighbor work. The 1M LAMBS SUBSAMPLE dilutes real halo density
+~80x in b-units, so the deep-overdensity regime (b spanning 4-20 local
+spacings, design note §4 case 2's target) is NOT reachable on the laptop.
+The structural claim (near-linear certified interior) is landed and
+correct; whether it pays at production density is an ANVIL measurement —
+the phase1_stages line in the sweep output decides it, on the same runs
+that decide the density-skew question. The skew fixes (density-weighted
+placement / work sharing) remain the primary phase-1 lever regardless:
+certificates cut the hot PE's work only where it is deeply overdense, not
+where it is merely dense.
