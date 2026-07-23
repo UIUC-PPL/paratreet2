@@ -93,7 +93,54 @@ dense chains (7 EmptyLeaf + 1 Internal(-1) per level) never advance.
 firstFlat/firstTip now carry the != 0 rule plus a loud CkAbort tripwire
 for genuinely inconsistent trees. Recorded in design/charm-notes.md.
 
-MEASURED (laptop; quiet machine, interleaved A/B): correctness everywhere
+## Connectivity suppression (2026-07-23, same session — the phaseA win)
+
+The certificate analysis showed the residual cost is the SHELL (mindist <=
+b < maxdist pairs) — and almost all shell work re-proves connectivity the
+UF already knows. Fix (Kale's hierarchical-fragment idea completed): a
+monotone per-node "internally connected, representative r" memo (shares
+cert_rep — certified nodes are born connected; find(r) stays valid across
+later merges = path compression at node granularity), maintained by
+`connectedRep`: leaves check directly (early-exit on first root mismatch,
+~2 finds when negative), internals consult only their CHILDREN'S memo
+entries (~1 hash lookup when negative), so connectivity percolates upward
+lazily as the walk revisits nodes. Three uses:
+1. walk-level PAIR SUPPRESSION (the phase-3 SEEN analog): both sides
+   connected + same root -> prune the pair, any level, no descent. A
+   connected node's SELF pair prunes the same way.
+2. single-witness early exit in leafLeafUnion when both leaves are
+   connected fragments (phase 3's uniform-leaf shortcut).
+3. self-pairs-first ordering in phaseA (local assembly populates the memo
+   before cross pairs consult it).
+Negative-memo experiments both LOST: an exact-epoch negative cache cost
++140% on subcritical uniform (map churn > the cheap checks it avoided) and
+a backoff cache blocked fresh suppressions (1.5x at b0.8). Failed checks
+are cheap by construction; memoize positives only.
+
+RESULTS (8M +p7, quiet machine; phaseA seconds):
+
+| input            | pre-cert | cert-only | +suppression |
+|------------------|----------|-----------|--------------|
+| Plummer b0.8     | 12.08    | 10.5-10.9 | **1.4-2.0 (~7x)** |
+| LAMBS-1M b0.2    | 0.20-0.26| 0.20      | 0.10-0.12 (~1.8x) |
+| Plummer b0.2     | 0.88-0.96| 0.94-0.96 | 1.11 (+~20%) |
+| uniform b0.2     | 0.13-0.16| 0.16-0.17 | 0.23 (+~45%) |
+
+3-6.5M pairs suppressed per PE at b0.8. AND THE SKEW COLLAPSES: b0.8
+phaseA_s min/avg/max went 1.37/6.8/12.1 (max/min 8.8) -> 1.0/1.3/2.0
+(max/min 2.0) — the hot PE's excess WAS the redundant re-proving in its
+dense region, so suppression attacks the scaling problem from the work
+side, complementing (and reducing the need for) placement fixes. The
+subcritical overhead (+20-45% of a small number) is the price of the
+per-pair connectivity checks; acceptable given production data is
+clustered, but a future tuning knob if it ever matters.
+
+Correctness: 12-run matrix + 1M b0.2 (333,889) + b0.8 (41,315) + LAMBS 1M
+(379,884) grid-verified + PBC (98,264) after every variant, and the 8M
+b0.8 stats line is bit-identical across cert-only and suppression builds.
+
+MEASURED for certificates alone (laptop; quiet machine, interleaved A/B):
+correctness everywhere
 (12-run matrix, 1M b0.2 333,889 / b0.8 41,315 grid-verified, LAMBS 1M
 379,884 grid-verified, PBC runs unchanged). Performance: PARITY at
 laptop-reachable densities — certificates fire heavily (~300k fragments/PE

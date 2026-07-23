@@ -580,18 +580,38 @@ public:
     for (auto& s : subtrees)
       for (int i = 0; i < s.n; i++) flat_order[s.offset + i] = s.parts[i].order;
 
-    for (size_t i = 0; i < subtrees.size(); i++) {
-      for (size_t j = i; j < subtrees.size(); j++) {
-        const SubtreeRef& sa = subtrees[i];
-        const SubtreeRef& sb = subtrees[j];
-        walk(sa.root, sb.root,
-             [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); },
-             [&](Node<Data>* a, Node<Data>* b) {
-               // Positive certificate: each node becomes a memoized fragment
-               // on first touch (certRep); repeat certificates are O(1).
-               int ra = certRep(a, sa);
-               if (a != b) unite(ra, certRep(b, sb));
-             });
+    // Self pairs FIRST, cross pairs after (merge-early ordering): local
+    // assembly populates the connectivity memo, so the cross-pair walks see
+    // maximal suppression (design/phase1-scaling.md, connectivity layer).
+    p1_conn_suppressed = 0;
+    for (int pass = 0; pass < 2; pass++) {
+      for (size_t i = 0; i < subtrees.size(); i++) {
+        for (size_t j = i; j < subtrees.size(); j++) {
+          if ((pass == 0) != (i == j)) continue; // pass 0: self; pass 1: cross
+          const SubtreeRef& sa = subtrees[i];
+          const SubtreeRef& sb = subtrees[j];
+          walk(sa.root, sb.root,
+               [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); },
+               [&](Node<Data>* a, Node<Data>* b) {
+                 // Positive certificate: each node becomes a memoized fragment
+                 // on first touch (certRep); repeat certificates are O(1).
+                 int ra = certRep(a, sa);
+                 if (a != b) unite(ra, certRep(b, sb));
+               },
+               [&](Node<Data>* a, Node<Data>* b) {
+                 // Connectivity suppression (phase-3 SEEN analog, monotone):
+                 // if both sides are internally connected and already share
+                 // a component, no cross test can change anything — prune
+                 // the pair. A connected node's SELF pair is likewise done.
+                 int ra = connectedRep(a, sa);
+                 if (ra < 0) return false;
+                 if (a == b) { p1_conn_suppressed++; return true; }
+                 int rb = connectedRep(b, sb);
+                 if (rb < 0) return false;
+                 if (find(ra) == find(rb)) { p1_conn_suppressed++; return true; }
+                 return false;
+               });
+        }
       }
     }
 
@@ -637,7 +657,11 @@ public:
                        (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
                    if (seen.insert(key).second) edge_buf.emplace_back(lo, hi);
                  }
-               });
+               },
+               // No connectivity suppression in phaseB: there is no live UF
+               // over frozen tips; the seen-set dedup plays that role at
+               // edge granularity.
+               [](Node<Data>*, Node<Data>*) { return false; });
         }
       }
     }
@@ -1017,13 +1041,16 @@ private:
   // a core at overdensity D the linking length spans many local spacings,
   // so whole subtrees certify). Skipped under PBC — maxdist2 is not
   // periodic (same exclusion as the phase-3 case-2 certificate).
-  // leaf_fn(a, b) is invoked on surviving leaf x leaf pairs.
-  template <typename LeafFn, typename CertFn>
+  // leaf_fn(a, b) is invoked on surviving leaf x leaf pairs. prune_fn(a, b)
+  // returning true means the pair is already fully resolved (connectivity
+  // suppression) — skip it entirely.
+  template <typename LeafFn, typename CertFn, typename PruneFn>
   void walk(Node<Data>* a, Node<Data>* b, const LeafFn& leaf_fn,
-            const CertFn& cert_fn) {
+            const CertFn& cert_fn, const PruneFn& prune_fn) {
     if (a == nullptr || b == nullptr) return;
     if (a->n_particles == 0 || b->n_particles == 0) return; // empty leaves
     if (paratreet::mindist2(a->data.box, b->data.box, period_) > b2_) return;
+    if (prune_fn(a, b)) return;
     const bool pbc = period_.x > 0 || period_.y > 0 || period_.z > 0;
     // Cheap conservative gate before the full maxdist2 test: per axis the
     // farthest cross pair spans at least (s_a + s_b)/2, so maxdist2 >=
@@ -1047,10 +1074,10 @@ private:
     else open_a = boxMeasure(a) >= boxMeasure(b); // open the larger box
     if (open_a) {
       for (int i = 0; i < a->n_children; i++)
-        walk(a->getChild(i), b, leaf_fn, cert_fn);
+        walk(a->getChild(i), b, leaf_fn, cert_fn, prune_fn);
     } else {
       for (int i = 0; i < b->n_children; i++)
-        walk(a, b->getChild(i), leaf_fn, cert_fn);
+        walk(a, b->getChild(i), leaf_fn, cert_fn, prune_fn);
     }
   }
 
@@ -1114,12 +1141,58 @@ private:
   // pair: all cross pairs are genuine links, so the star through the
   // partner connects n internally even when n alone is not a clique.
   // Cleared at the start of each phaseA (node pointers are walk-scoped).
+  //
+  // The SAME map doubles as the connectivity memo for suppression
+  // (connectedRep below): an entry means "internally connected, with this
+  // representative" — monotone, so it never invalidates; find(rep) always
+  // yields the CURRENT root even after later merges.
   std::unordered_map<Node<Data>*, int> cert_rep;
   int certRep(Node<Data>* n, const SubtreeRef& s) {
     auto it = cert_rep.find(n);
     if (it != cert_rep.end()) return it->second;
     int rep = firstFlat(n, s);
     uniteSubtree(n, s, rep);
+    cert_rep.emplace(n, rep);
+    return rep;
+  }
+
+  // Connectivity query with lazy bottom-up upgrade (the suppression layer,
+  // design/phase1-scaling.md): returns a representative flat index if n is
+  // CURRENTLY internally connected, else -1. Positives are memoized in
+  // cert_rep (monotone — never invalidated). NON-recursive on internals:
+  // it consults only the CHILDREN'S memo entries, so connectivity
+  // percolates upward across successive queries as the walk revisits nodes
+  // against new partners ("frequent path compression" at node granularity).
+  long p1_conn_suppressed = 0; // pairs pruned by connectivity suppression
+  int connectedRep(Node<Data>* n, const SubtreeRef& s) {
+    auto it = cert_rep.find(n);
+    if (it != cert_rep.end()) return it->second;
+    // No negative memo: a FAILED check is cheap by construction — the leaf
+    // path exits on the first root mismatch (~2 finds; in subcritical
+    // regions leaf particles rarely share a root), and the internal path
+    // exits on the first un-memoized child (~1 hash lookup). Both are
+    // cheaper than the negative-memo bookkeeping they would avoid (an
+    // exact-epoch memo cost +140% phaseA on 8M uniform b0.2; a backoff
+    // memo blocked fresh suppressions and cost 1.5x at 8M b0.8).
+    int rep = -1;
+    if (n->isLeaf()) {
+      if (n->n_particles <= 0) return -1;
+      int f = s.offset + int(n->particles() - s.parts);
+      rep = find(f);
+      for (int i = 1; i < n->n_particles; i++)
+        if (find(f + i) != rep) return -1;
+    } else {
+      for (int i = 0; i < n->n_children; i++) {
+        Node<Data>* c = n->getChild(i);
+        if (c == nullptr || c->n_particles == 0) continue; // empty leaf
+        auto ci = cert_rep.find(c);
+        if (ci == cert_rep.end()) return -1;
+        int r = find(ci->second);
+        if (rep < 0) rep = r;
+        else if (r != rep) return -1;
+      }
+      if (rep < 0) return -1; // no live child
+    }
     cert_rep.emplace(n, rep);
     return rep;
   }
@@ -1178,7 +1251,10 @@ private:
     return sz.x + sz.y + sz.z;
   }
 
-  // phaseA leaf action: pairwise distance checks -> union.
+  // phaseA leaf action: pairwise distance checks -> union. When BOTH leaves
+  // are already internally connected fragments (walk-level suppression has
+  // ruled out same-component pairs), a single witness merges everything —
+  // return after the first hit (phase 3's uniform-leaf-pair shortcut).
   void leafLeafUnion(Node<Data>* a, Node<Data>* b,
                      const SubtreeRef& sa, const SubtreeRef& sb) {
     const Particle* pa = a->particles();
@@ -1191,10 +1267,14 @@ private:
           if (paratreet::periodicDistSq(pa[i].position, pa[j].position, period_) <= b2_)
             unite(fa + i, fa + j);
     } else {
+      const bool one_witness =
+          connectedRep(a, sa) >= 0 && connectedRep(b, sb) >= 0;
       for (int i = 0; i < a->n_particles; i++)
         for (int j = 0; j < b->n_particles; j++)
-          if (paratreet::periodicDistSq(pa[i].position, pb[j].position, period_) <= b2_)
+          if (paratreet::periodicDistSq(pa[i].position, pb[j].position, period_) <= b2_) {
             unite(fa + i, fb + j);
+            if (one_witness) return;
+          }
     }
   }
 
