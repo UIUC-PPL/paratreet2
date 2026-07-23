@@ -29,6 +29,21 @@ shipper after the refresh" reorder does NOT fix it — the fix is keep-newest
 dedup (`stable_sort` + last occurrence per key). Symptom: nondeterministically
 stale cached annotations. (General kernel is in the general file.)
 
+## Local-tree internal nodes have n_particles = -1 BY DESIGN
+
+Only LEAF nodes carry particle counts; internal nodes of a Subtree's live
+local tree keep the constructor sentinel -1 (Node.h: "non-leaves will have
+this as -1"), and empty regions are EmptyLeaf children with count 0. Any
+code descending a local tree by "child that has particles" must therefore
+test `n_particles != 0` (skip known-empty), never `> 0` — with `> 0` a deep
+dense chain (7 EmptyLeaf + 1 Internal(-1) per level, routine in LAMBS
+halos) never qualifies a child and the descent spins forever. Bit us in
+the phase-1 certificate work (2026-07-23, 77 CPU-minutes of spin); the
+`n_particles == 0` "skip empty" guards elsewhere were accidentally correct
+because -1 passes them. Note the contrast: cache-shipped SpatialNode
+copies (what phase-3 visitors see) DO carry populated counts — the -1 rule
+is specifically about the live local tree.
+
 ## FoF positive certificate (case 2) rarely fires — test it explicitly
 
 In the phase-3 dual-tree walk the first encounter of a fragment pair is the
