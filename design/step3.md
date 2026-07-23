@@ -528,6 +528,61 @@ Note (nice discovery): the parent-uniformity test, if parent is reliable, gives
 3b's searcher-identity rule with NO node keys at all -- reconsider whether 3b
 even needs the key machinery, or just parent frag-data + the IN_FLIGHT table.
 
+## 6h. Anvil 80M-LAMBS redundancy sweep: 3b is a NO-GO (2026-07-23)
+
+Ritvik ran `redundancy_sweep.sh` on Anvil (80M LAMBS, 15 PEs/process,
+b_factor 0.2, `-u dist`) — the §6d go/no-go measurement. Results (edges_sent
+and skew derived from ratio = redundant/edges_sent and min/avg/max):
+
+| procs | cores | redundant | ratio  | edges_sent | walk_s | per-proc avg | skew max/avg |
+|-------|-------|-----------|--------|------------|--------|--------------|--------------|
+| 1     | 15    | 98,207    | 0.000  | 0          | 83.129 | 98,207       | 1.00         |
+| 2     | 30    | 100,463   | 19.652 | 5,112      | 29.779 | 50,232       | 1.005        |
+| 4     | 60    | 114,944   | 7.075  | 16,247     | 7.719  | 28,736       | 1.14         |
+| 8     | 120   | 123,167   | 5.517  | 22,325     | 2.816  | 15,396       | 1.14         |
+| 16    | 240   | 134,671   | 4.079  | 33,016     | 1.265  | 8,417        | 1.55         |
+
+**Verdict: NO-GO on 3b parking.** The concurrency-driven blowup extrapolated
+from loopback (§6d: 6x growth 2→4 procs) did NOT materialize on the real
+network:
+
+1. **Per-process redundancy FALLS ~P^-0.89** (98k → 8.4k avg); total is
+   near-flat (+37% over a 16x process sweep). Per-pair ratio falls
+   monotonically 19.7 → 4.1 — redundancy dilutes as the pair set grows.
+2. **The P=1 row is a control that reclassifies the counter.**
+   `p3_redundant_descents` (FoFPhase3.h open()) counts EVERY both-uniform
+   descent on an unSEEN pair — including the necessary first descent of each
+   true-edge pair AND all descents over near-miss NO-EDGE pairs, which no
+   mechanism can skip: SEEN never marks them (search failure ≠ no-edge
+   globally, §4.1), and 3b parking re-releases parked lists on failure. At
+   P=1 phase 1 resolves every link, M is empty (ratio 0.000 = edges_sent 0
+   divide guard), so ALL 98,207 counted descents are unsavable verification
+   work. That ~100k-class floor persists at every P.
+3. **The parkable residual is marginal.** At P=16: 134,671 total − ~33k
+   necessary first-descents (= edges_sent) − the no-edge floor ⇒ genuinely
+   parkable pre-witness excess is order 10^4 descents in a 1.27 s walk on
+   240 cores (~1% of walk core-seconds even at 100 µs/remote descent).
+4. **The walk's perf story is the LOW-P regime, not redundancy**: 65.7x
+   speedup on 16x cores (1,247 → 304 core-seconds of total walk work) — the
+   §6b 16M superlinearity again. Big local working sets are the expensive
+   regime, pointing at the §6f flat-target-leaf-list / dual-tree lever and
+   cache footprint, not at redundant descents.
+5. **Skew is mild** (max/avg 1.0 → 1.55). Watch it past P=16, but no
+   giant-fragment redundancy pathology at these counts.
+
+Side-finding (edge-submission.md): edges_sent grows ≈ P^0.9 (5.1k → 33k over
+2→16 procs) — near the percolating/space-filling regime that doc predicts, so
+the per-process edge buffer is roughly FLAT with P. Absolute numbers are tiny
+(~2k edges/process at P=16), so batch submission stays comfortable and
+streaming stays unwarranted at this scale.
+
+Status: 3b (parking + searcher-identity + counter-QD) is RETIRED unless a
+larger-P run reverses these trends (per-process redundancy or skew turning
+upward). The framework pieces it motivated that are independently useful
+(§6g key-threading) stay. Caveats: sweep tops out at P=16 (240 cores);
+b_factor assumed 0.2 (script default). Phase-3 perf work should target §6f
+(target-side descent) and the low-P working-set superlinearity instead.
+
 ## 7. Explicitly deferred past 3b
 
 htram aggregation for edge emission (counters above are already
