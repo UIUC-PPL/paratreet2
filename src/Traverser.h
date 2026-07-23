@@ -67,6 +67,40 @@ inline bool doCell(Visitor& v, Node* source, Node* target, StatCollector* stats)
   return should_open;
 }
 
+// Opt-in DualTraverser split policy (same opt-in idiom as maybeSetKeys): a
+// visitor that declares `static constexpr bool SplitLargerOnly = true` gets
+// 8-way alternating splits (only the shallower = larger-box side splits per
+// step, children explored closest-box-first) instead of the default 64-way
+// joint child product. Visitors without the trait keep the historical
+// behavior bit-for-bit.
+template <typename V>
+constexpr auto dualSplitLargerOnly(int) -> decltype(V::SplitLargerOnly) {
+  return V::SplitLargerOnly;
+}
+template <typename V>
+constexpr bool dualSplitLargerOnly(long) { return false; }
+
+// Squared min distance between two nodes' bounding boxes (every paratreet
+// Data carries `box`; see the Data-concept requirement). Used only to ORDER
+// child exploration (closest first), so open-boundary distance is fine even
+// under PBC -- ordering is a heuristic, correctness never depends on it.
+template <typename Data>
+inline double dualBoxMinDist2(const Node<Data>* a, const Node<Data>* b) {
+  const auto& ab = a->data.box;
+  const auto& bb = b->data.box;
+  double d2 = 0;
+  double gap = std::max((double)ab.lesser_corner.x - (double)bb.greater_corner.x,
+                        (double)bb.lesser_corner.x - (double)ab.greater_corner.x);
+  if (gap > 0) d2 += gap * gap;
+  gap = std::max((double)ab.lesser_corner.y - (double)bb.greater_corner.y,
+                 (double)bb.lesser_corner.y - (double)ab.greater_corner.y);
+  if (gap > 0) d2 += gap * gap;
+  gap = std::max((double)ab.lesser_corner.z - (double)bb.greater_corner.z,
+                 (double)bb.lesser_corner.z - (double)ab.greater_corner.z);
+  if (gap > 0) d2 += gap * gap;
+  return d2;
+}
+
 template <typename Data>
 // returns if_requested
 inline bool handleRemoteNode(Node<Data>* node, size_t trav_idx, size_t part_idx, CProxy_TreeCanopy<Data> tc_proxy, CProxy_CacheManager<Data> cm_proxy, CProxy_Resumer<Data> r_proxy) {
@@ -694,6 +728,33 @@ public:
                 }
               }
               else doNode(v, node, curr_payload, stats);
+            }
+            else if (dualSplitLargerOnly<Visitor>(0)) {
+              // Alternating split (opt-in): split ONLY the shallower
+              // (larger-box) side, tie -> source, so every pair gets a
+              // pruning test at each single-level refinement instead of
+              // jumping straight to the 64-way child product. Children are
+              // pushed farthest-first so the LIFO stack explores the
+              // closest-box pair first -- witnesses land early and SEEN
+              // suppression covers the rest of the expansion.
+              const bool split_src = node->depth <= curr_payload->depth;
+              Node<Data>* splitting = split_src ? node : curr_payload;
+              Node<Data>* fixed = split_src ? curr_payload : node;
+              std::vector<std::pair<double, int>> order;
+              order.reserve(splitting->n_children);
+              for (int i = 0; i < splitting->n_children; i++)
+                order.emplace_back(
+                    dualBoxMinDist2(splitting->getChild(i), fixed), i);
+              std::sort(order.begin(), order.end(),
+                        [](const std::pair<double, int>& x,
+                           const std::pair<double, int>& y) {
+                          return x.first > y.first; // farthest pushed first
+                        });
+              for (auto& oi : order) {
+                Node<Data>* c = splitting->getChild(oi.second);
+                if (split_src) nodes.emplace(c, curr_payload);
+                else nodes.emplace(node, c);
+              }
             }
             else {
               for (int i = 0; i < node->n_children; i++) {

@@ -74,6 +74,25 @@ public:
   // Self-leaf pairs live inside one Subtree (one PE), so phase 1 already
   // unioned them: they can never produce a cross-process edge. Skip them.
   static constexpr const bool CallSelfLeaf = false;
+  // Dual-tree walk traits (design/dual-tree.md; consulted only by
+  // DualTraverser -- the transposed startDown path ignores both):
+  // leaf() runs the particle loop on BOTH sides, so it must only ever see
+  // leaf x leaf pairs; a leaf source against an internal target descends the
+  // target via runInvertedTraversal instead.
+  static constexpr const bool TargetMustBeLeaf = true;
+  // Balanced co-descent: hold the target while the (deeper-rooted global)
+  // source catches up, then split both sides together -- keeps the compared
+  // boxes size-matched so internal x internal certificates fire early.
+  // (Superseded by SplitLargerOnly below when both are set; kept for the
+  // trait-complete record.)
+  static constexpr const bool ForceEvenDepth = true;
+  // 8-way alternating split, closest-child-first (Traverser.h): the 64-way
+  // joint product was only ~5% selective at its leaf frontier (20.4M leaf
+  // pairs -> 994k survivors at 1M b0.2; design/dual-tree.md) -- an extra
+  // pruning test per single-level refinement trades a few more internal
+  // tests for far less leaf-level chaff, and closest-first exploration finds
+  // witnesses early so SEEN suppression covers the rest of the expansion.
+  static constexpr const bool SplitLargerOnly = true;
 
   CProxy_FoFPhase1<FragData> fof;
   double b2 = 0.0;
@@ -176,6 +195,37 @@ public:
     return true;
   }
 
+  // Dual-tree walk only (DualTraverser consults cell() for internal x
+  // internal pairs to decide JOINT descent; the transposed walk never calls
+  // it). CONTRACT: cell() is a PURE PREDICATE mirroring open()'s verdict for
+  // the same pair -- NO counters, NO SEEN inserts, NO edge emission. All
+  // actions/FOF3STAT counters stay in open()/leaf(): a pair cell() rejects
+  // flows into runInvertedTraversal, whose first doOpen() re-tests it once
+  // WITH counters and terminates there. The two verdicts can diverge only if
+  // another PE inserts the pair into SEEN between the calls, which turns a
+  // descend into a prune -- the safe direction (SEEN only grows during the
+  // walk). Consequence for stats: internal x internal joint descents bypass
+  // open(), so both_uniform_descents/redundancy UNDERCOUNT on the dual walk
+  // relative to the transposed baseline (prune counters are unaffected).
+  bool cell(const SpatialNode<FragData>& source, SpatialNode<FragData>& target) {
+    enforceValidAnnotation(source);
+    enforceValidAnnotation(target);
+    auto* branch = fof.ckLocalBranch();
+    const bool pbc = period.x > 0 || period.y > 0 || period.z > 0;
+    if (source.data.uniform() && target.data.uniform()) {
+      long g = source.data.min_frag;
+      long f = target.data.min_frag;
+      if (g == f) return false;                     // same-tip prune
+      if (branch->seenContains(paratreet::packTipPair(g, f)))
+        return false;                               // case 3: suppression
+      if (!pbc && source.n_particles != 0 && target.n_particles != 0 &&
+          paratreet::maxdist2(source.data.box, target.data.box) <= b2)
+        return false;   // case 2: positive certificate (open() emits it)
+    }
+    // case 1: negative certificate iff mindist > b
+    return paratreet::mindist2(source.data.box, target.data.box, period) <= b2;
+  }
+
   void node(const SpatialNode<FragData>& source, SpatialNode<FragData>& target) {}
 
   void leaf(const SpatialNode<FragData>& source, SpatialNode<FragData>& target) {
@@ -183,6 +233,18 @@ public:
     enforceValidAnnotation(source);
     enforceValidAnnotation(target);
     auto* branch = fof.ckLocalBranch();
+    // Leaf-level box gate: the case-1 mindist test on the leaves' OWN boxes.
+    // Neither traverser applies open() to a leaf x leaf pair: the transposed
+    // walk's last test was against the source PARENT's (looser) box, and the
+    // dual walk's co-descent reaches leaf pairs after an equal-depth internal
+    // test whose boxes are ~2x the leaf size (design/dual-tree.md -- without
+    // this gate the dual walk's leaf visits blow up ~4x and erase its
+    // internal-prune win). Counted as a negative prune, not a leaf visit, so
+    // leaf_visits keeps meaning "leaf pairs actually processed".
+    if (paratreet::mindist2(source.data.box, target.data.box, period) > b2) {
+      branch->p3_negative_prunes++;
+      return;
+    }
     branch->p3_leaf_visits++;
     if (source.data.uniform() && target.data.uniform()) {
       // Uniform leaf pair: one (g, f) covers every particle pair, so
@@ -420,11 +482,21 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
 // t_uf2 covers initUF2 + fireUF2Edges + CkWaitQD + find_components (the
 // distributed analog of the old serial-map-build bracket), t_relabel covers
 // applyUF2Labels.
+// dual_walk (design/dual-tree.md): launch the walk as a symmetric dual-tree
+// traversal (Subtree::startDual -> DualTraverser) instead of the transposed
+// source-tree-vs-flat-target-leaves walk. Same visitor, same edge set (the
+// SEEN table and all emission live in open()/leaf() either way); targets are
+// the subtrees' live local trees, whose internal nodes upwardPass annotated
+// in place, so internal x internal pruning (the design/step3.md 6f lever)
+// becomes available. `subtrees` is only consulted when dual_walk is true.
 inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         CProxy_FoFPhase1<FragData> fof,
                                         CProxy_FoFPhase1Node<FragData> fof_node,
                                         double linking_length,
-                                        Vector3D<Real> period = Vector3D<Real>(0, 0, 0)) {
+                                        Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
+                                        bool dual_walk = false,
+                                        CProxy_Subtree<FragData> subtrees =
+                                            CProxy_Subtree<FragData>()) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
   partitions.verifySharedLeaves(CkCallbackResumeThread());
@@ -436,7 +508,10 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // precondition above), so the edges FoFEdgeVisitor buffers into edge_buf3
   // are already UF_2 vertex ids -- no translation needed anywhere below.
   double t0 = CkWallTimer();
-  partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+  if (dual_walk)
+    subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+  else
+    partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
   CkWaitQD();
   double t1 = CkWallTimer();
 

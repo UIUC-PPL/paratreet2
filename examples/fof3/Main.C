@@ -53,8 +53,13 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:")) != -1) {
       switch (c) {
+        case 'w':
+          if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
+          else if (strcmp(optarg, "transposed") == 0) walk_mode = WalkMode::Transposed;
+          else CkAbort("-w requires one of: transposed, dual");
+          break;
         case 'b':
           fof_b_factor = atof(optarg);
           if (!(fof_b_factor > 0.0)) CkAbort("-b requires a factor > 0");
@@ -93,6 +98,8 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t    components with size >= m (a reporting filter only)]\n");
           CkPrintf("\t-P [periodic box period L (cubic, all axes); default 0 = off\n");
           CkPrintf("\t    (open boundaries). Minimum-image PBC; requires b < L/2]\n");
+          CkPrintf("\t-w [phase-3 walk: dual (default; requires -u dist),\n");
+          CkPrintf("\t    transposed (original walk, kept as the A/B oracle)]\n");
           CkPrintf("Framework options (see src/Configuration.h):\n");
           CkPrintf("\t-f [input file]\n");
           CkPrintf("\t-n [number of treepieces]\n");
