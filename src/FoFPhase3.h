@@ -510,12 +510,27 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
 
   fof.initUF2(uf_proxy, CkCallbackResumeThread());
   fof.fireUF2Edges(uf_proxy, CkCallbackResumeThread());
-  // Message-driven completion of the union_request cascade: every send
-  // above is entry-method-driven (plain sends, no htram this step), so
-  // RTS-level QD is sound here exactly as the v1 walk's CkWaitQD is
-  // (design/step4.md QD strategy; htram later forces the counter-QD design
-  // of design/step3.md §5, same as it will for the walk).
+#ifdef AGGREGATION
+  // htram-aware completion of the union_request cascade: items parked in
+  // tram buffers are invisible to RTS-level QD (design note §6.3a), so a
+  // bare CkWaitQD could fire with unions still buffered and silently drop
+  // merges. UnionFindLib::quiesce runs htram's flush+QD+count loop (QD ->
+  // flush all buffers -> QD -> reduce residual buffer counts -> repeat
+  // until zero), which subsumes the plain CkWaitQD of the htram-off path.
+  {
+    // This driver runs on PE 0; UFNodeMap places element 0 on node 0's
+    // first PE, so the local branch is present here.
+    UnionFindLib* lib0 = uf_proxy[0].ckLocal();
+    CkEnforce(lib0 != nullptr);
+    CkCallbackResumeThread uf_done;
+    lib0->quiesce(uf_done);
+  } // ~CkCallbackResumeThread blocks until the quiesce callback fires
+#else
+  // Message-driven completion: every send above is entry-method-driven
+  // (plain sends, htram off), so RTS-level QD is sound here exactly as the
+  // v1 walk's CkWaitQD is (design/step4.md QD strategy).
   CkWaitQD();
+#endif
 
   uf_proxy.find_components(CkCallbackResumeThread());
   double t3 = CkWallTimer();

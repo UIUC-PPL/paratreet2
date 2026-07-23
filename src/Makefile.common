@@ -9,6 +9,17 @@ HTRAM_DIR = $(BASE_PATH)/../htram
 PREFIX_LIB_DIR = $(UNION_FIND_DIR)/prefixLib
 
 INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I$(PARATREET_PATH) -I$(PREFIX_LIB_DIR) -I$(UNION_FIND_DIR) -I$(HTRAM_DIR) -I.
+
+# htram aggregation for the unionfind sibling. MUST MATCH how ../unionfind was
+# built (its Makefile.common also defaults AGGREGATION on): unionFindLib.h
+# changes class layout under this flag, so a mismatch is an ABI break. Both
+# default ON; to build without htram, use `make AGGREGATION=` HERE AND in
+# ../unionfind, and make clean everywhere in between.
+# -DUNIONFIND rides along because AGGREGATION makes unionFindLib.h include
+# htram_group.h, whose datatype selection needs that macro in every client TU
+# (harmlessly duplicated where OPTS already define it).
+AGGREGATION ?= -DAGGREGATION -DUNIONFIND
+INCLUDES:=$(INCLUDES) $(AGGREGATION)
 CHARM_HOME ?= $(HOME)/charm_reconverse
 
 LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet -L$(UNION_FIND_DIR) -lunionFind -L${PREFIX_LIB_DIR} -lprefix -L${HTRAM_DIR} -lhtram_group_unionfind

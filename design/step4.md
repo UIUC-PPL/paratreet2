@@ -170,6 +170,44 @@ the same argument will eventually need to be revisited for the union
 cascade's completion detection if/when it is aggregated too (out of scope
 this step — no aggregation, per the task's explicit exclusion of htram).
 
+### 4a. htram aggregation ON (2026-07-23) — the revisit happened
+
+Kale's call: turn aggregation on now — with htram's frequent flushes (the
+shipped tram config flushes every 10 us) the small-scale regression risk is
+low, and at multi-billion-particle / 100+-process scale on real networks it
+is likely beneficial, especially on clustered/filament data where UF_2
+traffic grows. Changes:
+
+- `../unionfind` now built with its DEFAULT `make PROFILE=` (AGGREGATION on,
+  profiling off). paratreet2's `src/Makefile.common` gained an `AGGREGATION`
+  toggle (default `-DAGGREGATION -DUNIONFIND`, disable with
+  `make AGGREGATION=`) threaded through src and all examples via INCLUDES —
+  REQUIRED to match the library build because `unionFindLib.h` changes class
+  layout under the flag (ABI). `-DUNIONFIND` rides along because
+  aggregation makes every client TU include `htram_group.h`, whose datatype
+  selection needs it.
+- The union cascade's completion in `runFoFPhase3Dist` is now, under
+  `#ifdef AGGREGATION`, the library's `quiesce()` = htram's htramQuiesce
+  loop (arm QD -> flush all buffers -> QD -> reduce residual buffered-item
+  counts -> repeat until zero -> fire callback), replacing the bare
+  `CkWaitQD()` which is UNSOUND under aggregation (buffered items invisible
+  to QD -> silent dropped unions). htram-off keeps the plain CkWaitQD.
+  Only this one QD needed changing: tram sends occur solely in the
+  boss_send/anchor_send cascade (between fireUF2Edges and find_components);
+  find_components' internal completion and the walk's QD see no tram
+  traffic. The step-3 §5 counter-QD design remains unneeded — htramQuiesce
+  provides equivalent tram-aware termination for the only aggregated phase.
+
+Validation (laptop, classic Converse): fof3 12-run matrix PASSED with the
+"Compiled with aggregation optimizations" banner (72/390/3549); 10k serial
+vs dist match; 1M b0.2 -> 333,889 and b0.8 -> 41,315 both grid-verified;
+5x 10k + 3x 1M-b0.8 multi-process repeats deterministic (QD-race probe);
+fof1/annotate/searchAlgos rebuilt and pass. Timing parity at 1M b0.2:
+uf2 0.342s (off) -> 0.292s (on), walk 1.169 -> 1.085 (run noise; no
+regression). No htram-off uf2 baseline exists for b0.8 (0.619s on).
+Reconverse/Anvil validation still pending — tram + reconverse QD is an
+untested combination (the reconverse gate applies; see charm notes).
+
 ## 5. Harness fix: label-agnostic final comparison
 
 `-u serial`'s gather-to-one UF_2 unions by min tip, so the final label
