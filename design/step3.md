@@ -579,9 +579,42 @@ streaming stays unwarranted at this scale.
 Status: 3b (parking + searcher-identity + counter-QD) is RETIRED unless a
 larger-P run reverses these trends (per-process redundancy or skew turning
 upward). The framework pieces it motivated that are independently useful
-(§6g key-threading) stay. Caveats: sweep tops out at P=16 (240 cores);
-b_factor assumed 0.2 (script default). Phase-3 perf work should target §6f
-(target-side descent) and the low-P working-set superlinearity instead.
+(§6g key-threading) stay. Caveats: sweep tops out at P=16 (240 cores).
+Ritvik confirmed b_factor 0.2 and all rows ok. Phase-3 perf work should
+target §6f (target-side descent) and the low-P working-set superlinearity
+instead.
+
+**Concentration histograms (same runs, 2026-07-23) — the floor is
+structural and the P-growth is a tiny hot tail.** Per-(g,f) log2 descent
+histograms (bin k = pairs with 2^k..2^(k+1)-1 descents), P = 1/2/4/8/16:
+
+```
+P=1:  0:50384 1:15565 2:2392 3:219 4:5
+P=2:  0:50433 1:15591 2:2398 3:231 4:14 5:4 6:1 8:1 9:1 10:1
+P=4:  0:50574 1:15693 2:2434 3:249 4:25 5:12 6:7 7:7 9:2 10:7
+P=8:  0:50632 1:15710 2:2470 3:250 4:33 5:10 6:13 7:6 8:2 9:5 10:7 11:1
+P=16: 0:50790 1:15817 2:2489 3:271 4:42 5:34 6:20 7:11 8:4 9:6 10:5 11:5
+```
+
+Two clean facts:
+- **Bins 0-3 are frozen across P** (within ~1%): ~68.5k pairs, ~98k
+  descents, 73% of pairs with exactly ONE descent — the §6h verification
+  floor confirmed structurally, and maximally SPREAD, so no top-k/parking/
+  splitting mechanism has anything to grab in it.
+- **All P-growth is bins >=4**: tail pairs 5 -> 22 -> 60 -> 77 -> 127, and
+  the tail's descent mass (~36k at P=16 by bin midpoints) equals the total's
+  growth over P=1 (36,464) almost exactly. Total = flat 98k floor + a
+  concentrated concurrency tail that IS the entire P-dependence. The tail is
+  precisely what 3b parking would target: ~1% of walk core-seconds. NO-GO
+  reconfirmed with the mechanism split measured, not inferred.
+
+Corollary: the GIANT-FRAGMENT SPLIT (design note 6.3e) is DEMOTED at
+production b=0.2 — the loopback alarm (§6e: one pair at 56,823 descents,
+bins 13-15) was a b=0.8 percolation artifact; on real LAMBS at b=0.2 the
+hottest pair is bin 11 (<=4,095 descents). Concentration SHAPE replicates
+at scale; magnitude does not justify a mechanism. Watch item: max bin crept
+4 -> 10 -> 10 -> 11 -> 11 over the sweep — revisit if a P~100s run shows
+bin-14+ pairs.
 
 ## 7. Explicitly deferred past 3b
 
