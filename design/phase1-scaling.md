@@ -1,5 +1,17 @@
 # Phase-1 scaling: the flattening is phaseA density skew
 
+**ANVIL 80M CONFIRMATION (2026-07-23, Ritvik's dual-tree-branch sweep,
+PRE-certificate/suppression build = the clean baseline).** phaseA AVERAGE
+scales as textbook 1/P (17.6 -> 8.9 -> 4.3 -> 2.2 -> 1.13 s over P =
+1..16 at 15 PEs/proc) while the MAX PE goes 25.5 -> 4.2 s with max/avg
+growing 1.45 -> 2.1 -> 3.4 -> 3.7 (max/min 13.5 at P=16): phase 1's wall
+is one hot PE; total work is fine — pure density skew, exactly the laptop
+diagnosis. merge() is 2-5 ms at EVERY P on 80M real data: the serial-step
+hypothesis is dead. phaseB ~0.5 s flat. After the dual walk (0.64 s at
+P=16), phase1 + tip_encode + upwardPass (~8.4 s) is ~90% of algorithmic
+time at P=16 — the scaling frontier. The next main-branch Anvil run
+measures the suppression layer against this baseline.
+
 Context: the Anvil 80M sweep (step3.md 6h) showed phase 1 speeding up only
 4.4x on 16x nodes and still flattening — now the dominant phase at scale.
 Laptop investigation, 2026-07-23, 8M inputs, classic Converse (NOTE: netlrts
