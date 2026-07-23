@@ -131,4 +131,38 @@ P=16) is this effect at full size.
 - Reconverse/Anvil untested (same gate as htram).
 - Default stays `-w transposed` pending cluster validation; flip after an
   Anvil A/B (expect the P=1..4 rows of the §6h sweep to compress toward the
-  P=16 row).
+  P=16 row). Keep transposed permanently as the A/B oracle: two independent
+  walk implementations producing bit-identical counts is a standing
+  correctness check.
+
+## Anvil test instructions (branch `dual-tree`)
+
+This branch = main (which already includes htram-aggregation-ON, step4.md
+4a) + the dual walk. Build:
+
+1. `unionfind`: rebuild aggregation-ON — `make clean && make PROFILE=`
+   (AGGREGATION defaults on there). htram must be built first (unchanged).
+2. `paratreet2`: `git fetch && git checkout dual-tree`; then
+   `make clean && make` in src/ and examples/fof3 (CHARM_HOME defaults to
+   $HOME/charm_reconverse). -DAGGREGATION now defaults ON in paratreet2 and
+   MUST match the unionfind build (ABI); htram-off requires
+   `make AGGREGATION=` in BOTH trees plus cleans.
+3. Reconverse gate FIRST (two untested combinations: tram+reconverse QD,
+   dual+reconverse resume path): a small multi-node run, e.g.
+   `FoF3 -f 100k.tipsy -d oct -u dist -w dual` on 2+ nodes, then the same
+   with `-w transposed`; counts must match each other and the known 100k
+   value, the banner must say "Compiled with aggregation optimizations",
+   and the FOF3STAT config line shows `walk dual`/`walk transposed`.
+4. The A/B that decides the default: the §6h sweep (80M LAMBS, 15 PEs/proc,
+   P = 1 2 4 8 16, b_factor 0.2) run twice — add `-w dual` / `-w transposed`
+   to the LAUNCH line of examples/fof3/redundancy_sweep.sh (the script now
+   echoes every FOF3STAT block, so phase times, balance lines, and
+   histograms all land in the table output this time). Compare walk_s
+   between walks per P, and component counts across ALL runs (stats-mode
+   determinism lines must be identical). Expected: transposed P=1 ~84s
+   compresses to single digits under dual; P=16 roughly unchanged. The uf2
+   column doubles as the htram-on-vs-off comparison against the 2026-07-23
+   logs (expect parity at these edge counts).
+5. Watch: FOF3STAT memory_MB (dual's pair stack), any hang in the walk or
+   uf2 phase (reconverse QD is the temperamental partner), and per-process
+   balance lines (dual has no parallel-help/pause machinery yet).
