@@ -616,6 +616,43 @@ at scale; magnitude does not justify a mechanism. Watch item: max bin crept
 4 -> 10 -> 10 -> 11 -> 11 over the sweep — revisit if a P~100s run shows
 bin-14+ pairs.
 
+**Cluster phase division (same runs, 2026-07-23): THE CRITICAL PATH HAS
+INVERTED — phase 1 is now the bottleneck at scale.** Full `time_s` blocks
+from Ritvik's logs (seconds; htram-off build — these are also the baseline
+for the post-aggregation Anvil comparison):
+
+| P  | phase1 | tip_encode | upwardPass | walk   | uf2   | relabel |
+|----|--------|------------|------------|--------|-------|---------|
+| 1  | 25.678 | 17.846     | 19.694     | 84.089 | 0.812 | 0.255   |
+| 2  | 13.800 | 11.376     | 12.264     | 29.781 | 0.572 | 0.307   |
+| 4  | 9.593  | 4.890      | 5.173      | 7.730  | 0.318 | 0.091   |
+| 8  | 7.818  | 2.087      | 2.151      | 2.795  | 0.170 | 0.045   |
+| 16 | 5.835  | 1.418      | 1.578      | 1.145  | 0.143 | 0.091   |
+
+(component_histogram 1.9-3.2s is harness reporting, excluded; edge_gather/
+loadCache/fragcheck/tip_sentinel all negligible.)
+
+- **uf2 is sub-second and FALLS with P** (0.81 -> 0.14; P=1 = pure fixed
+  overhead, zero edges). UF_2 definitively a non-factor at this scale;
+  htram's justification stays the multi-billion/filament extrapolation.
+- **The walk strong-scales superbly** (73x on 16x nodes, superlinear — the
+  low-P working-set effect again) and is down to 11% of algorithmic time.
+- **Phase 1 scales at only 4.4x on 16x nodes and is STILL FLATTENING**
+  (8 -> 16 procs: 1.34x). At P=16 phase1 (5.8s) + tip_encode (1.4s) +
+  upwardPass (1.6s) = 8.8s = ~86% of the ~10.2s algorithmic total, vs the
+  walk's 1.1s. The laptop picture (phase1 "nearly free" at 4%) does not
+  transfer: at production P, phase 1 IS the FoF runtime.
+- tip_encode/upwardPass scale ~12.5x — acceptable, though their P=1 costs
+  sit in the same cache-thrash regime as the walk's.
+
+Undiagnosed: whether phase 1's flattening is (a) the per-process SERIAL
+merge step of the frozen-phase scheme, (b) per-PE skew on clustered data,
+or (c) a term scaling with N not N/P. The discriminator — `FOF3STAT
+balance: phaseA_s/phaseB_s min/avg/max over PEs` — is already printed and
+sits in Ritvik's same logs; get those 5 lines before designing a fix.
+Consequence for priorities: dual-tree (§6f) now optimizes an 11% slice;
+PHASE-1 STRONG SCALING is plausibly the bigger production lever.
+
 ## 7. Explicitly deferred past 3b
 
 htram aggregation for edge emission (counters above are already

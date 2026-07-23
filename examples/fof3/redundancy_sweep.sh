@@ -68,5 +68,10 @@ for P in $PROCS; do
   fi
   printf '%-6s %-6s %-7s %14s %9s %8s %-28s %s\n' \
     "$P" "$PPN" "$NPE" "${total:-ERR}" "${ratio:-ERR}" "${walk:-ERR}" "${bal:-ERR}" "$status"
+  # Echo the full stat blocks per run: the tabulated columns are a summary,
+  # but the phase division (all time_s lines), the per-PE skew (balance
+  # lines), and the concentration histogram have each been needed after the
+  # fact (design/step3.md 6h twice) — never make the logs the only copy.
+  echo "$out" | grep -E 'FOF3STAT (time_s|balance|redundancy_concentration|edges|fragments|config):' | sed "s/^/# P=$P /"
   sleep "$SETTLE"
 done
