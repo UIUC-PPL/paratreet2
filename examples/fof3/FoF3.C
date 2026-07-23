@@ -65,8 +65,17 @@ using namespace paratreet;
                0.5 * (double)pbc_period);
     }
     double t0 = CkWallTimer();
-    paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b, pbc);
+    paratreet::FoFPhase1Stages p1s;
+    paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b, pbc,
+                            &p1s);
     double t1 = CkWallTimer();
+    // Stage decomposition of the phase1 total (barrier-to-barrier walls;
+    // the phase-1 scaling question of design/step3.md 6h: merge is the
+    // per-process SERIAL step, relabel/phaseA/phaseB are parallel).
+    CkPrintf("FOF3STAT time_s: phase1_stages reset %.3f register %.3f "
+             "phaseA %.3f phaseB %.3f merge %.3f relabel %.3f\n",
+             p1s.reset, p1s.register_s, p1s.phaseA, p1s.phaseB, p1s.merge,
+             p1s.relabel);
 
     // Step 4 (-u dist; design/step4.md "Tip encoding"): renumber tips to
     // (owning_process << 40) | dense_index BEFORE upwardPass/loadCache, so

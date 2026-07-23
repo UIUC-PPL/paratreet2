@@ -1086,26 +1086,46 @@ private:
 
 namespace paratreet {
 
+// Per-stage wall times of runFoFPhase1 (barrier-to-barrier on the driving
+// thread, so each includes its reduction latency and is bounded by the
+// SLOWEST PE/process — the right decomposition for the phase-1 scaling
+// question, design/step3.md 6h: which stage stops speeding up with P).
+struct FoFPhase1Stages {
+  double reset = 0, register_s = 0, phaseA = 0, phaseB = 0, merge = 0,
+         relabel = 0;
+};
+
 // Convenience driver for the full phase-1 sequence. Must be called from a
 // [threaded] entry method (uses blocking callbacks), between tree build and
 // the next rebuild/reset (registered particle blocks must stay alive).
+// `stages`, if non-null, receives the per-stage wall times.
 template <typename Data>
 void runFoFPhase1(CProxy_Subtree<Data> subtrees,
                   CProxy_FoFPhase1<Data> fof,
                   CProxy_FoFPhase1Node<Data> fof_node,
                   double linking_length,
-                  Vector3D<Real> period = Vector3D<Real>(0, 0, 0)) {
+                  Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
+                  FoFPhase1Stages* stages = nullptr) {
   double b2 = linking_length * linking_length;
+  FoFPhase1Stages local;
+  double t = CkWallTimer();
   fof_node.reset(CkCallbackResumeThread());
   fof.reset(CkCallbackResumeThread());
   // PBC (design/pbc.md): broadcast the box period to every PE branch before
   // phaseA. Default {0,0,0} = open boundaries (exact current behavior).
   fof.setPeriod(period, CkCallbackResumeThread());
+  local.reset = CkWallTimer() - t; t = CkWallTimer();
   subtrees.registerFoF(fof, CkCallbackResumeThread());
+  local.register_s = CkWallTimer() - t; t = CkWallTimer();
   fof.phaseA(b2, CkCallbackResumeThread());
+  local.phaseA = CkWallTimer() - t; t = CkWallTimer();
   fof.phaseB(b2, CkCallbackResumeThread());
+  local.phaseB = CkWallTimer() - t; t = CkWallTimer();
   fof_node.merge(CkCallbackResumeThread());
+  local.merge = CkWallTimer() - t; t = CkWallTimer();
   fof.relabel(CkCallbackResumeThread());
+  local.relabel = CkWallTimer() - t;
+  if (stages) *stages = local;
 }
 
 // Convenience driver for the fragment-size histogram. Run after
