@@ -83,7 +83,16 @@ public:
   // Balanced co-descent: hold the target while the (deeper-rooted global)
   // source catches up, then split both sides together -- keeps the compared
   // boxes size-matched so internal x internal certificates fire early.
+  // (Superseded by SplitLargerOnly below when both are set; kept for the
+  // trait-complete record.)
   static constexpr const bool ForceEvenDepth = true;
+  // 8-way alternating split, closest-child-first (Traverser.h): the 64-way
+  // joint product was only ~5% selective at its leaf frontier (20.4M leaf
+  // pairs -> 994k survivors at 1M b0.2; design/dual-tree.md) -- an extra
+  // pruning test per single-level refinement trades a few more internal
+  // tests for far less leaf-level chaff, and closest-first exploration finds
+  // witnesses early so SEEN suppression covers the rest of the expansion.
+  static constexpr const bool SplitLargerOnly = true;
 
   CProxy_FoFPhase1<FragData> fof;
   double b2 = 0.0;

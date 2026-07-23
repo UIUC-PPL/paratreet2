@@ -55,6 +55,30 @@ Two supporting fixes that also stand alone:
    misroute. Latent until fof3 -w dual became the first app to mix both walk
    types in one run.
 
+## v2: alternating split + closest-first ordering (same day, after review)
+
+Kale's review raised two points against the v1 64-way joint split: quantify
+its selectivity loss, and ask whether child pairs are explored
+closest-boxes-first (they were not — plain LIFO, Morton order; the design
+note §6.2 priority idea was never built).
+
+Quantified (1M b0.2, from the pre/post-leaf-gate counter deltas): v1 dual
+made 2.4x FEWER internal-level tests than transposed (5.76M vs 13.6M) but
+its leaf frontier was only 4.9% selective vs transposed's 16% — 20.4M leaf
+pairs generated, 19.4M chaff — because the last test compares equal-depth
+boxes ~2x leaf size on both sides. Net +40% total tests.
+
+Fix (Traverser.h, opt-in trait `SplitLargerOnly`, same idiom as
+maybeSetKeys — trait-less visitors keep the old behavior bit-for-bit):
+split ONLY the shallower (larger-box) side per step (8-way alternating, tie
+-> source), inserting a pruning test at every single-level refinement; and
+push the 8 children farthest-first so the LIFO stack explores the
+closest-box pair FIRST (dualBoxMinDist2 on the generic Data::box) — the
+local form of §6.2's witness-first priority, so SEEN suppression covers the
+rest of the expansion. Effect at 1M b0.2: total tests 25.2M -> 7.9M (2.3x
+FEWER than transposed now), suppression prunes 209k -> 53k, same_frag 1.0M
+-> 395k (witnesses land before siblings are even generated).
+
 ## Results (laptop, 2026-07-23, classic Converse, htram-on build)
 
 Identical outputs everywhere: 100/1k/10k grid-verified single- and
@@ -63,20 +87,23 @@ grid-verified; 8M/16M stats-mode component count + max_size + full histogram
 bit-identical to the transposed walk (2,657,656/2,055,507 and
 5,317,213/4,094,096).
 
-Walk time (seconds), transposed vs dual, leaf gate active in both:
+Walk time (seconds), transposed vs dual v1 (64-way joint split) vs dual v2
+(alternating split + closest-first), leaf gate active in all:
 
-| config               | transposed | dual  | ratio |
-|----------------------|-----------|-------|-------|
-| 1M  b0.2, 4proc x 2PE | 1.035     | 1.177 | 0.88x (dual slower) |
-| 1M  b0.8, 4proc x 2PE | 0.456     | 0.431 | 1.06x |
-| 8M  b0.2, +p2 (1proc) | 43.53     | 3.07  | **14.2x** |
-| 8M  b0.2, 4proc x 2PE | 4.59      | 2.84  | 1.6x  |
-| 16M b0.2, +p2 (1proc) | 159.15    | 6.36  | **25.0x** |
+| config               | transposed | dual v1 | dual v2 | v2 speedup |
+|----------------------|-----------|---------|---------|------------|
+| 1M  b0.2, 4proc x 2PE | 1.035     | 1.177   | 1.092   | 0.95x (par) |
+| 1M  b0.8, 4proc x 2PE | 0.456     | 0.431   | 0.481   | ~par (noise) |
+| 8M  b0.2, +p2 (1proc) | 43.53     | 3.07    | 2.11    | **20.7x** |
+| 8M  b0.2, 4proc x 2PE | 4.59      | 2.84    | 2.58    | 1.8x  |
+| 16M b0.2, +p2 (1proc) | 159.15    | 6.36    | 4.26    | **37.4x** |
 
-Dual is LINEAR in N at fixed cores (8M -> 16M: 3.07 -> 6.36); transposed is
-superlinear (43.5 -> 159). At small N-per-PE the two are comparable (dual
-~13% slower at 1M b0.2 — the 64-way joint-split fanout near threshold b is
-slightly less selective than per-leaf tests; it flips to a dual win by b0.8).
+Dual is LINEAR in N at fixed cores (v2: 2.11 -> 4.26 for 8M -> 16M);
+transposed is superlinear (43.5 -> 159). At 1M-per-8PE dual v2 is at parity
+despite doing 2.3x fewer tests — transposed's flat bucket sweep is very
+cache-friendly at small leaves-per-partition, while the dual stack pays
+push/pop + sort overhead per node; the gap closes as local N grows and
+transposed's sweep degrades.
 
 ## The superlinearity root cause (solved)
 
