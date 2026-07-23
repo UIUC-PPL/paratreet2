@@ -1,5 +1,40 @@
 # Phase-1 scaling: the flattening is phaseA density skew
 
+## NEXT ANVIL SWEEP (merged main, 2026-07-23) — the suppression-at-80M run
+
+Main now carries everything: dual walk BY DEFAULT, phase-1 certificates +
+connectivity suppression, htram-on, stage timers. One sweep, same command
+as before, NO -w flag needed:
+
+1. `git checkout main && git pull`; unionfind unchanged (keep the
+   aggregation-on build); paratreet2: `make clean && make` in src/ AND
+   examples/fof3 (headers/.ci changed — no header-dep tracking).
+2. Sanity: any small run; the FOF3STAT config line must say `walk dual`.
+3. Sweep: INPUT=<lambb.00500> PPN=15 PROCS="1 2 4 8 16" BFACTOR=0.2
+   LAUNCH='srun --unbuffered --mpi=pmi2 -n {P} ./FoF3 -f $INPUT -d oct
+   -u dist -b $BFACTOR +ppn {PPN}' ./redundancy_sweep.sh
+   If the allocation permits, extend PROCS with 32 (and 64): the skew
+   trend at higher P is exactly the placement-decision data.
+
+READOUT (vs the 2026-07-23 pre-suppression baseline in the header above):
+- CORRECTNESS: fragments/components lines must match that sweep's values
+  at the same P, bit for bit.
+- THE MEASUREMENT: phase1_stages phaseA and balance phaseA_s min/avg/max
+  against baseline max 25.5/13.6/9.2/7.3/4.2 and avg 17.6/8.9/4.3/2.2/1.13
+  (P = 1/2/4/8/16). Certificates + suppression should cut the hot-PE max
+  (laptop: ~6x off the hot PE's excess at dense b); what survives at real
+  80M density is the decision variable.
+- Also expect: walk_s ~ the dual numbers (4.0 -> 0.64), uf2 ~0.3-0.9s,
+  tip_encode/upwardPass roughly unchanged.
+
+DECISION RULE for the next work item:
+- phaseA max/avg collapses to ~1-1.5 => phase-1 skew is solved by
+  suppression; the frontier moves to tip_encode + upwardPass (~3.4s at
+  P=16) and structural items (FoF module extraction, htram tuning).
+- max/avg stays >~2-3 => density-weighted subtree->PE placement (design
+  note §7 static cost model, fix direction 1 below) is the next build,
+  with intra-process work sharing as its complement.
+
 **ANVIL 80M CONFIRMATION (2026-07-23, Ritvik's dual-tree-branch sweep,
 PRE-certificate/suppression build = the clean baseline).** phaseA AVERAGE
 scales as textbook 1/P (17.6 -> 8.9 -> 4.3 -> 2.2 -> 1.13 s over P =
