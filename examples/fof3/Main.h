@@ -41,12 +41,13 @@ class ExMain: public paratreet::Main<FragData> {
   CheckMode check_mode = CheckMode::Auto;
   enum class UF2Mode { Dist, Serial };
   UF2Mode uf2_mode = UF2Mode::Dist;
-  // Phase-3 walk mechanism (-w; design/dual-tree.md): transposed (default,
-  // the validated startDown source-tree-vs-flat-target-leaves walk) or dual
-  // (Subtree::startDual symmetric dual-tree walk -- the design/step3.md 6f
-  // lever; prototype, -u dist only).
+  // Phase-3 walk mechanism (-w; design/dual-tree.md): dual (DEFAULT since
+  // the Anvil 80M A/B — 20x/15x/7.6x/2.9x/1.6x faster than transposed at
+  // P = 1/2/4/8/16, identical outputs; -u dist only) or transposed (the
+  // original startDown source-tree-vs-flat-target-leaves walk, kept
+  // permanently as the independent A/B oracle).
   enum class WalkMode { Transposed, Dual };
-  WalkMode walk_mode = WalkMode::Transposed;
+  WalkMode walk_mode = WalkMode::Dual;
   // Min component size for reporting (-m); 0 = report everything (default).
   int fof_min_component_size = 0;
   // Periodic boundary conditions (-P <L>; design/pbc.md): cubic box period

@@ -129,11 +129,38 @@ P=16) is this effect at full size.
 - -u serial + -w dual is rejected (CkAbort); the dual walk is wired to the
   dist path only.
 - Reconverse/Anvil untested (same gate as htram).
-- Default stays `-w transposed` pending cluster validation; flip after an
-  Anvil A/B (expect the P=1..4 rows of the §6h sweep to compress toward the
-  P=16 row). Keep transposed permanently as the A/B oracle: two independent
-  walk implementations producing bit-identical counts is a standing
-  correctness check.
+- ~~Default stays `-w transposed` pending cluster validation~~ **FLIPPED to
+  `-w dual` after the Anvil A/B below.** Transposed stays permanently as the
+  A/B oracle: two independent walk implementations producing bit-identical
+  counts is a standing correctness check.
+
+## Anvil 80M A/B results (2026-07-23, Ritvik; the flip decision)
+
+80M LAMBS (lambb.00500), 15 PEs/proc, b_factor 0.2, htram-on, reconverse.
+Identical outputs between walks at every P (Ritvik-confirmed; fragments
+lines bit-identical). walk_s:
+
+| P  | transposed | dual  | speedup |
+|----|-----------|-------|---------|
+| 1  | 80.03     | 4.00  | 20.0x   |
+| 2  | 28.83     | 1.90  | 15.2x   |
+| 4  | 7.45      | 0.975 | 7.6x    |
+| 8  | 2.51      | 0.855 | 2.9x    |
+| 16 | 1.00      | 0.635 | 1.6x    |
+
+Dual wins at EVERY P — better than the laptop extrapolation (which only
+promised compression of the low-P rows). Also: the redundancy
+concentration collapses under dual (max_per_pair 32-37 vs transposed's
+1621-5650 spikes) — closest-first exploration resolves hot pairs
+immediately; 3b is buried for good. The reconverse gate PASSED: ten
+multi-node runs through the tram quiesce loop and the dual resume path,
+no hangs. htram-on uf2 at P=16 measured 0.44-0.55s vs 0.14s htram-off
+(the 10us flush machinery is a small net cost at 33k edges — harmless,
+kept as insurance for multi-billion-particle scale).
+
+Post-flip picture at P=16: walk 0.64s; phase1 + tip_encode + upwardPass
+~8.4s = ~90% of algorithmic time — phase 1 is the scaling frontier
+(design/phase1-scaling.md; the suppression layer on main targets it).
 
 ## Anvil test instructions (branch `dual-tree`)
 
