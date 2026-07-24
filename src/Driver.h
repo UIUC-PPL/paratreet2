@@ -140,6 +140,14 @@ public:
     // Create Partitions
     CkArrayOptions partition_opts(n_partitions);
     treespec.ckLocalBranch()->getPartitionDecomposition()->setArrayOpts(partition_opts, {}, false);
+    // setArrayOpts may have ckNew'd a fresh array-map GROUP. Barrier before
+    // creating the array that uses it: group creation is only guaranteed
+    // locally, and on a runtime without group-dependency buffering
+    // (reconverse) the array-construction broadcast can reach a remote
+    // process before the map branch exists there -> CkAbort "Local branch
+    // of array map is NULL!" (first seen at 32 processes on Anvil,
+    // 2026-07-24). Classic Converse delays such messages; do not rely on it.
+    CkStartQD(CkCallbackResumeThread());
     partitions = CProxy_Partition<Data>::ckNew(
       n_partitions, cache_manager, resumer, calculator,
       this->thisProxy, matching_decomps, partition_opts
@@ -175,6 +183,9 @@ public:
     CkArrayOptions subtree_opts(n_subtrees);
     if (matching_decomps) subtree_opts.bindTo(partitions);
     treespec.ckLocalBranch()->getSubtreeDecomposition()->setArrayOpts(subtree_opts, partition_locations, !matching_decomps);
+    // Same map-group creation barrier as for Partitions above (reconverse
+    // has no group-dependency buffering; see that comment).
+    CkStartQD(CkCallbackResumeThread());
     subtrees = CProxy_Subtree<Data>::ckNew(
       CkCallbackResumeThread(),
       universe.n_particles, n_subtrees, n_partitions,

@@ -496,7 +496,12 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
                                         bool dual_walk = false,
                                         CProxy_Subtree<FragData> subtrees =
-                                            CProxy_Subtree<FragData>()) {
+                                            CProxy_Subtree<FragData>(),
+                                        // Pre-created UFNodeMap group (see
+                                        // unionFindInitOnePerNode overload:
+                                        // inline map creation races with the
+                                        // array construction on reconverse).
+                                        CkGroupID uf_node_map_gid = CkGroupID()) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
   partitions.verifySharedLeaves(CkCallbackResumeThread());
@@ -580,8 +585,13 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // via UFNodeMap; created fresh per call (fof3 always runs a single
   // iteration, so no cross-iteration reuse is needed -- see design/step4.md
   // deviations).
+  // Use the caller's pre-created UFNodeMap when given (race-safe on
+  // reconverse); fall back to the compatibility form otherwise.
   CProxy_UnionFindLib uf_proxy =
-      UnionFindLib::unionFindInitOnePerNode(CkCallbackResumeThread());
+      uf_node_map_gid.isZero()
+          ? UnionFindLib::unionFindInitOnePerNode(CkCallbackResumeThread())
+          : UnionFindLib::unionFindInitOnePerNode(
+                CkCallbackResumeThread(), CProxy_UFNodeMap(uf_node_map_gid));
 
   fof.initUF2(uf_proxy, CkCallbackResumeThread());
   fof.fireUF2Edges(uf_proxy, CkCallbackResumeThread());

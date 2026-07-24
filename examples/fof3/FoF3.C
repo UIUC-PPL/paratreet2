@@ -22,6 +22,15 @@ using namespace paratreet;
   // annotation-validity CkEnforce in FoFEdgeVisitor trips if this ordering
   // regresses.
   void ExMain::preTraversalFn(ProxyPack<FragData>& proxy_pack) {
+    // Create the UF_2 placement-map group NOW, long before phase 3 uses it:
+    // the whole phase-1 barrier chain sits between this ckNew and the array
+    // creation that consults the map, so its branches exist on every process
+    // by then. Creating it inline at array-creation time races on runtimes
+    // without group-dependency buffering (reconverse: CkAbort "Local branch
+    // of array map is NULL!", first seen at 32 processes).
+    if (uf2_mode == UF2Mode::Dist)
+      uf_node_map_gid = CProxy_UFNodeMap::ckNew();
+
     // Linking length from the universe box: b = 0.2 * (V/N)^(1/3). The
     // universe is not passed to preTraversalFn; read it from the
     // ThreadStateHolder branch on this PE (set during decomposition, same
@@ -456,7 +465,7 @@ using namespace paratreet;
     FoFPhase3Result pr = uf2_mode == UF2Mode::Dist
         ? paratreet::runFoFPhase3Dist(proxy_pack.partition, fof, fof_node, b, pbc,
                                       walk_mode == WalkMode::Dual,
-                                      proxy_pack.subtree)
+                                      proxy_pack.subtree, uf_node_map_gid)
         : paratreet::runFoFPhase3(proxy_pack.partition, fof, b, pbc);
     CkPrintf("FOF3STAT edges: emitted %ld sent %ld unique %ld tips_remapped %ld\n",
              pr.edges_emitted, pr.edges_sent, pr.edges_unique, pr.tips_remapped);

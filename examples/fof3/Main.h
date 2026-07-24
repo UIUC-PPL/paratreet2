@@ -50,6 +50,10 @@ class ExMain: public paratreet::Main<FragData> {
   WalkMode walk_mode = WalkMode::Dual;
   // Min component size for reporting (-m); 0 = report everything (default).
   int fof_min_component_size = 0;
+  // Pre-created UF_2 placement-map group (see preTraversalFn): created early
+  // so its branches exist everywhere before phase 3's array creation
+  // consults it (reconverse has no group-dependency buffering).
+  CkGroupID uf_node_map_gid;
   // Periodic boundary conditions (-P <L>; design/pbc.md): cubic box period
   // applied on all three axes. Default 0 = open boundaries (PBC off, exact
   // current behavior; the periodic branch is a no-op). Threaded into phase 1
