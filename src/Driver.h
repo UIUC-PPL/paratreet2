@@ -141,12 +141,24 @@ public:
     CkArrayOptions partition_opts(n_partitions);
     treespec.ckLocalBranch()->getPartitionDecomposition()->setArrayOpts(partition_opts, {}, false);
     // setArrayOpts may have ckNew'd a fresh array-map GROUP. Barrier before
-    // creating the array that uses it: group creation is only guaranteed
-    // locally, and on a runtime without group-dependency buffering
-    // (reconverse) the array-construction broadcast can reach a remote
-    // process before the map branch exists there -> CkAbort "Local branch
-    // of array map is NULL!" (first seen at 32 processes on Anvil,
-    // 2026-07-24). Classic Converse delays such messages; do not rely on it.
+    // creating the array that uses it. Context (Kale): creations made in
+    // MAINCHARE CONSTRUCTORS are batched from PE 0 with sequence info and
+    // installed everywhere in creation order before the scheduler runs
+    // anything else — group-then-array is unconditionally safe there. This
+    // Driver creates maps/arrays POST-INIT from a threaded entry (the tree
+    // rebuilds per iteration), where ordering rests only on per-message
+    // group DEPENDENCIES — and those cover the plain setMap path
+    // (CkCreateArray chains locCache -> map) but NOT bindTo + fresh map:
+    // bindTo reuses the bound-to array's location manager, skips that
+    // block, and declares no dependency on the new map, so the CkArray
+    // constructor's map lookup (ckarray.C:912) races the map-creation
+    // broadcast: CkAbort "Local branch of array map is NULL!" on a remote
+    // process. Both classic Converse and reconverse (shared Ck layer);
+    // probability grows with process count (seen at 32 on Anvil,
+    // 2026-07-24; never lost on loopback). The Subtree creation below
+    // (bindTo(partitions) + fresh DecompArrayMap) is the exposed
+    // combination; this Partition barrier is defense in depth. Upstream
+    // charm candidate: bindTo + fresh setMap should dep on the map.
     CkStartQD(CkCallbackResumeThread());
     partitions = CProxy_Partition<Data>::ckNew(
       n_partitions, cache_manager, resumer, calculator,
@@ -183,8 +195,10 @@ public:
     CkArrayOptions subtree_opts(n_subtrees);
     if (matching_decomps) subtree_opts.bindTo(partitions);
     treespec.ckLocalBranch()->getSubtreeDecomposition()->setArrayOpts(subtree_opts, partition_locations, !matching_decomps);
-    // Same map-group creation barrier as for Partitions above (reconverse
-    // has no group-dependency buffering; see that comment).
+    // Same map-group creation barrier as for Partitions above — and THIS is
+    // the exposed site: bindTo(partitions) + the fresh DecompArrayMap from
+    // setArrayOpts is exactly the unprotected combination (see the comment
+    // at the Partition creation).
     CkStartQD(CkCallbackResumeThread());
     subtrees = CProxy_Subtree<Data>::ckNew(
       CkCallbackResumeThread(),
