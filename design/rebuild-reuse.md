@@ -46,7 +46,20 @@ disposable per-rebuild objects," not a necessity.
    time — inside Charm++'s sequenced-installation regime, so it exists
    everywhere forever) with an `update(pe_intervals)` entry invoked each
    rebuild. Eliminates the bindTo+fresh-setMap race BY CONSTRUCTION (no
-   post-init group creation at all) and removes the QD barriers.
+   post-init group creation at all).
+
+   Note on synchronization mechanisms for the interim (resolved
+   2026-07-24): the first fix used CkStartQD — correct but too broad a
+   condition (quiescence requires that no other computation is in flight,
+   which a framework path must not assume). A reduction over the map
+   branches ("resume when all maps are installed", Kale's suggestion) is
+   NOT available for array maps: CkArrayMap derives from IrrGroup, not
+   Group, so map constructors have no contribute(). The mechanism that IS
+   provided, and is better than any barrier: CkEntryOptions::
+   setGroupDepID(map_gid) on the array's ckNew — CkCreateArray copies
+   user group dependencies onto the CkArray creation, so each PE buffers
+   the array-creation message until its map branch exists. The message
+   waits; no thread waits. This is the current Driver::decompose code.
 2. **findSplitters over the Partitions, not the Readers**: the dump-back
    round trip exists only because the splitter code is written to read
    from the Reader group. Histogramming over the particles where they
