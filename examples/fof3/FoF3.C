@@ -651,6 +651,34 @@ using namespace paratreet;
              "CmiMemoryUsage, process-wide under SMP)\n",
              ms.min_bytes / 1e6, ms.avg_bytes / 1e6, ms.max_bytes / 1e6,
              CkNumPes());
+
+    // Cache-specific memory (CacheManager::cacheStats): what the walk
+    // FETCHED beyond what the process owns. amplification = total cached
+    // particle copies / N = average fraction of the whole dataset each
+    // process ends up holding a copy of. max_MB flags a hot process (dense
+    // region pulls more of the tree). Post-QD read: phase-separated from
+    // any fills, per the cache concurrency contract.
+    {
+      void* result = nullptr;
+      proxy_pack.cache.cacheStats(CkCallbackResumeThread(result));
+      CkReductionMsg* msg = (CkReductionMsg*)result;
+      CkReduction::tupleElement* elems = nullptr;
+      int n_elems = 0;
+      msg->toTuple(&elems, &n_elems);
+      CkEnforce(n_elems == 2);
+      const long* sums = (const long*)elems[0].data;
+      long max_bytes = *(const long*)elems[1].data;
+      int procs = CkNumNodes();
+      double N = (double)universe.n_particles;
+      CkPrintf("FOF3STAT cache: pool_MB %.1f used_nodes %ld cached_leaves %ld "
+               "cached_particles %ld amplification %.3f avg_MB %.1f max_MB %.1f "
+               "(totals over %d processes)\n",
+               sums[0] / 1e6, sums[1], sums[2], sums[3],
+               N > 0 ? sums[3] / N : 0.0, sums[4] / 1e6 / procs,
+               max_bytes / 1e6, procs);
+      delete[] elems;
+      delete msg;
+    }
   }
 
   Real ExMain::getTimestep(BoundingBox& universe, Real max_velocity) {

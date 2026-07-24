@@ -20,6 +20,11 @@ struct NodePool {
   virtual Node<Data>* alloc(Key key, typename Node<Data>::Type type, int depth, int n_particles, Particle* particles, Node<Data>* parent, int tp_index, int cm_index) = 0;
   virtual Node<Data>* alloc(Key key, typename Node<Data>::Type type, SpatialNode<Data> spatial_node, Node<Data>* parent, Particle* particles, int tp_index, int cm_index) = 0;
   virtual void cleanup() = 0;
+  // Memory accounting: bytes of pool blocks allocated (capacity, not just
+  // in-use — blocks are never returned until destruction) and node slots
+  // currently in use.
+  virtual size_t allocatedBytes() const = 0;
+  virtual size_t usedNodes() const = 0;
 };
 
 template <typename Data, size_t BranchFactor>
@@ -58,6 +63,16 @@ private:
     for (auto& elem : list) elem.idx = 0;
     curr = std::begin(list);
   }
+public:
+  virtual size_t allocatedBytes() const override {
+    return list.size() * pool_elem_size * sizeof(FullNode<Data, BranchFactor>);
+  }
+  virtual size_t usedNodes() const override {
+    size_t n = 0;
+    for (auto& elem : list) n += elem.idx;
+    return n;
+  }
+private:
 private:
   void append() {
     list.emplace_back();
@@ -142,6 +157,65 @@ public:
   }
   void unlockMaps() {
     if (this->isNodeGroup()) maps_lock.unlock();
+  }
+
+  // Cache memory accounting (app-agnostic). Per-PROCESS (one nodegroup
+  // branch each) totals: node-pool capacity bytes, node slots in use,
+  // cached remote leaves and their copied particles. The walk may fetch far
+  // more nodes/particles than the process owns, and CmiMemoryUsage cannot
+  // separate that overhead — this can. Call at a phase boundary
+  // (quiescence-separated from fills): the same phase-separation contract
+  // as every post-build cache read; maps_lock guards only the leaf_lookup
+  // scan. Contributes a 2-element tuple: sums of {pool_bytes, used_nodes,
+  // cached_leaves, cached_particles, total_bytes} and the max per-process
+  // total_bytes (skew).
+  void cacheStats(const CkCallback& cb) {
+    long pool_bytes = 0, used_nodes = 0;
+    for (auto& p : pools) {
+      pool_bytes += (long)p->allocatedBytes();
+      used_nodes += (long)p->usedNodes();
+    }
+    // Tally by traversing the cache tree itself (leaf_lookup is not
+    // populated on every fetch path): count Cached* nodes and the particle
+    // copies on CachedRemoteLeafs. Post-QD single reader — safe.
+    long cached_leaf_count = 0, cached_particles = 0, cached_nodes = 0;
+    tallyCache(root, cached_nodes, cached_leaf_count, cached_particles);
+    long total_bytes = pool_bytes + cached_particles * (long)sizeof(Particle);
+    long sums[5] = {pool_bytes, cached_nodes, cached_leaf_count,
+                    cached_particles, total_bytes};
+    (void)used_nodes; // pool slots incl. placeholders; cached_nodes is the
+                      // fetched-content count reported instead
+    CkReduction::tupleElement elems[2] = {
+        CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
+        CkReduction::tupleElement(sizeof(long), &total_bytes,
+                                  CkReduction::max_long)};
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(elems, 2);
+    msg->setCallback(cb);
+    this->contribute(msg);
+  }
+
+  // Recursive tally over the cache tree: fetched (Cached*) nodes, cached
+  // remote leaves, and their copied particles. Descends everywhere — local
+  // subtrees can hang below cached boundary nodes and vice versa.
+  void tallyCache(Node<Data>* n, long& cached_nodes, long& cached_leaves_n,
+                  long& cached_particles) {
+    if (n == nullptr) return;
+    switch (n->type) {
+      case Node<Data>::Type::CachedRemoteLeaf:
+        cached_nodes++;
+        cached_leaves_n++;
+        if (n->n_particles > 0) cached_particles += n->n_particles;
+        return;
+      case Node<Data>::Type::CachedRemote:
+      case Node<Data>::Type::CachedBoundary:
+        cached_nodes++;
+        break;
+      default:
+        break;
+    }
+    for (int i = 0; i < n->n_children; i++)
+      tallyCache(n->getChild(i), cached_nodes, cached_leaves_n,
+                 cached_particles);
   }
 
   ~CacheManager() {

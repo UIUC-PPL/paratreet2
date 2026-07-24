@@ -72,6 +72,6 @@ for P in $PROCS; do
   # but the phase division (all time_s lines), the per-PE skew (balance
   # lines), and the concentration histogram have each been needed after the
   # fact (design/step3.md 6h twice) — never make the logs the only copy.
-  echo "$out" | grep -E 'FOF3STAT (time_s|balance|redundancy_concentration|edges|fragments|config):' | sed "s/^/# P=$P /"
+  echo "$out" | grep -E 'FOF3STAT (time_s|balance|redundancy_concentration|edges|fragments|config|memory_MB|cache):' | sed "s/^/# P=$P /"
   sleep "$SETTLE"
 done

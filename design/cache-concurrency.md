@@ -51,3 +51,32 @@ You probably need phase separation instead. If a genuinely new concurrent
 *writer* is required on the hot path, extend the atomic scheme (narrow,
 lock-free) — do not introduce a mutex on the data path. Revisit this note and
 the `CONCURRENCY DESIGN` block atop `CacheManager` before changing any of it.
+
+## Memory accounting + eviction (added 2026-07-24)
+
+The cache can hold far more than the process owns: the walk fetches remote
+subtree copies (nodes into the per-rank FullNodePools, particle copies on
+CachedRemoteLeafs) and nothing is ever evicted during a run. Measured with
+the new `CacheManager::cacheStats` (per-process nodegroup reduction,
+printed as `FOF3STAT cache:` by fof3, post-QD = phase-separated read):
+at 8M / 4 processes under the dual walk, 1.12 GB of pool capacity + 3.1M
+cached particle copies = 39% of the entire dataset duplicated, ~370 MB per
+process — MORE than the ~200 MB of owned particle data. `amplification` in
+the printout = total cached particle copies / N (the average fraction of
+the whole dataset each process holds copies of); expect it to grow with
+process count (more neighbors' shells) — the Anvil sweep now reports it.
+
+EVICTION (deferred until the numbers say otherwise): any mid-walk eviction
+collides with the lock-free design — readers hold raw Node* with no
+refcounts, so entries are effectively pinned while a traversal runs. The
+viable options, in cost order: (a) BETWEEN-PHASE teardown (already exists:
+cleanup()/resetCachedParticles at iteration boundaries — frees everything,
+fine for single-walk apps like FoF); (b) between-phase SELECTIVE eviction
+(walk the tree at a quiescence point, demote cold cached subtrees back to
+Remote placeholders — same phase-separation contract as refreshSubtreeCopy,
+no new concurrency machinery, useful for multi-traversal apps); (c) TRUE
+mid-walk eviction — requires epoch-based reclamation or refcounting on the
+hot path; expensive and against the design; only if a single walk's
+working set ever exceeds memory. For FoF the walk is one shot, so (a)
+suffices today; watch `FOF3STAT cache: max_MB` at scale for the moment (b)
+becomes worth building.
