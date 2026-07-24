@@ -8,6 +8,19 @@ only for the paratreet2-internal specifics that would be noise there. When a
 lesson has both a general kernel and a project detail, the kernel goes to the
 general file and the detail lands here.
 
+## Traversal terminology: source = walked tree, target = local (NOT remote/local)
+
+Settled 2026-07-23 after a review question, by reading old paratreet: in the
+inherited visitor convention `open(source, target)` / `leaf(source, target)`,
+**target is the walking chare's OWN data** (the partition's bucket leaves in
+the transposed walk — GravityVisitor writes its results INTO target — or the
+subtree's live local tree in the dual walk), and **source is the DESCENDED
+global tree**, whose nodes may be local or cache-shipped remote. paratreet2
+kept this unchanged. Do NOT gloss source as "remote": the global tree
+includes the walker's own subtrees, so a source node is only *possibly*
+remote. If a comment needs the locality distinction, say "cached-remote or
+local" for source and "own/local" for target.
+
 ## Two particle copies, two audiences
 
 The framework keeps separate copies of the same particle data for different

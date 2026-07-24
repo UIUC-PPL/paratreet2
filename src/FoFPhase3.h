@@ -153,8 +153,8 @@ public:
     // checks below are belt-and-braces for the case-2 certificate.
     const bool both_uniform = source.data.uniform() && target.data.uniform();
     if (both_uniform) {
-      long g = source.data.min_frag; // remote/source tip
-      long f = target.data.min_frag; // local/target tip
+      long g = source.data.min_frag; // source tip (walked global tree: may be local OR cached-remote)
+      long f = target.data.min_frag; // target tip (this chare's own local leaves/tree)
       if (g == f) {
         // Same tip on both sides: tips are process-local, so this is an
         // intra-process pair phase 1 already unioned; no edge can arise.
