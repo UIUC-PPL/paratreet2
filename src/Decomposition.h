@@ -19,7 +19,7 @@ using SendParticlesFn = std::function<void(int,int,Particle*)>;
 struct Decomposition;
 class DecompArrayMap : public CkArrayMap {
 public:
-  DecompArrayMap(Decomposition*, int, int);
+  DecompArrayMap(Decomposition*, long, int);
   int procNum(int, const CkArrayIndex &idx);
 private:
   std::vector<size_t> pe_intervals;
@@ -100,7 +100,7 @@ private:
 protected:
   std::vector<Splitter> splitters;
   std::vector<int> partition_idxs;
-  int saved_n_total_particles = 0;
+  long saved_n_total_particles = 0; // global count: 64-bit
 };
 
 struct OctDecomposition : public SfcDecomposition {
@@ -157,7 +157,7 @@ private:
 protected:
   std::vector<GenericSplitter> splitters; //dim, splitter value
   size_t depth = 0;
-  int saved_n_total_particles = 0;
+  long saved_n_total_particles = 0; // global count: 64-bit
   std::vector<int> bins_sizes;
   std::vector<int> partition_idxs;
   std::vector<Bin> bins;

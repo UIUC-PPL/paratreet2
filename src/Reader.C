@@ -29,7 +29,8 @@ void Reader::load(std::string input_file, const CkCallback& cb) {
 
     int n_particles = n_total / n_readers;
     int excess = n_total % n_readers;
-    unsigned int start_particle = n_particles * thisIndex;
+    // 64-bit: the product overflows int at ~2.1e9 total particles.
+    long start_particle = (long)n_particles * thisIndex;
     if (thisIndex < (unsigned int)excess) {
       n_particles++;
       start_particle += thisIndex;

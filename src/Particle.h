@@ -6,7 +6,10 @@
 
 struct Particle {
   Key key;
-  int order; // serial number of particle, set by order in initial file (ID)
+  // Serial number of particle, set by order in initial file (ID). 64-bit:
+  // this is the GLOBAL particle id and the value domain of FoF tips; int
+  // overflows at 2.147e9 particles (64-bit audit, 2026-07-25).
+  long order;
   int partition_idx = 0; // Only used when Subtree and Partition have different decomp types
 
   Real mass;

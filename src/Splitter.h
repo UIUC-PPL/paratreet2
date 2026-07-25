@@ -41,7 +41,7 @@ struct GenericSplitter {
   Key 	start_key = Key(0);
   Key 	end_key = (~Key(0));
   Key 	midKey() const {return start_key + (end_key - start_key) / 2;}
-  int 	goal_rank;
+  long 	goal_rank; // rank in [0, N): 64-bit
   bool 	pending = true;
   int 	dim = -1;
   Real  start_float = 0;

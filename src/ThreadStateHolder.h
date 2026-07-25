@@ -11,10 +11,11 @@ public: // these need to be seen by other local chares
   unsigned long long n_node_ints = 0ull;
   unsigned long long n_opens     = 0ull;
   unsigned long long n_closes    = 0ull;
-  unsigned n_partition_particles = 0u;
-  unsigned n_subtree_particles   = 0u;
-  unsigned n_ps_copies           = 0u;
-  unsigned n_ps_shares           = 0u;
+  // 64-bit: process-summed totals reach N (> 2^31 at 2B+ particles).
+  unsigned long n_partition_particles = 0u;
+  unsigned long n_subtree_particles   = 0u;
+  unsigned long n_ps_copies           = 0u;
+  unsigned long n_ps_shares           = 0u;
 
   BoundingBox universe;
 

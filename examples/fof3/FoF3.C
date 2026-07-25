@@ -37,9 +37,9 @@ using namespace paratreet;
     // value Driver::run later passes to traversalFn).
     const BoundingBox& universe = thread_state_holder.ckLocalBranch()->universe;
     double V = universe.box.volume();
-    int N = universe.n_particles;
+    long N = universe.n_particles;
     fof_b = fof_b_factor * std::cbrt(V / (double)N);
-    CkPrintf("FoF linking length b = %g (factor %g, V = %g, N = %d)\n",
+    CkPrintf("FoF linking length b = %g (factor %g, V = %g, N = %ld)\n",
              fof_b, fof_b_factor, V, N);
 
     // Phase 1: register -> phaseA -> phaseB -> merge -> relabel. Tips are
@@ -364,7 +364,7 @@ using namespace paratreet;
     // Phase 1 + upwardPass already ran in preTraversalFn (before loadCache;
     // see the ordering note there). Sanity-check that the linking length
     // computed there matches this universe.
-    int N = universe.n_particles;
+    long N = universe.n_particles;
     double b = fof_b;
     CkEnforce(b > 0.0);
     CkEnforce(std::fabs(b - fof_b_factor *
@@ -389,7 +389,7 @@ using namespace paratreet;
 
     // Self-describing config line: every FOF3STAT block starts with this.
     // pbc = the cubic box period L (0 = open boundaries; design/pbc.md).
-    CkPrintf("FOF3STAT config: pes %d nodes %d N %d b %.12g b_factor %g "
+    CkPrintf("FOF3STAT config: pes %d nodes %d N %ld b %.12g b_factor %g "
              "decomp %s tree %s leafsize %d mode %s pbc %g walk %s iter %d\n",
              CkNumPes(), CkNumNodes(), N, b, fof_b_factor,
              paratreet::asString(conf.decomp_type).c_str(),
@@ -449,7 +449,7 @@ using namespace paratreet;
     // separately by Partition::verifySharedLeaves inside runFoFPhase3[Dist].)
     double tg0 = CkWallTimer();
     if (uf2_mode == UF2Mode::Dist) paratreet::runFoFVerifyEncodedTips(fof);
-    else                           paratreet::runFoFVerifyTips(fof, (long)N);
+    else                           paratreet::runFoFVerifyTips(fof, N);
     double tg1 = CkWallTimer();
     CkPrintf("FOF3STAT time_s: fragcheck %.3f tip_sentinel %.3f\n",
              tc1 - tc0, tg1 - tg0);
@@ -549,7 +549,7 @@ using namespace paratreet;
     // global order of the component's min-order member -- the same canonical
     // representative the serial reference computes -- so compare directly.
     double tv0 = CkWallTimer();
-    CkReductionMsg* msg = gatherRecords(fof, N, "final");
+    CkReductionMsg* msg = gatherRecords(fof, (int)N, "final"); // gated: full verify only runs at N <= kAutoFullMaxN
     double tv1 = CkWallTimer();
     const auto* recs = (const FoFParticleRecord*)msg->getData();
     // Reference partition: exact grid-hash FoF (O(n) at fixed density). At
@@ -558,7 +558,7 @@ using namespace paratreet;
     // the grid runs — the O(n^2) path stays available behind this size
     // threshold).
     std::vector<long> serial_rep;
-    long serial_components = gridReference(recs, N, b, b * b, pbc, serial_rep);
+    long serial_components = gridReference(recs, (int)N, b, b * b, pbc, serial_rep);
     double tv2 = CkWallTimer();
     if (N <= 10000) {
       std::vector<long> n2_rep;

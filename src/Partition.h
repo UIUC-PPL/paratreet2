@@ -63,7 +63,7 @@ struct Partition : public CBase_Partition<Data> {
   void output(CProxy_Writer w, int n_total_particles, CkCallback cb);
   void output(CProxy_TipsyWriter w, int n_total_particles, CkCallback cb);
   void callPerLeafFn(paratreet::PerLeafAble<Data>&, const CkCallback&);
-  void deleteParticleOfOrder(int order) {particle_delete_order.insert(order);}
+  void deleteParticleOfOrder(long order) {particle_delete_order.insert(order);}
   void requestParticleUpdates(int cm_index, std::vector<Key> pKeys);
   void applyOpposingEffects(std::vector<std::pair<Key, Particle::Effect>> effects);
   void verifySharedLeaves(const CkCallback& cb);

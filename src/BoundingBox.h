@@ -13,10 +13,11 @@
  */
 struct BoundingBox {
   OrientedBox<Real> box;
-  int n_particles = 0;
-  int n_sph = 0;
-  int n_dark = 0;
-  int n_star = 0;
+  // Global particle counts: 64-bit (int overflows at 2.147e9 particles).
+  long n_particles = 0;
+  long n_sph = 0;
+  long n_dark = 0;
+  long n_star = 0;
   Real pe;
   Real ke;
   Real mass;

@@ -653,9 +653,8 @@ public:
                  long tb = certTipRep(b);
                  if (ta != tb) {
                    long lo = std::min(ta, tb), hi = std::max(ta, tb);
-                   uint64_t key =
-                       (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
-                   if (seen.insert(key).second) edge_buf.emplace_back(lo, hi);
+                   if (seen.insert(paratreet::packTipPair(lo, hi)).second)
+                     edge_buf.emplace_back(lo, hi);
                  }
                },
                // No connectivity suppression in phaseB: there is no live UF
@@ -1222,8 +1221,8 @@ private:
         long t = p[i].group_number;
         if (t == rep_tip) continue;
         long lo = std::min(rep_tip, t), hi = std::max(rep_tip, t);
-        uint64_t key = (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
-        if (seen.insert(key).second) edge_buf.emplace_back(lo, hi);
+        if (seen.insert(paratreet::packTipPair(lo, hi)).second)
+          edge_buf.emplace_back(lo, hi);
       }
       return;
     }
@@ -1289,9 +1288,10 @@ private:
         long tj = pb[j].group_number;
         if (ti == tj) continue;
         long lo = std::min(ti, tj), hi = std::max(ti, tj);
-        // Tips are particle orders (int), so they pack into 32 bits each.
-        uint64_t key = (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
-        if (seen.insert(key).second) edge_buf.emplace_back(lo, hi);
+        // Exact key (64-bit audit): the old 32|32 packing collides above
+        // 4.29e9 particles, silently suppressing real edges.
+        if (seen.insert(paratreet::packTipPair(lo, hi)).second)
+          edge_buf.emplace_back(lo, hi);
       }
     }
   }
@@ -1317,10 +1317,12 @@ private:
 
   CProxy_FoFPhase1Node<Data> node_proxy;
   std::vector<SubtreeRef> subtrees;
+  // uf_parent stays int: PE-LOCAL flat indices (a single PE never holds
+  // 2^31 particles). flat_order holds GLOBAL orders: 64-bit.
   std::vector<int> uf_parent;  // per-PE UF over the flat index space
-  std::vector<int> flat_order; // flat index -> global particle order
+  std::vector<long> flat_order; // flat index -> global particle order
   std::vector<std::pair<long, long>> edge_buf;
-  std::unordered_set<uint64_t> seen;
+  std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen;
   // Phase-3 cross-process buffers (kept separate from phaseB's, above).
   std::vector<std::pair<long, long>> edge_buf3;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;

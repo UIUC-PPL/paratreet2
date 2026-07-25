@@ -1,7 +1,7 @@
 #include "Writer.h"
 #include "TipsyFile.h"
 
-Writer::Writer(std::string of, int n_particles)
+Writer::Writer(std::string of, long n_particles)
   : output_file(of), total_particles(n_particles)
 {
 }
@@ -37,11 +37,11 @@ void Writer::do_write()
   FILE *fpGrp;
   if (thisIndex == 0 && cur_dim == 0) {
     fp = CmiFopen((output_file+".acc").c_str(), "w");
-    fprintf(fp, "%d\n", total_particles);
+    fprintf(fp, "%ld\n", total_particles);
     fpDen = CmiFopen((output_file+".den").c_str(), "w");
-    fprintf(fpDen, "%d\n", total_particles);
+    fprintf(fpDen, "%ld\n", total_particles);
     fpPres = CmiFopen((output_file+".pres").c_str(), "w");
-    fprintf(fpPres, "%d\n", total_particles);
+    fprintf(fpPres, "%ld\n", total_particles);
   } else {
       fp = CmiFopen((output_file+".acc").c_str(), "a");
       fpDen = CmiFopen((output_file+".den").c_str(), "a");
@@ -86,28 +86,31 @@ void TipsyWriter::receive(std::vector<Particle> ps, Real time, int iter)
   iter_ = iter;
 }
 
-void TipsyWriter::write(int prefix_count, CkCallback cb) {
+void TipsyWriter::write(long prefix_count, CkCallback cb) {
   // Received expected number of particles, sort the particles
   std::sort(particles.begin(), particles.end(),
             [](const Particle& left, const Particle& right) {
               return left.order < right.order;
             });
 
-  int new_prefix_count = prefix_count + particles.size();
+  long new_prefix_count = prefix_count + (long)particles.size();
   do_write(prefix_count);
   if (thisIndex != CkNumPes() - 1) thisProxy[thisIndex + 1].write(new_prefix_count, cb);
   else cb.send();
 }
 
-void TipsyWriter::do_write(int prefix_count)
+void TipsyWriter::do_write(long prefix_count)
 {
   Tipsy::header tipsyHeader;
 
   tipsyHeader.time = time_;
-  tipsyHeader.nbodies = box.n_particles;
-  tipsyHeader.nsph = box.n_sph;
-  tipsyHeader.ndark = box.n_dark;
-  tipsyHeader.nstar = box.n_star;
+  // Tipsy header fields are int32 BY FORMAT: the format itself cannot
+  // describe > 2^31-1 particles (use NChilada or split outputs beyond).
+  CkEnforce(box.n_particles <= 0x7fffffffL);
+  tipsyHeader.nbodies = (int)box.n_particles;
+  tipsyHeader.nsph = (int)box.n_sph;
+  tipsyHeader.ndark = (int)box.n_dark;
+  tipsyHeader.nstar = (int)box.n_star;
 
   bool use_double = sizeof(Real) == 8;
 
@@ -120,7 +123,7 @@ void TipsyWriter::do_write(int prefix_count)
   if(thisIndex == 0) w.writeHeader();
 
   if(!w.seekParticleNum(prefix_count)) {
-    CkPrintf("seeking %d particles for total %d gas %d dark %d star %d\n",
+    CkPrintf("seeking %ld particles for total %ld gas %ld dark %ld star %ld\n",
       prefix_count, box.n_particles, box.n_sph, box.n_dark, box.n_star);
     CkAbort("bad seek");
   }
