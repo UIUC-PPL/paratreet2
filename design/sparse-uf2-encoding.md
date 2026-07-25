@@ -213,11 +213,14 @@ Algorithmic total at P=8 is now ~3.2 s (phase1 1.09 + canopy/loadCache
 state and ~15 s on 07-23. The design's predicted ~2.2 s recovery
 undercounted: the indirect upwardPass effect roughly doubles it.
 
-Correctness: components 23,707,197 max_size 1,519,203 (full histogram in
-the log). REMAINING GATE: diff this components line bit-for-bit against
-any P=8 line from the 07-24 sweep logs — the count matches the known
-~23.7M total but the histogram comparison is the real check.
-"Number of components found: 7029" is the expected touched-only print.
+Correctness: CLOSED (2026-07-25 evening). The FOF3STAT components line
+from this run and the pre-branch baseline log are BIT-IDENTICAL through
+the full log2 histogram (23,707,197 components, max 1,519,203, all 21
+bins). Cross-run edge statistics also match (edges_emitted avg 186.1
+per PE in both runs, through two different walks). "Number of
+components found: 7029" is the expected touched-only print.
+Validation of the sparse-uf2 + fairness + chain branches is COMPLETE:
+laptop classic, laptop reconverse, and Anvil 80M at scale.
 
 New observations from the run:
 - FOF3STAT memory_MB prints 0.0 on Anvil/reconverse — CmiMemoryUsage
