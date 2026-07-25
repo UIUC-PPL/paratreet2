@@ -213,17 +213,15 @@ Algorithmic total at P=8 is now ~3.2 s (phase1 1.09 + canopy/loadCache
 state and ~15 s on 07-23. The design's predicted ~2.2 s recovery
 undercounted: the indirect upwardPass effect roughly doubles it.
 
-Correctness: components 23,707,197 max_size 1,519,203 (full histogram
-in the log). REMAINING GATE — STILL OPEN (a line thought to be the
-baseline on 2026-07-25 evening turned out to be this same run's
-output): Ritvik must grep "FOF3STAT components:" from ANY log of the
-07-23 or 07-24 sweeps (any P works — the line is config-invariant, its
-cross-config identity is the documented determinism check) and diff it
-against this run's line. Supporting but weaker evidence already in
-hand: edges_emitted avg 186.1/PE matches the pre-branch baseline
-through two different walks, and all laptop-scale histograms (8M, 16M,
-LAMBS, 1M grid-verified) are bit-identical. "Number of components
-found: 7029" is the expected touched-only print.
+Correctness: GATE CLOSED (2026-07-25, second attempt with provenance
+verified). Ritvik supplied the components line FROM THE 07-23 SWEEP
+LOG ("from 2 days ago"); it is BIT-IDENTICAL to today's branch run
+through the full 21-bin histogram: 23,707,197 components, max
+1,519,203. With the matching edge statistics (avg 186.1 emitted/PE
+across two different walks) and every laptop-scale histogram
+bit-identical, validation of the sparse-uf2 + fairness + chain
+branches is COMPLETE: laptop classic, laptop reconverse, Anvil 80M.
+"Number of components found: 7029" is the expected touched-only print.
 
 New observations from the run:
 - FOF3STAT memory_MB prints 0.0 on Anvil/reconverse — CmiMemoryUsage
