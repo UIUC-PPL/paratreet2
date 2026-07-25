@@ -156,6 +156,7 @@ module paratreet {
     // applyUF2Labels: owner-writes rewrite from encoded tip to the UF_2
     // library's componentNumber (read back from the node's vertex array,
     // which UnionFindLib::find_components mutated in place).
+    entry void collectUF2Labels(CProxy_UnionFindLib, const CkCallback&);
     entry void applyUF2Labels(const CkCallback&);
   };
 

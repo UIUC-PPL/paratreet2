@@ -586,11 +586,15 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // iteration, so no cross-iteration reuse is needed -- see design/step4.md
   // deviations).
   // Use the caller's pre-created UFNodeMap when given (race-safe on
-  // reconverse); fall back to the compatibility form otherwise.
+  // reconverse); the inline-ckNew fallback keeps the old one-argument
+  // form's semantics (classic Converse only).
+  // Lazy vertex storage (sparse-uf2): vertices are created on first touch;
+  // no per-fragment enumeration or vertex array exists.
   CProxy_UnionFindLib uf_proxy =
       uf_node_map_gid.isZero()
-          ? UnionFindLib::unionFindInitOnePerNode(CkCallbackResumeThread())
-          : UnionFindLib::unionFindInitOnePerNode(
+          ? UnionFindLib::unionFindInitOnePerNodeLazy(
+                CkCallbackResumeThread(), CProxy_UFNodeMap::ckNew())
+          : UnionFindLib::unionFindInitOnePerNodeLazy(
                 CkCallbackResumeThread(), CProxy_UFNodeMap(uf_node_map_gid));
 
   fof.initUF2(uf_proxy, CkCallbackResumeThread());
@@ -620,6 +624,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   uf_proxy.find_components(CkCallbackResumeThread());
   double t3 = CkWallTimer();
 
+  fof.collectUF2Labels(uf_proxy, CkCallbackResumeThread());
   fof.applyUF2Labels(CkCallbackResumeThread());
   double t4 = CkWallTimer();
 

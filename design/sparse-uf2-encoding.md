@@ -1,8 +1,31 @@
 # Enumeration-free tip encoding + lazy UF_2 vertex storage
 
-**STATUS: DESIGN FOR DISCUSSION (with Ritvik — UnionFindLib API is his).
-No code change yet.** Recorded 2026-07-24, from the Projections analysis
-of the 80M P=8 trace (design/phase1-scaling.md has the numbers).
+**STATUS: IMPLEMENTED ON BRANCHES (2026-07-25) — paratreet2
+`sparse-uf2` + unionfind `lazy-vertices`. NOT merged: Ritvik's review of
+the UnionFindLib API addition is still wanted (the library is his to
+steward), and main is frozen while he tests the 64-bit-audit/slimming
+commits.** Design recorded 2026-07-24, from the Projections analysis of
+the 80M P=8 trace (design/phase1-scaling.md has the numbers).
+
+Implementation notes (where they differ from or pin down the text
+below): the split is 43/20, not 44/20 — one bit is reserved so encoded
+tips never set the sign bit of the (long) group_number field, keeping
+the -1 sentinel and the negative final labels -(component + 2) disjoint
+from encoded tips (static_assert in FoFPhase1.h). The library gains
+LAZY mode behind `unionFindInitOnePerNodeLazy(ready, node_map)` +
+`registerMakeVertexID` (the inverse the library uses to reconstruct a
+vertex's full id on first touch); dense mode is byte-for-byte unchanged.
+Label readback is two-step (collectUF2Labels copies the touched-vertex
+labels out of the library's hash storage on each process's home PE;
+applyUF2Labels rewrites touched tips to negative labels,
+identity-if-absent for untouched fragments). fof3 gains `-g` to opt the
+fragments histogram (the only surviving countFragments consumer) back
+in. Validated 2026-07-25 (laptop): 12-run small matrix 72/390/3549; 1M
+b0.2 333,889 / b0.8 41,315 grid-verified; LAMBS 1M 379,884; 8M and 16M
+stats histograms bit-identical dist-vs-serial (2,657,656 / 5,317,213);
+100k at 32 processes full-check PASSED. The library's "Number of
+components found" print now reports touched-only counts in lazy mode,
+as anticipated below.
 
 ## The costs this removes
 

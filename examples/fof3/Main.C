@@ -53,7 +53,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:g")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -74,6 +74,9 @@ PARATREET_REGISTER_MAIN(ExMain);
           if (strcmp(optarg, "dist") == 0)        uf2_mode = UF2Mode::Dist;
           else if (strcmp(optarg, "serial") == 0) uf2_mode = UF2Mode::Serial;
           else CkAbort("-u requires one of: dist, serial");
+          break;
+        case 'g':
+          fof_frag_histogram = true;
           break;
         case 'm':
           fof_min_component_size = atoi(optarg);
@@ -100,6 +103,9 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t    (open boundaries). Minimum-image PBC; requires b < L/2]\n");
           CkPrintf("\t-w [phase-3 walk: dual (default; requires -u dist),\n");
           CkPrintf("\t    transposed (original walk, kept as the A/B oracle)]\n");
+          CkPrintf("\t-g [compute and print the phase-1 fragments histogram\n");
+          CkPrintf("\t    (FOF3STAT fragments line); off by default in -u dist\n");
+          CkPrintf("\t    since it adds a full countFragments pass]\n");
           CkPrintf("Framework options (see src/Configuration.h):\n");
           CkPrintf("\t-f [input file]\n");
           CkPrintf("\t-n [number of treepieces]\n");
@@ -131,6 +137,8 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("Min component size for reporting: %d%s\n",
              fof_min_component_size,
              fof_min_component_size == 0 ? " (report all)" : "");
+    CkPrintf("Fragments histogram (-g): %s\n",
+             fof_frag_histogram ? "on" : "off (serial mode prints it regardless)");
     // PBC (design/pbc.md). Note: -P (capital) does not collide with any
     // framework-registered CLI letter (the framework uses lowercase 'p' for
     // nPartitionsMin and the multi-char 'pbc'/'px'/'py'/'pz'), so no

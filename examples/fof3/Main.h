@@ -50,6 +50,12 @@ class ExMain: public paratreet::Main<FragData> {
   WalkMode walk_mode = WalkMode::Dual;
   // Min component size for reporting (-m); 0 = report everything (default).
   int fof_min_component_size = 0;
+  // -g: compute and print the phase-1 fragments histogram (FOF3STAT
+  // fragments line). Off by default since sparse-uf2: the histogram was the
+  // only surviving consumer of countFragments, which is otherwise off the
+  // dist critical path (design/sparse-uf2-encoding.md). Serial mode (-u
+  // serial) always prints it, as before.
+  bool fof_frag_histogram = false;
   // Pre-created UF_2 placement-map group (see preTraversalFn): created early
   // so its branches exist everywhere before phase 3's array creation
   // consults it (reconverse has no group-dependency buffering).

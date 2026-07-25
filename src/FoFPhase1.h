@@ -74,8 +74,19 @@ namespace paratreet {
 // cannot learn a remote tip's dense id without a directory anyway).
 // 40 index bits -> up to ~1.1e12 fragments per process (never binding at any
 // realistic scale); the remaining 24 bits address up to ~16M processes.
-constexpr int kUF2IdxBits = 40;
+// 43/20 split (sparse-uf2, 2026-07-25): the local field holds a RAW
+// particle order (enumeration-free encoding), so kUF2IdxBits >= log2(N):
+// 43 bits = 8.8e12 particles. 20 process bits = 1,048,576 processes. The
+// remaining top bit is the SIGN bit of the (signed long) group_number and
+// must stay clear: negative values are reserved for the -1 "never
+// labeled" sentinel and for final component labels (-(comp+2)), which
+// keeps the label namespace disjoint from untouched fragments' encoded
+// tips without any enumeration.
+constexpr int kUF2IdxBits = 43;
+constexpr int kUF2ProcBits = 20;
 constexpr uint64_t kUF2IdxMask = (uint64_t(1) << kUF2IdxBits) - 1;
+static_assert(kUF2IdxBits + kUF2ProcBits <= 63,
+              "encoded tips must leave the sign bit of long clear");
 
 inline uint64_t uf2EncodeTip(int process, long dense_index) {
   return (uint64_t(uint32_t(process)) << kUF2IdxBits) | (uint64_t(dense_index) & kUF2IdxMask);
@@ -84,8 +95,12 @@ inline uint64_t uf2EncodeTip(int process, long dense_index) {
 // Registered with UnionFindLib::registerGetLocationFromID. Must be a plain
 // function (not a capturing lambda): the library stores it as a raw
 // std::pair<int,int>(*)(uint64_t) function pointer.
-inline std::pair<int, int> uf2LocationFromID(uint64_t vid) {
-  return { int(vid >> kUF2IdxBits), int(vid & kUF2IdxMask) };
+inline uint64_t uf2MakeVertexID(int chare, uint64_t localId) {
+  return uf2EncodeTip(chare, (long)localId);
+}
+
+inline std::pair<int, uint64_t> uf2LocationFromID(uint64_t vid) {
+  return { int(vid >> kUF2IdxBits), vid & kUF2IdxMask };
 }
 
 // Component-wise gap distance squared between two axis-aligned boxes
@@ -292,7 +307,10 @@ public:
   // here) -- UnionFindLib mutates componentNumber/parent/size IN PLACE in
   // this same storage, so applyUF2Labels reads results straight out of it.
   std::unordered_map<long, long> encode_map; // process-tip -> encoded tip
-  std::vector<unionFindVertex> uf2_vertices;
+  std::vector<unionFindVertex> uf2_vertices; // dense path only (unused by sparse-uf2)
+  // Lazy-mode label readback buffer (collectUF2Labels -> applyUF2Labels):
+  // localId -> componentNumber for every touched vertex of this process.
+  std::unordered_map<uint64_t, long> uf2_labels;
 
   // Phase-3a SEEN table (design/step3.md §1, §3): process-level set of
   // packed (g, f) fragment pairs for which an edge has been (or is being)
@@ -414,6 +432,7 @@ public:
     frag_counts.clear();
     encode_map.clear();
     uf2_vertices.clear();
+    uf2_labels.clear();
     clearSeen();
     this->contribute(cb);
   }
@@ -696,30 +715,30 @@ public:
     this->contribute(cb);
   }
 
-  // --- Step 4 (distributed UF_2, -u dist; see design/step4.md). Sequence,
-  // driven by paratreet::runFoFPhase3Dist: countFragments (above, builds
-  // frag_counts) -> FoFPhase1Node::computeTipEncoding (builds encode_map +
-  // the UF_2 vertex array) -> applyTipEncoding (below; must run and
+  // --- Step 4 (distributed UF_2, -u dist; see design/step4.md and
+  // design/sparse-uf2-encoding.md). Sequence, driven by the app +
+  // paratreet::runFoFPhase3Dist: applyTipEncoding (below; must run and
   // complete, as a barrier, BEFORE upwardPass/loadCache/the phase-3 walk,
   // so every particle copy the walk reads already carries the encoded tip;
   // see paratreet::uf2EncodeTip's comment) -> [walk emits encoded-tip edges
   // into edge_buf3 exactly as in v1/3a, no visitor changes needed] ->
   // initUF2 -> fireUF2Edges -> CkWaitQD -> UnionFindLib::find_components ->
-  // applyUF2Labels.
+  // collectUF2Labels -> applyUF2Labels.
 
-  // Owner-writes rewrite of this PE's particles' tips through the node's
-  // encode map (identity is never valid here: every registered particle's
-  // tip must appear in frag_counts, hence in encode_map, since
-  // countFragments enumerated exactly these tips on every PE of this
-  // process before computeTipEncoding ran -- CkEnforce catches any
-  // ordering regression).
+  // Enumeration-free (sparse-uf2, 2026-07-25): a tip is already globally
+  // unique (the min-order particle's global order) and every particle of a
+  // fragment lives in this process, so the owner-decodable id is a pure
+  // per-particle rewrite — no counting, no per-process enumeration, no
+  // encode map. countFragments/computeTipEncoding are no longer on this
+  // path (the fragments histogram, their only surviving consumer, is
+  // optional reporting: fof3 -g).
   void applyTipEncoding(const CkCallback& cb) {
-    auto& encode_map = node_proxy.ckLocalBranch()->encode_map;
+    int my_node = CkMyNode();
     for (auto& s : subtrees) {
       for (int i = 0; i < s.n; i++) {
-        auto it = encode_map.find(s.parts[i].group_number);
-        CkEnforce(it != encode_map.end());
-        s.parts[i].group_number = (long)it->second;
+        long tip = s.parts[i].group_number;
+        CkEnforce(tip >= 0 && (uint64_t)tip <= paratreet::kUF2IdxMask);
+        s.parts[i].group_number = (long)paratreet::uf2EncodeTip(my_node, tip);
       }
     }
     this->contribute(cb);
@@ -734,12 +753,12 @@ public:
   // PEs of the process no-op (barrier still closes via contribute).
   void initUF2(CProxy_UnionFindLib uf_proxy, const CkCallback& cb) {
     if (CkMyPe() == CkNodeFirst(CkMyNode())) {
-      auto* nb = node_proxy.ckLocalBranch();
       UnionFindLib* lib = uf_proxy[CkMyNode()].ckLocal();
       CkEnforce(lib != nullptr); // must be true on the element's home PE
       lib->registerGetLocationFromID(&paratreet::uf2LocationFromID);
-      lib->initialize_vertices(nb->uf2_vertices.data(),
-                               (int)nb->uf2_vertices.size());
+      // Lazy mode: no vertex array. The library creates a vertex on first
+      // touch, reconstructing its full id with the registered inverse.
+      lib->registerMakeVertexID(&paratreet::uf2MakeVertexID);
     }
     this->contribute(cb);
   }
@@ -765,14 +784,12 @@ public:
   // UF_2 vertex array. A violation here means applyTipEncoding ran against
   // stale/foreign state (ordering bug), not a UF_2 library bug.
   void verifyEncodedTips(const CkCallback& cb) {
-    auto* nb = node_proxy.ckLocalBranch();
-    long n_vertices = (long)nb->uf2_vertices.size();
     int my_node = CkMyNode();
     for (auto& s : subtrees) {
       for (int i = 0; i < s.n; i++) {
-        uint64_t enc = (uint64_t)s.parts[i].group_number;
-        CkEnforce(int(enc >> paratreet::kUF2IdxBits) == my_node);
-        CkEnforce(long(enc & paratreet::kUF2IdxMask) < n_vertices);
+        long enc = s.parts[i].group_number;
+        CkEnforce(enc >= 0); // sign bit clear (43/20 split)
+        CkEnforce(int(uint64_t(enc) >> paratreet::kUF2IdxBits) == my_node);
       }
     }
     this->contribute(cb);
@@ -787,16 +804,42 @@ public:
   // fof3 harness canonicalizes both by re-deriving min order per label
   // group from the gathered records, so this is fine (design/step4.md,
   // decision 3).
+  // Step 1 of the lazy-mode label readback: the element's home PE copies
+  // the touched-vertex labels (localId -> componentNumber) out of the
+  // library's hash storage into the node branch, where every PE of the
+  // process can read them after the barrier.
+  void collectUF2Labels(CProxy_UnionFindLib uf_proxy, const CkCallback& cb) {
+    if (CkMyPe() == CkNodeFirst(CkMyNode())) {
+      auto* nb = node_proxy.ckLocalBranch();
+      UnionFindLib* lib = uf_proxy[CkMyNode()].ckLocal();
+      CkEnforce(lib != nullptr);
+      nb->uf2_labels.clear();
+      lib->collectComponentLabels(nb->uf2_labels);
+    }
+    this->contribute(cb);
+  }
+
+  // Step 2: owner-writes rewrite. A tip PRESENT in the touched-label map
+  // becomes -(componentNumber + 2): negative, so the final label namespace
+  // is disjoint from untouched fragments' (non-negative) encoded tips, and
+  // distinct from the -1 sentinel. A tip ABSENT from the map was never
+  // referenced by any merge edge — the fragment is its own component and
+  // keeps its encoded tip as its (globally unique) label. This is the
+  // identity-if-absent convention relabel/applyGlobalMap already use.
+  // Labels are arbitrary per-run values either way; the fof3 harness
+  // canonicalizes by min order per label group (design/step4.md).
   void applyUF2Labels(const CkCallback& cb) {
     auto* nb = node_proxy.ckLocalBranch();
-    auto& verts = nb->uf2_vertices;
+    auto& labels = nb->uf2_labels;
     for (auto& s : subtrees) {
       for (int i = 0; i < s.n; i++) {
-        long idx = s.parts[i].group_number & (long)paratreet::kUF2IdxMask;
-        CkEnforce(idx >= 0 && idx < (long)verts.size());
-        long comp = verts[idx].componentNumber;
-        CkEnforce(comp != -1);
-        s.parts[i].group_number = comp;
+        uint64_t local_id =
+            (uint64_t)s.parts[i].group_number & paratreet::kUF2IdxMask;
+        auto it = labels.find(local_id);
+        if (it != labels.end()) {
+          CkEnforce(it->second != -1);
+          s.parts[i].group_number = -(it->second + 2);
+        } // else: untouched fragment keeps its encoded tip
       }
     }
     this->contribute(cb);

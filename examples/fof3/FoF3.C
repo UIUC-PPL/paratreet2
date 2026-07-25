@@ -86,22 +86,27 @@ using namespace paratreet;
              p1s.reset, p1s.register_s, p1s.phaseA, p1s.phaseB, p1s.merge,
              p1s.relabel);
 
-    // Step 4 (-u dist; design/step4.md "Tip encoding"): renumber tips to
-    // (owning_process << 40) | dense_index BEFORE upwardPass/loadCache, so
-    // every particle copy the phase-3 walk later reads (including
-    // cache-shipped remote copies) already carries the encoded value --
-    // same class of ordering hazard as the loadCache/annotation-validity
-    // fix above, and fixed the same way (do the rewrite before the ship).
-    // countFragments must run first (builds frag_counts, the per-process
-    // tip domain computeTipEncoding enumerates); the later fragment
-    // histogram print in traversalFn reuses this same frag_counts via
-    // runFoFFragmentHistogramNode (NOT runFoFFragmentHistogram, which would
-    // re-invoke countFragments and double-count).
-    double t_encode = 0.0;
+    // Step 4 (-u dist; design/step4.md "Tip encoding" as revised by
+    // design/sparse-uf2-encoding.md): rewrite every tip to the
+    // owner-decodable (owning_process << kUF2IdxBits) | tip value BEFORE
+    // upwardPass/loadCache, so every particle copy the phase-3 walk later
+    // reads (including cache-shipped remote copies) already carries the
+    // encoded value -- same class of ordering hazard as the
+    // loadCache/annotation-validity fix above, and fixed the same way (do
+    // the rewrite before the ship). The rewrite is a pure per-particle
+    // operation (the tip is already globally unique), so no fragment
+    // counting or enumeration runs here. countFragments survives only as
+    // the optional -g fragments-histogram pass; it must still run BEFORE
+    // applyTipEncoding, because it counts by the raw (unencoded) tips that
+    // traversalFn's runFoFFragmentHistogramNode reads back.
+    double t_encode = 0.0, t_fragcount = 0.0;
     if (uf2_mode == UF2Mode::Dist) {
+      if (fof_frag_histogram) {
+        double tf0 = CkWallTimer();
+        fof.countFragments(CkCallbackResumeThread());
+        t_fragcount = CkWallTimer() - tf0;
+      }
       double te0 = CkWallTimer();
-      fof.countFragments(CkCallbackResumeThread());
-      fof_node.computeTipEncoding(CkCallbackResumeThread());
       fof.applyTipEncoding(CkCallbackResumeThread());
       t_encode = CkWallTimer() - te0;
     }
@@ -115,8 +120,9 @@ using namespace paratreet;
     // Only now ship the starter pack: every canopy annotation is valid.
     proxy_pack.driver.loadCache(CkCallbackResumeThread());
     double t3 = CkWallTimer();
-    CkPrintf("FOF3STAT time_s: phase1 %.3f tip_encode %.3f upwardPass %.3f loadCache %.3f\n",
-             t1 - t0, t_encode, t2 - t1, t3 - t2);
+    CkPrintf("FOF3STAT time_s: phase1 %.3f tip_encode %.3f fragcount %.3f "
+             "upwardPass %.3f loadCache %.3f\n",
+             t1 - t0, t_encode, t_fragcount, t2 - t1, t3 - t2);
   }
 
   // Shared printer for the final component-count + histogram line: full and
@@ -423,11 +429,13 @@ using namespace paratreet;
 
     // Phase-1 fragment (process-tip) histogram — design note §6.3e data;
     // must run before the phase-3 relabel overwrites the tips. Distributed
-    // (reduction-based), so it runs in both check modes. Dist mode already
-    // ran countFragments in preTraversalFn (before tip encoding), so it
-    // reads frag_counts back directly rather than re-invoking countFragments
+    // (reduction-based), so it runs in both check modes. In dist mode it is
+    // OPTIONAL (-g): countFragments is off the critical path since
+    // sparse-uf2, so frag_counts is only populated when -g ran it in
+    // preTraversalFn (before tip encoding); read it back via
+    // runFoFFragmentHistogramNode rather than re-invoking countFragments
     // (which would double-count against encoded tips -- see preTraversalFn).
-    {
+    if (uf2_mode != UF2Mode::Dist || fof_frag_histogram) {
       auto h = uf2_mode == UF2Mode::Dist
                    ? paratreet::runFoFFragmentHistogramNode(fof_node)
                    : paratreet::runFoFFragmentHistogram(fof, fof_node);
