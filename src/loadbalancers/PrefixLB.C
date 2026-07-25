@@ -8,7 +8,10 @@ CkpvExtern(int, _lb_obj_index);
 
 using LBCommon::LBUserData;
 
-CreateLBFunc_Def(PrefixLB, "Move jobs base on prefix sum.")
+static void lbinit()
+{
+  LBRegisterBalancer<PrefixLB>("PrefixLB", "Move jobs base on prefix sum.");
+}
 
 PrefixLB::PrefixLB(const CkLBOptions &opt): CBase_PrefixLB(opt)
 {
