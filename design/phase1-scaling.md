@@ -303,3 +303,22 @@ Expected effect at scale: phaseA's cross-PROCESS skew (max/avg 2.26 at
 P=16 post-suppression) stops multiplying with the per-stage barrier
 count; processes overlap their stages. Within-process skew is attacked
 by item 1.
+
+### Status (2026-07-25): both landed on sparse-uf2
+
+Commit 62fd898 (fairness) and 041c67f (chain), branch pushed. Validated
+on classic Converse (fof3 12-run matrix, 1M both b grid-verified, LAMBS
+379,884, 8M histogram bit-identical; fof1 exact at 1/2/4 PEs single
+process — the 4-PE run exercises both: 37 cross-PE edges, 30 remapped
+tips) and on reconverse (fof1 4 PE, fof3 2-proc 10k + LAMBS, 32-proc
+x4 all PASS). phaseB is sub-50 ms on the laptop, so the skew effect
+itself is an Anvil measurement (balance phaseB_s line).
+
+Trap recorded during validation: `charmrun +pN` WITHOUT `++ppn` on the
+SMP build launches N processes x 1 worker PE (default ppn = 1), not one
+process with N PEs. fof1 compares process-level phase-1 tips against a
+global serial FoF and is therefore single-process-only; run it as
+`+pN ++ppn N`. It now aborts with a clear message otherwise. (The
+apparent "+p2 phase-1 bug" chased on 2026-07-25 was exactly this
+configuration, reproducible unchanged back to phase 1's creation
+commit.)
