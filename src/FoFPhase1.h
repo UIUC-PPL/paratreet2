@@ -49,6 +49,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <numeric>
 #include <unordered_map>
@@ -444,7 +445,20 @@ public:
     for (auto& kv : counts) frag_counts[kv.first] += kv.second;
   }
 
+  // Within-process chain state (design/phase1-scaling.md, 2026-07-25):
+  // phaseA..relabel are sequenced per process by deposit counters instead
+  // of global reductions. chain_t0 is stamped by the first PE entering the
+  // chain; stage walls are process-local (no barrier latency).
+  std::atomic<int> chain_started{0};
+  std::atomic<int> a_done{0};
+  std::atomic<int> b_done{0};
+  double chain_t0 = 0, stage_tA = 0, stage_tB = 0, stage_tM = 0;
+
   void reset(const CkCallback& cb) {
+    chain_started = 0;
+    a_done = 0;
+    b_done = 0;
+    chain_t0 = stage_tA = stage_tB = stage_tM = 0;
     pe_subtrees.clear();
     edges.clear();
     tip_map.clear();
@@ -512,9 +526,11 @@ public:
     this->contribute(msg);
   }
 
-  // One execution per process (nodegroup broadcast): serial union-find over
-  // the boundary edges; touches only tips that appear in edges.
-  void merge(const CkCallback& cb) {
+  // One execution per process: serial union-find over the boundary edges;
+  // touches only tips that appear in edges. Called inline by the last PE
+  // to finish phaseB (all edge buffers are in, so access is exclusive);
+  // no longer a broadcast entry.
+  void mergeBody() {
     std::unordered_map<long, long> parent;
     for (auto& e : edges) {
       long ra = findRoot(parent, e.first);
@@ -528,7 +544,6 @@ public:
       long root = findRoot(parent, kv.first);
       if (root != kv.first) tip_map.emplace(kv.first, root);
     }
-    this->contribute(cb);
   }
 
 private:
@@ -602,7 +617,7 @@ public:
   // (a) Per-PE union-find via dual walks over all pairs of this PE's
   // subtrees (self-pairs included), then full path compression and tip
   // assignment into Particle::group_number.
-  void phaseA(double b2, const CkCallback& cb) {
+  void phaseABody(double b2) {
     double t0 = CkWallTimer();
     b2_ = b2;
     // Offset table: flat index space over this PE's particle blocks.
@@ -660,7 +675,6 @@ public:
         s.parts[i].group_number = flat_order[find(s.offset + i)];
 
     t_phaseA = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
-    this->contribute(cb);
   }
 
   // (b) Cross-PE edge emission. For each subtree pair spanning this PE and a
@@ -668,7 +682,7 @@ public:
   // deduplicated (tip, tip) edges into this PE's buffer; hand the buffer to
   // the nodegroup. No-op when this process has a single PE (non-SMP or
   // one-PE-per-process runs).
-  void phaseB(double b2, const CkCallback& cb) {
+  void phaseBBody(double b2) {
     double t0 = CkWallTimer();
     b2_ = b2;
     edge_buf.clear();
@@ -711,12 +725,11 @@ public:
     edge_buf.clear();
     seen.clear();
     t_phaseB = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
-    this->contribute(cb);
   }
 
   // (d) Rewrite this PE's particles' group_number through the merge map
   // (identity if absent).
-  void relabel(const CkCallback& cb) {
+  void relabelBody() {
     auto& tip_map = node_proxy.ckLocalBranch()->tip_map;
     for (auto& s : subtrees) {
       for (int i = 0; i < s.n; i++) {
@@ -724,7 +737,59 @@ public:
         if (it != tip_map.end()) s.parts[i].group_number = it->second;
       }
     }
-    this->contribute(cb);
+  }
+
+  // --- Within-process chain (design/phase1-scaling.md, 2026-07-25).
+  // Every stage of phaseA -> phaseB -> merge -> relabel reads and writes
+  // only process-local data (tips are global particle orders taken from
+  // particle data), so the four global reductions the driver used to
+  // interpose are replaced by per-process deposit counters on the node
+  // branch: each PE deposits stage completion; the LAST depositor triggers
+  // the next stage on the process's PEs. Cross-PE visibility is carried by
+  // the deposit chain itself (the last fetch_add on the shared counter
+  // synchronizes with every earlier one, so all of the process's phaseA
+  // writes happen-before the phaseB trigger) plus message delivery. One
+  // global reduction remains, at relabel end, carrying the process-local
+  // stage walls (max-reduced) to the driver. A dense process no longer
+  // holds every other process at each stage boundary.
+
+  void startPhase1Chain(double b2, const CkCallback& done) {
+    done_cb_ = done;
+    auto* nb = node_proxy.ckLocalBranch();
+    if (nb->chain_started.fetch_add(1) == 0) nb->chain_t0 = CkWallTimer();
+    phaseABody(b2);
+    if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+      nb->stage_tA = CkWallTimer() - nb->chain_t0;
+      int first = CkNodeFirst(CkMyNode());
+      for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+        this->thisProxy[pe].phaseBChained();
+    }
+  }
+
+  void phaseBChained() {
+    auto* nb = node_proxy.ckLocalBranch();
+    phaseBBody(b2_); // b2_ set by phaseABody on this PE
+    if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+      nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
+      double tm0 = CkWallTimer();
+      nb->mergeBody();
+      nb->stage_tM = CkWallTimer() - tm0;
+      int first = CkNodeFirst(CkMyNode());
+      for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+        this->thisProxy[pe].relabelChained(nb->stage_tA, nb->stage_tB,
+                                           nb->stage_tM);
+    }
+  }
+
+  void relabelChained(double tA, double tB, double tM) {
+    double t0 = CkWallTimer();
+    relabelBody();
+    // Stage walls to the driver: process-local values, max-reduced over
+    // all PEs (every PE of a process contributes its process's identical
+    // tA/tB/tM plus its own relabel time).
+    double vals[4] = {tA, tB, tM, CkWallTimer() - t0};
+    this->contribute(4 * sizeof(double), vals, CkReduction::max_double,
+                     done_cb_);
   }
 
   // Fragment-size histogram, step 1 of 2 (run after relabel): count this
@@ -1395,16 +1460,22 @@ private:
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;
   long phase3_emitted = 0;
   double b2_ = 0.0;
+  // Final-reduction callback of the within-process chain (startPhase1Chain).
+  CkCallback done_cb_;
   // Box period for PBC (design/pbc.md); {0,0,0} = open (default).
   Vector3D<Real> period_ = Vector3D<Real>(0, 0, 0);
 };
 
 namespace paratreet {
 
-// Per-stage wall times of runFoFPhase1 (barrier-to-barrier on the driving
-// thread, so each includes its reduction latency and is bounded by the
-// SLOWEST PE/process — the right decomposition for the phase-1 scaling
-// question, design/step3.md 6h: which stage stops speeding up with P).
+// Per-stage wall times of runFoFPhase1. reset/register are still
+// barrier-to-barrier on the driving thread. phaseA/phaseB/merge are
+// PROCESS-LOCAL walls, max-reduced over processes (relabel: max over
+// PEs) — no global barrier separates the stages anymore (the
+// within-process chain, design/phase1-scaling.md 2026-07-25), so the
+// stage values no longer include barrier latency and their SUM can
+// exceed the phase-1 wall (stages of different processes overlap; the
+// wall is the max over processes of each process's own sum).
 struct FoFPhase1Stages {
   double reset = 0, register_s = 0, phaseA = 0, phaseB = 0, merge = 0,
          relabel = 0;
@@ -1431,15 +1502,20 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
   fof.setPeriod(period, CkCallbackResumeThread());
   local.reset = CkWallTimer() - t; t = CkWallTimer();
   subtrees.registerFoF(fof, CkCallbackResumeThread());
-  local.register_s = CkWallTimer() - t; t = CkWallTimer();
-  fof.phaseA(b2, CkCallbackResumeThread());
-  local.phaseA = CkWallTimer() - t; t = CkWallTimer();
-  fof.phaseB(b2, CkCallbackResumeThread());
-  local.phaseB = CkWallTimer() - t; t = CkWallTimer();
-  fof_node.merge(CkCallbackResumeThread());
-  local.merge = CkWallTimer() - t; t = CkWallTimer();
-  fof.relabel(CkCallbackResumeThread());
-  local.relabel = CkWallTimer() - t;
+  local.register_s = CkWallTimer() - t;
+  // One broadcast starts the within-process chain; the single global
+  // reduction at its end delivers the max-reduced stage walls.
+  void* result = nullptr;
+  fof.startPhase1Chain(b2, CkCallbackResumeThread(result));
+  {
+    CkReductionMsg* m = (CkReductionMsg*)result;
+    const double* v = (const double*)m->getData();
+    local.phaseA = v[0];
+    local.phaseB = v[1];
+    local.merge = v[2];
+    local.relabel = v[3];
+    delete m;
+  }
   if (stages) *stages = local;
 }
 

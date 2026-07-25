@@ -78,9 +78,11 @@ using namespace paratreet;
     paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b, pbc,
                             &p1s);
     double t1 = CkWallTimer();
-    // Stage decomposition of the phase1 total (barrier-to-barrier walls;
-    // the phase-1 scaling question of design/step3.md 6h: merge is the
-    // per-process SERIAL step, relabel/phaseA/phaseB are parallel).
+    // Stage decomposition of the phase1 total. reset/register are
+    // barrier-to-barrier; phaseA/phaseB/merge/relabel are process-local
+    // walls max-reduced over processes (the within-process chain,
+    // design/phase1-scaling.md): stages of different processes overlap,
+    // so their sum can exceed the phase1 wall.
     CkPrintf("FOF3STAT time_s: phase1_stages reset %.3f register %.3f "
              "phaseA %.3f phaseB %.3f merge %.3f relabel %.3f\n",
              p1s.reset, p1s.register_s, p1s.phaseA, p1s.phaseB, p1s.merge,

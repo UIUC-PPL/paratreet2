@@ -96,7 +96,6 @@ module paratreet {
   nodegroup FoFPhase1Node {
     entry FoFPhase1Node();
     entry void reset(const CkCallback&);
-    entry void merge(const CkCallback&);
     entry void fragmentHistogram(const CkCallback&);
     entry void redundancyHistogram(const CkCallback&);
     // Step 4 (distributed UF_2, -u dist): builds the owner-encoded tip
@@ -121,9 +120,9 @@ module paratreet {
     // Periodic boundary conditions (design/pbc.md): broadcast the box period
     // (0 per axis = open, the default = exact current behavior) before phaseA.
     entry void setPeriod(Vector3D<Real> period, const CkCallback&);
-    entry void phaseA(double b2, const CkCallback&);
-    entry void phaseB(double b2, const CkCallback&);
-    entry void relabel(const CkCallback&);
+    entry void startPhase1Chain(double b2, const CkCallback&);
+    entry void phaseBChained();
+    entry void relabelChained(double tA, double tB, double tM);
     entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);
     entry void resetPhase3(const CkCallback&);

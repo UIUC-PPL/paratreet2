@@ -98,6 +98,16 @@ using namespace paratreet;
     double b = 0.2 * std::cbrt(V / (double)N);
     CkPrintf("FoF linking length b = %g (V = %g, N = %d)\n", b, V, N);
 
+    // fof1 is SINGLE-PROCESS-ONLY by design: phase 1 computes
+    // PROCESS-level components, and this harness compares them against a
+    // GLOBAL serial FoF — valid only when the process spans all PEs.
+    // charmrun +pN without ++ppn launches N processes x 1 PE (SMP), which
+    // silently fails the comparison; guard against that trap (use
+    // +pN ++ppn N for the multi-PE single-process configs).
+    if (CkNumNodes() > 1)
+      CkAbort("fof1 requires a single process (run +pN ++ppn N); "
+              "cross-process merging is phase 3, which fof1 does not run");
+
     // Phase-1 sequence: register -> phaseA -> phaseB -> merge -> relabel.
     paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, b);
 
