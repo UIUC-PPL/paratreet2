@@ -15,6 +15,20 @@ from encoded tips (static_assert in FoFPhase1.h). The library gains
 LAZY mode behind `unionFindInitOnePerNodeLazy(ready, node_map)` +
 `registerMakeVertexID` (the inverse the library uses to reconstruct a
 vertex's full id on first touch); dense mode is byte-for-byte unchanged.
+DENSE-MODE REGRESSION (2026-07-25, Kale's question): the library's
+examples/simple_graph explicit-graph client (ported to the current API,
+commit d69a848 on lazy-vertices) produces component counts IDENTICAL
+between the lazy-vertices and pre-lazy (map-race-fix) builds on all 14
+test graphs — dense storage verified unchanged by test, not only by
+inspection. TWO caveats for old clients (Ritvik's review): (1) the
+branch widens the client-facing locator to
+std::pair<int,uint64_t>(*)(uint64_t) (and entry vertex indices to
+uint64_t), so existing dense clients need a recompile plus a two-line
+signature update — old paratreet's contiguous dense encoding still
+works after that, converting by arithmetic as recorded below; (2) the
+example suite's expected.results is stale on ALL branches (recorded
+under the old pruned-count print semantics) — library-steward
+maintenance item.
 Label readback is two-step (collectUF2Labels copies the touched-vertex
 labels out of the library's hash storage on each process's home PE;
 applyUF2Labels rewrites touched tips to negative labels,
