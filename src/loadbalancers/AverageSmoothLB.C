@@ -4,7 +4,10 @@
 extern int quietModeRequested;
 CkpvExtern(int, _lb_obj_index);
 
-CreateLBFunc_Def(AverageSmoothLB, "Move jobs base on average smoothing.")
+static void lbinit()
+{
+  LBRegisterBalancer<AverageSmoothLB>("AverageSmoothLB", "Move jobs base on average smoothing.");
+}
 
 AverageSmoothLB::AverageSmoothLB(const CkLBOptions& opt):CBase_AverageSmoothLB(opt){
   lbname = (char*)"AverageSmoothLB";

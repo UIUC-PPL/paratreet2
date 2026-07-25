@@ -5,7 +5,10 @@
 extern int quietModeRequested;
 CkpvExtern(int, _lb_obj_index);
 
-CreateLBFunc_Def(OrbLB, "Move jobs base on Orb.")
+static void lbinit()
+{
+  LBRegisterBalancer<OrbLB>("OrbLB", "Move jobs base on Orb.");
+}
 
 OrbLB::OrbLB(const CkLBOptions &opt): CBase_OrbLB(opt)
 {

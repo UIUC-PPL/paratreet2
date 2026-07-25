@@ -5,7 +5,10 @@
 extern int quietModeRequested;
 CkpvExtern(int, _lb_obj_index);
 
-CreateLBFunc_Def(DiffusionLB, "Move jobs base on Diffusion.")
+static void lbinit()
+{
+  LBRegisterBalancer<DiffusionLB>("DiffusionLB", "Move jobs base on Diffusion.");
+}
 
 DiffusionLB::DiffusionLB(const CkLBOptions &opt): CBase_DiffusionLB(opt)
 {
