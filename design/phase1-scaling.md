@@ -1,6 +1,38 @@
 # Phase-1 scaling: the flattening is phaseA density skew
 
-## NEXT ANVIL SWEEP (merged main, 2026-07-23) — the suppression-at-80M run
+## SUPPRESSION AT 80M: CONFIRMED, PLACEMENT DEFERRED (2026-07-24 sweep)
+
+Ritvik's first sweep on merged main (certificates + connectivity
+suppression + dual walk), 80M LAMBS, 15 PEs/proc, vs the 2026-07-23
+pre-suppression baseline. phaseA wall (slowest PE) and max/avg skew:
+
+| P  | phaseA base | phaseA new | speedup | skew base -> new |
+|----|-------------|------------|---------|------------------|
+| 1  | 25.70       | 5.96       | 4.3x    | 1.45 -> 1.20     |
+| 2  | 13.94       | 3.17       | 4.4x    | 1.57 -> 1.30     |
+| 4  | 9.23        | 1.59       | 5.8x    | 2.13 -> 1.36     |
+| 8  | 7.34        | 0.98       | 7.5x    | 3.38 -> 1.58     |
+| 16 | 4.30        | 0.80       | 5.4x    | 3.74 -> 2.26     |
+
+phase1 total at P=16: 4.998 -> 1.462 s. merge 2-14 ms everywhere.
+DECISION per the rule in the section below: skew at P=16 (2.26) is above
+the ~1.5 bar, but perfect placement would recover at most max-avg ~= 0.45
+s of a ~6.4 s pipeline (~7%) — DENSITY-WEIGHTED PLACEMENT DEFERRED;
+revisit only if higher-P runs show phaseA max growing again.
+
+THE FRONTIER MOVED: at P=16, upwardPass 1.94 s + tip_encode 1.67 s = 57%
+of algorithmic time (phase1 23%, walk 0.67, uf2 0.46). Both scale ~10x
+over 16x; P=1 values (18-19.5 s each) far exceed their nominal work —
+suspects: upwardPass's canopy/recvTC path funnels through the Driver on
+PE 0 plus a QD settle; tip_encode does per-particle hash lookups over 80M
+particles against ~24M fragments. Secondary: phaseB wall ~flat 0.34-0.42 s
+across P with ~11x PE skew inside it; relabel 0.23 s. NEXT WORK ITEM:
+instrument upwardPass (local fold / canopy+recvTC / QD) and tip_encode
+(countFragments / computeTipEncoding / applyTipEncoding) internally, then
+optimize what the timers indict. Note: this sweep predates the map-race
+fix and the cache: line — pull current main before any P>=32 run.
+
+## NEXT ANVIL SWEEP (merged main, 2026-07-23) — the suppression-at-80M run [FULFILLED by the section above]
 
 Main now carries everything: dual walk BY DEFAULT, phase-1 certificates +
 connectivity suppression, htram-on, stage timers. One sweep, same command
