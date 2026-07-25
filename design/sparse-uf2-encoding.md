@@ -137,3 +137,56 @@ Laptop matrix + 1M b0.2/b0.8 + LAMBS 1M grid-verified, 8M/16M stats
 determinism vs current main; 32-proc reconverse run; then an Anvil sweep —
 expected effect at P=8: the wedge and plateau vanish (~2.2 s), uf2 phase
 shrinks (O(touched) scans), memory_MB drops by the vertex-array size.
+
+## Anvil validation run (instructions for Ritvik, 2026-07-25)
+
+One run suffices: 80M (lambb.00500), b_factor 0.2, 8 processes x 15
+PEs/proc (120 cores) — the same configuration as the 2026-07-24 sweep's
+P=8 point and the Projections trace, so every number has a direct
+baseline. Repeat the identical run once only if a number looks
+surprising.
+
+Branches (BOTH required, and unionfind needs a CLEAN rebuild — the
+vertex-storage header layout changed, stale .o files will link garbage):
+
+    cd unionfind && git fetch && git checkout lazy-vertices
+    make clean && make            # PROFILE= as usual; AGGREGATION stays on
+    cd ../paratreet2 && git fetch && git checkout sparse-uf2
+    cd src && make clean && make
+    cd ../examples/fof3 && make clean && make
+
+Run: same command as the last sweep (no -w flag needed, dual is the
+default; do NOT pass -g on the timed run).
+
+Output changes that are EXPECTED, not bugs:
+- The library line "Number of components found: N" now prints the
+  touched-vertex count (tens of thousands), not ~24M. Lazy mode counts
+  only fragments an edge reached; the authoritative count is the
+  FOF3STAT components line, unchanged.
+- No "FOF3STAT fragments:" line unless -g is passed (countFragments is
+  off the timed path now). If you want the fragments histogram, do one
+  extra run with -g.
+- The "FOF3STAT time_s: phase1 ..." line has a new fragcount field
+  (0.000 without -g).
+- phase1_stages values are now process-local walls (stages of different
+  processes overlap; their sum can exceed the phase1 total) — the four
+  global barriers between phaseA/phaseB/merge/relabel are gone.
+- -u serial (if you A/B) now needs an explicit -w transposed.
+
+Readout against your 2026-07-24 P=8 numbers:
+1. CORRECTNESS: FOF3STAT components line must match bit-for-bit.
+2. tip_encode: was ~1.5s countFragments wedge + ~0.7s computeTipEncoding
+   plateau at P=8; should drop to ~tens of ms.
+3. upwardPass: laptop showed a large indirect drop (0.805 -> ~0.06s at
+   8M, suspected heap-churn removal) — confirm or refute at 80M.
+4. uf2: the O(V) per-process scans are gone; expect a visible drop at
+   80M (they were the Projections hotspot).
+5. memory_MB: should drop by roughly the vertex-array + counting-map
+   size (laptop: -215 MB/proc at 8M).
+6. balance phaseB_s min/avg/max: the lower-PE triangular rule is
+   replaced by a fair subtree-pair hash; skew (was ~11x inside a
+   process) should compress.
+
+Rollback if anything fails: current main (= audit + slimming) is the
+first fallback; the branch commits are separable (sparse UF_2 66d258d,
+phaseB fairness 62fd898, barrier chain 041c67f) for bisection.
