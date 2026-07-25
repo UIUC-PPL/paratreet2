@@ -25,6 +25,14 @@ struct FragData {
     : min_frag(std::numeric_limits<long>::max()),
       max_frag(std::numeric_limits<long>::min()) {}
 
+  // Remote-particle slimming opt-in (MultiData.h): the FoF walk reads only
+  // position (distance tests) and group_number (the tip, for edge emission)
+  // from cache-shipped particles — ship exactly those (~20 of ~112 bytes).
+  static void pupRemoteParticle(PUP::er& p, Particle& part) {
+    p | part.position;
+    p | part.group_number;
+  }
+
   FragData(const Particle* particles, int n_particles, int depth) : FragData() {
     for (int i = 0; i < n_particles; i++) {
       box.grow(particles[i].position);
