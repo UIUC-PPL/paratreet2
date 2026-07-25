@@ -77,6 +77,29 @@ the library changes meaning for lazy-mode clients; document it.
   lazy vertices can default size=1 or carry sizes only if a client
   supplies them. Confirm no other consumer with Ritvik.
 
+## Variant recorded for later: process-local tip values (not now)
+
+The tip value need not be global (Kale, 2026-07-25). The encoded id only
+requires PROCESS-LOCAL distinctness (the prefix separates processes), so
+the process-wide flat index of the min particle would serve in place of
+its global order. Effects: the local field needs only
+log2(particles-per-process) bits (~24-26 at any realistic scale) instead
+of log2(N) — the id becomes scale-invariant in N and the 40-vs-44-bit
+question disappears; smaller ids also shave hashing cost (mask the unused
+bits) and communication (do not send them) — ultra-optimizations, noted
+as negligible today. The price: tips and untouched-fragment labels become
+decomposition-dependent (global orders are input-stable across runs and
+process counts; component STRUCTURE stays deterministic either way, and
+the step-4 label-agnostic checks compare structure, not labels).
+Decision: keep global orders now (zero-change option); this variant is
+the escape hatch if the bit budget or id-handling costs ever matter.
+
+## Sizing rule (2026-07-25): kUF2IdxBits >= log2(N) under this design
+(the local field holds a raw particle order). Default for the branch:
+44/20 — 17.6e12 particles, 1,048,576 processes (HACC is at a trillion;
+process counts will not approach a million). Single constexpr; add a
+static assertion when the branch starts.
+
 ## Fallback if the lib change is declined
 
 Sharded parallel encoding (paratreet2-only): hash-shard the tip space
