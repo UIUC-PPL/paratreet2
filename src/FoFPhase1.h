@@ -103,6 +103,25 @@ inline std::pair<int, uint64_t> uf2LocationFromID(uint64_t vid) {
   return { int(vid >> kUF2IdxBits), vid & kUF2IdxMask };
 }
 
+// Fair phaseB work division (design/phase1-scaling.md, 2026-07-25): each
+// unordered subtree pair spanning two PEs of a process is walked by
+// exactly one of the two, chosen by one bit of a symmetric mix of the two
+// subtree ROOT KEYS (stable Morton keys — identical on both sides, so
+// both PEs agree without communication; pointers would vary under ASLR).
+// Subtree granularity splits every PE pair's ~64 subtree pairs about in
+// half with density mixing — the lower-PE-walks-everything rule gave PE i
+// of an N-PE process N-1-i partner PEs (triangular; ~11x phaseB skew in
+// the 80M logs). The emitted edge SET is unchanged (merge unions are
+// idempotent to the cross-walker duplicates that already existed).
+inline int phaseBWalker(Key ka, Key kb, int p, int q) {
+  uint64_t lo = std::min<uint64_t>(ka, kb), hi = std::max<uint64_t>(ka, kb);
+  uint64_t h = lo * 0x9E3779B97F4A7C15ull;
+  h ^= hi + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+  h *= 0xBF58476D1CE4E5B9ull;
+  h ^= h >> 31;
+  return (h & 1) ? std::min(p, q) : std::max(p, q);
+}
+
 // Component-wise gap distance squared between two axis-aligned boxes
 // (0 if they overlap). Space.h has no box-box version of this, so it
 // lives here.
@@ -659,9 +678,14 @@ public:
     int my_pe = CkMyPe();
     // pe_subtrees is frozen since the registration barrier: safe to read.
     for (auto& kv : nb->pe_subtrees) {
-      if (kv.first <= my_pe) continue; // lower-PE side walks the pair
+      if (kv.first == my_pe) continue;
       for (auto& sa : subtrees) {
         for (auto& sb : kv.second) {
+          // Fair division: walk only the subtree pairs the symmetric
+          // hash assigns to this PE (see phaseBWalker).
+          if (paratreet::phaseBWalker(sa.root->key, sb.root->key,
+                                      my_pe, kv.first) != my_pe)
+            continue;
           walk(sa.root, sb.root,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
                [&](Node<Data>* a, Node<Data>* b) {

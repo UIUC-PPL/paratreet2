@@ -236,3 +236,70 @@ that decide the density-skew question. The skew fixes (density-weighted
 placement / work sharing) remain the primary phase-1 lever regardless:
 certificates cut the hot PE's work only where it is deeply overdense, not
 where it is merely dense.
+
+## PhaseB fairness + within-process barriers (sparse-uf2 branch, 2026-07-25)
+
+Two follow-on optimizations agreed after the sparse-uf2 work, both on this
+branch (Kale, 2026-07-25). Vetting recorded before implementation.
+
+### 1. Fair phaseB pair division (separate commit)
+
+Current rule: for each PE pair (p, q) of a process, the LOWER PE walks all
+subtree pairs spanning the two. Load is triangular: PE i of an N-PE
+process walks pairs with N-1-i partner PEs; PE 0 carries N-1 partners,
+the last PE none. Ritvik's 80M logs show ~11x phaseB skew inside a
+process.
+
+Options vetted:
+- "Even/odd of the smaller PE" (walker = smaller PE if its number is
+  even, else larger): UNBALANCED. At N=4 the pair counts per PE are
+  3,0,2,1 — an odd-numbered PE never wins as the smaller side, so PE 1
+  gets nothing and PE 0 keeps its full triangle row.
+- (i+j) parity (walker = min if i+j even, else max): balanced pair
+  COUNTS (each PE gets ~(N-1)/2 partners) — but pair COST varies with
+  boundary density, which parity cannot see.
+- Symmetric hash per SUBTREE pair (chosen): the work unit is the
+  (sa, sb) subtree pair, not the PE pair. walker = min-or-max PE by one
+  bit of a symmetric mix of the two subtree ROOT KEYS (Morton keys:
+  stable, cheap, identical on both sides; pointers would work but vary
+  run-to-run under ASLR). Each PE pair spans ~64 subtree pairs at the
+  default 8 subtrees/PE, so each side gets ~half IN EXPECTATION with
+  density mixing — finer-grained balance than any PE-level rule, and it
+  is the subtree-level version of Kale's "base it on vertex id"
+  suggestion.
+
+Correctness invariants: every unordered subtree pair is examined by both
+PEs and walked by exactly one (the hash is symmetric and both sides
+compute it identically); the emitted edge SET is unchanged — only the
+emitting PE changes. Cross-PE duplicate edges (same tip pair found from
+different subtree pairs assigned to different walkers) already occur
+under the lower-PE rule and are harmless: FoFPhase1Node::merge unions
+are idempotent. Per-PE seen/cert_tip dedup keeps working per walker.
+
+### 2. Within-process-only barriers (separate commit)
+
+runFoFPhase1 currently drives six GLOBAL reductions: reset, register,
+phaseA, phaseB, merge, relabel. Dependency audit: after registration
+(pe_subtrees frozen), every stage reads and writes only process-local
+data — phaseB reads phaseA's frozen tips of its own process's PEs;
+merge folds the process's edge buffers; relabel reads the process's
+tip_map. Tips are global particle orders taken from particle data, so
+NO cross-process traffic exists anywhere in phaseA..relabel.
+
+Change: keep the cheap reset/register global barriers (~1-2 ms
+measured); replace the four stage barriers with a per-process chain on
+FoFPhase1Node — each PE deposits stage completion (atomic counter);
+the last depositor triggers the next stage on the process's PEs (merge
+runs inline on the last-depositing PE — exclusive access holds because
+all phaseB deposits are in). One global reduction remains, at relabel
+end, carrying the per-process stage walls (max-reduced) so the FOF3STAT
+phase1_stages line survives with changed semantics: per-stage values
+become MAX OVER PROCESSES of process-local walls (no barrier latency),
+and phase1 total becomes max over processes of the SUM of stages — a
+dense process no longer holds every other process at each stage
+boundary.
+
+Expected effect at scale: phaseA's cross-PROCESS skew (max/avg 2.26 at
+P=16 post-suppression) stops multiplying with the per-stage barrier
+count; processes overlap their stages. Within-process skew is attacked
+by item 1.
