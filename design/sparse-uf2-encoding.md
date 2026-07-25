@@ -190,3 +190,51 @@ Readout against your 2026-07-24 P=8 numbers:
 Rollback if anything fails: current main (= audit + slimming) is the
 first fallback; the branch commits are separable (sparse UF_2 66d258d,
 phaseB fairness 62fd898, barrier chain 041c67f) for bisection.
+
+## Anvil result (2026-07-25, Ritvik): CONFIRMED
+
+80M lambb.00500, b 0.2, 8 procs x 15 PEs (120 cores), branch build
+(sparse-uf2 + lazy-vertices, includes fairness + chain commits).
+Baselines: 07-23 phase-division table (step3.md 6h) and the 07-24
+suppression sweep, both P=8.
+
+| field | baseline P=8 | this run | change |
+|---|---|---|---|
+| tip_encode | 2.087 | 0.036 | 58x — wedge+plateau gone |
+| upwardPass | 2.151 | 0.108 | 20x — the laptop's indirect drop holds at scale |
+| uf2 | 0.170 (htram-off) | 0.043 | O(touched) scans; htram-on here |
+| phase1 | 7.818 pre-suppr; phaseA 0.98 post-suppr | 1.087 (phaseA 0.911) | consistent + barrier latency gone |
+| phaseB wall | 0.34-0.42 | 0.197 | fair division ~2x |
+| walk (dual) | ~0.96 (2.795 transposed / 2.9x) | 0.718 | ~25%, plausibly slimming |
+| relabel | 0.045 | 0.024 | |
+
+Algorithmic total at P=8 is now ~3.2 s (phase1 1.09 + canopy/loadCache
+1.20 + walk 0.72 + tips/upward/uf2/relabel ~0.2) vs ~8 s on the 07-24
+state and ~15 s on 07-23. The design's predicted ~2.2 s recovery
+undercounted: the indirect upwardPass effect roughly doubles it.
+
+Correctness: components 23,707,197 max_size 1,519,203 (full histogram in
+the log). REMAINING GATE: diff this components line bit-for-bit against
+any P=8 line from the 07-24 sweep logs — the count matches the known
+~23.7M total but the histogram comparison is the real check.
+"Number of components found: 7029" is the expected touched-only print.
+
+New observations from the run:
+- FOF3STAT memory_MB prints 0.0 on Anvil/reconverse — CmiMemoryUsage
+  returns 0 there. The vertex-array memory win cannot be verified from
+  this line; the cache line works (pool_MB 8338 over 8 procs). Gap
+  noted for the charm-convergence project.
+- 15x "Allocating out of pool" from the CacheManager pools (~1 GB/proc
+  pools exhausted). Harmless (falls back to heap) but pool sizing is
+  now on the radar.
+- component_histogram (harness stats, off the algorithm) grew to 5.2 s
+  (23.7M label-count pairs concat-gathered to PE 0) — exclude from any
+  timing readout, distribute if it ever matters.
+- phaseB residual: max/avg 0.197/0.014 over 120 PEs — the fair division
+  halved the wall but one density-hot PE remains; not worth further
+  work at 0.2 s.
+- End-to-end, input+decomposition (9.8 s: Tipsy read 3.1 + flush 5.9)
+  now dominates the iteration. Within the algorithm the frontier is
+  canopy loading (1.2 s), phaseA (0.91 s), walk (0.72 s) — the walk is
+  where the asynchronous-control research questions (interleaving
+  traversal with union-find) will surface at larger scale.
