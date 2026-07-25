@@ -240,7 +240,27 @@ New observations from the run:
   halved the wall but one density-hot PE remains; not worth further
   work at 0.2 s.
 - End-to-end, input+decomposition (9.8 s: Tipsy read 3.1 + flush 5.9)
-  now dominates the iteration. Within the algorithm the frontier is
-  canopy loading (1.2 s), phaseA (0.91 s), walk (0.72 s) — the walk is
-  where the asynchronous-control research questions (interleaving
-  traversal with union-find) will surface at larger scale.
+  now dominates the iteration. CORRECTION (from the trace + color key):
+  the "TreeCanopy cache loading: 1197.850 ms" print is NOT a separate
+  cost — it equals phase1 + tips + upwardPass + loadCache (1.233 s
+  summed) measured from a different anchor and overlaps them. The
+  in-algorithm frontier is exactly two structures: phaseA (0.91 s) and
+  the walk (0.72 s).
+
+Projections decomposition of the branch run
+(sparseUF2TimePProfile120.png, entry colors from Ritvik): tree build
+(magenta 0.43 s); phaseA violet triangle 0.38/0.63/0.91 min/avg/max;
+phaseBChained/merge/relabelChained spikes RIDING phaseA's declining
+tail — the within-process chain's overlap, directly visible;
+applyTipEncoding green sliver (0.036 s, was a ~0.5 s full-height bar);
+upwardPass cyan 0.108 s (was ~2 s); verifyEncodedTips red 0.018 s;
+startDual solid yellow ~0.3 s at ~100% (the walk's local descent);
+then the jagged requestNodes/addCache/process mixture to ~13.9 — the
+walk's remote-fetch/resume tail, latency-bound and imbalanced
+(leaf_visits 12,616/399,901/643,437 min/avg/max, 51x). More than half
+the walk is this tail: the dual descent itself is healthy; the
+resumption phase is where asynchronous control (streaming edges into
+UF during traversal, better partition-to-PE distribution) becomes the
+research frontier at larger scale. The pale-yellow block after 13.91
+is presumed label collection + the component-histogram gather (5.2 s
+harness, continues past the window).
