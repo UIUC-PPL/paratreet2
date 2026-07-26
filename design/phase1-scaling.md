@@ -357,8 +357,21 @@ particles per cell) the cliques are thin, face unions rare, and the
 ~160-offset residual stencil costs more than the certificate+
 suppression walk, which is already near-linear here. The payoff regime
 — cliques of many particles, face-clusters spanning halo cores — needs
-1000x+ overdensity at production b, i.e. the REAL 80M (the 1M LAMBS
-subsample dilutes halo density ~80x in b-units; recorded 2026-07-23).
+1000x+ overdensity at production b. CORRECTION (Kale, 2026-07-25): the
+old "1M subsample dilutes halo density ~80x in b-units" claim is WRONG
+— under uniform subsampling with b scaled to mean separation, neighbor
+counts within b and cell occupancies are INVARIANT (rho*b^3 is
+scale-free). What actually differs at 80M: (1) cusp/substructure
+resolution — occupancy MEANS are invariant but the TAIL grows, since
+4.3x smaller cells/chares sit deeper in rho ~ r^-gamma cusps
+(overdensity ~4.3^gamma higher at chare scale); (2) lambb.00500 is a
+LATER snapshot than our lambs.00200 subsample — more evolved, denser
+in b-units (confirm provenance with Ritvik); (3) empirically,
+certificates+suppression gained 4.3-7.5x at 80M vs ~1.8x on 1M LAMBS —
+under exact invariance those would match, so the tail/snapshot effects
+are real. The grid A/B expectation is therefore UNCERTAIN, not
+confident: it wins only if those effects push chare-scale occupancy
+past the gate.
 
 DECISION (dual-tree discipline: no default flip without cluster
 evidence): grid DEFAULT OFF (-G 0). Anvil A/B instructions: same 80M
