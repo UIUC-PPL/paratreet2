@@ -664,6 +664,20 @@ public:
           if ((pass == 0) != (i == j)) continue; // pass 0: self; pass 1: cross
           const SubtreeRef& sa = subtrees[i];
           const SubtreeRef& sb = subtrees[j];
+          // Per-chare grid (design/phase1-scaling.md "grid phaseA",
+          // 2026-07-25): a dense chare's SELF pair is solved by a cell
+          // grid in ~O(n) instead of the tree walk. Gated on occupancy
+          // (expected particles per cell) at the chare root — the walk
+          // with its certificates stays the right tool in sparse chares
+          // and for all cross-chare pairs.
+          if (i == j && grid_thresh_ > 0 && sa.n >= 64) {
+            double vol = (double)sa.root->data.box.volume();
+            double b = std::sqrt(b2_);
+            double c = b / std::sqrt(6.0);
+            if (vol > 0 && (double)sa.n * c * c * c / vol >= grid_thresh_ &&
+                gridSelfUnion(sa))
+              continue;
+          }
           walk(sa.root, sb.root,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); },
                [&](Node<Data>* a, Node<Data>* b) {
@@ -774,8 +788,9 @@ public:
   // stage walls (max-reduced) to the driver. A dense process no longer
   // holds every other process at each stage boundary.
 
-  void startPhase1Chain(double b2, const CkCallback& done) {
+  void startPhase1Chain(double b2, double grid_thresh, const CkCallback& done) {
     done_cb_ = done;
+    grid_thresh_ = grid_thresh;
     auto* nb = node_proxy.ckLocalBranch();
     if (nb->chain_started.fetch_add(1) == 0) nb->chain_t0 = CkWallTimer();
     phaseABody(b2);
@@ -1325,6 +1340,135 @@ private:
     }
   }
 
+  // Residual stencil for the b/sqrt(6) grid: forward-half offsets whose
+  // cells can hold a pair within b. Minimum gap between cells offset by d
+  // is (|d|-1)+ cells per axis, so the reachability condition is
+  // sum(((|d|-1)+)^2) <= 6 (equality included: gap exactly b). Face
+  // offsets (single +1) are in the list too but recognized by the caller
+  // for the test-free union.
+  static const std::vector<std::array<int, 3>>& gridOffsets() {
+    static const std::vector<std::array<int, 3>> offs = [] {
+      std::vector<std::array<int, 3>> v;
+      for (int dz = -3; dz <= 3; dz++)
+        for (int dy = -3; dy <= 3; dy++)
+          for (int dx = -3; dx <= 3; dx++) {
+            if (dz < 0 || (dz == 0 && dy < 0) ||
+                (dz == 0 && dy == 0 && dx <= 0))
+              continue; // forward half-space: each unordered pair once
+            auto g = [](int d) { int a = std::abs(d) - 1; return a > 0 ? a : 0; };
+            if (g(dx) * g(dx) + g(dy) * g(dy) + g(dz) * g(dz) <= 6)
+              v.push_back({dx, dy, dz});
+          }
+      return v;
+    }();
+    return offs;
+  }
+
+  // Grid solve of one dense chare's self pair (Kale's cell idea,
+  // 2026-07-25; design/phase1-scaling.md). Cell side c = b/sqrt(6) gives
+  // two test-free guarantees: any same-cell pair is within b (diagonal
+  // c*sqrt(3) = b/sqrt(2)) and any pair in FACE-adjacent cells is within
+  // b (max separation c*sqrt(6) = b). So one pass unions each cell into a
+  // clique through its first-seen representative, a neighbor pass unions
+  // face-adjacent occupied cells rep-to-rep, and distance tests survive
+  // only across the residual stencil between cells not already in the
+  // same component (first witness merges, same as leafLeafUnion).
+  // Euclidean bounds only shrink under minimum-image PBC, so the free
+  // unions stay valid with a period; residual tests use periodicDistSq.
+  // Returns false when the grid would be degenerate (caller falls back to
+  // the walk): key-packing overflow, or a PBC chare spanning half the box.
+  bool gridSelfUnion(const SubtreeRef& s) {
+    const double b = std::sqrt(b2_);
+    const double c = b / std::sqrt(6.0);
+    const auto& box = s.root->data.box;
+    const double ox = (double)box.lesser_corner.x;
+    const double oy = (double)box.lesser_corner.y;
+    const double oz = (double)box.lesser_corner.z;
+    const double exx = (double)box.greater_corner.x - ox;
+    const double exy = (double)box.greater_corner.y - oy;
+    const double exz = (double)box.greater_corner.z - oz;
+    const int64_t nx = (int64_t)(exx / c) + 1;
+    const int64_t ny = (int64_t)(exy / c) + 1;
+    const int64_t nz = (int64_t)(exz / c) + 1;
+    if (nx > (1 << 20) || ny > (1 << 20) || nz > (1 << 20)) return false;
+    if (period_.x > 0 && (exx > period_.x / 2 || exy > period_.y / 2 ||
+                          exz > period_.z / 2))
+      return false; // minimum-image identity with plain distance broken
+
+    auto cellKey = [&](int64_t ix, int64_t iy, int64_t iz) -> uint64_t {
+      return ((uint64_t)ix << 40) | ((uint64_t)iy << 20) | (uint64_t)iz;
+    };
+    std::vector<std::pair<uint64_t, int>> cells(s.n);
+    for (int i = 0; i < s.n; i++) {
+      int64_t ix = (int64_t)(((double)s.parts[i].position.x - ox) / c);
+      int64_t iy = (int64_t)(((double)s.parts[i].position.y - oy) / c);
+      int64_t iz = (int64_t)(((double)s.parts[i].position.z - oz) / c);
+      if (ix < 0) ix = 0; if (ix >= nx) ix = nx - 1;
+      if (iy < 0) iy = 0; if (iy >= ny) iy = ny - 1;
+      if (iz < 0) iz = 0; if (iz >= nz) iz = nz - 1;
+      cells[i] = {cellKey(ix, iy, iz), i};
+    }
+    std::sort(cells.begin(), cells.end());
+
+    // Occupied-cell ranges over the sorted array; same-cell cliques union
+    // through the first particle as representative.
+    struct OccCell { uint64_t key; int begin, end, rep; };
+    std::vector<OccCell> occ;
+    for (int k = 0; k < (int)cells.size();) {
+      int e = k + 1;
+      int rep = s.offset + cells[k].second;
+      while (e < (int)cells.size() && cells[e].first == cells[k].first) {
+        unite(rep, s.offset + cells[e].second);
+        e++;
+      }
+      occ.push_back({cells[k].first, k, e, rep});
+      k = e;
+    }
+
+    auto findOcc = [&](uint64_t key) -> const OccCell* {
+      int lo = 0, hi = (int)occ.size() - 1;
+      while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (occ[mid].key == key) return &occ[mid];
+        if (occ[mid].key < key) lo = mid + 1; else hi = mid - 1;
+      }
+      return nullptr;
+    };
+
+    const auto& offs = gridOffsets();
+    for (auto& oc : occ) {
+      int64_t ix = (int64_t)(oc.key >> 40);
+      int64_t iy = (int64_t)((oc.key >> 20) & 0xFFFFF);
+      int64_t iz = (int64_t)(oc.key & 0xFFFFF);
+      for (auto& d : offs) {
+        int64_t jx = ix + d[0], jy = iy + d[1], jz = iz + d[2];
+        if (jx < 0 || jx >= nx || jy < 0 || jy >= ny || jz < 0 || jz >= nz)
+          continue;
+        const OccCell* nb = findOcc(cellKey(jx, jy, jz));
+        if (nb == nullptr) continue;
+        if (std::abs(d[0]) + std::abs(d[1]) + std::abs(d[2]) == 1) {
+          unite(oc.rep, nb->rep); // face-adjacent: test-free
+          continue;
+        }
+        if (find(oc.rep) == find(nb->rep)) continue; // already connected
+        bool merged = false;
+        for (int a = oc.begin; a < oc.end && !merged; a++) {
+          const Particle& pa = s.parts[cells[a].second];
+          for (int q = nb->begin; q < nb->end; q++) {
+            const Particle& pb = s.parts[cells[q].second];
+            if (paratreet::periodicDistSq(pa.position, pb.position, period_) <=
+                b2_) {
+              unite(s.offset + cells[a].second, s.offset + cells[q].second);
+              merged = true; // one witness merges the components
+              break;
+            }
+          }
+        }
+      }
+    }
+    return true;
+  }
+
   // Flat index (phaseA union-find space) of the first particle under n.
   // Only called on non-empty nodes, so the descent always terminates at a
   // non-empty leaf. NOTE: local-tree INTERNAL nodes carry n_particles = -1
@@ -1573,6 +1717,11 @@ private:
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;
   long phase3_emitted = 0;
   double b2_ = 0.0;
+  // Occupancy gate for the per-chare grid (expected particles per cell of
+  // side b/sqrt(6)); <= 0 disables the grid entirely (walk-only default —
+  // laptop A/B showed parity-to-slightly-worse at reachable densities;
+  // the deep-overdensity payoff regime needs the Anvil A/B).
+  double grid_thresh_ = 0.0;
   // Final-reduction callback of the within-process chain (startPhase1Chain).
   CkCallback done_cb_;
   // Touched-component (negative-label) per-process totals held between
@@ -1607,7 +1756,13 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
                   CProxy_FoFPhase1Node<Data> fof_node,
                   double linking_length,
                   Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
-                  FoFPhase1Stages* stages = nullptr) {
+                  FoFPhase1Stages* stages = nullptr,
+                  // Occupancy gate for the per-chare grid in phaseA
+                  // (expected particles per b/sqrt(6) cell at the chare
+                  // root); <= 0 (default) disables the grid — enable via
+                  // fof3 -G for the density-regime A/B (see
+                  // design/phase1-scaling.md).
+                  double grid_occupancy_threshold = 0.0) {
   double b2 = linking_length * linking_length;
   FoFPhase1Stages local;
   double t = CkWallTimer();
@@ -1622,7 +1777,8 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
   // One broadcast starts the within-process chain; the single global
   // reduction at its end delivers the max-reduced stage walls.
   void* result = nullptr;
-  fof.startPhase1Chain(b2, CkCallbackResumeThread(result));
+  fof.startPhase1Chain(b2, grid_occupancy_threshold,
+                       CkCallbackResumeThread(result));
   {
     CkReductionMsg* m = (CkReductionMsg*)result;
     const double* v = (const double*)m->getData();

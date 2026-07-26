@@ -50,6 +50,11 @@ class ExMain: public paratreet::Main<FragData> {
   WalkMode walk_mode = WalkMode::Dual;
   // Min component size for reporting (-m); 0 = report everything (default).
   int fof_min_component_size = 0;
+  // -G <t>: occupancy threshold (expected particles per b/sqrt(6) cell at
+  // a chare's root) above which phaseA solves that chare's self pair with
+  // the cell grid instead of the tree walk. 0 disables the grid (the
+  // walk-only oracle for A/B). Default 1.0.
+  double fof_grid_threshold = 1.0;
   // -g: compute and print the phase-1 fragments histogram (FOF3STAT
   // fragments line). Off by default since sparse-uf2: the histogram was the
   // only surviving consumer of countFragments, which is otherwise off the

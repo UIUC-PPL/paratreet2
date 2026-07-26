@@ -19,6 +19,11 @@ class ExMain: public paratreet::Main<FragData> {
   CProxy_FoFPhase1<FragData> fof;
   CProxy_FoFPhase1Node<FragData> fof_node;
 
+  // -G <t>: phaseA grid occupancy threshold (see fof3 -G); 0 disables the
+  // grid, a low value forces it onto every chare — both used by the
+  // phase-1 exactness test. Default 0 (off), matching fof3.
+  double fof_grid_threshold = 0.0;
+
   // Serial O(n^2) reference results, stashed by the phase-1 validation and
   // reused by the fragment-histogram checks (exact on single-process runs).
   long serial_n_components = 0;

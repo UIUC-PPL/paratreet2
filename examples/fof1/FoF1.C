@@ -109,7 +109,11 @@ using namespace paratreet;
               "cross-process merging is phase 3, which fof1 does not run");
 
     // Phase-1 sequence: register -> phaseA -> phaseB -> merge -> relabel.
-    paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, b);
+    // grid_threshold: see fof3 -G; settable here so the exactness test can
+    // force the grid onto every chare (low threshold) or disable it (0).
+    paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, b,
+                            Vector3D<Real>(0, 0, 0), nullptr,
+                            fof_grid_threshold);
 
     // Gather (position, tip, order) for every particle and verify against a
     // serial O(n^2) FoF with the same b.

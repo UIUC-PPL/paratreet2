@@ -1,5 +1,8 @@
 #include "Main.h"
 
+#include <cstdlib>
+#include <unistd.h>
+
 #include "FragCheckVisitor.h"
 
 PARATREET_REGISTER_MAIN(ExMain);
@@ -30,6 +33,12 @@ PARATREET_REGISTER_MAIN(ExMain);
 
   void ExMain::main(CkArgMsg* m) {
     peanoKey = 3;
+    // Single app flag: -G <grid occupancy threshold> (see Main.h).
+    int c;
+    while ((c = getopt(m->argc, m->argv, "G:")) != -1) {
+      if (c == 'G') fof_grid_threshold = atof(optarg);
+      else CkAbort("fof1: unknown flag (only -G <threshold> is accepted)");
+    }
     delete m;
 
     CkPrintf("\n[PARATREET FOF PHASE 1]\n");

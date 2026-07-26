@@ -322,3 +322,49 @@ global serial FoF and is therefore single-process-only; run it as
 apparent "+p2 phase-1 bug" chased on 2026-07-25 was exactly this
 configuration, reproducible unchanged back to phase 1's creation
 commit.)
+
+## Per-chare grid phaseA (branch phase1-grid, 2026-07-25)
+
+Kale's cell idea, refined in discussion: cell side c = b/sqrt(6) gives
+two TEST-FREE union guarantees — every same-cell pair is within b
+(diagonal b/sqrt(2)) and every pair in face-adjacent cells is within b
+(max separation exactly b) — so a dense chare's self pair is solved by:
+one pass unioning each cell into a clique through its first-seen
+representative, a face-adjacency pass unioning occupied neighbor cells
+rep-to-rep, and residual pair tests only across the remaining stencil
+(offsets with sum(((|d|-1)+)^2) <= 6, first-witness exit, skipped when
+the components already match). Per-CHARE (a PE's chares are not a dense
+cube; a chare root is a tight oct box and provides the density gate),
+gated on occupancy = n * c^3 / volume at the chare root. Kale's
+original bit-only variant (prove the whole cube face-connected, then
+assign one parent in a second particle loop) is the special case that
+skips particle lists when it fires; the representative version subsumes
+it gracefully (per-cluster collapse, residual skipped via
+find-equality) at ~zero extra cost. PBC-safe: euclidean guarantees only
+shrink under minimum image; residual tests use periodicDistSq; chares
+spanning half the box fall back to the walk.
+
+CORRECTNESS (laptop, complete): forced onto every chare (-G 0.0001) —
+fof1 phase-1-exact at 4 PEs; fof3 full checks 10k / 1M b0.2 / 1M b0.8 /
+LAMBS 1M / PBC 100k-uniform b0.8 all PASS with identical counts; 8M
+b0.8 stats identical (332,466) grid-on vs grid-off — a new determinism
+pair for that config.
+
+PERFORMANCE (laptop): parity to slightly WORSE everywhere reachable —
+8M Plummer b0.8 interleaved repeats: walk 1.07-1.12 avg vs grid(-G 4)
+1.15-1.22; 1M b2.0 parity. Cause: at laptop-reachable occupancy (~1-4
+particles per cell) the cliques are thin, face unions rare, and the
+~160-offset residual stencil costs more than the certificate+
+suppression walk, which is already near-linear here. The payoff regime
+— cliques of many particles, face-clusters spanning halo cores — needs
+1000x+ overdensity at production b, i.e. the REAL 80M (the 1M LAMBS
+subsample dilutes halo density ~80x in b-units; recorded 2026-07-23).
+
+DECISION (dual-tree discipline: no default flip without cluster
+evidence): grid DEFAULT OFF (-G 0). Anvil A/B instructions: same 80M
+P=8 run with -G 0 (default) vs -G 4 (optionally 2/8/16); readout =
+phaseA_s min/avg/max and phase1_stages phaseA; counts must stay
+bit-identical. If the grid wins, tune threshold and flip the default;
+if not, the walk keeps phaseA and the machinery stays as the validated
+fallback. STEP 2 (intra-process stealing for the walks that remain) is
+deferred until this A/B lands and only if phaseA skew survives it.

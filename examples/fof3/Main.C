@@ -53,7 +53,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:g")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -77,6 +77,9 @@ PARATREET_REGISTER_MAIN(ExMain);
           break;
         case 'g':
           fof_frag_histogram = true;
+          break;
+        case 'G':
+          fof_grid_threshold = atof(optarg);
           break;
         case 'm':
           fof_min_component_size = atoi(optarg);
@@ -103,6 +106,10 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t    (open boundaries). Minimum-image PBC; requires b < L/2]\n");
           CkPrintf("\t-w [phase-3 walk: dual (default; requires -u dist),\n");
           CkPrintf("\t    transposed (original walk, kept as the A/B oracle)]\n");
+          CkPrintf("\t-G [phaseA grid occupancy threshold; a chare denser than\n");
+          CkPrintf("\t    this (particles per b/sqrt(6) cell) is solved by the\n");
+          CkPrintf("\t    cell grid instead of the tree walk; default 0 = off;\n");
+          CkPrintf("\t    try -G 4 for the dense-regime A/B]\n");
           CkPrintf("\t-g [compute and print the phase-1 fragments histogram\n");
           CkPrintf("\t    (FOF3STAT fragments line); off by default in -u dist\n");
           CkPrintf("\t    since it adds a full countFragments pass]\n");
@@ -139,6 +146,8 @@ PARATREET_REGISTER_MAIN(ExMain);
              fof_min_component_size == 0 ? " (report all)" : "");
     CkPrintf("Fragments histogram (-g): %s\n",
              fof_frag_histogram ? "on" : "off (serial mode prints it regardless)");
+    CkPrintf("phaseA grid threshold (-G): %g%s\n",
+             fof_grid_threshold, fof_grid_threshold > 0 ? "" : " (grid off)");
     // PBC (design/pbc.md). Note: -P (capital) does not collide with any
     // framework-registered CLI letter (the framework uses lowercase 'p' for
     // nPartitionsMin and the multi-char 'pbc'/'px'/'py'/'pz'), so no
