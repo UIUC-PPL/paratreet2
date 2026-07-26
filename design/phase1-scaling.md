@@ -408,3 +408,29 @@ build stealing when phaseA's share grows (the ~2B dataset), not now.
 (This A/B is also evidence in the scale-free question above: laptop
 parity + 80M tail-win + invariant mean density localizes the
 1M-vs-80M difference to the occupancy tail.)
+
+SCALING FOLLOW-UP (2026-07-26, Anvil 1/2/4 nodes, medians of phaseA
+max): the grid's advantage FADES WITH NODE COUNT at fixed N and
+inverts at 4 nodes —
+
+| nodes | PEs | G0    | G4    | grid   |
+|-------|-----|-------|-------|--------|
+| 1     | 120 | 0.912 | 0.816 | -10.5% |
+| 2     | 240 | 0.796 | 0.761 | -4.4%  |
+| 4     | 480 | 0.370 | 0.387 | +4.6%  |
+
+Structural, not noise: (a) chare count scales with PEs, so particles
+per chare fall 17k -> 4k, and the grid only touches INTRA-chare
+linking — surface-to-volume shrinks the grid-addressable fraction of
+near-b pairs as chares shrink; (b) the tail being compressed shrinks
+absolutely (phaseA strong-scales regardless) while the grid's
+per-particle overhead is scale-independent. CONTROLLING VARIABLE:
+particles per chare ~= N/(8*PEs), jointly with the occupancy tail —
+worth trying -G only when that ratio is ~15k+ and the dataset has
+dense cores; at ~2B on proportionally more nodes the ratio returns to
+today's winning regime, so re-measure once, there. Guidance stands:
+DEFAULT OFF; the "-G 4 for production runs" suggestion is WITHDRAWN
+(production node counts are where it loses). The same scaling trims
+the stealing case: phaseA max is 0.37 s and falling at production
+scale — the whole phaseA lever family is receding, and the frontier
+(walk fetch/resume tail; input/decomposition) is where effort goes.
