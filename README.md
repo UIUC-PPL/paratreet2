@@ -172,13 +172,14 @@ The app-specific flags (all other flags are the framework's; see
   exceeds `threshold` expected particles per cell (cell side
   b/sqrt(6)) solves its internal linking with a cell grid (test-free
   same-cell and face-adjacent unions) instead of the tree walk.
-  `0` (default) = off. Measured effect at 80M LAMBS, 120 cores:
-  `-G 4` cut the slowest-PE phaseA time ~10% by compressing the
-  density tail, with bit-identical output; the same threshold was
-  slightly slower than the walk on dense small-scale data — so treat
-  it as an option to A/B on your dataset (start with `-G 4`), not a
-  default. Output is identical either way, so it is always safe to
-  try. Thresholds 2 and 16 measured worse than 4.
+  `0` (default) = off. Measured at 80M LAMBS: `-G 4` cut the
+  slowest-PE phaseA time ~10% at 120 PEs, fading to a slight LOSS by
+  480 PEs (the grid accelerates only intra-chare linking, and
+  particles per chare shrink with PE count). Output is bit-identical
+  either way, so it is always safe to A/B; worth trying only when
+  particles per chare (roughly N / (8 x total PEs)) is ~15k or more
+  AND the dataset has dense cores. Thresholds 2 and 16 measured worse
+  than 4.
 
 Example run matrix per input (adapt launcher syntax to your Charm++ build):
 
