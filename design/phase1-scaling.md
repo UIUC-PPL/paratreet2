@@ -389,17 +389,22 @@ uf2 variance of the same magnitude (0.44-0.55 s) is on record from the
 timing-sensitive and the grid merely perturbs upstream timing;
 AGGREGATION-off would remove it.
 
-DECISION (2026-07-26): DEFAULT STAYS OFF; -G 4 is the RECOMMENDED
-setting for production LAMBS-class runs (record in sweep
-instructions). Rationale: the win is real but tail-only and
-regime-specific — the SAME threshold 4 measured slightly WORSE than
-the walk on laptop dense Plummer b0.8, so a global default would
-regress measured configurations. Revisit at the ~2B dataset: the
-tail-only shape is exactly what should GROW with resolution if the
-occupancy-tail argument holds. (This A/B is also evidence in the
-scale-free question above: laptop parity + 80M tail-win + invariant
-mean density localizes the difference to the occupancy tail.)
-STEP 2 (intra-process stealing for the walks that remain) stays
-deferred: post-grid phaseA max is ~0.82 s vs avg 0.63 — skew ~1.3,
-recovering it is ~0.2 s of a ~3.8 s iteration; build it when a
-dataset makes that fraction matter.
+DECISION (2026-07-26, revised after Kale's skew question): DEFAULT
+STAYS OFF; -G is documented as an OPTION to A/B per dataset (start at
+4), not a recommendation — the win is tail-only and regime-specific
+(the SAME threshold measured slightly WORSE on laptop dense Plummer
+b0.8), and the skew decomposition shows the grid is mostly SKEW
+COMPRESSION, not work reduction: avg moved only 1.9% (0.640->0.628)
+while max moved 10.5%; max/avg 1.43 -> 1.30. That reprioritizes STEP
+2: perfect intra-process stealing bounds phaseA at ~avg REGARDLESS of
+the tail's cause — ceiling ~30% at G0 (0.912->0.64), ~3x the grid's
+realized gain, threshold-free and dataset-agnostic — and even after
+-G 4 there remains 0.19 s of residual skew the grid cannot recover.
+Stealing therefore SUBSUMES most of the grid's benefit and is the
+right next phaseA investment when one is warranted; realistic yield
+is between half and all of the ceiling (helpers lose per-PE memo
+locality). Timing: all of this is ~0.2-0.3 s of a ~3.8 s iteration —
+build stealing when phaseA's share grows (the ~2B dataset), not now.
+(This A/B is also evidence in the scale-free question above: laptop
+parity + 80M tail-win + invariant mean density localizes the
+1M-vs-80M difference to the occupancy tail.)

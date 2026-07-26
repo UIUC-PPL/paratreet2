@@ -152,6 +152,33 @@ The app-specific flags (all other flags are the framework's; see
     across runs/configs (see below).
   - `auto` (default): `full` if N <= 20,000,000, else `stats` with a printed
     warning that full verification was skipped.
+- `-u <impl>` — UF_2 (cross-process union-find) implementation: `dist`
+  (default; distributed UnionFindLib) or `serial` (gather-to-one oracle,
+  kept for A/B; requires `-w transposed`).
+- `-w <walk>` — phase-3 walk: `dual` (default; symmetric dual-tree
+  traversal) or `transposed` (the original walk, kept permanently as the
+  independent A/B oracle).
+- `-m <size>` — minimum component size for REPORTING: when > 0, an extra
+  `FOF3STAT surviving` line lists only components with size >= m (the
+  full, unpruned components line always prints too). Reporting filter
+  only; never changes the computed partition. Default 0.
+- `-P <L>` — periodic boundary conditions: cubic box period L on all
+  axes (minimum-image; requires b < L/2 and L >= the box extent).
+  Default 0 = open boundaries.
+- `-g` — compute and print the phase-1 fragments histogram
+  (`FOF3STAT fragments` line). Off by default: it adds a full
+  fragment-counting pass to an otherwise enumeration-free path.
+- `-G <threshold>` — phase-1 per-chare grid: a chare whose density
+  exceeds `threshold` expected particles per cell (cell side
+  b/sqrt(6)) solves its internal linking with a cell grid (test-free
+  same-cell and face-adjacent unions) instead of the tree walk.
+  `0` (default) = off. Measured effect at 80M LAMBS, 120 cores:
+  `-G 4` cut the slowest-PE phaseA time ~10% by compressing the
+  density tail, with bit-identical output; the same threshold was
+  slightly slower than the walk on dense small-scale data — so treat
+  it as an option to A/B on your dataset (start with `-G 4`), not a
+  default. Output is identical either way, so it is always safe to
+  try. Thresholds 2 and 16 measured worse than 4.
 
 Example run matrix per input (adapt launcher syntax to your Charm++ build):
 
