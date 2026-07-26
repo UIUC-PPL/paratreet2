@@ -373,11 +373,33 @@ are real. The grid A/B expectation is therefore UNCERTAIN, not
 confident: it wins only if those effects push chare-scale occupancy
 past the gate.
 
-DECISION (dual-tree discipline: no default flip without cluster
-evidence): grid DEFAULT OFF (-G 0). Anvil A/B instructions: same 80M
-P=8 run with -G 0 (default) vs -G 4 (optionally 2/8/16); readout =
-phaseA_s min/avg/max and phase1_stages phaseA; counts must stay
-bit-identical. If the grid wins, tune threshold and flip the default;
-if not, the walk keeps phaseA and the machinery stays as the validated
-fallback. STEP 2 (intra-process stealing for the walks that remain) is
-deferred until this A/B lands and only if phaseA skew survives it.
+ANVIL A/B RESULT (2026-07-26, 12 runs at 80M P=8x15, run by Kale's
+Anvil session): CORRECTNESS 12/12 — every components line byte-identical
+to the reference. GRID WINS AT -G 4: phaseA max median 0.912 -> 0.816
+(~10.5%), with min unchanged (~0.38) and avg ~1% — TAIL-ONLY
+compression, exactly the density-gated mechanism predicted. G0
+reproduced the prior baseline to the millisecond (0.912 vs 0.911).
+Threshold ordering G4 < G2 < G0 ~= G16 (G2 fires on sparse chares
+where the residual stencil costs; G16 rarely fires). Secondary:
+component_histogram 5.2 s -> 0.23-0.28 s (~21x), confirming the
+distributed histogram at scale. Observed uf2 spikes (0.27-1.0 s in 3
+of 7 grid-on runs vs 0.032 s typical) are NOT a grid effect: htram-on
+uf2 variance of the same magnitude (0.44-0.55 s) is on record from the
+07-23 sweep, pre-grid — the htram quiesce loop's QD/flush alignment is
+timing-sensitive and the grid merely perturbs upstream timing;
+AGGREGATION-off would remove it.
+
+DECISION (2026-07-26): DEFAULT STAYS OFF; -G 4 is the RECOMMENDED
+setting for production LAMBS-class runs (record in sweep
+instructions). Rationale: the win is real but tail-only and
+regime-specific — the SAME threshold 4 measured slightly WORSE than
+the walk on laptop dense Plummer b0.8, so a global default would
+regress measured configurations. Revisit at the ~2B dataset: the
+tail-only shape is exactly what should GROW with resolution if the
+occupancy-tail argument holds. (This A/B is also evidence in the
+scale-free question above: laptop parity + 80M tail-win + invariant
+mean density localizes the difference to the occupancy tail.)
+STEP 2 (intra-process stealing for the walks that remain) stays
+deferred: post-grid phaseA max is ~0.82 s vs avg 0.63 — skew ~1.3,
+recovering it is ~0.2 s of a ~3.8 s iteration; build it when a
+dataset makes that fraction matter.
