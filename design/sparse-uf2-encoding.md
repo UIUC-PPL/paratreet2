@@ -247,7 +247,23 @@ New observations from the run:
   now on the radar.
 - component_histogram (harness stats, off the algorithm) grew to 5.2 s
   (23.7M label-count pairs concat-gathered to PE 0) — exclude from any
-  timing readout, distribute if it ever matters.
+  timing readout, distribute if it ever matters. RESOLVED (2026-07-25
+  evening, commit 28eb6b4): the gather is gone. Kale's scheme: the
+  label SIGN classifies components — positive = untouched
+  single-fragment = process-local, sizes binned in-process and
+  sum-reduced as a fixed 64-bin vector (standard reduction mold);
+  negative = the few edge-touched components (7,029 at 80M P=8), whose
+  per-process totals cross processes as a ~112 KB concat. Fragment
+  sizes aggregate intra-process by a shared-memory reduce-scatter
+  (label-hash shards on the node branch), not a locked merge. General
+  reduction lessons (pre-merge at process level; direct sends beat
+  spanning trees for large concat payloads; reduce-scatter naming)
+  recorded in charm_best_practices.md. Validated: 8M/16M/1M/LAMBS
+  lines bit-identical to references, -m surviving exact, cross-config
+  identical, 32-proc full PASS, classic + reconverse; laptop
+  component_histogram 0.75->0.62 s (8M), 1.74->1.43 s (16M) — the
+  tree-depth amplification it removes is cluster-scale, so the blob's
+  disappearance shows in the next Anvil trace.
 - phaseB residual: max/avg 0.197/0.014 over 120 PEs — the fair division
   halved the wall but one density-hot PE remains; not worth further
   work at 0.2 s.
