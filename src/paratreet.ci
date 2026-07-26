@@ -136,7 +136,9 @@ module paratreet {
     // fof3 harness's stats mode (no full particle gather).
     entry void verifyTips(long n_total, const CkCallback&);
     entry void memoryStats(const CkCallback&);
-    entry void collectLabelCounts(const CkCallback&);
+    entry void depositLabelCounts(const CkCallback&);
+    entry void histogramShard(int min_component_size, const CkCallback&);
+    entry void collectTouchedCounts(const CkCallback&);
     // Distributed UF_2 (step 4; encoded tips required — see design/step4.md).
     // applyTipEncoding: owner-writes rewrite of this PE's particles' tips
     // through the node's encode map (built by FoFPhase1Node::computeTipEncoding).

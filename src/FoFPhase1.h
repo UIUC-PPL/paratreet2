@@ -339,6 +339,26 @@ public:
   // every node pair over (g, f) is generated on f's owner process. Guarded
   // by its own mutex (single mutex is fine for 3a; stripe if contention
   // shows). Called synchronously from FoFEdgeVisitor via ckLocalBranch.
+  // Component-histogram intra-process reduce-scatter buffers
+  // (design/phase1-scaling.md "distributed component histogram",
+  // 2026-07-25): PEs deposit (label, count) pairs bucketed by label hash;
+  // the PE owning shard r merges bucket r. Per-shard mutexes: contention
+  // is one append per depositing PE per shard.
+  struct LabelShard {
+    std::mutex m;
+    std::vector<std::pair<long, long>> pairs;
+  };
+  std::vector<std::unique_ptr<LabelShard>> label_shards;
+  std::mutex label_shards_init_lock;
+  void ensureLabelShards(int n) {
+    std::lock_guard<std::mutex> g(label_shards_init_lock);
+    if ((int)label_shards.size() != n) {
+      label_shards.clear();
+      for (int i = 0; i < n; i++)
+        label_shards.emplace_back(new LabelShard);
+    }
+  }
+
   std::mutex seen3_lock;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3_pairs;
 
@@ -455,6 +475,7 @@ public:
   double chain_t0 = 0, stage_tA = 0, stage_tB = 0, stage_tM = 0;
 
   void reset(const CkCallback& cb) {
+    label_shards.clear();
     chain_started = 0;
     a_done = 0;
     b_done = 0;
@@ -1115,13 +1136,105 @@ public:
   // clustered data (worst case, all-singleton labels, it degrades toward
   // 16 B/particle; the full record gather is 24 B/particle). Used by the
   // fof3 harness's stats mode via runFoFComponentHistogram.
-  void collectLabelCounts(const CkCallback& cb) {
+  //
+  // Distributed component histogram (Kale's scheme, 2026-07-25; replaces
+  // the 240-way concat gather whose spanning-tree copying was ~400 MB x
+  // tree depth of runtime overhead at 80M — the black blob in the
+  // Projections trace). Key facts it exploits: after applyUF2Labels the
+  // label SIGN classifies every component — POSITIVE labels are untouched
+  // single-fragment components, entirely process-local (fragments are
+  // process-level), so their exact sizes are computable inside the
+  // process; NEGATIVE labels mark components reached by cross-process
+  // merge edges — few (7,029 at 80M P=8) — and only those need global
+  // per-label summing. Three stages, driven by runFoFComponentHistogram:
+  //  1. depositLabelCounts: per-PE label counts, bucketed by label hash
+  //     into the node branch's per-shard buffers (intra-process
+  //     reduce-scatter — NOT a locked whole-map merge, which would be the
+  //     countFragments wedge reborn).
+  //  2. histogramShard: the PE owning shard r merges bucket r; positive
+  //     labels are binned locally and tuple-SUM-reduced (a fixed 64-bin
+  //     vector fits the standard reduction mold); negative totals are
+  //     kept aside per PE.
+  //  3. collectTouchedCounts: tiny concat of the per-process negative
+  //     (label, total) pairs to PE 0, which sums across processes and
+  //     folds them into the histogram.
+
+  static uint64_t labelShardMix(long label) {
+    uint64_t h = (uint64_t)label;
+    h ^= h >> 33; h *= 0xFF51AFD7ED558CCDull;
+    h ^= h >> 33; h *= 0xC4CEB9FE1A85EC53ull;
+    h ^= h >> 33;
+    return h;
+  }
+
+  void depositLabelCounts(const CkCallback& cb) {
+    int n_shards = CkNodeSize(CkMyNode());
+    auto* nb = node_proxy.ckLocalBranch();
+    nb->ensureLabelShards(n_shards);
     std::unordered_map<long, long> counts;
     for (auto& s : subtrees)
       for (int i = 0; i < s.n; i++) counts[s.parts[i].group_number]++;
-    std::vector<std::pair<long, long>> v(counts.begin(), counts.end());
-    this->contribute(v.size() * sizeof(std::pair<long, long>),
-                     v.data(), CkReduction::concat, cb);
+    std::vector<std::vector<std::pair<long, long>>> buckets(n_shards);
+    for (auto& kv : counts)
+      buckets[labelShardMix(kv.first) % n_shards].emplace_back(kv.first,
+                                                               kv.second);
+    for (int r = 0; r < n_shards; r++) {
+      if (buckets[r].empty()) continue;
+      auto& shard = *nb->label_shards[r];
+      std::lock_guard<std::mutex> g(shard.m);
+      shard.pairs.insert(shard.pairs.end(), buckets[r].begin(),
+                         buckets[r].end());
+    }
+    this->contribute(cb);
+  }
+
+  void histogramShard(int min_component_size, const CkCallback& cb) {
+    int my_shard = CkMyRank();
+    auto* nb = node_proxy.ckLocalBranch();
+    touched_totals_.clear();
+    // 2 x (64 bins + count + max): totals then survivors.
+    long bins[64] = {0}, sbins[64] = {0};
+    long n = 0, maxs = 0, sn = 0, smaxs = 0;
+    if (my_shard < (int)nb->label_shards.size()) {
+      auto& shard = *nb->label_shards[my_shard];
+      std::unordered_map<long, long> totals;
+      totals.reserve(shard.pairs.size());
+      for (auto& p : shard.pairs) totals[p.first] += p.second;
+      shard.pairs.clear();
+      shard.pairs.shrink_to_fit();
+      for (auto& kv : totals) {
+        if (kv.first < 0) { // touched: global summing needed (stage 3)
+          touched_totals_.emplace_back(kv.first, kv.second);
+          continue;
+        }
+        long size = kv.second; // untouched fragment: complete local total
+        int bin = 0;
+        while (bin < 63 && (1L << (bin + 1)) <= size) bin++;
+        bins[bin]++; n++;
+        if (size > maxs) maxs = size;
+        if (size >= (long)min_component_size) {
+          sbins[bin]++; sn++;
+          if (size > smaxs) smaxs = size;
+        }
+      }
+    }
+    CkReduction::tupleElement tuple[] = {
+      CkReduction::tupleElement(sizeof(bins), bins, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &n, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &maxs, CkReduction::max_long),
+      CkReduction::tupleElement(sizeof(sbins), sbins, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &sn, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &smaxs, CkReduction::max_long)
+    };
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tuple, 6);
+    msg->setCallback(cb);
+    this->contribute(msg);
+  }
+
+  void collectTouchedCounts(const CkCallback& cb) {
+    this->contribute(touched_totals_.size() * sizeof(std::pair<long, long>),
+                     touched_totals_.data(), CkReduction::concat, cb);
+    touched_totals_.clear();
   }
 
   // Owner-writes relabel through the global tip -> root map computed by the
@@ -1462,6 +1575,9 @@ private:
   double b2_ = 0.0;
   // Final-reduction callback of the within-process chain (startPhase1Chain).
   CkCallback done_cb_;
+  // Touched-component (negative-label) per-process totals held between
+  // histogramShard and collectTouchedCounts.
+  std::vector<std::pair<long, long>> touched_totals_;
   // Box period for PBC (design/pbc.md); {0,0,0} = open (default).
   Vector3D<Real> period_ = Vector3D<Real>(0, 0, 0);
 };
@@ -1601,47 +1717,70 @@ FoFMemoryStats runFoFMemoryStats(CProxy_FoFPhase1<Data> fof) {
   return s;
 }
 
-// Global component-size histogram over the final labels WITHOUT a particle
-// gather (see FoFPhase1::collectLabelCounts): concat-gather the per-PE
-// (label, count) pairs to this thread, merge to exact global sizes, and
-// log2-bin them with the same binning as the fragment histogram. Run after
-// the phase-3 relabel (labels must be global); call from a [threaded]
-// context on PE 0. This is the stats-mode determinism observable: for a
-// given input it must be bit-identical across process/PE configurations.
+// Global component-size histogram over the final labels, computed FULLY
+// DISTRIBUTED (see FoFPhase1::depositLabelCounts and the scheme comment
+// there): untouched (positive-label) components are process-local, so
+// their sizes are binned inside each process and SUM-reduced as a fixed
+// 64-bin vector; only the few edge-touched (negative-label) components
+// need cross-process per-label summing, gathered as a tiny concat. Run
+// after the phase-3 relabel (labels must be global); call from a
+// [threaded] context on PE 0. This is the stats-mode determinism
+// observable: for a given input the resulting line must be bit-identical
+// across process/PE configurations (and it computes the same multiset of
+// sizes as the old 240-way concat gather it replaces).
 template <typename Data>
 FoFComponentHistogram runFoFComponentHistogram(CProxy_FoFPhase1<Data> fof,
                                                int min_component_size = 0) {
-  void* result = nullptr;
-  fof.collectLabelCounts(CkCallbackResumeThread(result));
-  CkReductionMsg* msg = (CkReductionMsg*)result;
-  int n_pairs = msg->getSize() / sizeof(std::pair<long, long>);
-  const auto* pairs = (const std::pair<long, long>*)msg->getData();
-  std::unordered_map<long, long> counts;
-  counts.reserve((size_t)n_pairs);
-  for (int i = 0; i < n_pairs; i++) counts[pairs[i].first] += pairs[i].second;
-  delete msg;
+  // Stage 1: per-PE counts into the intra-process shard buffers.
+  fof.depositLabelCounts(CkCallbackResumeThread());
 
+  // Stage 2: shard merge + local binning of process-local components.
   FoFComponentHistogram h;
   std::memset(h.bins, 0, sizeof(h.bins));
   std::memset(h.surviving_bins, 0, sizeof(h.surviving_bins));
-  h.n_components = 0;
-  h.max_size = 0;
-  h.surviving_count = 0;
-  h.surviving_max_size = 0;
   h.min_component_size = min_component_size;
-  for (auto& kv : counts) {
-    long size = kv.second;
-    int bin = 0; // floor(log2(size)); size >= 1 always
-    while (bin < 63 && (1L << (bin + 1)) <= size) bin++;
-    h.bins[bin]++;
-    h.n_components++;
-    if (size > h.max_size) h.max_size = size;
-    // Reporting filter (step 5): survivors are components with size >= m,
-    // tallied from the same merged counts (no extra gather/reduction).
-    if (size >= (long)min_component_size) {
-      h.surviving_bins[bin]++;
-      h.surviving_count++;
-      if (size > h.surviving_max_size) h.surviving_max_size = size;
+  {
+    void* result = nullptr;
+    fof.histogramShard(min_component_size, CkCallbackResumeThread(result));
+    CkReductionMsg* msg = (CkReductionMsg*)result;
+    CkReduction::tupleElement* elems = nullptr;
+    int n_elems = 0;
+    msg->toTuple(&elems, &n_elems);
+    CkEnforce(n_elems == 6);
+    std::memcpy(h.bins, elems[0].data, sizeof(h.bins));
+    h.n_components = *(const long*)elems[1].data;
+    h.max_size = *(const long*)elems[2].data;
+    std::memcpy(h.surviving_bins, elems[3].data, sizeof(h.surviving_bins));
+    h.surviving_count = *(const long*)elems[4].data;
+    h.surviving_max_size = *(const long*)elems[5].data;
+    delete[] elems;
+    delete msg;
+  }
+
+  // Stage 3: cross-process summing of the touched components only
+  // (~per-process #touched pairs; 7,029 labels total at 80M P=8).
+  {
+    void* result = nullptr;
+    fof.collectTouchedCounts(CkCallbackResumeThread(result));
+    CkReductionMsg* msg = (CkReductionMsg*)result;
+    int n_pairs = msg->getSize() / sizeof(std::pair<long, long>);
+    const auto* pairs = (const std::pair<long, long>*)msg->getData();
+    std::unordered_map<long, long> totals;
+    totals.reserve((size_t)n_pairs);
+    for (int i = 0; i < n_pairs; i++) totals[pairs[i].first] += pairs[i].second;
+    delete msg;
+    for (auto& kv : totals) {
+      long size = kv.second;
+      int bin = 0; // floor(log2(size)); size >= 1 always
+      while (bin < 63 && (1L << (bin + 1)) <= size) bin++;
+      h.bins[bin]++;
+      h.n_components++;
+      if (size > h.max_size) h.max_size = size;
+      if (size >= (long)min_component_size) {
+        h.surviving_bins[bin]++;
+        h.surviving_count++;
+        if (size > h.surviving_max_size) h.surviving_max_size = size;
+      }
     }
   }
   return h;
