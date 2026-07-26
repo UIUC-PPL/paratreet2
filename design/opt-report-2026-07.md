@@ -266,6 +266,33 @@ records), so the laptop-vs-80M difference lives in the occupancy
 TAIL (finer sampling resolves density cusps; the 80M snapshot is
 also later and more clustered).
 
+A multi-node follow-up completed the picture — the grid's advantage
+fades with PE count at fixed N and inverts by 4 nodes (medians of
+phaseA max):
+
+| nodes | PEs | G0 | G4 | grid effect |
+|---|---|---|---|---|
+| 1 | 120 | 0.912 | 0.816 | -10.5% |
+| 2 | 240 | 0.796 | 0.761 | -4.4% |
+| 4 | 480 | 0.370 | 0.387 | +4.6% (loses) |
+
+The trend is structural. Chare count scales with PEs, so particles
+per chare fall from ~17k to ~4k across this table; the grid
+accelerates only INTRA-chare linking, and surface-to-volume shrinks
+that addressable fraction as chares shrink — while the grid's
+per-particle overhead is scale-independent and the tail it
+compresses shrinks absolutely (phaseA strong-scales regardless). The
+controlling variable is therefore **particles per chare, roughly
+N / (8 x total PEs)**, jointly with the occupancy tail: -G is worth
+an A/B when that ratio is ~15k or more on a dataset with dense
+cores, and not otherwise. In particular, LARGER DATASETS RESTORE THE
+RATIO — anything from a few hundred million particles upward at
+today's node counts, and certainly the ~2B target on proportional
+resources, re-enters the regime where -G 4 won; it should be
+re-tried at each significant dataset-size step, not written off. On
+current 80M production configurations (2+ nodes) the default-off
+choice stands.
+
 ## 11. Robustness work enabling the campaign (not speed, but load-bearing)
 
 - **Array-map creation race**: "Local branch of array map is NULL!"
