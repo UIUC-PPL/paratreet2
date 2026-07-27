@@ -469,3 +469,30 @@ line (confirms the diagnosis and measures the fix); (2) LPT ordering
 cross product at pool build — 64 claimable subunits take the floor
 from ~0.148 s toward ~0.01-0.02 s. This is the phaseB instance of the
 same indivisible-unit lesson as phaseA's dense chares.
+
+### Final round (job 19533887, 2026-07-27, directed from the laptop via ssh)
+
+Interleaved, one 4-node allocation, 12 runs, correctness 12/12.
+
+phaseB arm (noagg builds): main 0.273/0.251/0.250 -> pool3 (LPT +
+gap-gated depth-2, bcf96a3) 0.066/0.066/0.066 — **-74% vs main**,
+ms-reproducible. avg FLAT (0.014 -> 0.015): the finer units and
+chunk-1 claims cost nothing measurable (Kale's watch item). The
+earlier +7 ms phaseA blip is gone (0.263-0.268 vs main 0.266-0.276).
+Residual: maxpair max 0.063 ~= wall — LPT removed the packing tail
+(~3 ms slack) and ONE grandchild unit remains; it was 0.062 under
+unconditional depth-2 too, so it is a depth-2 unit and only a THIRD
+split level (same gap-gated rule, depth cap 3) would divide it —
+worth ~15-18 ms against the ~46-50 ms cross-process floor below.
+DECISION: stop here; depth-3 recorded as the knob if a larger dataset
+re-inflates phaseB. Cross-process floor remains the true limit and
+needs work movement between processes.
+
+uf2 htram arm (pool2 agg vs pool2.noagg, same commit, interleaved):
+agg 1.336/2.117/2.506 vs noagg 0.542/0.051/0.151 — non-overlapping.
+htram costs ~1-2.4 s of uf2 at 480 PEs while carrying 22k edges,
+consistent with the tram-creation black wedge (buffers scale with PE
+count). VERDICT: aggregation-off is the right DEFAULT BUILD at
+current scales (decision for Kale+Ritvik — it changes the default in
+both Makefile.commons); the flag and the multi-billion-scale
+insurance argument remain.
