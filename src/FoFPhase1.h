@@ -473,9 +473,22 @@ public:
   std::atomic<int> a_done{0};
   std::atomic<int> b_done{0};
   double chain_t0 = 0, stage_tA = 0, stage_tB = 0, stage_tM = 0;
+  // PhaseB dynamic pool (branch phaseb-pool): every cross-PE subtree pair
+  // of this process, enumerated once by the last phaseA finisher and
+  // CLAIMED IN CHUNKS by whichever PEs are free — replacing the static
+  // per-pair hash assignment. Safe because a phaseB pair only reads
+  // frozen data and emits edges into the executing PE's own buffer (the
+  // merge is idempotent to cross-PE duplicate edges); any PE may execute
+  // any pair. The pool converts phaseB stragglers into work absorbed by
+  // idle sibling PEs (the trailing per-PE streaks in the 480-PE
+  // timeline view, 2026-07-26).
+  std::vector<std::pair<Node<Data>*, Node<Data>*>> phaseb_pool;
+  std::atomic<size_t> phaseb_next{0};
 
   void reset(const CkCallback& cb) {
     label_shards.clear();
+    phaseb_pool.clear();
+    phaseb_next = 0;
     chain_started = 0;
     a_done = 0;
     b_done = 0;
@@ -724,18 +737,17 @@ public:
     seen.clear();
     cert_tip.clear();
     auto* nb = node_proxy.ckLocalBranch();
-    int my_pe = CkMyPe();
-    // pe_subtrees is frozen since the registration barrier: safe to read.
-    for (auto& kv : nb->pe_subtrees) {
-      if (kv.first == my_pe) continue;
-      for (auto& sa : subtrees) {
-        for (auto& sb : kv.second) {
-          // Fair division: walk only the subtree pairs the symmetric
-          // hash assigns to this PE (see phaseBWalker).
-          if (paratreet::phaseBWalker(sa.root->key, sb.root->key,
-                                      my_pe, kv.first) != my_pe)
-            continue;
-          walk(sa.root, sb.root,
+    // Claim chunks from the process-wide pool until it drains (dynamic
+    // self-scheduling; supersedes the static symmetric-hash assignment —
+    // see the pool comment on FoFPhase1Node). Chunked claims keep the
+    // atomic traffic to ~pool/CHUNK increments per process.
+    const size_t CHUNK = 8;
+    for (;;) {
+      size_t start = nb->phaseb_next.fetch_add(CHUNK);
+      if (start >= nb->phaseb_pool.size()) break;
+      size_t end = std::min(start + CHUNK, nb->phaseb_pool.size());
+      for (size_t k = start; k < end; k++) {
+          walk(nb->phaseb_pool[k].first, nb->phaseb_pool[k].second,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
                [&](Node<Data>* a, Node<Data>* b) {
                  // Positive certificate over frozen tips, memoized: each
@@ -753,7 +765,6 @@ public:
                // over frozen tips; the seen-set dedup plays that role at
                // edge granularity.
                [](Node<Data>*, Node<Data>*) { return false; });
-        }
       }
     }
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
@@ -796,6 +807,20 @@ public:
     phaseABody(b2);
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
+      // Enumerate the process's phaseB pool before releasing the PEs:
+      // every cross-PE subtree pair, once (single-threaded, ~thousands
+      // of entries; pe_subtrees frozen since registration). Visibility:
+      // built before the trigger messages are sent.
+      nb->phaseb_pool.clear();
+      nb->phaseb_next = 0;
+      for (auto ita = nb->pe_subtrees.begin(); ita != nb->pe_subtrees.end();
+           ++ita) {
+        auto itb = ita;
+        for (++itb; itb != nb->pe_subtrees.end(); ++itb)
+          for (auto& sa : ita->second)
+            for (auto& sb : itb->second)
+              nb->phaseb_pool.emplace_back(sa.root, sb.root);
+      }
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].phaseBChained();
