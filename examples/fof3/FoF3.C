@@ -503,9 +503,12 @@ using namespace paratreet;
     {
       double n_pes = (double)CkNumPes();
       CkPrintf("FOF3STAT balance: phaseA_s %.3f/%.3f/%.3f "
-               "phaseB_s %.3f/%.3f/%.3f (min/avg/max over %d PEs)\n",
+               "phaseB_s %.3f/%.3f/%.3f "
+               "phaseB_maxpair_s %.3f/%.3f/%.3f (min/avg/max over %d PEs)\n",
                pr.t_phaseA_min, pr.t_phaseA_avg, pr.t_phaseA_max,
-               pr.t_phaseB_min, pr.t_phaseB_avg, pr.t_phaseB_max, CkNumPes());
+               pr.t_phaseB_min, pr.t_phaseB_avg, pr.t_phaseB_max,
+               pr.t_pb_maxpair_min, pr.t_pb_maxpair_avg, pr.t_pb_maxpair_max,
+               CkNumPes());
       CkPrintf("FOF3STAT balance: leaf_visits %ld/%.1f/%ld "
                "edges_emitted %ld/%.1f/%ld (min/avg/max over %d PEs)\n",
                pr.leaf_visits_min, pr.leaf_visits / n_pes, pr.leaf_visits_max,

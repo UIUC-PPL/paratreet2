@@ -637,6 +637,7 @@ public:
     seen3.clear();
     t_phaseA = 0.0;
     t_phaseB = 0.0;
+    t_phaseB_maxpair = 0.0;
     phase3_emitted = 0;
     p3_negative_prunes = 0;
     p3_positive_prunes = 0;
@@ -733,6 +734,7 @@ public:
   void phaseBBody(double b2) {
     double t0 = CkWallTimer();
     b2_ = b2;
+    t_phaseB_maxpair = 0.0;
     edge_buf.clear();
     seen.clear();
     cert_tip.clear();
@@ -747,6 +749,7 @@ public:
       if (start >= nb->phaseb_pool.size()) break;
       size_t end = std::min(start + CHUNK, nb->phaseb_pool.size());
       for (size_t k = start; k < end; k++) {
+          double tp0 = CkWallTimer();
           walk(nb->phaseb_pool[k].first, nb->phaseb_pool[k].second,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
                [&](Node<Data>* a, Node<Data>* b) {
@@ -765,6 +768,12 @@ public:
                // over frozen tips; the seen-set dedup plays that role at
                // edge granularity.
                [](Node<Data>*, Node<Data>*) { return false; });
+          // Max single-unit wall: the divisibility diagnostic. If this
+          // reduces to ~= the phaseB wall, an indivisible unit remains
+          // and the split needs another level; if it collapses, the
+          // leveling is complete (design/phase1-scaling.md).
+          double tp = CkWallTimer() - tp0;
+          if (tp > t_phaseB_maxpair) t_phaseB_maxpair = tp;
       }
     }
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
@@ -807,19 +816,45 @@ public:
     phaseABody(b2);
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
-      // Enumerate the process's phaseB pool before releasing the PEs:
-      // every cross-PE subtree pair, once (single-threaded, ~thousands
-      // of entries; pe_subtrees frozen since registration). Visibility:
-      // built before the trigger messages are sent.
+      // Enumerate the process's phaseB pool before releasing the PEs
+      // (single-threaded; pe_subtrees frozen since registration;
+      // visibility: built before the trigger messages are sent).
+      // Geometry-gated build (design/phase1-scaling.md): a pair enters
+      // the pool only if it can interact — the walk's own mindist test,
+      // run once here — and every surviving pair is split one level
+      // (8x8 child cross product, itself mindist-filtered) so no single
+      // claimable unit can hide a dense-boundary giant (the Anvil
+      // 4-node residue: one indivisible ~0.148 s pair). No tunable
+      // threshold: geometry decides. b2_/period_ were set by this PE's
+      // phaseABody.
       nb->phaseb_pool.clear();
       nb->phaseb_next = 0;
+      auto poolPush = [&](Node<Data>* a, Node<Data>* b) {
+        if (paratreet::mindist2(a->data.box, b->data.box, period_) > b2_)
+          return;
+        if (a->isLeaf() || b->isLeaf()) {
+          nb->phaseb_pool.emplace_back(a, b);
+          return;
+        }
+        for (int ci = 0; ci < a->n_children; ci++) {
+          Node<Data>* ca = a->getChild(ci);
+          if (ca == nullptr || ca->n_particles == 0) continue;
+          for (int cj = 0; cj < b->n_children; cj++) {
+            Node<Data>* cb = b->getChild(cj);
+            if (cb == nullptr || cb->n_particles == 0) continue;
+            if (paratreet::mindist2(ca->data.box, cb->data.box, period_) <=
+                b2_)
+              nb->phaseb_pool.emplace_back(ca, cb);
+          }
+        }
+      };
       for (auto ita = nb->pe_subtrees.begin(); ita != nb->pe_subtrees.end();
            ++ita) {
         auto itb = ita;
         for (++itb; itb != nb->pe_subtrees.end(); ++itb)
           for (auto& sa : ita->second)
             for (auto& sb : itb->second)
-              nb->phaseb_pool.emplace_back(sa.root, sb.root);
+              poolPush(sa.root, sb.root);
       }
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
@@ -1053,6 +1088,7 @@ public:
   // before the phase-3 reset each iteration.
   double t_phaseA = 0.0;
   double t_phaseB = 0.0;
+  double t_phaseB_maxpair = 0.0; // longest single pool-unit walk this PE ran
 
   void resetPhase3(const CkCallback& cb) {
     edge_buf3.clear();
@@ -1110,7 +1146,7 @@ public:
     // p3_redundant_descents-sum / CkNumNodes() at the consumer.
     long node_redundant = node_proxy.ckLocalBranch()->p3_node_redundant;
     long per_pe[3] = {p3_leaf_visits, phase3_emitted, node_redundant};
-    double times[2] = {t_phaseA, t_phaseB};
+    double times[3] = {t_phaseA, t_phaseB, t_phaseB_maxpair};
     CkReduction::tupleElement tupleRedn[] = {
       CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
       CkReduction::tupleElement(sizeof(long), &peak, CkReduction::max_long),

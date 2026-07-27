@@ -332,6 +332,10 @@ struct FoFPhase3Result {
   long redun_max_per_pair;   // most descents on any single pair
   double t_phaseA_min, t_phaseA_avg, t_phaseA_max;
   double t_phaseB_min, t_phaseB_avg, t_phaseB_max;
+  // Longest single phaseB pool-unit walk (min/avg/max over PEs): the
+  // divisibility diagnostic — ~= t_phaseB_max means an indivisible unit
+  // still sets the wall.
+  double t_pb_maxpair_min, t_pb_maxpair_avg, t_pb_maxpair_max;
 };
 
 // Convenience driver for the full phase-3 sequence:
@@ -409,6 +413,8 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
     double n_pes = (double)CkNumPes();
     r.t_phaseA_min = tmin[0]; r.t_phaseA_avg = tsum[0] / n_pes; r.t_phaseA_max = tmax[0];
     r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];
+    r.t_pb_maxpair_min = tmin[2]; r.t_pb_maxpair_avg = tsum[2] / n_pes;
+    r.t_pb_maxpair_max = tmax[2];
   }
   delete[] stats_elems;
   CkEnforce(r.edges_sent == (long)n_edges);
@@ -559,6 +565,8 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     double n_pes = (double)CkNumPes();
     r.t_phaseA_min = tmin[0]; r.t_phaseA_avg = tsum[0] / n_pes; r.t_phaseA_max = tmax[0];
     r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];
+    r.t_pb_maxpair_min = tmin[2]; r.t_pb_maxpair_avg = tsum[2] / n_pes;
+    r.t_pb_maxpair_max = tmax[2];
   }
   delete[] stats_elems;
   delete stats_msg;
