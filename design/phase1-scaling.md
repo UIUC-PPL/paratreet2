@@ -434,3 +434,38 @@ DEFAULT OFF; the "-G 4 for production runs" suggestion is WITHDRAWN
 the stealing case: phaseA max is 0.37 s and falling at production
 scale — the whole phaseA lever family is receding, and the frontier
 (walk fetch/resume tail; input/decomposition) is where effort goes.
+
+## PhaseB dynamic pool (branch phaseb-pool, 2026-07-26/27)
+
+The 480-PE timeline view showed phaseB stragglers trailing the phaseA
+chain against idle sibling PEs. A phaseB subtree pair reads only frozen
+data and emits edges into the executing PE's own buffer (merge is
+idempotent to duplicates), so ANY PE of the process may execute any
+pair: the static symmetric-hash assignment is replaced by a
+process-wide pool — the last phaseA finisher enumerates every cross-PE
+subtree pair once; PEs claim chunks of 8 via an atomic index until it
+drains. Termination unchanged (deposit after last claimed pair).
+
+LAPTOP A/B (8M, reconverse): zero measurable synchronization overhead
+(avg unchanged), phaseB leveled to ~1 ms spread; wall 0.029 -> 0.016
+(1x8), 0.011 flat (2x4). Counts identical.
+
+ANVIL A/B (2026-07-27, Kale's session; 80M, 4 nodes, 32x15, 3+3 runs):
+correctness byte-identical in all 6 logs. phaseB wall 0.255 -> 0.151
+(-41%, ranges disjoint); phase1 0.52 -> 0.42 s. BUT the laptop's
+leveling did not reproduce: phaseB_s spread is still ~10x (avg 0.014,
+max ~0.148). DIAGNOSIS (from reproducibility): pool max is
+0.148/0.149/0.148 across reps — the signature of ONE INDIVISIBLE PAIR,
+a single ~0.148 s subtree-pair walk (dense-core boundary within one
+process); main's 0.25 straggler was that giant plus movable work the
+pool stripped away. The pool cannot split its own work unit. Also
+noted: phaseA +7 ms on pool (0.266 -> 0.273, reproducible) — no causal
+path through the timers (pool build is stamped outside phaseA);
+suspected code-layout perturbation; watch, don't chase.
+
+NEXT on the branch: (1) per-PE max-single-pair wall in the balance
+line (confirms the diagnosis and measures the fix); (2) LPT ordering
+(largest pairs first); (3) split large pairs into their 8x8 child
+cross product at pool build — 64 claimable subunits take the floor
+from ~0.148 s toward ~0.01-0.02 s. This is the phaseB instance of the
+same indivisible-unit lesson as phaseA's dense chares.
