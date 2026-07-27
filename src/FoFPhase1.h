@@ -50,6 +50,7 @@
 #include <limits>
 #include <map>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <numeric>
 #include <unordered_map>
@@ -482,7 +483,12 @@ public:
   // any pair. The pool converts phaseB stragglers into work absorbed by
   // idle sibling PEs (the trailing per-PE streaks in the 480-PE
   // timeline view, 2026-07-26).
-  std::vector<std::pair<Node<Data>*, Node<Data>*>> phaseb_pool;
+  struct PoolUnit {
+    double key; // LPT order: ascending = costliest-first (see poolPush)
+    Node<Data>* a;
+    Node<Data>* b;
+  };
+  std::vector<PoolUnit> phaseb_pool;
   std::atomic<size_t> phaseb_next{0};
 
   void reset(const CkCallback& cb) {
@@ -739,18 +745,20 @@ public:
     seen.clear();
     cert_tip.clear();
     auto* nb = node_proxy.ckLocalBranch();
-    // Claim chunks from the process-wide pool until it drains (dynamic
+    // Claim units from the process-wide pool until it drains (dynamic
     // self-scheduling; supersedes the static symmetric-hash assignment —
-    // see the pool comment on FoFPhase1Node). Chunked claims keep the
-    // atomic traffic to ~pool/CHUNK increments per process.
-    const size_t CHUNK = 8;
+    // see the pool comment on FoFPhase1Node). Unit claims (chunk 1):
+    // the pool is LPT-sorted, so consecutive units are the costliest —
+    // chunked claims would stack them on one PE. Atomic traffic is one
+    // fetch_add per unit, a few thousand per PE.
+    const size_t CHUNK = 1;
     for (;;) {
       size_t start = nb->phaseb_next.fetch_add(CHUNK);
       if (start >= nb->phaseb_pool.size()) break;
       size_t end = std::min(start + CHUNK, nb->phaseb_pool.size());
       for (size_t k = start; k < end; k++) {
           double tp0 = CkWallTimer();
-          walk(nb->phaseb_pool[k].first, nb->phaseb_pool[k].second,
+          walk(nb->phaseb_pool[k].a, nb->phaseb_pool[k].b,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
                [&](Node<Data>* a, Node<Data>* b) {
                  // Positive certificate over frozen tips, memoized: each
@@ -829,11 +837,46 @@ public:
       // phaseABody.
       nb->phaseb_pool.clear();
       nb->phaseb_next = 0;
-      auto poolPush = [&](Node<Data>* a, Node<Data>* b) {
-        if (paratreet::mindist2(a->data.box, b->data.box, period_) > b2_)
-          return;
-        if (a->isLeaf() || b->isLeaf()) {
-          nb->phaseb_pool.emplace_back(a, b);
+      // Two split levels: the Anvil trace showed a 62 ms unit surviving
+      // ONE level (design/status-poolab-2026-07-27.md) — larger than a
+      // perfectly-leveled process share, so grandchild granularity is
+      // warranted. Each level is mindist-filtered, so only interacting
+      // pairs multiply.
+      std::function<void(Node<Data>*, Node<Data>*, int)> poolPush =
+          [&](Node<Data>* a, Node<Data>* b, int depth) {
+        double d2 = paratreet::mindist2(a->data.box, b->data.box, period_);
+        if (d2 > b2_) return;
+        // Depth 2 is reserved for OVERLAPPING pairs (gap 0): only dense
+        // shared boundaries can hide a giant unit, and unconditional
+        // grandchild granularity measurably inflated the per-unit fixed
+        // costs (phaseB avg 0.014 -> 0.020 on the laptop). Separated
+        // pairs stay at depth-1 granularity. Still pure geometry.
+        if (depth >= 2 || (depth == 1 && d2 > 0) || a->isLeaf() ||
+            b->isLeaf()) {
+          // LPT key, pure geometry (no thresholds): overlapping pairs
+          // (gap 0) are the expensive ones, ordered by DESCENDING box
+          // overlap volume; separated pairs follow by ascending gap.
+          // Ascending sort then claims costliest-first, so the pool's
+          // tail is cheap units and the last claim cannot be a giant.
+          double key;
+          if (d2 > 0) {
+            key = d2;
+          } else {
+            const auto& ba = a->data.box;
+            const auto& bb = b->data.box;
+            double ov = 1;
+            ov *= std::max(0.0,
+                (double)std::min(ba.greater_corner.x, bb.greater_corner.x) -
+                (double)std::max(ba.lesser_corner.x, bb.lesser_corner.x));
+            ov *= std::max(0.0,
+                (double)std::min(ba.greater_corner.y, bb.greater_corner.y) -
+                (double)std::max(ba.lesser_corner.y, bb.lesser_corner.y));
+            ov *= std::max(0.0,
+                (double)std::min(ba.greater_corner.z, bb.greater_corner.z) -
+                (double)std::max(ba.lesser_corner.z, bb.lesser_corner.z));
+            key = -ov;
+          }
+          nb->phaseb_pool.push_back({key, a, b});
           return;
         }
         for (int ci = 0; ci < a->n_children; ci++) {
@@ -842,9 +885,7 @@ public:
           for (int cj = 0; cj < b->n_children; cj++) {
             Node<Data>* cb = b->getChild(cj);
             if (cb == nullptr || cb->n_particles == 0) continue;
-            if (paratreet::mindist2(ca->data.box, cb->data.box, period_) <=
-                b2_)
-              nb->phaseb_pool.emplace_back(ca, cb);
+            poolPush(ca, cb, depth + 1);
           }
         }
       };
@@ -854,8 +895,13 @@ public:
         for (++itb; itb != nb->pe_subtrees.end(); ++itb)
           for (auto& sa : ita->second)
             for (auto& sb : itb->second)
-              poolPush(sa.root, sb.root);
+              poolPush(sa.root, sb.root, 0);
       }
+      std::stable_sort(nb->phaseb_pool.begin(), nb->phaseb_pool.end(),
+                       [](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                          const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                         return x.key < y.key;
+                       });
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].phaseBChained();
