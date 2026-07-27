@@ -18,7 +18,14 @@ INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I$(PARATREET_PATH
 # -DUNIONFIND rides along because AGGREGATION makes unionFindLib.h include
 # htram_group.h, whose datatype selection needs that macro in every client TU
 # (harmlessly duplicated where OPTS already define it).
-AGGREGATION ?= -DAGGREGATION -DUNIONFIND
+# DEFAULT OFF since 2026-07-27 (interleaved 80M/480-PE measurement: htram
+# cost 1-2.4 s of uf2 at 22k edges; see design/phase1-scaling.md "Final
+# round"). -DUNIONFIND stays: it selects the htram datatype and is
+# independent of whether aggregation is used. To build WITH aggregation
+# (multi-billion-particle insurance), use — HERE AND in the sibling
+# unionfind (make AGGREGATION=-DAGGREGATION there), plus make clean both:
+#   make AGGREGATION="-DAGGREGATION -DUNIONFIND"
+AGGREGATION ?= -DUNIONFIND
 INCLUDES:=$(INCLUDES) $(AGGREGATION)
 CHARM_HOME ?= $(HOME)/charm_reconverse
 
