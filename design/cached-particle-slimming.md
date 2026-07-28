@@ -114,9 +114,17 @@ full Particle — ~19 GB saved machine-wide). Components 424,897,832
 (max 185.3M), identical across reps — the reference line for
 cosmo25cmb.768g2_dm.001024. phaseB with the pool: 2.78 s vs 9.8 s
 static in the OOM run. component_histogram: 0.609 s for 425M
-components. Forward signals: phaseB_maxpair 0.575 s (the depth-3
-split revisit trigger fires at 2B density); phaseA skew 2.8x
-(particles/chare ~29k — the -G predictor's regime; worth the A/B).
+components. Forward signals, CORRECTED after reading the
+balance line properly (Kale's question, 2026-07-28): phaseB_maxpair
+0.575 s << the straggler PE's 2.761 s total — the diagnostic's own
+rule says depth-3 splitting is NOT justified; the phaseB wall at 2B
+is the CROSS-PROCESS floor (the heavy process carries ~20x the
+average process's phaseB work, leveled across its PEs by the pool).
+The lever is inter-process work movement or subtree->process
+placement, not finer units. phaseA skew 2.8x (particles/chare ~29k —
+the -G predictor's regime; worth the A/B). Not instrumented yet:
+pool unit COUNTS (so no mean per-unit time); a 5-line balance-line
+addition if wanted.
 The 8-node companion run did NOT fail on memory: it hit the LCI IBV
 completion assert (charm-notes/reconverse-qd-latency.md addendum) —
 a runtime robustness issue, identical binary succeeded at 16 nodes.
