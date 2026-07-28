@@ -1,7 +1,9 @@
 # Extracting the SMP cache as a standalone library (the local-only cut)
 
-**STATUS: DESIGN DIRECTION (Kale, 2026-07-28) — for discussion with
-Ritvik/Joseph, and eventually the ChaNGa side. The interface shape in
+**STATUS: DESIGN DIRECTION (Kale, 2026-07-28). Decision: Kale, with
+discussion with Ritvik, and Thomas Quinn (UW) for the ChaNGa side.
+(Joseph Hutter, the original ParaTreeT author, remains attached to the
+work but is in medical school.) The interface shape in
 Sec. 2 is Kale's; it supersedes an earlier framework-owner-interface
 sketch because it removes messaging from the library entirely.**
 
@@ -114,8 +116,15 @@ creation to keep that guarantee self-contained.
 
 ## 5. ChaNGa adoption path
 
-ChaNGa's cache (CkCache) is the ancestor of this design without the
-lock-free SMP interior. Adoption = ChaNGa keeps its request/reply
+VERIFIED against N-BodyShop/changa (2026-07-28): ChaNGa's
+CacheInterface.h builds on charm's CkCache (`CkCacheEntryType`,
+`CkCacheFillMsg`), and its tree nodes are GenericTreeNode. Two
+consequences. First, CkCache is the ancestor of this design without
+the lock-free SMP interior. Second — encouraging for adoption —
+ChaNGa's `CkCacheEntryType` already carries a per-entry-type
+`unpack(CkCacheFillMsg*, ...)` converter: structurally the SAME seam
+as this library's transform hooks, so a binding slots where `unpack`
+sits today instead of asking ChaNGa to learn a new idiom. Adoption = ChaNGa keeps its request/reply
 protocol and treats this library as its process-level store: its
 GenericTreeNode maps through the transform hooks (either into
 Node<Data> with a ChaNGa-shaped Data, or — if impedance is too high —

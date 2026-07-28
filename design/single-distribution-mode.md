@@ -1,7 +1,7 @@
 # Single-distribution mode: making Partitions optional
 
-**STATUS: DESIGN DIRECTION (Kale, 2026-07-28) — for discussion with
-Ritvik/Joseph. Decision context: Kale is certain of the direction as
+**STATUS: DESIGN DIRECTION (Kale, 2026-07-28) — decision Kale's, with
+discussion with Ritvik. Decision context: Kale is certain of the direction as
 long as both options exist, and skeptical that the partition degree of
 freedom ever bought much even for load balancing.**
 
