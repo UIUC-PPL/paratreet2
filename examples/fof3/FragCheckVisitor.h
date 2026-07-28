@@ -32,7 +32,7 @@ public:
     long minf = std::numeric_limits<long>::max();
     long maxf = std::numeric_limits<long>::min();
     for (int i = 0; i < source.n_particles; i++) {
-      long g = source.particles()[i].group_number;
+      long g = source.sourceParticle(i).group_number;
       if (g < minf) minf = g;
       if (g > maxf) maxf = g;
     }

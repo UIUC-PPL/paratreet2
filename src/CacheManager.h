@@ -2,6 +2,7 @@
 #define PARATREET_CACHEMANAGER_H_
 
 #include "paratreet.decl.h"
+#include <type_traits>
 #include "common.h"
 #include "Utility.h"
 #include "templates.h"
@@ -228,13 +229,18 @@ public:
 
 public:
   void resetCachedParticles(PPHolder<Data> pp_holder) {
+    // Requires FULL particles on cached leaves (reads key/partition_idx):
+    // invalid for applications that opt into a slim CachedParticle.
+    if (!std::is_same<CachedP, Particle>::value)
+      CkAbort("resetCachedParticles requires full cached particles; this "
+              "application declares a slim Data::CachedParticle");
     for (auto && clv : cached_leaves) {
       for (auto && cl : clv) {
         SpatialNode<Data> empty_sn (cl->depth, 0);
         auto new_leaf = makeCachedNode(cl->key, Node<Data>::Type::Remote, empty_sn, cl->parent, nullptr, cl->tp_index, cl->cm_index); // placeholder
         auto which_child = cl->key % branch_factor;
         cl->parent->exchangeChild(which_child, new_leaf);
-        cl->freeParticles();
+        cl->freeCachedParticles();
       }
       clv.clear();
     }
@@ -275,10 +281,10 @@ public:
   }
   void destroy(bool restore) {
     for (auto& clv : cached_leaves) {
-      for (auto l : clv) l->freeParticles();
+      for (auto l : clv) l->freeCachedParticles();
       clv.clear();
     }
-    for (auto& l : leaf_lookup) l.second->freeParticles();
+    for (auto& l : leaf_lookup) l.second->freeCachedParticles();
     for (auto& dlv : displaced_leaves) {
       dlv.clear();
     }
@@ -296,13 +302,31 @@ public:
     return pools[CkMyRank()]->alloc(key, type, depth, n_particles, particles, parent, tp_index, cm_index);
   }
 
-  Node<Data>* makeCachedNode(Key key, typename Node<Data>::Type type, SpatialNode<Data> spatial_node, Node<Data>* parent, const Particle* particlesToCopy, int tp_index, int cm_index) {
-    Particle* particles = nullptr;
+  using CachedP = typename CachedParticleOf<Data>::type;
+  Node<Data>* makeCachedNode(Key key, typename Node<Data>::Type type, SpatialNode<Data> spatial_node, Node<Data>* parent, const CachedP* particlesToCopy, int tp_index, int cm_index) {
+    // Cached copies are stored in the application's CachedParticle type
+    // (design/cached-particle-slimming.md); the node's legacy Particle
+    // pointer aliases the same array when CachedParticle == Particle.
+    CachedP* cached = nullptr;
     if (spatial_node.n_particles > 0) {
-      particles = new Particle [spatial_node.n_particles];
-      std::copy(particlesToCopy, particlesToCopy + spatial_node.n_particles, particles);
+      cached = new CachedP [spatial_node.n_particles];
+      std::copy(particlesToCopy, particlesToCopy + spatial_node.n_particles, cached);
     }
-    return pools[CkMyRank()]->alloc(key, type, spatial_node, parent, particles, tp_index, cm_index);
+    auto* node = pools[CkMyRank()]->alloc(key, type, spatial_node, parent, nullptr, tp_index, cm_index);
+    if (cached) node->setCachedParticles(cached);
+    return node;
+  }
+
+  // refreshSubtreeCopy particle-refresh dispatch: real update when the
+  // cached type is the full Particle; abort otherwise (C++11 overload
+  // selection — exact match wins when CachedP == Particle).
+  static void refreshCachedParticle(Node<Data>* node, int i, const Particle& p) {
+    node->changeParticle(i, p);
+  }
+  template <typename T>
+  static void refreshCachedParticle(Node<Data>*, int, const T&) {
+    CkAbort("refreshSubtreeCopy's particle refresh requires full cached "
+            "particles; this application declares a slim Data::CachedParticle");
   }
 
   template <typename Visitor>
@@ -320,7 +344,7 @@ public:
 
 private:
   void makeMsgPerNode(int, std::vector<Node<Data>*>&, std::vector<Particle>&, Node<Data>*);
-  Node<Data>* addCacheHelper(Particle*, int, std::pair<Key, SpatialNode<Data>>*, int, int, int, bool);
+  Node<Data>* addCacheHelper(const CachedP*, int, std::pair<Key, SpatialNode<Data>>*, int, int, int, bool);
   void restoreDataHelper(std::pair<Key, SpatialNode<Data>>&, bool);
   void insertNode(Node<Data>*, bool, bool);
   void swapIn(Node<Data>*);
@@ -449,7 +473,7 @@ void CacheManager<Data>::refreshSubtreeCopy(MultiData<Data> multidata) {
   Node<Data>* top = (it != local_tps.end()) ? it->second : nullptr;
   unlockMaps();
   if (!top) return; // no copy of this subtree lives here
-  Particle* particles = multidata.particles.data();
+  const CachedP* particles = multidata.particles.data();
   int p_index = 0;
   for (int j = 0; j < n_nodes; j++) {
     auto&& key = nodes[j].first;
@@ -457,9 +481,11 @@ void CacheManager<Data>::refreshSubtreeCopy(MultiData<Data> multidata) {
     Node<Data>* node = top->getDescendant(key);
     if (node) {
       node->data = spatial_node.data; // refreshed annotation
-      // Leaves carry n_particles > -1; refresh their particle copies in place.
+      // Leaves carry n_particles > -1; refresh their particle copies in
+      // place. Only valid when cached storage is full Particle (the
+      // overload dispatch below aborts for slim-CachedParticle apps).
       for (int i = 0; i < spatial_node.n_particles; i++) {
-        node->changeParticle(i, particles[p_index + i]);
+        refreshCachedParticle(node, i, particles[p_index + i]);
       }
     }
     if (spatial_node.n_particles > -1) p_index += spatial_node.n_particles;
@@ -473,7 +499,7 @@ void CacheManager<Data>::addCache(MultiData<Data> multidata) {
 }
 
 template <typename Data>
-Node<Data>* CacheManager<Data>::addCacheHelper(Particle* particles, int n_particles, std::pair<Key, SpatialNode<Data>>* nodes, int n_nodes, int cm_index, int tp_index, bool add_to_tps) {
+Node<Data>* CacheManager<Data>::addCacheHelper(const typename CacheManager<Data>::CachedP* particles, int n_particles, std::pair<Key, SpatialNode<Data>>* nodes, int n_nodes, int cm_index, int tp_index, bool add_to_tps) {
 #if DEBUG
   CkPrintf("adding cache for top node 0x%" PRIx64 " on cm %d\n", nodes[0].first, this->thisIndex);
 #endif

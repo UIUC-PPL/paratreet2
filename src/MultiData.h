@@ -10,47 +10,37 @@
 #include <iterator>
 #include <utility>
 
-// Opt-in remote-particle slimming (same compile-time opt-in idiom as
-// maybeSetKeys): a Data type that defines
-//     static void pupRemoteParticle(PUP::er&, Particle&);
-// has the particles of cache-shipped subtree copies serialized by that
-// function instead of the full Particle pup, cutting wire volume for
-// traversals that read only a few fields from REMOTE particles (FoF:
-// position + group_number = 20 of ~112 bytes, ~5x). Receivers reconstruct
-// full Particle objects whose unshipped fields hold default values, so
-// cached-leaf storage and every particle type are unchanged (cache MEMORY
-// reduction is a separate, deeper change). CONTRACT for an opting-in app:
-// nothing may read an unshipped field from a cache-shipped particle — that
-// includes visitors AND cache-lifecycle machinery (resetCachedParticles
-// reads key/partition_idx on cached leaves in multi-iteration flows; FoF
-// is single-iteration and its walk reads only the two shipped fields).
-// The OWNED-particle exchange (ParticleMsg: decomposition flush,
-// Partition<->Subtree routing) is a different path and always ships full
-// particles.
-template <typename D>
-inline auto pupParticlesDispatch(PUP::er& p, std::vector<Particle>& v, int)
-    -> decltype(D::pupRemoteParticle(std::declval<PUP::er&>(),
-                                     std::declval<Particle&>()),
-                void()) {
-  size_t n = v.size();
-  p | n;
-  if (p.isUnpacking()) v.assign(n, Particle());
-  for (auto& part : v) D::pupRemoteParticle(p, part);
-}
-template <typename D>
-inline void pupParticlesDispatch(PUP::er& p, std::vector<Particle>& v, long) {
-  p | v; // no opt-in: full particles
-}
-
+// Remote-particle slimming (design/cached-particle-slimming.md): the
+// particles of cache-shipped subtree copies are CONVERTED ONCE here, at
+// pack time, into the application's CachedParticle type (see
+// CachedParticleOf in Particle.h) and stay in that type on the wire AND
+// in cached-leaf storage. For a non-opting app CachedParticle is
+// Particle and behavior is byte-identical to the unparameterized
+// framework. CONTRACT for an opting app: cached copies carry ONLY the
+// fields CachedParticle keeps — code paths that need full particles
+// from cached leaves (resetCachedParticles, refreshSubtreeCopy's
+// particle refresh) abort with a clear message for opting apps; the
+// OWNED-particle exchange (ParticleMsg: decomposition flush,
+// Partition<->Subtree routing) is a different path and always ships
+// full particles. This supersedes the older pupRemoteParticle wire-only
+// mechanism (removed).
 template <typename Data>
 struct MultiData {
-  std::vector<Particle> particles;
+  using CachedP = typename CachedParticleOf<Data>::type;
+  std::vector<CachedP> particles;
   std::vector<std::pair<Key, SpatialNode<Data>>> nodes;
   int cm_index = -1;
   int tp_index = -1;
 
   MultiData();
-  MultiData(Particle*, int, Node<Data>**, int, int, int);
+  MultiData(const Particle*, int, Node<Data>**, int, int, int);
+  // Assign from full particles, converting once (same conversion point
+  // semantics as the constructor). Used by Subtree's flat_subtree.
+  void setParticles(const std::vector<Particle>& src) {
+    particles.clear();
+    particles.reserve(src.size());
+    for (const auto& p : src) particles.emplace_back(CachedP(p));
+  }
   void pup(PUP::er& p);
   void clear();
 };
@@ -59,10 +49,12 @@ template <typename Data>
 MultiData<Data>::MultiData() {}
 
 template <typename Data>
-inline MultiData<Data>::MultiData(Particle* particlesi, int n_particles, Node<Data>** nodesi, int n_nodes, int cm_indexi, int tp_indexi) {
+inline MultiData<Data>::MultiData(const Particle* particlesi, int n_particles, Node<Data>** nodesi, int n_nodes, int cm_indexi, int tp_indexi) {
   cm_index      = cm_indexi;
   tp_index      = tp_indexi;
-  std::copy(particlesi, particlesi + n_particles, std::back_inserter(particles));
+  particles.reserve(n_particles);
+  for (int i = 0; i < n_particles; i++)
+    particles.emplace_back(CachedP(particlesi[i])); // the ONE conversion point
   std::transform(nodesi, nodesi + n_nodes, std::back_inserter(nodes), [] (Node<Data>* node) {
     SpatialNode<Data> copy = *node;
     return std::make_pair(node->key, copy);
@@ -71,7 +63,7 @@ inline MultiData<Data>::MultiData(Particle* particlesi, int n_particles, Node<Da
 
 template <typename Data>
 void MultiData<Data>::pup(PUP::er& p) {
-  pupParticlesDispatch<Data>(p, particles, 0); // slim if Data opts in
+  p | particles; // CachedP on the wire (== Particle for non-opting apps)
   p | nodes;
   p | cm_index;
   p | tp_index;

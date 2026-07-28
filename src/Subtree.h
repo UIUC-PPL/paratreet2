@@ -317,7 +317,7 @@ void Subtree<Data>::requestCopy(int cm_index, PPHolder<Data> pp_holder) {
 template <typename Data>
 void Subtree<Data>::refreshCopies(const CkCallback& cb) {
   if (!copy_requesters.empty()) {
-    flat_subtree.particles = particles;   // mutated particle data
+    flat_subtree.setParticles(particles); // mutated particle data (converted to CachedParticle)
     flat_subtree.nodes.clear();
     addNodeToFlatSubtree(local_root);     // post-upwardPass node annotations
     for (int cm_index : copy_requesters) {
@@ -367,7 +367,7 @@ void Subtree<Data>::buildTree(CProxy_Partition<Data> part, CkCallback cb) {
 
   flat_subtree.tp_index  = this->thisIndex;
   flat_subtree.cm_index  = cm_proxy.ckLocalBranch()->thisIndex;
-  flat_subtree.particles = particles;
+  flat_subtree.setParticles(particles);
 
   // Populate the tree structure (including TreeCanopy)
   populateTree();

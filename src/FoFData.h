@@ -16,7 +16,23 @@
 // (relabel) to compute the real annotations. uniform() is the hereditary
 // predicate phase 3 prunes on: every particle under the node belongs to the
 // same fragment.
+struct FoFCachedParticle {
+  // The 20 bytes the FoF walk reads from REMOTE particles
+  // (design/cached-particle-slimming.md): stored AND shipped form of
+  // cache-copied particles for this application.
+  Vector3D<Real> position;
+  long group_number = -1;
+  FoFCachedParticle() = default;
+  explicit FoFCachedParticle(const Particle& p)
+      : position(p.position), group_number(p.group_number) {}
+  void pup(PUP::er& p) {
+    p | position;
+    p | group_number;
+  }
+};
+
 struct FragData {
+  using CachedParticle = FoFCachedParticle;
   OrientedBox<Real> box; // required by the Data concept (grown from positions)
   long min_frag;
   long max_frag;
@@ -28,10 +44,6 @@ struct FragData {
   // Remote-particle slimming opt-in (MultiData.h): the FoF walk reads only
   // position (distance tests) and group_number (the tip, for edge emission)
   // from cache-shipped particles — ship exactly those (~20 of ~112 bytes).
-  static void pupRemoteParticle(PUP::er& p, Particle& part) {
-    p | part.position;
-    p | part.group_number;
-  }
 
   FragData(const Particle* particles, int n_particles, int depth) : FragData() {
     for (int i = 0; i < n_particles; i++) {

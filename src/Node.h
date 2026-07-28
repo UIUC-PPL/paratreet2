@@ -59,8 +59,44 @@ public:
   bool      order_range_initialized = false;
   inline const Particle* particles() const {return particles_;}
 
+  // --- Cached-copy storage (design/cached-particle-slimming.md).
+  // Cache-shipped remote particles are stored as the application's
+  // CachedParticle type. When that type IS Particle (no opt-in), the
+  // legacy particles_ pointer aliases the same array, so every existing
+  // accessor keeps working unchanged. When the app opts into a slim
+  // type, particles_ stays null on cached leaves and remote reads go
+  // through sourceParticle().
+  using CachedP = typename CachedParticleOf<Data>::type;
+
+  // Read particle i of a node that may be either local (full Particle)
+  // or cached (CachedP storage). Returns by value — CachedP is small by
+  // design; for CachedP == Particle this is the plain copy visitors
+  // already make.
+  inline CachedP sourceParticle(int i) const {
+    return cached_particles_ ? cached_particles_[i] : CachedP(particles_[i]);
+  }
+  void setCachedParticles(CachedP* p) {
+    cached_particles_ = p;
+    setLegacyAlias(p); // aliases particles_ only when CachedP == Particle
+  }
+  void freeCachedParticles() {
+    if (cached_particles_) {
+      delete[] cached_particles_;
+      cached_particles_ = nullptr;
+      clearLegacyAlias(cached_particles_);
+    }
+  }
+
 private:
   Particle* particles_ = nullptr;
+  CachedP*  cached_particles_ = nullptr; // owned; never pupped (transient)
+
+  // Overload trick (C++11, no if-constexpr): exact-match overloads fire
+  // only when CachedP == Particle.
+  void setLegacyAlias(Particle* p) { particles_ = p; }
+  template <typename T> void setLegacyAlias(T*) {}
+  void clearLegacyAlias(Particle*) { particles_ = nullptr; }
+  template <typename T> void clearLegacyAlias(T*) {}
 
 public:
   void freeParticles() {
@@ -226,7 +262,7 @@ public:
 
   virtual ~Node() {
     if (type == Type::CachedRemoteLeaf) {
-      this->freeParticles();
+      this->freeCachedParticles();
     }
   }
 

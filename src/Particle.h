@@ -65,4 +65,23 @@ struct Particle {
   bool operator<(const Particle&) const;
 };
 
+
+// Cached-particle type selection (design/cached-particle-slimming.md).
+// An application's Data type may declare
+//     using CachedParticle = <struct>;
+// and the framework then STORES cache-shipped remote particles in that
+// type (and ships them in it). The struct must be constructible from a
+// full Particle (that constructor defines which fields survive) and be
+// PUPable. Absent the declaration, CachedParticle is Particle and every
+// code path is byte-identical to the unparameterized framework —
+// non-opting applications are untouched. The old MultiData
+// pupRemoteParticle wire-only mechanism is superseded by this.
+template <typename D>
+class CachedParticleOf {
+  template <typename T> static typename T::CachedParticle test(int);
+  template <typename T> static Particle test(...);
+ public:
+  using type = decltype(test<D>(0));
+};
+
 #endif // PARATREET_PARTICLE_H_

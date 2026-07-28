@@ -262,7 +262,7 @@ public:
         return;
       }
       for (int i = 0; i < source.n_particles; i++) {
-        const Particle& sp = source.particles()[i];
+        const auto sp = source.sourceParticle(i); // cached: slim copy
         for (int j = 0; j < target.n_particles; j++) {
           const Particle& tp = target.particles()[j];
           if (paratreet::periodicDistSq(sp.position, tp.position, period) > b2) continue;
@@ -276,7 +276,7 @@ public:
     // Mixed fragments on at least one side: per particle-pair witness, as
     // in v1, but SEEN-gated so each (g, f) is emitted once per process.
     for (int i = 0; i < source.n_particles; i++) {
-      const Particle& sp = source.particles()[i];
+      const auto sp = source.sourceParticle(i); // cached: slim copy
       for (int j = 0; j < target.n_particles; j++) {
         const Particle& tp = target.particles()[j];
         if (paratreet::periodicDistSq(sp.position, tp.position, period) > b2) continue;
