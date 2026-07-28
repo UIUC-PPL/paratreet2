@@ -1,7 +1,19 @@
 # Cached-particle slimming: per-application cached-copy types
 
-**STATUS: DESIGN FOR REVIEW (Kale), 2026-07-28. Motivated by the ~2B
-dataset running out of memory at 16 nodes.** Companion to the wire-side
+**STATUS: IMPLEMENTED on main (2026-07-28, commits 757d795 probe +
+917ea51 slimming + d5094af accounting; Kale approved proceeding without
+waiting for the 16-node OOM data — "pure optimization without
+downside"). Validated: fof1 exact, all fof3 full checks (incl. PBC),
+8M stats bit-identical, annotate (4 configs incl. multi-process) and
+searchAlgos UNCHANGED (framework purity), both runtimes; the
+FOF3STAT memory_MB line now reports process RSS (works on reconverse)
+and the cache line prints cached_particle_MB with the actual stored
+type (8M laptop: 19.0 MB vs 88.9 full-particle). Separate-compilation
+answer (Kale's question): no impact — the mechanism rides the existing
+Data-template seam; libparatreet.a (Reader/Writer/Decomposition/
+concrete Particle) is untouched, and unionfind never sees particles.**
+Original motivation: the ~2B dataset running out of memory at 16
+nodes. Companion to the wire-side
 slimming already shipped (MultiData::pupRemoteParticle, commit f0acacc):
 that cut what is SENT to 20 of ~112 bytes per remote particle; this cuts
 what is STORED.
