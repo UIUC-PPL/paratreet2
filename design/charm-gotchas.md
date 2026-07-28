@@ -2,9 +2,11 @@
 
 Charm/Converse lessons tied to THIS codebase's internals (the cache, the
 Subtree/Partition copy split, the FoF certificate walk). General, transferable
-Charm lessons live in the machine-wide practitioner file
-(`~/software/tutorialcharmclaude/notes/charm_best_practices.md`); this file is
-only for the paratreet2-internal specifics that would be noise there. When a
+Charm lessons live in the SHARED practitioner repo
+(github.com/UIUC-PPL/charm-notes, `charm_best_practices.md`); this file is
+only for the paratreet2-internal specifics that would be noise there.
+(Renamed from design/charm-notes.md 2026-07-28 to end the name collision
+with that repo.) When a
 lesson has both a general kernel and a project detail, the kernel goes to the
 general file and the detail lands here.
 
