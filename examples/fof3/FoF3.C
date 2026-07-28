@@ -663,14 +663,15 @@ using namespace paratreet;
 
   void ExMain::postIterationFn(BoundingBox& universe, ProxyPack<FragData>& proxy_pack, int iter) {
     // End-of-iteration memory footprint, min/avg/max over PEs (tuple
-    // reduction on the FoFPhase1 branches; CmiMemoryUsage). Limitation: in
-    // SMP builds CmiMemoryUsage reports PROCESS-wide allocation, so every PE
-    // of a process contributes the same value and min/avg/max are effectively
+    // reduction on the FoFPhase1 branches; process RSS from the OS — see
+    // FoFPhase1::processRSSBytes; CmiMemoryUsage only as fallback, since it
+    // returns 0 on reconverse). RSS is process-wide, so every PE of a
+    // process contributes the same value and min/avg/max are effectively
     // over processes; it is current (not peak) usage, so the walk-time or
     // gather-time high-water mark can exceed it.
     auto ms = paratreet::runFoFMemoryStats(fof);
     CkPrintf("FOF3STAT memory_MB: %.1f/%.1f/%.1f (min/avg/max over %d PEs; "
-             "CmiMemoryUsage, process-wide under SMP)\n",
+             "process RSS)\n",
              ms.min_bytes / 1e6, ms.avg_bytes / 1e6, ms.max_bytes / 1e6,
              CkNumPes());
 

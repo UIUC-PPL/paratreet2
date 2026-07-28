@@ -50,6 +50,11 @@
 #include <limits>
 #include <map>
 #include <atomic>
+#include <cstdio>
+#include <unistd.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
 #include <functional>
 #include <mutex>
 #include <numeric>
@@ -289,8 +294,9 @@ struct FoFComponentHistogram {
   int min_component_size;   // the m used (0 = no filter)
 };
 
-// Result of the per-PE memory reduction (CmiMemoryUsage). In SMP builds
-// CmiMemoryUsage reports PROCESS-wide allocation, so every PE of a process
+// Result of the per-PE memory reduction (process RSS from the OS; see
+// FoFPhase1::processRSSBytes — CmiMemoryUsage is only the fallback, it
+// returns 0 on reconverse). RSS is PROCESS-wide, so every PE of a process
 // contributes the same value; min/avg/max are then over processes in
 // practice. avg = sum / CkNumPes().
 struct FoFMemoryStats {
@@ -1239,8 +1245,32 @@ public:
   //   [2] max over PEs (long).
   // In SMP builds CmiMemoryUsage is process-wide (every PE of a process
   // reports the same value); see paratreet::FoFMemoryStats.
+  // Resident-set size of this process, from the OS accounting: works on
+  // runtimes where CmiMemoryUsage returns 0 (reconverse does not wrap the
+  // allocator). One pseudo-file read per call — negligible.
+  static long processRSSBytes() {
+    long rss = 0;
+#if defined(__APPLE__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) == KERN_SUCCESS)
+      rss = (long)info.resident_size;
+#else
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (f) {
+      long tot = 0, res = 0;
+      if (fscanf(f, "%ld %ld", &tot, &res) == 2)
+        rss = res * sysconf(_SC_PAGESIZE);
+      fclose(f);
+    }
+#endif
+    if (rss <= 0) rss = (long)CmiMemoryUsage(); // fallback
+    return rss;
+  }
+
   void memoryStats(const CkCallback& cb) {
-    long mem = (long)CmiMemoryUsage();
+    long mem = processRSSBytes();
     CkReduction::tupleElement tupleRedn[] = {
       CkReduction::tupleElement(sizeof(long), &mem, CkReduction::min_long),
       CkReduction::tupleElement(sizeof(long), &mem, CkReduction::sum_long),
