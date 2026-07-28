@@ -181,7 +181,11 @@ public:
     // copies on CachedRemoteLeafs. Post-QD single reader — safe.
     long cached_leaf_count = 0, cached_particles = 0, cached_nodes = 0;
     tallyCache(root, cached_nodes, cached_leaf_count, cached_particles);
-    long total_bytes = pool_bytes + cached_particles * (long)sizeof(Particle);
+    // Cached-particle bytes use the ACTUAL stored type (CachedParticle —
+    // Particle unless the app opts into a slim type; see
+    // design/cached-particle-slimming.md), so this line directly shows
+    // the slimming saving.
+    long total_bytes = pool_bytes + cached_particles * (long)sizeof(CachedP);
     long sums[5] = {pool_bytes, cached_nodes, cached_leaf_count,
                     cached_particles, total_bytes};
     (void)used_nodes; // pool slots incl. placeholders; cached_nodes is the
