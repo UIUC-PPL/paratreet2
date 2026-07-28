@@ -40,14 +40,33 @@ Given a cache handle shared by the threads/PEs of one process:
   this caller is the first to miss this slot (the per-node atomic
   request bitmask lives INSIDE the cache; `first` is what tells the
   framework "issue the request" vs "someone already did — just wait").
-- **`install(slot, PartialSubtree) -> Node* `**
-  Atomically add a fetched partial subtree (what a node request
-  returns today: the node, its descendants to the configured share
-  depth, and leaf particle payloads) at the slot. Publication is the
-  existing atomic child-pointer exchange; concurrent lookups either
-  see the placeholder (miss) or the complete installed subtree, never
-  a partial state. Returns the installed root so the caller can
-  resume parked work.
+  (A partial subtree = what a node request returns today: the node,
+  its descendants to the configured share depth, and leaf particle
+  payloads. Publication is the existing atomic child-pointer
+  exchange; concurrent lookups see the placeholder or the complete
+  subtree, never a partial state.)
+- **`park(slot, opaque) -> PARKED | ALREADY_INSTALLED`**
+  (Resolution of the continuation question, Kale 2026-07-28.) The
+  per-slot waiting list lives INSIDE the library, on the placeholder —
+  not because clients couldn't keep a slot->waiters map of their own,
+  but because the park-vs-install race can only be closed against
+  install's atomic publication, i.e., inside. `park` appends an OPAQUE
+  reference (a small value the library never interprets) to the
+  placeholder's lock-free list; ALREADY_INSTALLED means the data won
+  the race and the caller proceeds synchronously — that return code is
+  the lost-wakeup fix, provided once here instead of re-solved by
+  every client.
+- **`install(slot, PartialSubtree) -> {Node*, parked_opaques[]}`**
+  Install RETURNS the parked continuations rather than invoking a
+  callback: the cache stays passive (no execution context, no
+  reentrancy, no runtime assumptions — ChaNGa and a Charm framework
+  will want different resumption machinery). The guarantee: every
+  parked opaque is handed back EXACTLY ONCE, by its own park
+  (ALREADY_INSTALLED) or by install's returned list. Push-style
+  callbacks are a five-line client-side layer over this pull
+  primitive. Under this design, paratreet2's Resumer shrinks to pure
+  policy — its waiting[key] map dissolves into the placeholders, and
+  it keeps only "given these opaques, schedule these resumptions."
 - **Transform hooks**: caller-supplied functions converting the
   incoming wire format into the cache's node/payload format (the seam
   that absorbs format differences — including ChaNGa's node layout —
@@ -72,7 +91,8 @@ ChaNGa would keep its own equivalents.
 | node pools (`FullNodePool`), cached-particle storage (CachedParticle) | inside |
 | `handleRemoteNode`'s "request or wait" decision | caller, driven by `Miss.first` |
 | `serviceRequest` / `addCache` entries, `requestNodes` routing | caller (framework transport) |
-| `Resumer`, waiting lists, `process()` | caller |
+| `Resumer` waiting[key] map | inside: per-placeholder parked lists |
+| `Resumer` resumption scheduling (`process()`) | caller: consumes install's returned opaques |
 | `recvStarterPack` / `restoreData` | thin caller wrappers over `install` |
 | `resetCachedParticles`, `destroy` teardown | auxiliaries |
 | cacheStats tally | auxiliary statistics |
