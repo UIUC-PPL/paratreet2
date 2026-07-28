@@ -170,7 +170,7 @@ empty regions are EmptyLeaf(0). Any consumer descending by "child with
 particles" must test n_particles != 0, NOT > 0 — with > 0, LAMBS's deep
 dense chains (7 EmptyLeaf + 1 Internal(-1) per level) never advance.
 firstFlat/firstTip now carry the != 0 rule plus a loud CkAbort tripwire
-for genuinely inconsistent trees. Recorded in design/charm-notes.md.
+for genuinely inconsistent trees. Recorded in design/charm-gotchas.md.
 
 ## Connectivity suppression (2026-07-23, same session — the phaseA win)
 
