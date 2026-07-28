@@ -103,3 +103,20 @@ htram per-destination buffers. The 2B failure report should record
 WHERE the OOM strikes (read, flush, build, walk) before any of these is
 declared the culprit. Also standing: Tipsy's int32 header caps input at
 2^31 particles; beyond that the file format, not memory, is the wall.
+
+## 2B result (2026-07-28, job 19549364 — the OOM retry, 3 days after the OOM)
+
+16 nodes / 128 procs x 15 PEs, current main (agg-off + slim cache +
+pool + probe), untraced: **1.98B particles end-to-end, twice, 33/30 s
+wall, zero OOM.** RSS 10.6-12.6 GB/process (~92 GB/node of 257).
+cached_particle_MB 5,195 (216.5M copies x 24 B; would be 24.2 GB at
+full Particle — ~19 GB saved machine-wide). Components 424,897,832
+(max 185.3M), identical across reps — the reference line for
+cosmo25cmb.768g2_dm.001024. phaseB with the pool: 2.78 s vs 9.8 s
+static in the OOM run. component_histogram: 0.609 s for 425M
+components. Forward signals: phaseB_maxpair 0.575 s (the depth-3
+split revisit trigger fires at 2B density); phaseA skew 2.8x
+(particles/chare ~29k — the -G predictor's regime; worth the A/B).
+The 8-node companion run did NOT fail on memory: it hit the LCI IBV
+completion assert (charm-notes/reconverse-qd-latency.md addendum) —
+a runtime robustness issue, identical binary succeeded at 16 nodes.
