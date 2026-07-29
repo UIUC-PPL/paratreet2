@@ -650,6 +650,8 @@ public:
     t_phaseA = 0.0;
     t_phaseB = 0.0;
     t_phaseB_maxpair = 0.0;
+    t_phaseB_units = 0;
+    density_x = 0.0;
     phase3_emitted = 0;
     p3_negative_prunes = 0;
     p3_positive_prunes = 0;
@@ -669,9 +671,12 @@ public:
     b2_ = b2;
     // Offset table: flat index space over this PE's particle blocks.
     int n_local = 0;
+    density_x = 0.0;
     for (auto& s : subtrees) {
       s.offset = n_local;
       n_local += s.n;
+      double vol = (double)s.root->data.box.volume();
+      if (vol > 0) density_x += (double)s.n * (double)s.n / vol;
     }
     uf_parent.resize(n_local);
     std::iota(uf_parent.begin(), uf_parent.end(), 0);
@@ -747,6 +752,7 @@ public:
     double t0 = CkWallTimer();
     b2_ = b2;
     t_phaseB_maxpair = 0.0;
+    t_phaseB_units = 0;
     edge_buf.clear();
     seen.clear();
     cert_tip.clear();
@@ -763,6 +769,7 @@ public:
       if (start >= nb->phaseb_pool.size()) break;
       size_t end = std::min(start + CHUNK, nb->phaseb_pool.size());
       for (size_t k = start; k < end; k++) {
+          t_phaseB_units++;
           double tp0 = CkWallTimer();
           walk(nb->phaseb_pool[k].a, nb->phaseb_pool[k].b,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
@@ -1141,6 +1148,12 @@ public:
   double t_phaseA = 0.0;
   double t_phaseB = 0.0;
   double t_phaseB_maxpair = 0.0; // longest single pool-unit walk this PE ran
+  long t_phaseB_units = 0;       // pool units this PE claimed (pool balance)
+  // Predicted phaseA pair work from geometry alone: sum over this PE's
+  // subtrees of n^2/V (pair count within a chare ~ n * local density).
+  // Correlated against t_phaseA across PEs by the stats reduction — the
+  // density-drives-phase1-work quantifier (Kale, 2026-07-29).
+  double density_x = 0.0;
 
   void resetPhase3(const CkCallback& cb) {
     edge_buf3.clear();
@@ -1170,25 +1183,31 @@ public:
   }
 
   // Edge + 3a-counter statistics, a tuple reduction:
-  //   element 0 (sum over PEs), long[8]:
+  //   element 0 (sum over PEs), long[9]:
   //     [0] edges emitted (SEEN wins reaching addPhase3Edge)
   //     [1] edges sent to the gather (after per-PE dedup)
   //     [2] negative prunes  [3] positive-certificate prunes
   //     [4] suppression prunes  [5] same-fragment prunes
   //     [6] leaf visits  [7] redundant (both-uniform) descents
+  //     [8] phaseB pool units claimed (total = process pool sizes summed)
   //   element 1 (max over PEs), long: peak edge-buffer size.
   // Load-imbalance extension (min/avg/max over PEs; avg = sum/CkNumPes at
   // the consumer):
-  //   element 2 (min over PEs), long[2]: [0] leaf visits [1] edges emitted
-  //   element 3 (max over PEs), long[2]: same layout
-  //   element 4 (sum over PEs), double[2]: [0] phaseA s [1] phaseB s
-  //   element 5 (min over PEs), double[2]: same layout
-  //   element 6 (max over PEs), double[2]: same layout
+  //   element 2 (min over PEs), long[4]: [0] leaf visits [1] edges emitted
+  //     [2] per-process redundant total [3] phaseB pool units claimed
+  //   element 3 (max over PEs), long[4]: same layout
+  //   element 4 (sum over PEs), double[4]: [0] phaseA s [1] phaseB s
+  //     [2] phaseB maxpair s [3] density-work proxy X (sum n^2/V)
+  //   element 5 (min over PEs), double[4]: same layout
+  //   element 6 (max over PEs), double[4]: same layout
+  //   element 7 (sum over PEs), double[3]: X*t_phaseA, X^2, t_phaseA^2 —
+  //     with element 4's X and phaseA sums these give the Pearson r of
+  //     predicted density work vs measured phaseA time across PEs.
   void phase3Stats(const CkCallback& cb) {
-    long sums[8] = {phase3_emitted, (long)edge_buf3.size(),
+    long sums[9] = {phase3_emitted, (long)edge_buf3.size(),
                     p3_negative_prunes, p3_positive_prunes,
                     p3_suppression_prunes, p3_same_frag_prunes,
-                    p3_leaf_visits, p3_redundant_descents};
+                    p3_leaf_visits, p3_redundant_descents, t_phaseB_units};
     long peak = p3_peak_edge_buf;
     // per_pe[0,1] are PER-PE (leaf visits, edges emitted); per_pe[2] is the
     // PER-PROCESS redundant-descent total (design/step3.md §6d) -- every PE of
@@ -1197,8 +1216,11 @@ public:
     // depositNodeRedundant to have run post-walk; avg-over-processes is
     // p3_redundant_descents-sum / CkNumNodes() at the consumer.
     long node_redundant = node_proxy.ckLocalBranch()->p3_node_redundant;
-    long per_pe[3] = {p3_leaf_visits, phase3_emitted, node_redundant};
-    double times[3] = {t_phaseA, t_phaseB, t_phaseB_maxpair};
+    long per_pe[4] = {p3_leaf_visits, phase3_emitted, node_redundant,
+                      t_phaseB_units};
+    double times[4] = {t_phaseA, t_phaseB, t_phaseB_maxpair, density_x};
+    double corr[3] = {density_x * t_phaseA, density_x * density_x,
+                      t_phaseA * t_phaseA};
     CkReduction::tupleElement tupleRedn[] = {
       CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
       CkReduction::tupleElement(sizeof(long), &peak, CkReduction::max_long),
@@ -1206,9 +1228,10 @@ public:
       CkReduction::tupleElement(sizeof(per_pe), per_pe, CkReduction::max_long),
       CkReduction::tupleElement(sizeof(times), times, CkReduction::sum_double),
       CkReduction::tupleElement(sizeof(times), times, CkReduction::min_double),
-      CkReduction::tupleElement(sizeof(times), times, CkReduction::max_double)
+      CkReduction::tupleElement(sizeof(times), times, CkReduction::max_double),
+      CkReduction::tupleElement(sizeof(corr), corr, CkReduction::sum_double)
     };
-    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 7);
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 8);
     msg->setCallback(cb);
     this->contribute(msg);
   }

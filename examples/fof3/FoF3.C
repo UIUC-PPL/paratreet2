@@ -509,6 +509,22 @@ using namespace paratreet;
                pr.t_phaseB_min, pr.t_phaseB_avg, pr.t_phaseB_max,
                pr.t_pb_maxpair_min, pr.t_pb_maxpair_avg, pr.t_pb_maxpair_max,
                CkNumPes());
+      // Pool self-scheduling observables: units claimed per PE (spread =
+      // how well the pool levels) and the mean cost of one unit.
+      CkPrintf("FOF3STAT balance: phaseB_units %ld/%.1f/%ld total %ld "
+               "mean_unit_ms %.3f (min/avg/max over %d PEs)\n",
+               pr.units_min, (double)pr.units_total / n_pes, pr.units_max,
+               pr.units_total,
+               pr.units_total > 0
+                   ? pr.t_phaseB_avg * n_pes / (double)pr.units_total * 1e3
+                   : 0.0,
+               CkNumPes());
+      // Density-vs-work correlation (Kale, 2026-07-29): X = per-PE
+      // sum(n^2/V) over subtrees, the geometric pair-work predictor.
+      // r near 1 = phaseA cost is predictable from the tree alone.
+      CkPrintf("FOF3STAT density: r_phaseA %.3f proxy_x %.3g/%.3g/%.3g "
+               "(min/avg/max over %d PEs)\n",
+               pr.density_r, pr.x_min, pr.x_avg, pr.x_max, CkNumPes());
       CkPrintf("FOF3STAT balance: leaf_visits %ld/%.1f/%ld "
                "edges_emitted %ld/%.1f/%ld (min/avg/max over %d PEs)\n",
                pr.leaf_visits_min, pr.leaf_visits / n_pes, pr.leaf_visits_max,

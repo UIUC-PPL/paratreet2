@@ -60,6 +60,8 @@
 #include "FoFPhase1.h"
 
 #include <cstdint>
+#include <algorithm>
+#include <cmath>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -336,6 +338,16 @@ struct FoFPhase3Result {
   // divisibility diagnostic — ~= t_phaseB_max means an indivisible unit
   // still sets the wall.
   double t_pb_maxpair_min, t_pb_maxpair_avg, t_pb_maxpair_max;
+  // phaseB pool units claimed per PE (min/max; total summed over PEs =
+  // pool sizes of all processes). units_total / t_phaseB sum = mean unit
+  // cost; min/max spread shows whether the pool's self-scheduling levels.
+  long units_min, units_max, units_total;
+  // Density-work proxy X = sum over a PE's subtrees of n^2/V (min/avg/max
+  // over PEs), and the Pearson r between X and t_phaseA across PEs: the
+  // density-drives-phase1-work quantifier. r near 1 = phaseA cost is
+  // geometry-predictable (placement can act on X before running).
+  double x_min, x_avg, x_max;
+  double density_r;
 };
 
 // Convenience driver for the full phase-3 sequence:
@@ -380,7 +392,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   CkReduction::tupleElement* stats_elems = nullptr;
   int n_stats_elems = 0;
   stats_msg->toTuple(&stats_elems, &n_stats_elems);
-  CkEnforce(n_stats_elems == 7);
+  CkEnforce(n_stats_elems == 8);
   const long* stats = (const long*)stats_elems[0].data;
   FoFPhase3Result r;
   r.edges_emitted = stats[0];
@@ -415,6 +427,18 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
     r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];
     r.t_pb_maxpair_min = tmin[2]; r.t_pb_maxpair_avg = tsum[2] / n_pes;
     r.t_pb_maxpair_max = tmax[2];
+    r.units_min = mins[3];
+    r.units_max = maxs[3];
+    r.units_total = stats[8];
+    r.x_min = tmin[3]; r.x_avg = tsum[3] / n_pes; r.x_max = tmax[3];
+    // Pearson r of density-work proxy X vs t_phaseA over PEs (layout:
+    // FoFPhase1::phase3Stats element 7).
+    const double* csum = (const double*)stats_elems[7].data;
+    double sx = tsum[3], sy = tsum[0];
+    double num = n_pes * csum[0] - sx * sy;
+    double den = std::sqrt(std::max(0.0, n_pes * csum[1] - sx * sx)) *
+                 std::sqrt(std::max(0.0, n_pes * csum[2] - sy * sy));
+    r.density_r = den > 0 ? num / den : 0.0;
   }
   delete[] stats_elems;
   CkEnforce(r.edges_sent == (long)n_edges);
@@ -536,7 +560,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   CkReduction::tupleElement* stats_elems = nullptr;
   int n_stats_elems = 0;
   stats_msg->toTuple(&stats_elems, &n_stats_elems);
-  CkEnforce(n_stats_elems == 7);
+  CkEnforce(n_stats_elems == 8);
   const long* stats = (const long*)stats_elems[0].data;
   FoFPhase3Result r;
   r.edges_emitted = stats[0];
@@ -567,6 +591,18 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];
     r.t_pb_maxpair_min = tmin[2]; r.t_pb_maxpair_avg = tsum[2] / n_pes;
     r.t_pb_maxpair_max = tmax[2];
+    r.units_min = mins[3];
+    r.units_max = maxs[3];
+    r.units_total = stats[8];
+    r.x_min = tmin[3]; r.x_avg = tsum[3] / n_pes; r.x_max = tmax[3];
+    // Pearson r of density-work proxy X vs t_phaseA over PEs (layout:
+    // FoFPhase1::phase3Stats element 7).
+    const double* csum = (const double*)stats_elems[7].data;
+    double sx = tsum[3], sy = tsum[0];
+    double num = n_pes * csum[0] - sx * sy;
+    double den = std::sqrt(std::max(0.0, n_pes * csum[1] - sx * sx)) *
+                 std::sqrt(std::max(0.0, n_pes * csum[2] - sy * sy));
+    r.density_r = den > 0 ? num / den : 0.0;
   }
   delete[] stats_elems;
   delete stats_msg;
