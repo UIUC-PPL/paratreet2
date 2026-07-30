@@ -653,6 +653,8 @@ public:
     t_phaseB_units = 0;
     density_x = 0.0;
     phase3_emitted = 0;
+    uf2_stream_batch = 0;
+    p3_edges_streamed = 0;
     p3_negative_prunes = 0;
     p3_positive_prunes = 0;
     p3_suppression_prunes = 0;
@@ -1022,6 +1024,19 @@ public:
     this->contribute(cb);
   }
 
+  // Enable mid-walk streaming of phase-3 edge batches into UF_2
+  // (design/walk-uf2-overlap.md step 1): once armed, addPhase3Edge submits
+  // edge_buf3 to the lib whenever it reaches `batch` edges. seen3 persists
+  // across batches, so per-PE dedup is exactly as in the buffered path.
+  // Plain-sends only (the dist driver forces batch=0 under AGGREGATION):
+  // streamed cascades must stay visible to the walk's QD.
+  void enableUF2Streaming(CProxy_UnionFindLib uf_proxy, long batch,
+                          const CkCallback& cb) {
+    uf2_stream_proxy = uf_proxy;
+    uf2_stream_batch = batch;
+    this->contribute(cb);
+  }
+
   // CkEnforce the owner-locality invariant the whole scheme depends on:
   // every registered particle's (encoded) tip must decode to THIS process
   // (node bits == CkMyNode()) with a dense index within this process's own
@@ -1108,6 +1123,21 @@ public:
       edge_buf3.emplace_back(lo, hi);
     if ((long)edge_buf3.size() > p3_peak_edge_buf)
       p3_peak_edge_buf = (long)edge_buf3.size();
+    if (uf2_stream_batch > 0 && (long)edge_buf3.size() >= uf2_stream_batch)
+      flushUF2Batch();
+  }
+
+  // Submit the current edge buffer to this process's UnionFindLib element
+  // (the library routes each edge to its owner). Non-entry; runs on the
+  // walking PE. The buffer clears but seen3 does NOT: dedup spans batches.
+  void flushUF2Batch() {
+    std::vector<UFEdge> edges;
+    edges.reserve(edge_buf3.size());
+    for (auto& e : edge_buf3)
+      edges.push_back(UFEdge{(uint64_t)e.first, (uint64_t)e.second});
+    uf2_stream_proxy[CkMyNode()].union_requests(edges);
+    p3_edges_streamed += (long)edge_buf3.size();
+    edge_buf3.clear();
   }
 
   // --- Phase-3a SEEN suppression (design/step3.md §1, §3): synchronous
@@ -1140,6 +1170,11 @@ public:
   long p3_redundant_descents = 0; // opens that descend while both-uniform
                                   // (unSEEN, distinct tips): §8.3 data
   long p3_peak_edge_buf = 0;      // high-water mark of edge_buf3.size()
+                                  // (with streaming on, <= the batch size)
+  // Mid-walk UF_2 streaming state (enableUF2Streaming / flushUF2Batch).
+  CProxy_UnionFindLib uf2_stream_proxy;
+  long uf2_stream_batch = 0;      // 0 = off (classic post-walk injection)
+  long p3_edges_streamed = 0;     // edges already submitted mid-walk
 
   // Per-PE wall time of the phaseA/phaseB entry bodies (load-imbalance
   // signals; set in the entries above, reset by reset(), reduced min/avg/max
@@ -1159,6 +1194,8 @@ public:
     edge_buf3.clear();
     seen3.clear();
     phase3_emitted = 0;
+    uf2_stream_batch = 0;
+    p3_edges_streamed = 0;
     p3_negative_prunes = 0;
     p3_positive_prunes = 0;
     p3_suppression_prunes = 0;
@@ -1204,7 +1241,10 @@ public:
   //     with element 4's X and phaseA sums these give the Pearson r of
   //     predicted density work vs measured phaseA time across PEs.
   void phase3Stats(const CkCallback& cb) {
-    long sums[9] = {phase3_emitted, (long)edge_buf3.size(),
+    // "edges sent" counts streamed batches plus what remains buffered (the
+    // two are disjoint: flushUF2Batch clears the buffer as it submits).
+    long sums[9] = {phase3_emitted,
+                    p3_edges_streamed + (long)edge_buf3.size(),
                     p3_negative_prunes, p3_positive_prunes,
                     p3_suppression_prunes, p3_same_frag_prunes,
                     p3_leaf_visits, p3_redundant_descents, t_phaseB_units};

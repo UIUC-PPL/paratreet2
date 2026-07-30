@@ -531,7 +531,12 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         // unionFindInitOnePerNode overload:
                                         // inline map creation races with the
                                         // array construction on reconverse).
-                                        CkGroupID uf_node_map_gid = CkGroupID()) {
+                                        CkGroupID uf_node_map_gid = CkGroupID(),
+                                        // Stream edge batches of this size
+                                        // into UF_2 DURING the walk (0 = off,
+                                        // the classic post-walk injection).
+                                        // design/walk-uf2-overlap.md step 1.
+                                        long uf2_stream_batch = 0) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
   partitions.verifySharedLeaves(CkCallbackResumeThread());
@@ -539,9 +544,35 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   double b2 = linking_length * linking_length;
   fof.resetPhase3(CkCallbackResumeThread());
 
+  // One UnionFindLib chare per process (design/step4.md decision 2), created
+  // BEFORE the walk so edge batches can stream into it mid-walk. Use the
+  // caller's pre-created UFNodeMap when given (race-safe on reconverse); the
+  // inline-ckNew fallback keeps the old one-argument form's semantics
+  // (classic Converse only). Lazy vertex storage (sparse-uf2): vertices are
+  // created on first touch.
+  CProxy_UnionFindLib uf_proxy =
+      uf_node_map_gid.isZero()
+          ? UnionFindLib::unionFindInitOnePerNodeLazy(
+                CkCallbackResumeThread(), CProxy_UFNodeMap::ckNew())
+          : UnionFindLib::unionFindInitOnePerNodeLazy(
+                CkCallbackResumeThread(), CProxy_UFNodeMap(uf_node_map_gid));
+  fof.initUF2(uf_proxy, CkCallbackResumeThread());
+#ifdef AGGREGATION
+  // Streamed unions would sit in tram buffers invisible to the walk's QD
+  // (the same soundness hole UnionFindLib::quiesce exists to close), so
+  // streaming is plain-sends only; with aggregation compiled in, fall back
+  // to post-walk injection.
+  uf2_stream_batch = 0;
+#endif
+  if (uf2_stream_batch > 0)
+    fof.enableUF2Streaming(uf_proxy, uf2_stream_batch, CkCallbackResumeThread());
+
   // The boundary walk: identical to v1/3a. Tips are already encoded (see
   // precondition above), so the edges FoFEdgeVisitor buffers into edge_buf3
   // are already UF_2 vertex ids -- no translation needed anywhere below.
+  // With streaming on, union_request cascades ride along under the walk's
+  // QD (all plain entry sends), overlapping uf2's latency chains with the
+  // walk's remaining work and fetch stalls.
   double t0 = CkWallTimer();
   if (dual_walk)
     subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
@@ -625,23 +656,10 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   }
   double t2 = CkWallTimer();
 
-  // One UnionFindLib chare per process (design/step4.md decision 2), placed
-  // via UFNodeMap; created fresh per call (fof3 always runs a single
-  // iteration, so no cross-iteration reuse is needed -- see design/step4.md
-  // deviations).
-  // Use the caller's pre-created UFNodeMap when given (race-safe on
-  // reconverse); the inline-ckNew fallback keeps the old one-argument
-  // form's semantics (classic Converse only).
-  // Lazy vertex storage (sparse-uf2): vertices are created on first touch;
-  // no per-fragment enumeration or vertex array exists.
-  CProxy_UnionFindLib uf_proxy =
-      uf_node_map_gid.isZero()
-          ? UnionFindLib::unionFindInitOnePerNodeLazy(
-                CkCallbackResumeThread(), CProxy_UFNodeMap::ckNew())
-          : UnionFindLib::unionFindInitOnePerNodeLazy(
-                CkCallbackResumeThread(), CProxy_UFNodeMap(uf_node_map_gid));
-
-  fof.initUF2(uf_proxy, CkCallbackResumeThread());
+  // Inject the REMAINDER (with streaming on, everything below the last
+  // batch threshold; with streaming off, all buffered edges — the classic
+  // injection). The lib and its locator registration were set up before
+  // the walk.
   fof.fireUF2Edges(uf_proxy, CkCallbackResumeThread());
 #ifdef AGGREGATION
   // htram-aware completion of the union_request cascade: items parked in

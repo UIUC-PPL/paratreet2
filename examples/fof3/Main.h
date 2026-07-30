@@ -55,6 +55,12 @@ class ExMain: public paratreet::Main<FragData> {
   // the cell grid instead of the tree walk. 0 disables the grid (the
   // walk-only oracle for A/B). Default 1.0.
   double fof_grid_threshold = 1.0;
+  // -E <n>: stream phase-3 edge batches of n edges into UF_2 DURING the
+  // walk (design/walk-uf2-overlap.md step 1), overlapping the union
+  // cascades with the walk under one QD. 0 = classic post-walk injection
+  // (the A/B oracle). Ignored under AGGREGATION (tram buffers are
+  // invisible to the walk's QD). Default 4096.
+  long fof_uf2_stream_batch = 4096;
   // -g: compute and print the phase-1 fragments histogram (FOF3STAT
   // fragments line). Off by default since sparse-uf2: the histogram was the
   // only surviving consumer of countFragments, which is otherwise off the
