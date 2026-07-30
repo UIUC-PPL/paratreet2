@@ -282,43 +282,51 @@ public:
 
       start_time = CkWallTimer();
 
+      // The end-of-iteration movement machinery (kick, perturb, rebuild)
+      // exists for apps that move particles. A static-analysis app
+      // (config.perturb_particles == false, e.g. FoF) skips it: particles
+      // did not move, so the kick/perturb sweeps and the rebuild's particle
+      // exchange are pure overhead, and the universe box is unchanged.
+      // postIterationFn always runs — it is an app hook, not movement.
+      bool complete_rebuild = false;
+      if (config.perturb_particles) {
+        // Move the particles in Partitions
+        partitions.kick(timestep_size, CkCallbackResumeThread());
 
-      // Move the particles in Partitions
-      partitions.kick(timestep_size, CkCallbackResumeThread());
+        // Now track PE imbalance for memory reasons
+        thread_state_holder.collectMetaData(CkCallbackResumeThread((void *&) msg2));
 
+        msg2->toTuple(&res2, &numRedn2);
 
-      // Now track PE imbalance for memory reasons
-      thread_state_holder.collectMetaData(CkCallbackResumeThread((void *&) msg2));
+        long numParticleCopies = *(long*)(res2[2].data);
+        long numParticleShares = *(long*)(res2[3].data);
+        long maxPESize = *(long*)(res2[0].data);
+        long sumPESize = *(long*)(res2[1].data);
+        float avgPESize = (float) universe.n_particles / (float) CkNumPes();
+        float ratio = (float) maxPESize / avgPESize;
+        complete_rebuild = (config.flush_period == 0) ?
+            (ratio > config.flush_max_avg_ratio || numParticleShares * 10 > universe.n_particles) :
+            (iter % config.flush_period == config.flush_period - 1);
 
-      msg2->toTuple(&res2, &numRedn2);
-
-      long numParticleCopies = *(long*)(res2[2].data);
-      long numParticleShares = *(long*)(res2[3].data);
-      long maxPESize = *(long*)(res2[0].data);
-      long sumPESize = *(long*)(res2[1].data);
-      float avgPESize = (float) universe.n_particles / (float) CkNumPes();
-      float ratio = (float) maxPESize / avgPESize;
-      bool complete_rebuild = (config.flush_period == 0) ?
-          (ratio > config.flush_max_avg_ratio || numParticleShares * 10 > universe.n_particles) :
-          (iter % config.flush_period == config.flush_period - 1);
-
-      if (iter + 1 == config.num_iterations) complete_rebuild = false;
-      CkPrintf("[Meta] n_subtree = %d; timestep_size = %f; numPSParticleCopies = %ld; numPSParticleShares = %ld; sumPESize = %ld; maxPESize = %ld, avgPESize = %f; ratio = %f; maxVelocity = %f; rebuild = %s\n", n_subtrees, timestep_size, numParticleCopies, numParticleShares, sumPESize, maxPESize, avgPESize, ratio, max_velocity, (complete_rebuild? "yes" : "no"));
+        if (iter + 1 == config.num_iterations) complete_rebuild = false;
+        CkPrintf("[Meta] n_subtree = %d; timestep_size = %f; numPSParticleCopies = %ld; numPSParticleShares = %ld; sumPESize = %ld; maxPESize = %ld, avgPESize = %f; ratio = %f; maxVelocity = %f; rebuild = %s\n", n_subtrees, timestep_size, numParticleCopies, numParticleShares, sumPESize, maxPESize, avgPESize, ratio, max_velocity, (complete_rebuild? "yes" : "no"));
+      }
       //End Subtree reduction message parsing
 
       paratreet::postIterationFn(universe, proxy_pack, iter);
 
+      if (config.perturb_particles) {
+        CkReductionMsg* result;
+        partitions.perturb(timestep_size, CkCallbackResumeThread((void *&)result));
 
-      CkReductionMsg* result;
-      partitions.perturb(timestep_size, CkCallbackResumeThread((void *&)result));
+        universe = *((BoundingBox*)result->getData());
+        delete result;
+        remakeUniverse();
+        partitions.rebuild(universe, subtrees, complete_rebuild); // 0.1s for example
 
-      universe = *((BoundingBox*)result->getData());
-      delete result;
-      remakeUniverse();
-      partitions.rebuild(universe, subtrees, complete_rebuild); // 0.1s for example
-
-      CkWaitQD();
-      CkPrintf("Perturbations: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
+        CkWaitQD();
+        CkPrintf("Perturbations: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
+      }
       if (!complete_rebuild && config.lb_period > 0 && iter % config.lb_period == config.lb_period - 1 && iter != config.num_iterations - 1) {
         start_time = CkWallTimer();
         //subtrees.pauseForLB(); // move them later

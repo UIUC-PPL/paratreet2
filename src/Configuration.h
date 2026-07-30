@@ -126,6 +126,11 @@ namespace paratreet {
         Real linking_length;
         // The minimum number of vertices per component for friends-of-friends is strictly greater than this
         int min_vertices_per_component;
+        // Whether the app moves particles between iterations. Static
+        // analysis apps (FoF) set this false to skip the end-of-iteration
+        // movement machinery (kick/perturb/rebuild); default true keeps
+        // simulation apps byte-identical.
+        bool perturb_particles = true;
 
         // we support loading config files with "-x"
         Configuration(const char* config_arg = "-x")
@@ -191,6 +196,7 @@ namespace paratreet {
             p | fPeriod;
             p | dSoft;
             p | linking_length;
+            p | perturb_particles;
         }
     };
 
