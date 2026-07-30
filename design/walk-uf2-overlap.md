@@ -67,6 +67,17 @@ Expected win at 2B: most of the current 1.0-1.2 s uf2 wall (ppn15)
 hides under the 3.3 s walk; at ppn31 it also erases most of that
 config's uf2 regression.
 
+**MEASURED (step 1). Implemented 3b71f9e (-E flag, default 4096; -E 0
+= classic oracle). Laptop: 1M/2M/LAMBS-1M exact incl. forced batch
+sizes 8-64 (hundreds of mid-walk flushes), classic + reconverse
+runtimes, multi-process. 80M A/B (job 19579881, 4 nodes, 3 interleaved
+reps): all 6 runs exact (23,707,197; identical 49,312 edges both
+arms); performance a WASH as predicted at this scale — walk+uf2
+E0 0.56/0.87/0.83 s vs E4096 0.78/0.92/0.67 s, inside the noise band,
+because 80M's uf2 wall is essentially one QD settle either way and the
+overlap-able find_boss chains are milliseconds at 49k edges. The
+benefit measurement is the 2B A/B (submitted, job 19582087).**
+
 ### (2) Batch the Resumer resumption fan-out  [the measured hotspot]
 
 The new finding. On subtree install, CacheManager sends process(key)
