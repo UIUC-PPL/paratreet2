@@ -198,6 +198,23 @@ is this worth building. The right shape when built:
   more cached memory — the slim CachedParticle makes that cheaper than
   it used to be). Run that A/B before writing any aggregation code.
 
+**MEASURED (step 4 cheap-half; fof3 -D runtime override, b84ddaf).
+SCALE-DEPENDENT SIGN FLIP. 80M (job 19587569, D3 vs D4 x3
+interleaved): all exact; D4 walk 0.510 -> 0.452 s (-12%, every D4 rep
+faster), cached particles 9.3M -> 29.1M (+15 MB/proc — trivial).
+2B (job 19588397, x2 interleaved): all exact; D3 walk 3.110/3.396 vs
+D4 6.727/7.226 s — D4 is 2x SLOWER. The cache line says why: at 2B
+depth 4 ships +34% internal nodes (86.5M -> 115.8M installed, pool
+232 -> 308 GB) for essentially the same particle payload (216.5M ->
+214.8M) — the reply-construction and install cost of the extra
+structure swamps the halved request count at 2B density, while at 80M
+the extra structure was small and fewer round trips won. VERDICT:
+default stays 3; -D is kept (one flag, useful at 80M-class runs and
+as the knob for any future depth tuning). Sum-detail traces of BOTH
+2B arms captured at 10 ms bins (traces/2b-sumdetail-D3, -D4 on the
+laptop) — the D4 set is a ready-made microscope on where overfetch
+cost lands if we ever revisit.**
+
 ## 3. Measurement protocol
 
 Each step: laptop correctness (components byte-identical, 1M/2M, both
