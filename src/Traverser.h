@@ -639,36 +639,18 @@ private:
   Subtree<Data>& tp;
   ThreadStateHolder* stats = nullptr;
   std::unordered_map<Key, std::vector<Node<Data>*>> curr_nodes; // source nodes to target nodes
-  // Chunked low-priority drain (design/walk-uf2-overlap.md step 3):
-  // with pause_interval > 0, a drain yields after pause_interval leaf
-  // interactions; the remaining pair stack is stashed here and continued
-  // via a LOW-priority self-send of Subtree::goDown, so fetch replies and
-  // resumptions (default priority) preempt local filler between chunks.
-  // 0 = the original monolithic drain (the A/B oracle). Work and ORDER are
-  // identical either way — the drain is only sliced — so leaf_visits and
-  // edges must not change.
-  int pause_interval = 0;
-  long chunk_count = 0;
-  bool continuation_pending = false;
-  std::vector<std::pair<Node<Data>*, Node<Data>*>> paused_pairs;
 public:
-  DualTraverser(Visitor& vi, size_t ti, Subtree<Data>& tpi, int pause_int = 0)
-      : v(vi), trav_idx(ti), tp(tpi), pause_interval(pause_int)
+  DualTraverser(Visitor& vi, size_t ti, Subtree<Data>& tpi) : v(vi), trav_idx(ti), tp(tpi)
   {
     stats = thread_state_holder.ckLocalBranch();
   }
   void start() override {
     curr_nodes[1].push_back(tp.local_root);
-    chunk_count = 0;
     doTrav(tp.cm_local->root);
     // do work
   }
   virtual void interact() override {}
-  virtual bool isFinished() override {
-    return curr_nodes.empty() && paused_pairs.empty();
-  }
-
-  void scheduleContinuation() { scheduleContinuationAtPriority(false); }
+  virtual bool isFinished() override {return curr_nodes.empty();}
 
   void runInvertedTraversal(Node<Data>* source_leaf, Node<Data>* target_node)
   {
@@ -693,73 +675,20 @@ public:
   }
 
   virtual void resumeTrav() override {
-    chunk_count = 0;
-    continuation_pending = false;
-    // Remote-pipeline work first: newly fetched subtrees resume parked
-    // walks (which promptly reach the next remote level and issue the next
-    // requests). Local filler continues after, under the same budget.
     auto && resume_nodes = tp.r_local->all_resume_nodes[std::make_pair(trav_idx, tp.thisIndex)];
     while (!resume_nodes.empty()) {
       doTrav(resume_nodes.front());
       resume_nodes.pop();
-      if (chunkBudgetSpent()) {
-        // Mid-drain yield: remaining ready nodes and/or stashed pairs
-        // continue via the pending continuation (default priority if
-        // ready resume work remains, low if only local filler is left).
-        if (!resume_nodes.empty()) continuation_pending = false;
-        scheduleContinuationAtPriority(!resume_nodes.empty());
-        return;
-      }
-    }
-    if (!paused_pairs.empty()) {
-      std::stack<std::pair<Node<Data>*, Node<Data>*>> nodes;
-      for (auto it = paused_pairs.rbegin(); it != paused_pairs.rend(); ++it)
-        nodes.push(*it); // old stack top back on top: order preserved
-      paused_pairs.clear();
-      runPairs(nodes);
-    }
-  }
-
-  bool chunkBudgetSpent() const {
-    return pause_interval > 0 && chunk_count >= pause_interval;
-  }
-
-  void scheduleContinuationAtPriority(bool urgent) {
-    if (continuation_pending) return;
-    continuation_pending = true;
-    if (urgent) {
-      tp.thisProxy[tp.thisIndex].goDown(trav_idx);
-    } else {
-      CkEntryOptions opts;
-      opts.setPriority(1000000);
-      tp.thisProxy[tp.thisIndex].goDown(trav_idx, &opts);
     }
   }
 
   void doTrav(Node<Data>* start_node) {
     Key new_key = start_node->key;
+    std::vector<std::pair<Key, Node<Data>*>> curr_nodes_insertions;
     auto& now_ready = curr_nodes[new_key];
     std::stack<std::pair<Node<Data>*, Node<Data>*>> nodes;
     for (auto && np : now_ready) nodes.emplace(start_node, np);
-    curr_nodes.erase(new_key);
-    runPairs(nodes);
-  }
-
-  // The traversal loop over an explicit pair stack; shared by the initial
-  // drain, resumptions, and paused-work continuations. Returns false if it
-  // yielded with work stashed in paused_pairs (continuation scheduled).
-  bool runPairs(std::stack<std::pair<Node<Data>*, Node<Data>*>>& nodes) {
-    std::vector<std::pair<Key, Node<Data>*>> curr_nodes_insertions;
     while (!nodes.empty()) {
-      if (chunkBudgetSpent()) {
-        while (!nodes.empty()) {
-          paused_pairs.push_back(nodes.top());
-          nodes.pop();
-        }
-        for (auto cn : curr_nodes_insertions) curr_nodes[cn.first].push_back(cn.second);
-        scheduleContinuation();
-        return false;
-      }
       Node<Data>* node = nodes.top().first, *curr_payload = nodes.top().second;
       // node is source, payload is target
       nodes.pop();
@@ -773,7 +702,6 @@ public:
         case Node<Data>::Type::Leaf:
         case Node<Data>::Type::CachedRemoteLeaf:
           {
-            chunk_count++; // leaf interactions are the chunk-budget unit
             if (curr_payload->isLeaf() || !Visitor::TargetMustBeLeaf) {
               doLeaf(v, node, curr_payload, stats); // n2 calc
             } else runInvertedTraversal(node, curr_payload);
@@ -793,10 +721,7 @@ public:
             }
             else if (!doCell(v, node, curr_payload, stats)) {
               // cell means should we open target
-              if (Visitor::TargetMustBeLeaf) {
-                chunk_count++;
-                runInvertedTraversal(node, curr_payload);
-              }
+              if (Visitor::TargetMustBeLeaf) runInvertedTraversal(node, curr_payload);
               else if (doOpen(v, node, curr_payload, stats)) {
                 for (int i = 0; i < node->n_children; i++) {
                   nodes.emplace(node->getChild(i), curr_payload);
@@ -854,8 +779,8 @@ public:
         default: break;
       }
     }
+    curr_nodes.erase(new_key);
     for (auto cn : curr_nodes_insertions) curr_nodes[cn.first].push_back(cn.second);
-    return true;
   }
 };
 
