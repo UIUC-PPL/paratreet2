@@ -156,6 +156,23 @@ half the stall portion is ~10% of the window. Synergy with (4): once
 local filler hides latency, added request latency from aggregation
 becomes nearly free.
 
+**MEASURED (step 3). Implemented dc646ec (-R chunk budget, 0=off
+default; DualTraverser pause/stash/low-priority continuation; DFS
+order untouched; reconverse's scheduler polls FIFO before the
+prioritized queue, so the continuation is strict filler there by
+construction). Laptop + reconverse: exact at all configs, chunk
+budgets 100-5000. 80M A/B (job 19586178, R0/R2000/R500 x3
+interleaved): all 9 exact, but chunking REGRESSES the walk wall at
+this scale — means R0 0.487 s, R500 0.549 s (+13%), R2000 0.583 s
+(+20%). Reading: post-fanout-fix, the 80M walk's natural
+entry-granularity interleaving (~8 chares/PE, resumptions running
+between chare drains) already covers the fetch stalls; slicing adds
+stash/restore and scheduling overhead with nothing left to overlap.
+DECISION PENDING: one -R arm piggybacked on the next 2B job settles
+whether the bigger fetch-stall structure there flips the sign; if 2B
+is also negative, REVERT the machinery (~70 lines) rather than carry
+an off-by-default feature that measured negative — complexity rule.**
+
 ### (4) Short-buffer PP aggregation for node requests  [do LAST, gated]
 
 Kale's tradeoff is real but the measured base is small: requests+replies
