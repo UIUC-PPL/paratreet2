@@ -168,10 +168,18 @@ this scale — means R0 0.487 s, R500 0.549 s (+13%), R2000 0.583 s
 entry-granularity interleaving (~8 chares/PE, resumptions running
 between chare drains) already covers the fetch stalls; slicing adds
 stash/restore and scheduling overhead with nothing left to overlap.
-DECISION PENDING: one -R arm piggybacked on the next 2B job settles
-whether the bigger fetch-stall structure there flips the sign; if 2B
-is also negative, REVERT the machinery (~70 lines) rather than carry
-an off-by-default feature that measured negative — complexity rule.**
+2B decider (job 19586235, R0 vs R2000 x2 interleaved): all 4 exact;
+walk R0 3.955/3.180 vs R2000 3.645/3.825 — no win (the clean
+rep2-vs-rep2 comparison is +20%, matching 80M). VERDICT: REVERTED
+(be70495) per the complexity rule — an off-by-default feature that
+measured negative at both scales does not stay in the tree. The
+experiment survives here and in git history (dc646ec) if a future
+workload with a genuinely fetch-serialized walk wants to retry it.
+Step 3's underlying idle share is real but is NOT drain-serialization:
+post-fanout-fix, chare-granularity interleaving already covers the
+stalls; the remaining idle is tail imbalance and transport latency
+(the reconverse sparse-message issue), neither of which slicing can
+touch.**
 
 ### (4) Short-buffer PP aggregation for node requests  [do LAST, gated]
 
