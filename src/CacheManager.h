@@ -605,12 +605,25 @@ void CacheManager<Data>::restoreDataHelper(std::pair<Key, SpatialNode<Data>>& pa
 
 template <typename Data>
 void CacheManager<Data>::swapIn(Node<Data>* to_swap) {
+  // The displaced placeholder carries the per-PE `requested` waiter bitmask
+  // (set by handleRemoteNode BEFORE parking). Hand it off to the installed
+  // node so process() can notify exactly the waiting PEs: waiters that
+  // parked on the placeholder before this exchange are captured here;
+  // a waiter that arrives after the exchange sees the substituted node via
+  // getDescendant and self-processes (handleRemoteNode's else-branch), so
+  // no wakeup is lost. Without this handoff the installed node's mask is
+  // empty and a mask-filtered process() drops resumptions (observed as
+  // undercounted components, 2026-07-30).
   if (to_swap->key > 1) {
     auto which_child = to_swap->key % branch_factor;
-    to_swap = to_swap->parent->exchangeChild(which_child, to_swap);
+    Node<Data>* displaced = to_swap->parent->exchangeChild(which_child, to_swap);
+    if (displaced) to_swap->requested.fetch_or(displaced->requested.load());
   }
   else {
     std::swap(root, to_swap);
+    // to_swap now holds the displaced old root; NULL on the very first swap
+    // (recvStarterPack installing the initial root).
+    if (to_swap) root->requested.fetch_or(to_swap->requested.load());
   }
 }
 
@@ -657,9 +670,19 @@ void CacheManager<Data>::process(Node<Data>* node) {
       }
     }
     else {
+      // Notify only the PEs whose requested bit is set. Safe because every
+      // waiter sets its bit BEFORE parking (handleRemoteNode: fetch_or, then
+      // waiting[] insert), and a waiter that parks after this load finds the
+      // placeholder already substituted and self-processes (the re-check in
+      // handleRemoteNode's else-branch). Was `|` — a bug that made this
+      // condition always true and broadcast process() to every PE of the
+      // process for every install: 15/15 PEs at ppn 15 where the average
+      // requester count is ~1, i.e. ~15x the necessary resumption messages
+      // (measured 7.79M of 8.9M walk-window messages at 80M/480 PEs;
+      // design/walk-uf2-overlap.md step 2).
       auto requested = node->requested.load();
       for (int i = 0; i < node_size; i++) {
-        if ((1ull << i) | requested) r_proxy[first_pe + i].process(node->key);
+        if ((1ull << i) & requested) r_proxy[first_pe + i].process(node->key);
       }
     }
   }
