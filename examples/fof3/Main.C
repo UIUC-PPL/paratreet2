@@ -55,7 +55,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -87,6 +87,14 @@ PARATREET_REGISTER_MAIN(ExMain);
           fof_uf2_stream_batch = atol(optarg);
           if (fof_uf2_stream_batch < 0)
             CkAbort("-E requires a batch size >= 0 (0 = off)");
+          break;
+        case 'D':
+          // Cache share depth override (design/walk-uf2-overlap.md step 4
+          // cheap-half: depth+1 halves the node-request count at the cost
+          // of larger replies and more cached memory).
+          conf.cache_share_depth = atoi(optarg);
+          if (conf.cache_share_depth < 1)
+            CkAbort("-D requires a cache share depth >= 1");
           break;
         case 'm':
           fof_min_component_size = atoi(optarg);
@@ -160,6 +168,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("UF_2 mid-walk stream batch (-E): %ld%s\n",
              fof_uf2_stream_batch,
              fof_uf2_stream_batch > 0 ? "" : " (post-walk injection)");
+    CkPrintf("Cache share depth (-D): %d\n", conf.cache_share_depth);
     // PBC (design/pbc.md). Note: -P (capital) does not collide with any
     // framework-registered CLI letter (the framework uses lowercase 'p' for
     // nPartitionsMin and the multi-char 'pbc'/'px'/'py'/'pz'), so no
