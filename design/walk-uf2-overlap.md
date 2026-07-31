@@ -226,3 +226,26 @@ then 2B when the 80M signal is clear. The observables per step:
     committing to design/tools/ if reused);
 (3) idle share in the walk window;
 (4) requestNodes count and walk wall.
+
+## Closing measurements (2026-08-01, session end): grid A/B on current main
+
+Jobs 19592347 (80M, G0 vs G4 x3) and 19592348 (2B, G0 vs G4 x2), all
+runs exact, -D 3, commit b84ddaf:
+
+- **80M**: phaseA G0 0.218/0.254/0.271 vs G4 0.225/0.210/0.219 s —
+  answers the standing question: -G 4 does NOT hurt 80M; mild win
+  (~-10% on the mean, within-noise per rep). At ~21k particles/chare
+  the grid predictor's low edge holds.
+- **2B**: phaseA G0 2.376/2.420 vs G4 1.764/2.188 s — the grid win
+  reproduces on current main (-19% mean; prior campaign measured -29%
+  on max). phaseB unchanged (2.72-2.77 both arms), as expected — the
+  grid attacks phaseA self-work only.
+- RECOMMENDATION for the pending default decision: -G 4 is safe at
+  both measured scales (never worse, wins where density is high);
+  making it the fof3 default is supported by all data to date.
+  Decision: Kale.
+
+Sum-detail traces of the -G 4 configuration at 2B (10 ms bins) are on
+the laptop: traces/2b-sumdetail-G4 (46 MB, alongside -D3 = grid-off
+baseline and -D4 = overfetch case). All three sets are at commit
+b84ddaf, so cross-set comparisons are apples-to-apples.
