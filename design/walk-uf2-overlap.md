@@ -129,7 +129,14 @@ its single-process ground truth), annotate sfc+oct PASS, reconverse
 2-proc exact. 80M A/B (job 19584083, pre-fix vs fix binaries, 3
 interleaved reps): all exact; **walk wall 0.606/0.571/0.630 ->
 0.511/0.493/0.512 s = -16%**, every fix rep faster than every pre rep.
-2B A/B: job 19584493.**
+2B A/B (job 19584493, 2 interleaved reps): all 4 exact; walk
+3.308/3.618 -> 3.311/3.308 s, ~-0.15 s (-4%). The smaller relative win
+at 2B is expected: installs per PE are similar to 80M, so the absolute
+message tax removed (~0.1-0.15 s of window) is similar, but the 2B walk
+carries ~6x more compute per PE. (One watch item: the fix reps showed
+phaseB_s max 4.15/3.22 vs the usual 2.74-2.82 band — phase 1 is
+untouched by this change, so this reads as run-to-run system noise on
+the heavy process, but re-check in the next 2B runs.)**
 
 ### (3) Local pairs as low-priority filler; remote frontier first
 [Kale's overlap proposal — attacks the 27% idle]
