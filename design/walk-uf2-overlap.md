@@ -75,8 +75,27 @@ reps): all 6 runs exact (23,707,197; identical 49,312 edges both
 arms); performance a WASH as predicted at this scale — walk+uf2
 E0 0.56/0.87/0.83 s vs E4096 0.78/0.92/0.67 s, inside the noise band,
 because 80M's uf2 wall is essentially one QD settle either way and the
-overlap-able find_boss chains are milliseconds at 49k edges. The
-benefit measurement is the 2B A/B (submitted, job 19582087).**
+overlap-able find_boss chains are milliseconds at 49k edges.
+2B A/B (job 19582087, 16 nodes, 2 interleaved reps): all 4 runs exact
+(424,897,832; identical 969,878 edges both arms); performance NEUTRAL —
+walk+uf2 E0 4.65/4.52 s vs E4096 4.67/4.67 s.
+
+VERDICT (documented per the campaign rule, including null results):
+correctness-clean at every scale, performance-neutral at both 80M and
+2B. The mechanism did what it was designed to do — union cascades
+demonstrably ride the walk's QD — but the find_boss cascades were
+never the uf2 wall: the earlier sum-detail analysis showed ALL uf2
+compute is 4.1 s machine-wide with the busiest lib-chare PE at 0.117 s.
+The 1.0-1.4 s uf2 wall at 2B sits in what runs AFTER all unions —
+find_components' own serial latency structure (boss-count prefix chain
+over 128 elements, set_component broadcasts, label collection, plus
+QD settles), which no amount of union overlap can touch by design.
+That is the sparse-message-latency disease again (reconverse-qd-latency
+note), not an application-schedulable cost. KEPT with default -E 4096:
+zero measured cost, bounds peak_edge_buf to the batch size, removes
+edge injection from the post-walk critical path, and the overlap
+benefit becomes real if edge volumes ever grow to where cascades
+matter. -E 0 remains the oracle.
 
 ### (2) Batch the Resumer resumption fan-out  [the measured hotspot]
 
