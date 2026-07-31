@@ -111,6 +111,26 @@ is a down payment on that interface, not throwaway.
 Expected win: order of 10% of the walk window at 80M; the resumer
 share grows with miss rate, so likely more at 2B.
 
+**MEASURED (step 2). The flood turned out to be a BUG, not a design
+cost: process() filtered its per-PE fanout with `(bit | mask)` —
+always true — broadcasting to all 15 PEs per install (519,535 installs
+x 15 = 7,793,025, the exact measured count). The one-character `&` fix
+alone UNDERCOUNTED components: the broadcast had been masking a second
+bug — waiters set requested bits on the PLACEHOLDER, which swapIn
+discards, so the installed node's mask was empty and filtered fanout
+dropped resumptions (walk QD converged with lost work; 334,753 vs
+333,889 at 1M). Complete fix (3350d4a): `&` plus swapIn hands the
+displaced placeholder's waiter bitmask to the installed node
+(NULL-guarded initial root); late parkers self-process via the
+substituted-placeholder re-check. This is precisely the park-vs-install
+race the smp-cache-extraction design says must close against install's
+publication. Validated: 10k/1M/2M/LAMBS/8M multi-process exact (8M ==
+its single-process ground truth), annotate sfc+oct PASS, reconverse
+2-proc exact. 80M A/B (job 19584083, pre-fix vs fix binaries, 3
+interleaved reps): all exact; **walk wall 0.606/0.571/0.630 ->
+0.511/0.493/0.512 s = -16%**, every fix rep faster than every pre rep.
+2B A/B: job 19584493.**
+
 ### (3) Local pairs as low-priority filler; remote frontier first
 [Kale's overlap proposal — attacks the 27% idle]
 
