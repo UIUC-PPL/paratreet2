@@ -55,7 +55,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:R:")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -87,6 +87,11 @@ PARATREET_REGISTER_MAIN(ExMain);
           fof_uf2_stream_batch = atol(optarg);
           if (fof_uf2_stream_batch < 0)
             CkAbort("-E requires a batch size >= 0 (0 = off)");
+          break;
+        case 'R':
+          fof_dual_pause_interval = atoi(optarg);
+          if (fof_dual_pause_interval < 0)
+            CkAbort("-R requires a chunk budget >= 0 (0 = off)");
           break;
         case 'm':
           fof_min_component_size = atoi(optarg);
@@ -160,6 +165,9 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("UF_2 mid-walk stream batch (-E): %ld%s\n",
              fof_uf2_stream_batch,
              fof_uf2_stream_batch > 0 ? "" : " (post-walk injection)");
+    CkPrintf("Dual-walk chunk budget (-R): %d%s\n",
+             fof_dual_pause_interval,
+             fof_dual_pause_interval > 0 ? "" : " (monolithic drain)");
     // PBC (design/pbc.md). Note: -P (capital) does not collide with any
     // framework-registered CLI letter (the framework uses lowercase 'p' for
     // nPartitionsMin and the multi-char 'pbc'/'px'/'py'/'pz'), so no

@@ -536,7 +536,12 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         // into UF_2 DURING the walk (0 = off,
                                         // the classic post-walk injection).
                                         // design/walk-uf2-overlap.md step 1.
-                                        long uf2_stream_batch = 0) {
+                                        long uf2_stream_batch = 0,
+                                        // Dual-walk chunk budget (leaf
+                                        // interactions per low-priority
+                                        // slice; 0 = monolithic drain).
+                                        // design/walk-uf2-overlap.md step 3.
+                                        int dual_pause_interval = 0) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
   partitions.verifySharedLeaves(CkCallbackResumeThread());
@@ -575,7 +580,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // walk's remaining work and fetch stalls.
   double t0 = CkWallTimer();
   if (dual_walk)
-    subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+    subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period), dual_pause_interval);
   else
     partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
   CkWaitQD();

@@ -65,7 +65,7 @@ public:
   typename Node<Data>::Type getType(size_t num_particles, size_t max_particles_per_leaf) const;
   void handlePossibleLeaf(Node<Data>* node);
   void sendLeaves(CProxy_Partition<Data>);
-  template <typename Visitor> void startDual(Visitor v);
+  template <typename Visitor> void startDual(Visitor v, int pause_interval);
   void goDown(size_t travIdx);
   void requestNodes(Key, int);
   void requestCopy(int, PPHolder<Data>);
@@ -260,11 +260,11 @@ void Subtree<Data>::sendLeaves(CProxy_Partition<Data> part)
 
 template <typename Data>
 template <typename Visitor>
-void Subtree<Data>::startDual(Visitor v) {
+void Subtree<Data>::startDual(Visitor v, int pause_interval) {
   r_local = r_proxy.ckLocalBranch();
   r_local->subtree_proxy = this->thisProxy;
   r_local->use_subtree = true;
-  traverser.reset(new DualTraverser<Data, Visitor>(v, 0, *this));
+  traverser.reset(new DualTraverser<Data, Visitor>(v, 0, *this, pause_interval));
   traverser->start();
 }
 

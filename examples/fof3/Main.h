@@ -61,6 +61,11 @@ class ExMain: public paratreet::Main<FragData> {
   // (the A/B oracle). Ignored under AGGREGATION (tram buffers are
   // invisible to the walk's QD). Default 4096.
   long fof_uf2_stream_batch = 4096;
+  // -R <n>: dual-walk chunk budget — leaf interactions per low-priority
+  // drain slice (design/walk-uf2-overlap.md step 3). Fetch replies and
+  // resumptions preempt between slices. 0 (default) = the original
+  // monolithic drain (the A/B oracle).
+  int fof_dual_pause_interval = 0;
   // -g: compute and print the phase-1 fragments histogram (FOF3STAT
   // fragments line). Off by default since sparse-uf2: the histogram was the
   // only surviving consumer of countFragments, which is otherwise off the

@@ -476,7 +476,8 @@ using namespace paratreet;
         ? paratreet::runFoFPhase3Dist(proxy_pack.partition, fof, fof_node, b, pbc,
                                       walk_mode == WalkMode::Dual,
                                       proxy_pack.subtree, uf_node_map_gid,
-                                      fof_uf2_stream_batch)
+                                      fof_uf2_stream_batch,
+                                      fof_dual_pause_interval)
         : paratreet::runFoFPhase3(proxy_pack.partition, fof, b, pbc);
     CkPrintf("FOF3STAT edges: emitted %ld sent %ld unique %ld tips_remapped %ld\n",
              pr.edges_emitted, pr.edges_sent, pr.edges_unique, pr.tips_remapped);
