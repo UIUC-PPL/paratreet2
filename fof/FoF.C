@@ -65,6 +65,25 @@ static void fofKeepAliveTick(void*) {
   }
 }
 
+// Diagnosis probe (temporary): counts the 100 ms periodic condition on
+// EVERY rank, independent of the keep-alive sender. Finding (16M local
+// run, 2026-08-04): no rank's ladder ever stops; the busiest rank's tick
+// interval stretches to ~250 ms during long entry-method executions
+// (the sends inside them also contend on the network library's endpoint
+// lock against other ranks' progress polling, per stack samples). So
+// tick rates between about 4 and 10 per second are all healthy.
+static thread_local long fof_rankprobe_ticks = 0;
+static thread_local double fof_rankprobe_t0 = 0;
+static void fofRankTickProbe(void*) {
+  fof_rankprobe_ticks++;
+  if (fof_rankprobe_ticks == 1) fof_rankprobe_t0 = CmiWallTimer();
+  if (fof_rankprobe_ticks <= 3 || fof_rankprobe_ticks % 50 == 0) {
+    CmiPrintf("rank-probe: process %d rank %d pe %d tick %ld at t=%.2f s\n",
+              CmiMyNode(), CmiMyRank(), CmiMyPe(), fof_rankprobe_ticks,
+              CmiWallTimer() - fof_rankprobe_t0);
+  }
+}
+
 // Diagnosis probe (temporary): counts CcdPROCESSOR_STILL_IDLE firings —
 // raised directly from the scheduler's idle branch with no timer
 // arithmetic — to discriminate "scheduler stopped servicing conditions"
@@ -92,14 +111,24 @@ void fofKeepAliveInit(void) {
   const char* venv = std::getenv("FOF_KEEPALIVE_VERBOSE");
   fof_keepalive_verbose = (venv && std::atoi(venv) != 0);
   if (!enabled || CmiNumNodes() < 2) return;
-  // Arm on the LAST rank of each process, not rank 0: on reconverse a
-  // [threaded] entry occupies its host pthread, and rank 0 of process 0
-  // hosts the mainchare and the Driver's threaded init/run — measured
-  // 2026-08-04: that rank's scheduler loop (and with it the whole
-  // periodic-condition ladder AND idle conditions) goes silent for the
-  // entire run, so a rank-0 heartbeat never ticks on exactly the process
-  // that also drives quiescence. The last rank hosts no singleton chares
-  // in this stack.
+  // Diagnosis (temporary): with verbose on, count the periodic condition
+  // on every rank so starved ranks identify themselves.
+  if (fof_keepalive_verbose) {
+    CcdCallOnConditionKeep(CcdPERIODIC_100ms, fofRankTickProbe, nullptr);
+  }
+  // Arm on the LAST rank of each process. Any rank is CORRECT: stack
+  // sampling plus per-rank tick counts (16M local run, 2026-08-04) show
+  // every rank's scheduler loop services the periodic conditions for the
+  // whole run — a bare-runtime probe program (ccdprobe, sibling of
+  // paratreet2) confirms threaded entry methods do not starve them
+  // either. But the tick INTERVAL stretches while a rank executes long
+  // entry methods: rank 0, which hosts the mainchare, the driver thread,
+  // and reduction roots, degraded from 10 to about 4 ticks per second
+  // during the heaviest phase, while the last rank held near 10. The
+  // last rank therefore keeps the ring rate closest to the measured
+  // basis of the workaround. (An earlier reading that rank 0's
+  // conditions "go silent" was wrong — an artifact of sparse print
+  // points and block-buffered multi-process output.)
   if (CmiMyRank() == CmiMyNodeSize() - 1) {
     CcdCallOnConditionKeep(CcdPERIODIC_100ms, fofKeepAliveTick, nullptr);
     if (fof_keepalive_verbose)
