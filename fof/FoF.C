@@ -48,14 +48,36 @@ static void fofKeepAliveTick(void*) {
   // or much slower than that, the implementation does not match the
   // measurement and the verification numbers mean something else.
   fof_keepalive_ticks++;
-  if (fof_keepalive_verbose && CmiMyNode() == 0) {
+  if (fof_keepalive_verbose) {
     if (fof_keepalive_ticks == 1) fof_keepalive_t0 = CmiWallTimer();
+    if (fof_keepalive_ticks <= 3 || fof_keepalive_ticks == 10 ||
+        fof_keepalive_ticks == 30) {
+      CmiPrintf("keep-alive tick %ld at t=%.2f s (process %d PE %d)\n",
+                fof_keepalive_ticks, CmiWallTimer() - fof_keepalive_t0,
+                CmiMyNode(), CmiMyPe());
+    }
     if (fof_keepalive_ticks % 100 == 0) {
       double dt = CmiWallTimer() - fof_keepalive_t0;
-      CmiPrintf("keep-alive rate: %ld ticks in %.1f s (%.1f/s)\n",
+      CmiPrintf("keep-alive rate: %ld ticks in %.1f s (%.1f/s, process %d)\n",
                 fof_keepalive_ticks, dt,
-                dt > 0 ? (fof_keepalive_ticks - 1) / dt : 0.0);
+                dt > 0 ? (fof_keepalive_ticks - 1) / dt : 0.0, CmiMyNode());
     }
+  }
+}
+
+// Diagnosis probe (temporary): counts CcdPROCESSOR_STILL_IDLE firings —
+// raised directly from the scheduler's idle branch with no timer
+// arithmetic — to discriminate "scheduler stopped servicing conditions"
+// from "the periodic ladder's time bookkeeping broke".
+static long fof_stillidle_count = 0;
+static void fofStillIdleProbe(void*) {
+  fof_stillidle_count++;
+  if (fof_stillidle_count == 1 || fof_stillidle_count == 1000000 ||
+      fof_stillidle_count == 10000000 || fof_stillidle_count == 100000000) {
+    CmiPrintf("still-idle probe: count %ld at t=%.2f s, keepalive ticks %ld "
+              "(process %d)\n",
+              fof_stillidle_count, CmiWallTimer(), fof_keepalive_ticks,
+              CmiMyNode());
   }
 }
 
@@ -70,8 +92,18 @@ void fofKeepAliveInit(void) {
   const char* venv = std::getenv("FOF_KEEPALIVE_VERBOSE");
   fof_keepalive_verbose = (venv && std::atoi(venv) != 0);
   if (!enabled || CmiNumNodes() < 2) return;
-  if (CmiMyRank() == 0) {
+  // Arm on the LAST rank of each process, not rank 0: on reconverse a
+  // [threaded] entry occupies its host pthread, and rank 0 of process 0
+  // hosts the mainchare and the Driver's threaded init/run — measured
+  // 2026-08-04: that rank's scheduler loop (and with it the whole
+  // periodic-condition ladder AND idle conditions) goes silent for the
+  // entire run, so a rank-0 heartbeat never ticks on exactly the process
+  // that also drives quiescence. The last rank hosts no singleton chares
+  // in this stack.
+  if (CmiMyRank() == CmiMyNodeSize() - 1) {
     CcdCallOnConditionKeep(CcdPERIODIC_100ms, fofKeepAliveTick, nullptr);
+    if (fof_keepalive_verbose)
+      CcdCallOnConditionKeep(CcdPROCESSOR_STILL_IDLE, fofStillIdleProbe, nullptr);
     if (CmiMyNode() == 0) {
       CmiPrintf("FoF keep-alive: 100 ms raw-Converse ring across %d "
                 "processes (FOF_KEEPALIVE=0 disables)\n",
