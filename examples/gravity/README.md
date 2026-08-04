@@ -148,6 +148,35 @@ approximation. (No positive theta can do that: the acceptance test is
 scale-relative, so some node always qualifies; the measured error just
 follows the theta-squared law downward.)
 
+## Tree types, decompositions, and load balancing
+
+Nothing in `GravityData` or `GravityVisitor` is specific to the 8-way
+octree: the payload combines through bounding boxes and the acceptance
+test is purely geometric, so any tree type works. Verified against the
+direct-sum reference (2-process, both production theta and the `-o 0`
+exact mode), 1k particles, 2026-08-04:
+
+- `-d oct -t oct` — the default; the only combination in `make test`.
+- `-d binoct -t binoct` — binary octree: 2 children per node,
+  alternating dimension (an octree level as three binary levels).
+- `-d kd -t kd` and `-d longest -t longest` — k-d trees.
+- `-d sfc -t oct` — space-filling-curve decomposition with an octree:
+  the decompositions do NOT match, so this exercises the framework's
+  copy/share path (Subtree copies shipped to Partitions) rather than
+  leaf aliasing.
+
+All pass; the monopole error band shifts a little with tree shape
+(root-mean-square 3.8e-3 to 6.8e-3 across the five, versus 4.3e-3 for
+oct/oct). Caveat: the k-d and binary-oct DECOMPOSITIONS were flagged
+"not audited" in the 64-bit particle-count review — fine at these sizes,
+re-check before using them beyond 2^31 particles.
+
+LOAD BALANCING IS NOT TESTED. No run here sets `lb_period`
+(`-b <iterations>`), so the Driver's load-balancing block never
+executes; the partition-versus-subtree balancing study is a planned
+experiment (design/single-distribution-mode.md), and this application is
+its intended vehicle.
+
 ## Flags
 
 - `-f <file>` input (Tipsy format), `-d oct` decomposition, `-i <n>`

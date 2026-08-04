@@ -100,12 +100,20 @@ namespace paratreet {
         int cache_share_depth;
         // how many nodes in one pool element. nodes are stored in pools
         int pool_elem_size; 
+        // Explicit defaults on the next three fields (2026-08-04): they are
+        // read by the Driver iteration loop (the rebuild decision and the
+        // load-balancing gate) for every particle-moving app, and
+        // previously had NO initializer — an app that did not set them in
+        // setDefaults read uninitialized memory. Defaults chosen: rebuild
+        // every iteration (flush_period 1, the predictable choice; set 0
+        // to use the max/avg-ratio rule instead), ratio threshold 2, load
+        // balancing off.
         // after how many iterations should we flush (re-do decomposition)
-        int flush_period;
+        int flush_period = 1;
         // after what decomposition (max/avg) ratio should we flush
-        int flush_max_avg_ratio;
+        int flush_max_avg_ratio = 2;
         // after how many iterations should we re-balance load
-        int lb_period;
+        int lb_period = 0;
         // after how many requests per Partition should we pause that traversal
         int request_pause_interval;
         // after how many iterations should we pause that traversal
