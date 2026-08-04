@@ -161,6 +161,12 @@ The app-specific flags (all other flags are the framework's; see
 - `-u <impl>` — UF_2 (cross-process union-find) implementation: `dist`
   (default; distributed UnionFindLib) or `serial` (gather-to-one oracle,
   kept for A/B; requires `-w transposed`).
+- Distribution: SINGLE distribution (no Partition array) is the default
+  since 2026-08-04 — decomposition is ~25% faster at 80M (the partition
+  creation and assignment passes vanish) with bit-identical output.
+  `-w transposed` (and with it `-u serial`) needs the Partition array
+  and automatically selects dual distribution, printing a note. `-S` is
+  accepted as a no-op for compatibility.
 - `-w <walk>` — phase-3 walk: `dual` (default; symmetric dual-tree
   traversal) or `transposed` (the original walk, kept permanently as the
   independent A/B oracle).

@@ -81,11 +81,16 @@ class ExMain: public paratreet::Main<FragData> {
   // dist critical path (design/sparse-uf2-encoding.md). Serial mode (-u
   // serial) always prints it, as before.
   bool fof_frag_histogram = false;
-  // -S: single-distribution mode (design/single-distribution-mode.md) — no
-  // Partition array; dual walk only. The FragCheckVisitor sweep of -c full
-  // is skipped (it is a Partition walk); the grid/O(n^2) component checks
-  // and the in-walk annotation CkEnforce still run.
-  bool single_distribution = false;
+  // Single-distribution mode (design/single-distribution-mode.md) — no
+  // Partition array. DEFAULT since 2026-08-04 (80M gate job 19661057:
+  // components bit-identical across 4 arms; decomposition ~25% faster —
+  // the partition creation + assignment passes vanish). -S is kept as a
+  // no-op for compatibility. -w transposed (the standing walk oracle)
+  // needs the Partition array and automatically selects dual
+  // distribution with a printed note; the FragCheckVisitor sweep of
+  // -c full runs only in that dual mode (the grid/O(n^2) component
+  // checks and the in-walk annotation CkEnforce always run).
+  bool single_distribution = true;
   // Pre-created UF_2 placement-map group (see preTraversalFn): created early
   // so its branches exist everywhere before phase 3's array creation
   // consults it (reconverse has no group-dependency buffering).

@@ -42,6 +42,8 @@ test: all
 	./FoF3 -f $(BASE_PATH)/inputs/10k.tipsy -d oct +p2
 	./charmrun ++local ./FoF3 -f $(BASE_PATH)/inputs/10k.tipsy -d oct +p2 ++ppn 1
 	./charmrun ++local ./FoF3 -f $(BASE_PATH)/inputs/10k.tipsy -d oct +p4 ++ppn 2
+	./FoF3 -f $(BASE_PATH)/inputs/1k.tipsy -d oct -w transposed +p2 ++ppn 2
+	./charmrun ++local ./FoF3 -f $(BASE_PATH)/inputs/1k.tipsy -d oct -w transposed +p4 ++ppn 2
 
 clean:
 	rm -f *.decl.h *.def.h conv-host *.o FoF3 charmrun

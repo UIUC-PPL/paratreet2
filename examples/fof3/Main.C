@@ -150,13 +150,15 @@ PARATREET_REGISTER_MAIN(ExMain);
     }
     delete m;
 
-    if (single_distribution) {
-      if (walk_mode != WalkMode::Dual)
-        CkAbort("-S (single distribution) requires the dual walk (-w dual): "
-                "the transposed walk runs from the Partition array, which "
-                "single mode does not create");
-      conf.single_distribution = true;
+    // Single distribution is the default; the transposed oracle walk (and
+    // with it -u serial) runs from the Partition array, so it selects dual
+    // distribution automatically.
+    if (walk_mode == WalkMode::Transposed && single_distribution) {
+      CkPrintf("Note: -w transposed runs from the Partition array; using "
+               "dual distribution for this run\n");
+      single_distribution = false;
     }
+    conf.single_distribution = single_distribution;
 
     CkPrintf("\n[PARATREET FOF PHASE 3]\n");
     if (conf.input_file.empty()) CkAbort("Input file unspecified");
@@ -166,6 +168,9 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("Minimum number of subtrees: %d\n", conf.min_n_subtrees);
     CkPrintf("Minimum number of partitions: %d\n", conf.min_n_partitions);
     CkPrintf("Maximum number of particles per leaf: %d\n", conf.max_particles_per_leaf);
+    CkPrintf("Distribution: %s\n",
+             conf.single_distribution ? "single (no Partition array)"
+                                      : "dual (Subtrees + Partitions)");
     CkPrintf("Linking-length factor: %g\n", fof_b_factor);
     CkPrintf("Correctness check mode: %s\n",
              check_mode == CheckMode::Full ? "full" :
