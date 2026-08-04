@@ -1,15 +1,11 @@
 include Makefile.common
 
-# add -DFOF -DUNIONFIND to build the Friends-of-Friends support (requires the
-# unionfind and htram sibling libraries; see Makefile.common)
-OPTS = -g -Ofast $(INCLUDES) -DDEBUG=0 $(MAKE_OPTS) -DFOF -DUNIONFIND 
+OPTS = -g -Ofast $(INCLUDES) -DDEBUG=0 $(MAKE_OPTS)
 CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 
 OBJS = Paratreet.o Loadable.o Reader.o Writer.o Particle.o BoundingBox.o Decomposition.o Modularization.o TreeSpec.o ThreadStateHolder.o
-# Distributed union-find (FoF step 4) is the sibling UIUC-PPL/unionfind
-# library (branch fof_with_aggregation), linked via Makefile.common. Build the
-# sibling FIRST, AGGREGATION-off (plain sends; htram linked but dormant):
-#   cd ../../unionfind && make AGGREGATION= PROFILE=
+# FoF (and its unionfind/htram sibling dependencies) live in the separate
+# fof/ module — see fof/Makefile. This core library is application-free.
 TIPSY_OBJS = NChilReader.o SS.o TipsyFile.o TipsyReader.o hilbert.o
 
 UTILITY_HEADERS = common.h Utility.h $(STRUCTURE_PATH)/Vector3D.h $(STRUCTURE_PATH)/SFC.h
@@ -27,9 +23,7 @@ lib: $(OBJS) $(LB_LIBS)
 	rm -f $(TIPSY_OBJS)
 	ranlib libparatreet.a
 
-# unionFindLib.decl.h comes from the pre-built sibling (on the include path
-# via -I$(UNION_FIND_DIR)); paratreet.ci extern-references its module.
-paratreet.decl.h: paratreet.ci $(UNION_FIND_DIR)/unionFindLib.decl.h
+paratreet.decl.h: paratreet.ci
 	$(CHARMC) $<
 
 Paratreet.o: $(UTILITY_HEADERS) $(CORE_HEADERS) $(IMPL_HEADERS) paratreet.decl.h

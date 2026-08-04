@@ -13,7 +13,6 @@
 #include "Resumer.h"
 #include "Driver.h"
 #include "OrientedBox.h"
-#include "FoFPhase1.h"
 
 #include <cstring>
 #include <queue>
@@ -77,8 +76,8 @@ public:
   void pup(PUP::er& p);
   void collectMetaData(const CkCallback & cb);
   void callPerLeafFn(paratreet::PerLeafAble<Data>&, const CkCallback&);
+  void callPerSubtreeFn(paratreet::PerSubtreeAble<Data>&, const CkCallback&);
   void upwardPass(const CkCallback&);
-  void registerFoF(CProxy_FoFPhase1<Data>, const CkCallback&);
   void recomputeData(Node<Data>*);
   void addNodeToFlatSubtree(Node<Data>* node);
   void pauseForLB(){
@@ -481,15 +480,16 @@ void Subtree<Data>::recomputeData(Node<Data>* node) {
   }
 }
 
-// Register this subtree's local tree and particle block with the FoF phase-1
-// group branch on this PE. The registered block (particles.data()) is stable
-// from the end of tree build until the next rebuild/reset; the whole phase-1
-// sequence must run inside that window.
+// Generic subtree-level hook (see paratreet::PerSubtreeAble): applies fn once
+// per Subtree element, handing it the element's local tree root and its
+// contiguous particle block. The block (particles.data()) is stable from the
+// end of tree build until the next rebuild/reset; a consumer that retains the
+// pointers must finish inside that window. Elements with no local tree or no
+// particles contribute without calling fn.
 template <typename Data>
-void Subtree<Data>::registerFoF(CProxy_FoFPhase1<Data> fof, const CkCallback& cb) {
+void Subtree<Data>::callPerSubtreeFn(paratreet::PerSubtreeAble<Data>& fn, const CkCallback& cb) {
   if (local_root != nullptr && !particles.empty()) {
-    fof.ckLocalBranch()->registerSubtree(local_root, particles.data(),
-                                         (int)particles.size());
+    fn(local_root, particles.data(), (int)particles.size());
   }
   this->contribute(cb);
 }

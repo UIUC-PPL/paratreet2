@@ -4,17 +4,25 @@
 BASE_PATH := $(abspath $(dir $(lastword $(MAKEFILE_LIST)))/..)
 PARATREET_PATH = $(BASE_PATH)/src
 STRUCTURE_PATH = $(BASE_PATH)/utility/structures
+
+INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I.
+
+CHARM_HOME ?= $(HOME)/charm_reconverse
+
+LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet
+
+# ---- FoF module (fof/) and its sibling libraries ----
+# Only FoF applications (examples/fof1, examples/fof3) need any of this: the
+# fof module extern-references unionFindLib, so unionfind/prefix/htram are an
+# FoF-only link. Non-FoF applications build without the siblings entirely.
+FOF_PATH = $(BASE_PATH)/fof
 UNION_FIND_DIR = $(BASE_PATH)/../unionfind
 HTRAM_DIR = $(BASE_PATH)/../htram
 PREFIX_LIB_DIR = $(UNION_FIND_DIR)/prefixLib
 
-INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I$(PARATREET_PATH) -I$(PREFIX_LIB_DIR) -I$(UNION_FIND_DIR) -I$(HTRAM_DIR) -I.
-
 # htram aggregation for the unionfind sibling. MUST MATCH how ../unionfind was
-# built (its Makefile.common also defaults AGGREGATION on): unionFindLib.h
-# changes class layout under this flag, so a mismatch is an ABI break. Both
-# default ON; to build without htram, use `make AGGREGATION=` HERE AND in
-# ../unionfind, and make clean everywhere in between.
+# built: unionFindLib.h changes class layout under this flag, so a mismatch is
+# an ABI break.
 # -DUNIONFIND rides along because AGGREGATION makes unionFindLib.h include
 # htram_group.h, whose datatype selection needs that macro in every client TU
 # (harmlessly duplicated where OPTS already define it).
@@ -22,14 +30,14 @@ INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I$(PARATREET_PATH
 # cost 1-2.4 s of uf2 at 22k edges; see design/phase1-scaling.md "Final
 # round"). -DUNIONFIND stays: it selects the htram datatype and is
 # independent of whether aggregation is used. To build WITH aggregation
-# (multi-billion-particle insurance), use — HERE AND in the sibling
-# unionfind (make AGGREGATION=-DAGGREGATION there), plus make clean both:
+# (multi-billion-particle insurance), use — in fof/ and the FoF examples AND
+# in the sibling unionfind (make AGGREGATION=-DAGGREGATION there), plus make
+# clean everywhere in between:
 #   make AGGREGATION="-DAGGREGATION -DUNIONFIND"
 AGGREGATION ?= -DUNIONFIND
-INCLUDES:=$(INCLUDES) $(AGGREGATION)
-CHARM_HOME ?= $(HOME)/charm_reconverse
 
-LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet -L$(UNION_FIND_DIR) -lunionFind -L${PREFIX_LIB_DIR} -lprefix -L${HTRAM_DIR} -lhtram_group_unionfind
+FOF_INCLUDES = -I$(FOF_PATH) -I$(PREFIX_LIB_DIR) -I$(UNION_FIND_DIR) -I$(HTRAM_DIR) $(AGGREGATION)
+FOF_LD_LIBS = -L$(FOF_PATH) -lfof -L$(UNION_FIND_DIR) -lunionFind -L${PREFIX_LIB_DIR} -lprefix -L${HTRAM_DIR} -lhtram_group_unionfind
 
 # XDR library for Tipsy file I/O
 # First check for system RPC XDR library, then fall back to utility/xdr

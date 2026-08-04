@@ -28,16 +28,24 @@
 // reads only data frozen by the preceding barrier.
 //
 // Driving sequence (from a [threaded] context; see paratreet::runFoFPhase1):
-//   fof_node.reset -> fof.reset -> subtrees.registerFoF -> fof.phaseA
-//   -> fof.phaseB -> fof_node.merge -> fof.relabel
+//   fof_node.reset -> fof.reset -> subtrees.callPerSubtreeFn(SubtreeRegisterFn)
+//   -> fof.phaseA -> fof.phaseB -> fof_node.merge -> fof.relabel
 // Optionally after relabel (see paratreet::runFoFFragmentHistogram):
 //   fof.countFragments -> fof_node.fragmentHistogram
 //
-// Lifetime contract: the Particle blocks registered by Subtree::registerFoF
-// (Subtree::particles.data()) are stable from the end of tree build until the
-// next rebuild/reset; run the whole sequence inside that window.
+// Lifetime contract: the Particle blocks registered through the generic
+// Subtree::callPerSubtreeFn hook (fof::SubtreeRegisterFn hands each Subtree
+// element's block to its PE's FoFPhase1 branch) are stable from the end of
+// tree build until the next rebuild/reset; run the whole sequence inside
+// that window.
 
-#include "paratreet.decl.h"
+#include "fof.decl.h"
+// Template definitions of this module's generated code (CBase_/closure/proxy
+// templates from fof.def.h) must be visible before any concrete-Data use of
+// the chares (e.g. FoFPhase3.h's FragData visitors) — same idiom as the
+// core's Subtree.h including templates.h.
+#include "fof-templates.h"
+#include "CoreFunctions.h"
 #include "common.h"
 #include "Node.h"
 #include "Particle.h"
@@ -623,7 +631,8 @@ public:
 
   FoFPhase1(CProxy_FoFPhase1Node<Data> node_proxy_) : node_proxy(node_proxy_) {}
 
-  // Synchronous, called by Subtree::registerFoF on this PE.
+  // Synchronous, called on this PE by fof::SubtreeRegisterFn (delivered per
+  // Subtree element through the generic Subtree::callPerSubtreeFn hook).
   void registerSubtree(Node<Data>* root, Particle* parts, int n) {
     subtrees.push_back(SubtreeRef{root, parts, n, 0});
     node_proxy.ckLocalBranch()->registerSubtree(CkMyPe(), root, parts, n);
@@ -1931,6 +1940,79 @@ private:
   Vector3D<Real> period_ = Vector3D<Real>(0, 0, 0);
 };
 
+namespace fof {
+
+// Subtree-registration functor, delivered to every Subtree element through
+// the core's generic Subtree::callPerSubtreeFn hook: hands the element's
+// local tree root and contiguous particle block to the FoFPhase1 branch on
+// the element's PE. This is the inversion that keeps the core FoF-free —
+// the core exposes subtree views to any PerSubtreeAble, and this module
+// consumes them; the core never names an FoF type.
+template <typename Data>
+class SubtreeRegisterFn : public paratreet::PerSubtreeAble<Data> {
+  CProxy_FoFPhase1<Data> fof_;
+
+ public:
+  SubtreeRegisterFn(void) = default;
+  explicit SubtreeRegisterFn(CProxy_FoFPhase1<Data> fof) : fof_(fof) {}
+  SubtreeRegisterFn(CkMigrateMessage* m)
+      : paratreet::PerSubtreeAble<Data>(m) {}
+
+  // Hand-expanded PUPable_decl_template: the macro's register_PUP_ID body
+  // calls register_constructor unqualified, which fails here because the
+  // PUP::able base is reached through a DEPENDENT base class
+  // (PerSubtreeAble<Data>) — unqualified lookup does not search dependent
+  // bases. Same contents, with the call qualified.
+ private:
+  static PUP::able* call_PUP_constructor(void) {
+    return new SubtreeRegisterFn<Data>((CkMigrateMessage*)0);
+  }
+  static PUP::able::PUP_ID my_PUP_ID;
+
+ public:
+  virtual const PUP::able::PUP_ID& get_PUP_ID(void) const override {
+    return my_PUP_ID;
+  }
+  static void register_PUP_ID(const char* name) {
+    my_PUP_ID = PUP::able::register_constructor(name, call_PUP_constructor);
+  }
+
+  virtual void pup(PUP::er& p) override {
+    paratreet::PerSubtreeAble<Data>::pup(p);
+    p | fof_;
+  }
+
+  virtual void operator()(Node<Data>* local_root, Particle* particles,
+                          int n_particles) override {
+    fof_.ckLocalBranch()->registerSubtree(local_root, particles, n_particles);
+  }
+};
+
+template <typename Data>
+PUP::able::PUP_ID SubtreeRegisterFn<Data>::my_PUP_ID = 0;
+
+// Per-Data registration of this module's templated chares and PUPables.
+// Applications call this from an overridden __register() in their Main
+// subclass, after the base paratreet::Main<T>::__register() (see
+// examples/fof3/Main.h). Mirrors the core's registration idiom.
+template <typename Data>
+void registerChares(void) {
+  // Intentionally leaked: Charm++ registration keeps the pointer for the
+  // lifetime of the program, and this runs once per type.
+  auto makeName = [](const char* ty) {
+    auto* name =
+        new std::string(std::string(ty) + "<" + typeid(Data).name() + ">");
+    return name->c_str();
+  };
+  CkIndex_FoFPhase1<Data>::__register(makeName("FoFPhase1"),
+                                      sizeof(FoFPhase1<Data>));
+  CkIndex_FoFPhase1Node<Data>::__register(makeName("FoFPhase1Node"),
+                                          sizeof(FoFPhase1Node<Data>));
+  PUPable_reg2(SubtreeRegisterFn<Data>, makeName("fof::SubtreeRegisterFn"));
+}
+
+}  // namespace fof
+
 namespace paratreet {
 
 // Per-stage wall times of runFoFPhase1. reset/register are still
@@ -1972,7 +2054,12 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
   // phaseA. Default {0,0,0} = open boundaries (exact current behavior).
   fof.setPeriod(period, CkCallbackResumeThread());
   local.reset = CkWallTimer() - t; t = CkWallTimer();
-  subtrees.registerFoF(fof, CkCallbackResumeThread());
+  {
+    fof::SubtreeRegisterFn<Data> reg_fn(fof);
+    subtrees.callPerSubtreeFn(
+        CkReference<paratreet::PerSubtreeAble<Data>>(reg_fn),
+        CkCallbackResumeThread());
+  }
   local.register_s = CkWallTimer() - t;
   // One broadcast starts the within-process chain; the single global
   // reduction at its end delivers the max-reduced stage walls.

@@ -86,9 +86,10 @@ target regime.
   [UIUC-PPL/unionfind](https://github.com/UIUC-PPL/unionfind) library
   (branch `fof_with_aggregation`), checked out **next to** paratreet2
   (`../unionfind`), plus [htram](https://github.com/UIUC-PPL/htram) at
-  `../htram`. Build unionfind **AGGREGATION-off** (plain sends; htram is
-  linked but dormant — turn it on later with `make` once perf data calls
-  for it):
+  `../htram`. These are needed only for the FoF applications: the core
+  toolkit (`src/`) and non-FoF examples build without them. Build unionfind
+  **AGGREGATION-off** (plain sends; htram is linked but dormant — turn it on
+  later with `make` once perf data calls for it):
 
   ```sh
   cd ../htram && make                              # -> libhtram_group_unionfind.a
@@ -98,14 +99,19 @@ target regime.
 
 ### Build
 
-In order (the library links `utility/structures/libTipsy.a` and the sibling
-`unionfind` into `libparatreet.a`; build unionfind FIRST, above):
+In order (the core library is application-free; the FoF chares live in the
+`fof/` module, which links the sibling `unionfind` — see
+`design/fof-module.md`):
 
 ```sh
-cd src && make                 # -> libparatreet.a  (links ../unionfind)
+cd src && make                 # -> libparatreet.a  (core toolkit, no FoF)
+cd ../fof && make              # -> libfof.a        (FoF module; needs ../unionfind)
 cd ../examples/fof3 && make    # -> FoF3
 cd ../../inputgen && make      # -> plummer, uniform, tipsyPlummer
 ```
+
+Non-FoF examples (`examples/annotate`, `examples/searchAlgos`) need only
+`src/`.
 
 `make test` in `examples/fof3` runs the standard 12-run small matrix
 ({100, 1k, 10k} x {+p1, +p2, 2 procs x 1 PE, 2 procs x 2 PEs}) against the

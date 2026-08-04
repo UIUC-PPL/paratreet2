@@ -53,7 +53,7 @@
 // instantiation of a templated visitor of a templated chare is avoidable
 // complexity). Generalize when a second payload needs it.
 
-#include "paratreet.decl.h"
+#include "fof.decl.h"
 #include "common.h"
 #include "Configuration.h"
 #include "FoFData.h"

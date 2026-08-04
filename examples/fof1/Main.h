@@ -4,8 +4,16 @@
 #include "Main.decl.h"
 #include "Paratreet.h"
 #include "FoFData.h"
+#include "FoFPhase1.h"
 
 class ExMain: public paratreet::Main<FragData> {
+  // The fof module's chares are registered by the app (the core registers
+  // only its own): extend the base registration with the fof module's.
+  virtual void __register(void) override {
+    paratreet::Main<FragData>::__register();
+    fof::registerChares<FragData>();
+  }
+
   virtual Real getTimestep(BoundingBox&, Real) override;
   virtual void preTraversalFn(ProxyPack<FragData>&) override;
   virtual void traversalFn(BoundingBox&, ProxyPack<FragData>&, int) override;
