@@ -6,6 +6,23 @@
 #include "Vector3D.h"
 #include "SFC.h"
 
+// Standalone (non-Charm) builds of the passive tree/cache core — the
+// TreeCache unit test, or a host application bringing its own runtime
+// (design/smp-cache-extraction.md phase 3). charmc defines __CHARMC__;
+// without it, the utility structures already compile their serialization
+// methods out (the same guard), and the few runtime calls in the
+// Node/Particle/TreeCache chain fall back to plain C here. Charm builds
+// are untouched (the block is skipped).
+#ifndef __CHARMC__
+#include <cassert>
+#include <cstdio>
+#include <cstdlib>
+#define CkAssert(expr) assert(expr)
+#define CkEnforce(expr) do { if (!(expr)) { fprintf(stderr, "CkEnforce failed: %s\n", #expr); abort(); } } while (0)
+#define CkAbort(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); abort(); } while (0)
+#define CkPrintf printf
+#endif
+
 // Floating point type
 #ifndef USE_DOUBLE_FP
 typedef float Real;

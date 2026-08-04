@@ -2,7 +2,8 @@
 #define PARATREET_PARTICLE_H_
 
 #include "common.h"
-#include "BoundingBox.h"
+#include "OrientedBox.h" // (was BoundingBox.h, unused here; OrientedBox is
+                         // standalone-safe — see common.h's non-Charm block)
 
 struct Particle {
   Key key;
@@ -49,7 +50,9 @@ struct Particle {
   bool isGas()  const {return type == Type::eGas;}
   bool isDark() const {return type == Type::eDark;}
 
+#ifdef __CHARMC__ // serialization only under Charm (same guard as Vector3D.h)
   void pup(PUP::er&) ;
+#endif
 
   void reset();
   void finishInit();

@@ -27,8 +27,7 @@
 // in the collect path was lifted to a parameter (share_depth).
 
 #include "common.h"
-#include "Utility.h"
-#include "MultiData.h"
+#include "Node.h"
 
 #include <list>
 #include <map>
@@ -291,8 +290,21 @@ public:
     root = nullptr;
   }
 
+  // Only PLACEHOLDERS (Remote / RemoteAboveTPKey) carry an open parked
+  // list; every other node is born with the list CLOSED, so a park on an
+  // already-installed (or local) node returns AlreadyInstalled instead of
+  // accepting a waiter nobody would ever drain. Found by the standalone
+  // unit test (tests/treecache); the framework's own walkers only park on
+  // placeholder types, but the library contract should not rely on that.
+  static bool isPlaceholderType(typename Node<Data>::Type type) {
+    return type == Node<Data>::Type::Remote ||
+           type == Node<Data>::Type::RemoteAboveTPKey;
+  }
+
   Node<Data>* makeNode(int lane, Key key, typename Node<Data>::Type type, int depth, int n_particles, Particle* particles, Node<Data>* parent, int tp_index, int cm_index) {
-    return pools[lane]->alloc(key, type, depth, n_particles, particles, parent, tp_index, cm_index);
+    auto* node = pools[lane]->alloc(key, type, depth, n_particles, particles, parent, tp_index, cm_index);
+    if (!isPlaceholderType(type)) node->parked_head.store(closedSentinel());
+    return node;
   }
 
   Node<Data>* makeCachedNode(int lane, Key key, typename Node<Data>::Type type, SpatialNode<Data> spatial_node, Node<Data>* parent, const CachedP* particlesToCopy, int tp_index, int cm_index) {
@@ -306,6 +318,7 @@ public:
     }
     auto* node = pools[lane]->alloc(key, type, spatial_node, parent, nullptr, tp_index, cm_index);
     if (cached) node->setCachedParticles(cached);
+    if (!isPlaceholderType(type)) node->parked_head.store(closedSentinel());
     return node;
   }
 

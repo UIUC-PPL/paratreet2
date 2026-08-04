@@ -40,6 +40,7 @@ void Particle::adjustNewUniverse(OrientedBox<Real> universe) {
 }
 
 
+#ifdef __CHARMC__ // serialization only under Charm
 void Particle::pup(PUP::er &p) {
   p|key;
   p|order;
@@ -59,6 +60,7 @@ void Particle::pup(PUP::er &p) {
   p|group_number;
   p|vertex_id;
 }
+#endif
 
 void Particle::reset() {
   pressure_dVolume = 0.0;

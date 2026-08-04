@@ -43,6 +43,7 @@ public:
     particles_[index].potential += pot;
   }
 
+#ifdef __CHARMC__ // serialization only under Charm (same guard as Vector3D.h)
   void pup (PUP::er& p) {
     p | depth;
     p | data;
@@ -50,6 +51,7 @@ public:
     p | particle_min_index;
     p | particle_max_index;
   }
+#endif
 
 public:
   Data      data;
