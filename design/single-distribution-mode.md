@@ -1,11 +1,24 @@
 # Single-distribution mode: making Partitions optional
 
-**STATUS: PHASE A IMPLEMENTED (2026-08-04, branch single-distribution) —
-static/dual-walk apps only; FoF opted in via fof3 -S. Movement (kick/
-perturb/rebuild) and LB stay Partition-resident, so perturb_particles
-apps (gravity) remain dual-distribution until Phase B moves that
-machinery to Subtree. Original design direction (Kale, 2026-07-28)
-below; decision Kale's, with discussion with Ritvik.**
+**STATUS: PHASES A AND B IMPLEMENTED (2026-08-04, on main). Phase B:
+Subtree gains kick/perturb/rebucket (movement on its own storage;
+re-homed particles land in incoming_particles = exactly what pup ships,
+so subtree LB migration is safe by the same argument as partitions), the
+Driver routes movement and the load-balancing block by mode, Subtree
+registers for AtSync only in single mode, and Subtree::startDown is the
+subtree-driven TRANSPOSED walk (TransposedDownTraverser's owner is a
+template parameter) with Partition's pause protocol mirrored
+(resumeAfterPause — its absence silently abandoned paused work
+multi-process). gravity -S validated: identical rms to dual mode at
+every arm, including 423 Subtree migrations under GreedyRefineLB. Two
+traps recorded: the DUAL walk is unsuitable for visitors that write
+into target particles (its cell()/inverted-traversal contract is
+FoF-shaped — internal-source doLeaf is a no-op on n_particles = -1);
+and any owner driving the transposed traverser MUST implement the pause
+protocol. Particle deletion (deleteParticleOfOrder) has no subtree-side
+equivalent yet — collision-style apps stay dual. Original design
+direction (Kale, 2026-07-28) below; decision Kale's, with discussion
+with Ritvik.**
 
 ## Phase A implementation record (2026-08-04)
 
