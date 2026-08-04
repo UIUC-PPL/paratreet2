@@ -117,11 +117,17 @@ void ExMain::traversalFn(BoundingBox& universe,
 
 void ExMain::postIterationFn(BoundingBox& universe,
                              ProxyPack<GravityData>& proxy_pack, int iter) {
-  // Verify at iteration 0 only: the driver has already run the traversal
-  // (accelerations populated) and the first half-kick (velocities — not
-  // compared), but not yet perturb (positions unmoved, accelerations not
-  // yet zeroed).
-  if (iter != 0) return;
+  // Verify at iteration 0 AND at the final iteration: the driver has
+  // already run the traversal (accelerations populated) and the first
+  // half-kick (velocities — not compared), but not yet perturb (positions
+  // unmoved, accelerations not yet zeroed), so positions and
+  // accelerations are consistent at both points. The final-iteration
+  // check matters for multi-iteration runs with load balancing or
+  // re-bucketing: it verifies the forces computed AFTER migrations and
+  // particle exchanges, against a fresh direct sum over the drifted
+  // positions.
+  if (iter != 0 && iter != paratreet::getConfiguration().num_iterations - 1)
+    return;
   bool enabled = check_mode == CheckMode::Full ||
                  (check_mode == CheckMode::Auto &&
                   universe.n_particles <= check_auto_limit);

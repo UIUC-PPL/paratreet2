@@ -171,11 +171,36 @@ oct/oct). Caveat: the k-d and binary-oct DECOMPOSITIONS were flagged
 "not audited" in the 64-bit particle-count review — fine at these sizes,
 re-check before using them beyond 2^31 particles.
 
-LOAD BALANCING IS NOT TESTED. No run here sets `lb_period`
-(`-b <iterations>`), so the Driver's load-balancing block never
-executes; the partition-versus-subtree balancing study is a planned
-experiment (design/single-distribution-mode.md), and this application is
-its intended vehicle.
+## Load balancing and the two particle-movement paths
+
+Two independent mechanisms redistribute work as particles drift, and
+both are now tested (2026-08-04, 1k, 2 processes, 10 iterations, all
+against the direct-sum reference at the first AND last iteration):
+
+1. **Migration-based load balancing, no re-sorting** — the Charm++
+   balancer moves chare array elements (Partitions, with their bound
+   Subtrees) between processors; particle-to-subtree assignment is
+   untouched. Enable with `-b <iterations>` (the balancing period) plus
+   the runtime flag `+balancer GreedyRefineLB` — in this Charm++ build
+   that name resolves to the TreeLB framework running its GreedyRefine
+   strategy. Verified: four balancing rounds, 199 element migrations,
+   final-iteration forces identical to the no-balancer control.
+2. **Re-bucketing and re-sorting** — between iterations, moved
+   particles are re-sent to the subtree whose key range now contains
+   them, through the EXISTING splitters (cheap, every iteration). A
+   full re-sort (back through the Readers, splitters recomputed,
+   arrays recreated) runs every `-u <iterations>`, or — the default,
+   `-u 0` — adaptively, only when the max/average particle-count ratio
+   exceeds a threshold. Production intent: full re-sorts infrequent.
+   Verified: periodic re-sort (`-u 3`), the adaptive default, and
+   re-sort interleaved with the balancer all reproduce the control's
+   final forces exactly.
+
+Not yet studied (deliberately deferred): whether the balancer IMPROVES
+anything — these runs verify correctness under migration, not benefit.
+The measurement study (partition- versus subtree-granularity balancing,
+imbalanced inputs, timing) is the planned experiment in
+design/single-distribution-mode.md.
 
 ## Flags
 
