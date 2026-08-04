@@ -471,19 +471,20 @@ using namespace paratreet;
              tc1 - tc0, tg1 - tg0);
 
     // Phase 3: cross-process boundary walk + UF_2 (dist: UnionFindLib per
-    // design/step4.md; serial: v1/3a gather-to-one) + global relabel.
+    // design/step4.md; serial: gather-to-one on PE 0 — the QD-free
+    // union-find bracket, see runFoFPhase3's comment) + global relabel.
     // -w dual (design/dual-tree.md) swaps the walk for the symmetric
-    // dual-tree traversal; implemented on the dist path only.
-    if (walk_mode == WalkMode::Dual && uf2_mode != UF2Mode::Dist)
-      CkAbort("-w dual requires -u dist (the dual walk is not wired to the "
-              "serial gather-to-one UF_2 path)");
+    // dual-tree traversal on either path; serial + dual is the
+    // configuration that works under single-distribution mode.
     Vector3D<Real> pbc(pbc_period, pbc_period, pbc_period);
     FoFPhase3Result pr = uf2_mode == UF2Mode::Dist
         ? paratreet::runFoFPhase3Dist(proxy_pack.partition, fof, fof_node, b, pbc,
                                       walk_mode == WalkMode::Dual,
                                       proxy_pack.subtree, uf_node_map_gid,
                                       fof_uf2_stream_batch)
-        : paratreet::runFoFPhase3(proxy_pack.partition, fof, b, pbc);
+        : paratreet::runFoFPhase3(proxy_pack.partition, fof, b, pbc,
+                                  walk_mode == WalkMode::Dual,
+                                  proxy_pack.subtree);
     CkPrintf("FOF3STAT edges: emitted %ld sent %ld unique %ld tips_remapped %ld\n",
              pr.edges_emitted, pr.edges_sent, pr.edges_unique, pr.tips_remapped);
     // 3a counters (design/step3.md §6). Redundancy ratio = both-uniform
