@@ -134,7 +134,42 @@ paratreet2 as the first client (behavior byte-identical, validated by
 the existing suites), then prototype a ChaNGa binding as a separate
 project with the ChaNGa maintainers.
 
-## 6. Relation to the toolkit-boundary program
+## 6. Implementation plan (2026-08-04, branch smp-cache; started on
+## Kale's go after the single-distribution merge)
+
+Each phase ends with the full regression (fof3 matrix + 1M baselines +
+gravity suite + annotate/searchAlgos, classic AND reconverse) and the
+outputs byte-identical / within recorded bands — no phase merges
+without it.
+
+- **Phase 1 — carve the passive core in place.** New `src/TreeCache.h`:
+  a plain class owning what is today CacheManager's passive state —
+  node pools, root, registries (local_tps/leaf_lookup + the narrow
+  maps_lock), placeholder creation, atomic install (today's
+  makeCachedNode/insertNode/swapIn/exchangeChild), the requested
+  bitmask logic behind Miss.first, teardown, and the cacheStats tally.
+  CacheManager keeps every entry method and all messaging, delegating
+  to the core. Pure code motion plus an interface; behavior identical.
+- **Phase 2 — waiting lists move inside.** park/install per the
+  resolution in section 2: per-slot parked lists on the placeholders,
+  install returns the opaques, ALREADY_INSTALLED closes the
+  park-vs-install race. Resumer::waiting dissolves; Resumer keeps only
+  scheduling policy (which goDown to send, subtree vs partition
+  routing). handleRemoteNode rewrites onto lookupChildren/park. The
+  fanout-fix semantics (notify exactly the requesting lanes) become
+  install's returned-opaque list.
+- **Phase 3 — Charm-independence audit.** No Charm types or calls
+  inside TreeCache.h: assert hook instead of CkAbort, caller-supplied
+  lane id instead of CkMyRank, transform hook instead of the MultiData
+  knowledge. Gate: a standalone C++ unit test (plain pthreads driving
+  concurrent lookup/park/install against a scripted fill order) that
+  compiles with no Charm headers on the include path.
+- **Phase 4 — documentation.** Library header carries the concurrency
+  contract (from cache-concurrency.md); mapping table below updated to
+  point at the new seams; ChaNGa binding remains a separate future
+  project with the maintainers.
+
+## 7. Relation to the toolkit-boundary program
 
 This is the complementary half of the standing structural item: FoF
 moves OUT of the core (fof/ module), and the cache moves BELOW it
