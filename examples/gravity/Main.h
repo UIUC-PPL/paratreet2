@@ -7,8 +7,11 @@
 
 #include <vector>
 
-// Flat per-particle record shipped through the concat reduction to PE 0 by
-// the verification harness (POD on purpose; see GravityCheck::collect).
+// Flat per-particle record shipped through the concatenating reduction to
+// processor 0 by the verification harness. Deliberately plain-old-data —
+// just bytes, no pointers or constructors — so the reduction can
+// concatenate the records without any packing/unpacking step (see
+// GravityCheck::collect).
 struct PartSample {
   long order;
   Real mass;

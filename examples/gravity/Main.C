@@ -172,9 +172,10 @@ void ExMain::runDirectSumCheck(BoundingBox& universe,
     }
   }
 
-  // Per-particle relative error against the reference, plus the momentum
-  // diagnostics: the reference is exactly antisymmetric (|sum m*a| ~ 0);
-  // the tree sum's violation of Newton's third law is reported, not gated.
+  // Per-particle relative error against the reference — the maximum and
+  // the root-mean-square ("rms" below) — plus the momentum diagnostics:
+  // the reference is exactly antisymmetric (|sum m*a| ~ 0); the tree
+  // sum's violation of Newton's third law is reported, not gated.
   double max_rel = 0, sum_sq_rel = 0;
   Vector3D<double> mom_tree(0, 0, 0), mom_ref(0, 0, 0);
   double mom_scale = 0;

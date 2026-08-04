@@ -8,10 +8,10 @@
 #include <algorithm>
 
 // Monopole node payload for the gravity example (design/barnes-hut-app.md):
-// bounding box (Data-concept requirement — LB load estimation reads it),
-// total mass, mass-weighted position sum (cm() = moment / totalMass),
-// particle count, and the opening radius read by GravityVisitor's
-// acceptance test. This is old paratreet's CentroidData with the multipole
+// bounding box (a requirement of the framework's Data concept — the load
+// balancer's load estimate reads it), total mass, mass-weighted position
+// sum (the center of mass is cm() = moment / totalMass), particle count,
+// and the opening radius read by GravityVisitor's acceptance test. This is old paratreet's CentroidData with the multipole
 // tensor and SPH/collision baggage removed — exactly what the monopole
 // (#ifdef BARNESHUT) gravity path consumed.
 //
