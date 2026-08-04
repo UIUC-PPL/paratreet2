@@ -32,6 +32,9 @@
 // reaches LCI). The workaround masks the symptom; the bug report lives in
 // lci-handover/.
 static int fof_keepalive_handler_id;
+static long fof_keepalive_ticks = 0;
+static double fof_keepalive_t0 = 0;
+static bool fof_keepalive_verbose = false;
 
 static void fofKeepAliveHandler(void* msg) { CmiFree(msg); }
 
@@ -40,6 +43,20 @@ static void fofKeepAliveTick(void*) {
   CmiSetHandler(msg, fof_keepalive_handler_id);
   CmiSyncNodeSendAndFree((CmiMyNode() + 1) % CmiNumNodes(),
                          CmiMsgHeaderSizeBytes, (char*)msg);
+  // Rate instrument (FOF_KEEPALIVE_VERBOSE=1): the workaround's measured
+  // basis is ~10 ticks/s/process; if the condition rung fires much faster
+  // or much slower than that, the implementation does not match the
+  // measurement and the verification numbers mean something else.
+  fof_keepalive_ticks++;
+  if (fof_keepalive_verbose && CmiMyNode() == 0) {
+    if (fof_keepalive_ticks == 1) fof_keepalive_t0 = CmiWallTimer();
+    if (fof_keepalive_ticks % 100 == 0) {
+      double dt = CmiWallTimer() - fof_keepalive_t0;
+      CmiPrintf("keep-alive rate: %ld ticks in %.1f s (%.1f/s)\n",
+                fof_keepalive_ticks, dt,
+                dt > 0 ? (fof_keepalive_ticks - 1) / dt : 0.0);
+    }
+  }
 }
 
 // initproc (fof.ci): runs on every PE, so the handler id is registered —
@@ -50,6 +67,8 @@ void fofKeepAliveInit(void) {
       CmiRegisterHandler((CmiHandler)fofKeepAliveHandler);
   const char* env = std::getenv("FOF_KEEPALIVE");
   bool enabled = !(env && std::atoi(env) == 0);
+  const char* venv = std::getenv("FOF_KEEPALIVE_VERBOSE");
+  fof_keepalive_verbose = (venv && std::atoi(venv) != 0);
   if (!enabled || CmiNumNodes() < 2) return;
   if (CmiMyRank() == 0) {
     CcdCallOnConditionKeep(CcdPERIODIC_100ms, fofKeepAliveTick, nullptr);
