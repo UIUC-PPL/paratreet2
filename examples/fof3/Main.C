@@ -55,7 +55,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:S")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -79,6 +79,12 @@ PARATREET_REGISTER_MAIN(ExMain);
           break;
         case 'g':
           fof_frag_histogram = true;
+          break;
+        case 'S':
+          // Single-distribution mode (design/single-distribution-mode.md):
+          // no Partition array; requires the dual walk (checked after the
+          // parse loop, once -w has also been seen).
+          single_distribution = true;
           break;
         case 'G':
           fof_grid_threshold = atof(optarg);
@@ -143,6 +149,14 @@ PARATREET_REGISTER_MAIN(ExMain);
       }
     }
     delete m;
+
+    if (single_distribution) {
+      if (walk_mode != WalkMode::Dual)
+        CkAbort("-S (single distribution) requires the dual walk (-w dual): "
+                "the transposed walk runs from the Partition array, which "
+                "single mode does not create");
+      conf.single_distribution = true;
+    }
 
     CkPrintf("\n[PARATREET FOF PHASE 3]\n");
     if (conf.input_file.empty()) CkAbort("Input file unspecified");

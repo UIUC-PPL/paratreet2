@@ -21,9 +21,10 @@ public: // these need to be seen by other local chares
 
   void reset() {
 #if DEBUG
+    // (Brace bit-rot fixed 2026-08-04: the block previously closed reset()
+    // early and only compiled because DEBUG=0 everywhere.)
     for (auto& trav : all_resume_nodes) {
-        if (!trav.second.empty()) CkAbort("did not complete last traversal");
-      }
+      if (!trav.second.empty()) CkAbort("did not complete last traversal");
     }
     CkAssert(waiting.empty()); // should have gotten rid of them
 #endif

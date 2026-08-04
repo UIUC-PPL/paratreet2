@@ -358,13 +358,23 @@ struct FoFPhase3Result {
 // runFoFPhase1 and Subtree::upwardPass (+ QD) and before the next tree
 // rebuild/reset. The gather-to-one UF_2 is v1 scaffolding (fine to ~1e6
 // edges); the distributed UF_2 replaces it in step 4.
+// Shared-leaf aliasing precondition: asserted via Partition::
+// verifySharedLeaves under dual distribution; under single-distribution
+// mode it holds BY CONSTRUCTION (traversal targets ARE the Subtree
+// leaves — there is no Partition array), so the check is skipped.
+inline void verifySharedLeavesUnlessSingle(
+    CProxy_Partition<FragData>& partitions) {
+  if (!paratreet::getConfiguration().single_distribution)
+    partitions.verifySharedLeaves(CkCallbackResumeThread());
+}
+
 inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
                                     CProxy_FoFPhase1<FragData> fof,
                                     double linking_length,
                                     Vector3D<Real> period = Vector3D<Real>(0, 0, 0)) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
-  partitions.verifySharedLeaves(CkCallbackResumeThread());
+  verifySharedLeavesUnlessSingle(partitions);
 
   double b2 = linking_length * linking_length;
   fof.resetPhase3(CkCallbackResumeThread());
@@ -372,6 +382,9 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   // The boundary walk: all Partitions against the global tree. QD covers
   // the traversal including cache fetches and resumptions.
   double t0 = CkWallTimer();
+  if (paratreet::getConfiguration().single_distribution)
+    CkAbort("transposed phase-3 walk needs the Partition array; use the dual"
+            " walk (-w dual) under single_distribution");
   partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
   CkWaitQD();
   double t1 = CkWallTimer();
@@ -539,7 +552,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         long uf2_stream_batch = 0) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
-  partitions.verifySharedLeaves(CkCallbackResumeThread());
+  verifySharedLeavesUnlessSingle(partitions);
 
   double b2 = linking_length * linking_length;
   fof.resetPhase3(CkCallbackResumeThread());
@@ -574,10 +587,14 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // QD (all plain entry sends), overlapping uf2's latency chains with the
   // walk's remaining work and fetch stalls.
   double t0 = CkWallTimer();
-  if (dual_walk)
+  if (dual_walk) {
     subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
-  else
+  } else {
+    if (paratreet::getConfiguration().single_distribution)
+      CkAbort("transposed phase-3 walk needs the Partition array; use the dual"
+              " walk (-w dual) under single_distribution");
     partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+  }
   CkWaitQD();
   double t1 = CkWallTimer();
 

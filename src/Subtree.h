@@ -263,6 +263,17 @@ void Subtree<Data>::startDual(Visitor v) {
   r_local = r_proxy.ckLocalBranch();
   r_local->subtree_proxy = this->thisProxy;
   r_local->use_subtree = true;
+  // Wire the per-PE resumer <-> cache cross-pointers the fetch/resume path
+  // needs (CacheManager::process -> Resumer::process -> goDown). Dual-
+  // distribution runs inherit these from Partition::initLocalBranches on
+  // every PE (Subtrees are bound to Partitions); in single-distribution
+  // mode there are no Partition elements, so the subtree-driven walk sets
+  // them itself. Idempotent — same values either way. Without cm r_proxy,
+  // installs notify a NULL group proxy: no walker ever resumes and the
+  // undeliverable sends stall quiescence (2-process hang, 2026-08-04).
+  auto* cml = cm_proxy.ckLocalBranch();
+  r_local->cm_local = cml;
+  cml->r_proxy = r_proxy;
   traverser.reset(new DualTraverser<Data, Visitor>(v, 0, *this));
   traverser->start();
 }
@@ -374,7 +385,9 @@ void Subtree<Data>::buildTree(CProxy_Partition<Data> part, CkCallback cb) {
   initCache();
 
   this->contribute(cb);
-  sendLeaves(part);
+  // Single-distribution mode has no Partition array to feed (part is a
+  // null proxy); traversal targets are this subtree's own leaves.
+  if (!paratreet::getConfiguration().single_distribution) sendLeaves(part);
 }
 
 template <typename Data>

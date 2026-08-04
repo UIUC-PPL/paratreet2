@@ -75,6 +75,11 @@ class ExMain: public paratreet::Main<FragData> {
   // dist critical path (design/sparse-uf2-encoding.md). Serial mode (-u
   // serial) always prints it, as before.
   bool fof_frag_histogram = false;
+  // -S: single-distribution mode (design/single-distribution-mode.md) — no
+  // Partition array; dual walk only. The FragCheckVisitor sweep of -c full
+  // is skipped (it is a Partition walk); the grid/O(n^2) component checks
+  // and the in-walk annotation CkEnforce still run.
+  bool single_distribution = false;
   // Pre-created UF_2 placement-map group (see preTraversalFn): created early
   // so its branches exist everywhere before phase 3's array creation
   // consults it (reconverse has no group-dependency buffering).

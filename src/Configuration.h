@@ -132,6 +132,17 @@ namespace paratreet {
         // simulation apps byte-identical.
         bool perturb_particles = true;
 
+        // Single-distribution mode (design/single-distribution-mode.md):
+        // no Partition array is created — traversals run from Subtrees
+        // (startDual), decomposition computes one set of splitters, and
+        // the copy/share machinery is unreachable. Requirements enforced
+        // by Driver::decompose: matching decompositions, and the app must
+        // not touch proxy_pack.partition (it is a null proxy) nor rely on
+        // partition-side movement/LB (perturb_particles apps stay dual-
+        // distribution until the movement machinery moves to Subtree —
+        // phase B of the design).
+        bool single_distribution = false;
+
         // we support loading config files with "-x"
         Configuration(const char* config_arg = "-x")
         : Loadable(config_arg) { register_fields(); }
@@ -197,6 +208,7 @@ namespace paratreet {
             p | dSoft;
             p | linking_length;
             p | perturb_particles;
+            p | single_distribution;
         }
     };
 

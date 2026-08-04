@@ -128,6 +128,19 @@ public:
     } else CkWaitQD();
 
     bool matching_decomps = config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type);
+    // Single-distribution mode (design/single-distribution-mode.md): no
+    // Partition array at all. One splitter computation (below, shared with
+    // the dual-distribution matching path), no partition assignment pass,
+    // Subtrees placed by their own decomposition map instead of bindTo.
+    // Restrictions enforced here; the movement machinery (kick/perturb/
+    // rebuild) is Partition-resident, so moving apps stay dual for now.
+    bool single = config.single_distribution;
+    if (single && !matching_decomps)
+      CkAbort("single_distribution requires matching decomposition and tree "
+              "types (e.g. -d oct with the oct tree)");
+    if (single && config.perturb_particles)
+      CkAbort("single_distribution does not yet support moving particles "
+              "(perturb_particles); use dual distribution");
     // Set up splitters for decomposition
     start_time = CkWallTimer();
     n_partitions = treespec.ckLocalBranch()->getPartitionDecomposition()->findSplitters(universe, readers, config.min_n_partitions);
@@ -136,6 +149,45 @@ public:
         CkPointer<Decomposition>(treespec.ckLocalBranch()->getPartitionDecomposition()), false);
     CkPrintf("Setting up splitters for particle decompositions: %.3lf ms\n",
         (CkWallTimer() - start_time) * 1000);
+
+    if (single) {
+      // No Partition array: reuse the splitters just computed as the
+      // subtree decomposition (the matching-decomps identity), create
+      // Subtrees on their own decomposition map, and flush particles
+      // straight to them. partitions stays a null proxy; ProxyPack
+      // carries it as such and single-mode apps must not use it.
+      n_subtrees = n_partitions;
+      treespec.receiveDecomposition(CkCallbackResumeThread(),
+        CkPointer<Decomposition>(treespec.ckLocalBranch()->getPartitionDecomposition()), true);
+
+      start_time = CkWallTimer();
+      CkArrayOptions subtree_opts(n_subtrees);
+      treespec.ckLocalBranch()->getSubtreeDecomposition()->setArrayOpts(subtree_opts, {}, false);
+      // Same map-creation ordering hazard as the dual-distribution path
+      // below (see that comment): declare the fresh map as a user group
+      // dependency of the array creation.
+      CkEntryOptions sub_dep_opts;
+      if (!subtree_opts.getMap().isZero())
+        sub_dep_opts.setGroupDepID(subtree_opts.getMap());
+      subtrees = CProxy_Subtree<Data>::ckNew(
+        CkCallbackResumeThread(),
+        universe.n_particles, n_subtrees, n_partitions,
+        calculator, resumer,
+        cache_manager, this->thisProxy, matching_decomps, subtree_opts,
+        &sub_dep_opts
+        );
+      CkPrintf("Created %d Subtrees (single distribution): %.3lf ms\n",
+          n_subtrees, (CkWallTimer() - start_time) * 1000);
+
+      start_time = CkWallTimer();
+      readers.flush(n_subtrees, subtrees);
+      CkStartQD(CkCallbackResumeThread());
+      CkPrintf("Flushing particles to Subtrees: %.3lf ms\n",
+          (CkWallTimer() - start_time) * 1000);
+      CkPrintf("**Total Decomposition time: %.3lf ms\n",
+          (CkWallTimer() - decomp_time) * 1000);
+      return;
+    }
 
     // Create Partitions
     CkArrayOptions partition_opts(n_partitions);
@@ -327,7 +379,10 @@ public:
         CkWaitQD();
         CkPrintf("Perturbations: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
       }
-      if (!complete_rebuild && config.lb_period > 0 && iter % config.lb_period == config.lb_period - 1 && iter != config.num_iterations - 1) {
+      // Partition-side LB and lifecycle: absent in single-distribution
+      // mode (LB hooks move to Subtree in a later phase of the design).
+      bool single = config.single_distribution;
+      if (!single && !complete_rebuild && config.lb_period > 0 && iter % config.lb_period == config.lb_period - 1 && iter != config.num_iterations - 1) {
         start_time = CkWallTimer();
         //subtrees.pauseForLB(); // move them later
         CkPrintf("Starting load balancing...\n");
@@ -340,10 +395,10 @@ public:
       if (complete_rebuild) {
         treespec.reset();
         subtrees.destroy();
-        partitions.destroy();
+        if (!single) partitions.destroy();
         decompose(iter+1);
       } else {
-        partitions.reset();
+        if (!single) partitions.reset();
         subtrees.reset();
       }
 

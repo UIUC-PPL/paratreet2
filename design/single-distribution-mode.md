@@ -1,9 +1,47 @@
 # Single-distribution mode: making Partitions optional
 
-**STATUS: DESIGN DIRECTION (Kale, 2026-07-28) — decision Kale's, with
-discussion with Ritvik. Decision context: Kale is certain of the direction as
-long as both options exist, and skeptical that the partition degree of
-freedom ever bought much even for load balancing.**
+**STATUS: PHASE A IMPLEMENTED (2026-08-04, branch single-distribution) —
+static/dual-walk apps only; FoF opted in via fof3 -S. Movement (kick/
+perturb/rebuild) and LB stay Partition-resident, so perturb_particles
+apps (gravity) remain dual-distribution until Phase B moves that
+machinery to Subtree. Original design direction (Kale, 2026-07-28)
+below; decision Kale's, with discussion with Ritvik.**
+
+## Phase A implementation record (2026-08-04)
+
+- `Configuration.single_distribution` (default false). Driver::decompose
+  enforces: matching decompositions, perturb_particles off. When set: ONE
+  splitter computation, no Partition array, no partition-assignment pass,
+  Subtrees placed by their own DecompArrayMap (with the setGroupDepID
+  map-dependency guard) instead of bindTo; Subtree::buildTree skips
+  sendLeaves; Driver::run skips partition destroy/reset/LB.
+- fof3 `-S` (requires `-w dual`): runFoFPhase3[Dist] skip
+  verifySharedLeaves (aliasing holds by construction — the walk targets
+  ARE the subtree leaves), transposed arm aborts with a clear message,
+  the -c full FragCheckVisitor sweep (a Partition walk) is skipped with a
+  printed note — the grid/O(n^2) component checks and the in-walk
+  annotation CkEnforce remain the gates.
+- **Bug found + fixed on the way: the per-PE resumer/cache wiring came
+  only from Partition.** `CacheManager::r_proxy` and `Resumer::cm_local`
+  were set solely in Partition::initLocalBranches; with no Partition
+  elements, every post-install CacheManager::process() notified a NULL
+  group proxy — walkers never resumed and the undeliverable sends
+  stalled quiescence (multi-process hang; single-process worked because
+  nothing crossed the cache). Fix: Subtree::startDual wires both
+  (idempotent in dual-distribution runs). Symptom worth remembering:
+  schedulers idle at empty queues + CkWaitQD never returns = a send on
+  a null/default group proxy is counted by QD but never delivered.
+- Also fixed: Resumer::reset's #if DEBUG block had brace bit-rot (never
+  compiled since DEBUG builds stopped).
+- VALIDATED: -S matrix 100/1k/10k x {+p1, 2 procs x 2 PEs} exact
+  (72/390/3549); 1M -S 4-proc b0.2 = 333,889 and b0.8 = 41,315
+  BIT-IDENTICAL to dual-distribution incl. full histograms; default-mode
+  regression untouched (fof3 12/12, fof1, gravity 7/7, annotate,
+  searchAlgos); reconverse: see running note below.
+- Expected-win check at laptop scale: decomposition prints "Created N
+  Subtrees (single distribution)" with no partition creation/assignment
+  lines; the 2B-scale ~2.4 s startup saving is measured at the next
+  cluster campaign.
 
 ## The situation being fixed
 

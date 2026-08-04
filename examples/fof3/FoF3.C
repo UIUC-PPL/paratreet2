@@ -423,7 +423,13 @@ using namespace paratreet;
     // the phase-3 walk actually consults) remains the tripwire. It has also
     // passed ungated at 1M (+p1, +p2, 2026-07-19).
     double tc0 = CkWallTimer();
-    if (N <= 100000) {
+    if (single_distribution) {
+      // The FragCheckVisitor sweep is a Partition walk; without the array
+      // it is skipped. The in-walk annotation-validity CkEnforce inside
+      // FoFEdgeVisitor (every node the phase-3 walk consults) remains the
+      // tripwire, and the grid/O(n^2) component checks below still gate.
+      CkPrintf("FragCheck sweep skipped (-S single distribution)\n");
+    } else if (N <= 100000) {
       proxy_pack.partition.template startDown<FragCheckVisitor>(FragCheckVisitor());
       CkWaitQD();
     }
