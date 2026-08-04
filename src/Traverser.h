@@ -160,7 +160,13 @@ public:
   virtual size_t pausedWorkSize() const { return 0; }
 };
 
-template <typename Data, typename Visitor>
+// Owner = the chare driving the walk: Partition (the classic dual-
+// distribution arrangement) or Subtree (single-distribution mode, where
+// the walk's target leaves are the subtree's own — phase B of
+// design/single-distribution-mode.md). Both provide the same member
+// names (leaves, thisIndex, cm_local, cm_proxy, tc_proxy, r_proxy,
+// r_local).
+template <typename Data, typename Visitor, typename Owner = Partition<Data>>
 class TransposedDownTraverser : public Traverser<Data> {
 public:
   using ABType = std::vector<char>; // Changed from std::vector<bool> to avoid bit-packing issues
@@ -169,7 +175,7 @@ protected:
   Visitor v;
   size_t trav_idx = 0;
   std::vector<Node<Data>*> leaves;
-  Partition<Data>& part;
+  Owner& part;
   ThreadStateHolder* stats = nullptr;
   std::unordered_map<Key, ABType> curr_nodes;
   std::vector<std::pair<Node<Data>*, ABType>> paused_curr_nodes;
@@ -187,7 +193,7 @@ protected:
   }
 
 public:
-  TransposedDownTraverser(Visitor& vi, size_t ti, std::vector<Node<Data>*> leavesi, Partition<Data>& parti, bool delay_leafi = false)
+  TransposedDownTraverser(Visitor& vi, size_t ti, std::vector<Node<Data>*> leavesi, Owner& parti, bool delay_leafi = false)
     : v(vi), trav_idx(ti), leaves(leavesi), part(parti), delay_leaf(delay_leafi)
   {
     request_pause_interval = paratreet::getConfiguration().request_pause_interval;

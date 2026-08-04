@@ -138,9 +138,6 @@ public:
     if (single && !matching_decomps)
       CkAbort("single_distribution requires matching decomposition and tree "
               "types (e.g. -d oct with the oct tree)");
-    if (single && config.perturb_particles)
-      CkAbort("single_distribution does not yet support moving particles "
-              "(perturb_particles); use dual distribution");
     // Set up splitters for decomposition
     start_time = CkWallTimer();
     n_partitions = treespec.ckLocalBranch()->getPartitionDecomposition()->findSplitters(universe, readers, config.min_n_partitions);
@@ -341,9 +338,12 @@ public:
       // exchange are pure overhead, and the universe box is unchanged.
       // postIterationFn always runs — it is an app hook, not movement.
       bool complete_rebuild = false;
+      bool single_iter = config.single_distribution;
       if (config.perturb_particles) {
-        // Move the particles in Partitions
-        partitions.kick(timestep_size, CkCallbackResumeThread());
+        // Move the particles: first leapfrog half-kick, on whichever array
+        // owns the traversal targets in this mode.
+        if (single_iter) subtrees.kick(timestep_size, CkCallbackResumeThread());
+        else partitions.kick(timestep_size, CkCallbackResumeThread());
 
         // Now track PE imbalance for memory reasons
         thread_state_holder.collectMetaData(CkCallbackResumeThread((void *&) msg2));
@@ -369,24 +369,29 @@ public:
 
       if (config.perturb_particles) {
         CkReductionMsg* result;
-        partitions.perturb(timestep_size, CkCallbackResumeThread((void *&)result));
+        if (single_iter) subtrees.perturb(timestep_size, CkCallbackResumeThread((void *&)result));
+        else partitions.perturb(timestep_size, CkCallbackResumeThread((void *&)result));
 
         universe = *((BoundingBox*)result->getData());
         delete result;
         remakeUniverse();
-        partitions.rebuild(universe, subtrees, complete_rebuild); // 0.1s for example
+        if (single_iter) subtrees.rebucket(universe, complete_rebuild);
+        else partitions.rebuild(universe, subtrees, complete_rebuild); // 0.1s for example
 
         CkWaitQD();
         CkPrintf("Perturbations: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
       }
-      // Partition-side LB and lifecycle: absent in single-distribution
-      // mode (LB hooks move to Subtree in a later phase of the design).
+      // Load balancing: Partitions drive it in dual mode, Subtrees in
+      // single mode (phase B — Subtree registers for AtSync only in
+      // single mode, and its pup ships incoming_particles, which the
+      // rebucket above just filled: exactly the state the next build
+      // needs).
       bool single = config.single_distribution;
-      if (!single && !complete_rebuild && config.lb_period > 0 && iter % config.lb_period == config.lb_period - 1 && iter != config.num_iterations - 1) {
+      if (!complete_rebuild && config.lb_period > 0 && iter % config.lb_period == config.lb_period - 1 && iter != config.num_iterations - 1) {
         start_time = CkWallTimer();
-        //subtrees.pauseForLB(); // move them later
         CkPrintf("Starting load balancing...\n");
-        partitions.pauseForLB();
+        if (single) subtrees.pauseForLB();
+        else partitions.pauseForLB();
         CkWaitQD();
         CkPrintf("Load balancing: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
       }

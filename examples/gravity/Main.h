@@ -51,8 +51,14 @@ class ExMain : public paratreet::Main<GravityData> {
   //               framework's adaptive max_velocity argument.
   //   -c <mode>   verification: full | off | auto (default auto = full
   //               when N <= check_auto_limit, at iteration 0)
+  //   -S          single-distribution mode (no Partition array;
+  //               design/single-distribution-mode.md): the force walk runs
+  //               as the subtree-driven dual traversal, movement through
+  //               Subtree::kick/perturb/rebucket, load balancing on the
+  //               Subtrees.
   double theta = 0.7;
   double fixed_dt = 0.01;
+  bool single_distribution = false;
   enum class CheckMode { Auto, Full, Off };
   CheckMode check_mode = CheckMode::Auto;
   static constexpr long check_auto_limit = 10000;

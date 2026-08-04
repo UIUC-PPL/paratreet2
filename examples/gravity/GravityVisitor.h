@@ -26,6 +26,13 @@ class GravityVisitor {
  public:
   // A target bucket must interact with its own source leaf.
   static constexpr const bool CallSelfLeaf = true;
+  // Dual-walk traits (consulted only by the subtree-driven dual traversal,
+  // which -S single-distribution mode uses; the default transposed walk
+  // ignores both). node()/leaf() write into target PARTICLES, so targets
+  // must be leaves: an accepted source against an internal target descends
+  // the target instead (runInvertedTraversal). No forced co-descent.
+  static constexpr const bool TargetMustBeLeaf = true;
+  static constexpr const bool ForceEvenDepth = false;
   static constexpr const Real opening_geometry_factor_squared = 4.0 / 3.0;
   static constexpr const int nMinParticleNode = 6;
 

@@ -56,7 +56,7 @@ void ExMain::main(CkArgMsg* m) {
   // App-specific arguments; everything framework-registered was consumed
   // and removed from argv by Configuration::parse before this runs.
   int c;
-  while ((c = getopt(m->argc, m->argv, "o:T:c:")) != -1) {
+  while ((c = getopt(m->argc, m->argv, "o:T:c:S")) != -1) {
     switch (c) {
       case 'o':
         theta = atof(optarg);
@@ -67,6 +67,9 @@ void ExMain::main(CkArgMsg* m) {
       case 'T':
         fixed_dt = atof(optarg);
         if (!(fixed_dt > 0.0)) CkAbort("-T requires a timestep > 0");
+        break;
+      case 'S':
+        single_distribution = true;
         break;
       case 'c':
         if (strcmp(optarg, "full") == 0)      check_mode = CheckMode::Full;
@@ -79,6 +82,8 @@ void ExMain::main(CkArgMsg* m) {
     }
   }
   delete m;
+
+  if (single_distribution) conf.single_distribution = true;
 
   CkPrintf("\n[PARATREET GRAVITY (monopole Barnes-Hut)]\n");
   if (conf.input_file.empty()) CkAbort("Input file unspecified");
@@ -111,8 +116,19 @@ void ExMain::preTraversalFn(ProxyPack<GravityData>& proxy_pack) {
 
 void ExMain::traversalFn(BoundingBox& universe,
                          ProxyPack<GravityData>& proxy_pack, int iter) {
-  proxy_pack.partition.template startDown<GravityVisitor>(
-      GravityVisitor(theta));
+  if (single_distribution) {
+    // The subtree-driven TRANSPOSED walk: identical traverser and
+    // acceptance semantics to the default mode, driven by the Subtrees
+    // (their leaves ARE the same target buckets). The dual walk is not
+    // used here: its cell()/inverted-traversal contract is shaped for
+    // FoF-style pure-predicate visitors, not for visitors that write
+    // into target particles.
+    proxy_pack.subtree.template startDown<GravityVisitor>(
+        GravityVisitor(theta));
+  } else {
+    proxy_pack.partition.template startDown<GravityVisitor>(
+        GravityVisitor(theta));
+  }
 }
 
 void ExMain::postIterationFn(BoundingBox& universe,
@@ -140,8 +156,14 @@ void ExMain::postIterationFn(BoundingBox& universe,
 void ExMain::runDirectSumCheck(BoundingBox& universe,
                                ProxyPack<GravityData>& proxy_pack) {
   double t0 = CkWallTimer();
-  proxy_pack.partition.callPerLeafFn(
-      PARATREET_PER_LEAF_FN(DepositFn, GravityData), CkCallbackResumeThread());
+  if (single_distribution)
+    proxy_pack.subtree.callPerLeafFn(
+        PARATREET_PER_LEAF_FN(DepositFn, GravityData),
+        CkCallbackResumeThread());
+  else
+    proxy_pack.partition.callPerLeafFn(
+        PARATREET_PER_LEAF_FN(DepositFn, GravityData),
+        CkCallbackResumeThread());
   void* result = nullptr;
   gravity_check.collect(CkCallbackResumeThread(result));
   CkReductionMsg* msg = (CkReductionMsg*)result;

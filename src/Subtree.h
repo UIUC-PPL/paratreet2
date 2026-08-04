@@ -65,6 +65,8 @@ public:
   void handlePossibleLeaf(Node<Data>* node);
   void sendLeaves(CProxy_Partition<Data>);
   template <typename Visitor> void startDual(Visitor v);
+  template <typename Visitor> void startDown(Visitor v);
+  void resumeAfterPause(size_t travIdx);
   void goDown(size_t travIdx);
   void requestNodes(Key, int);
   void requestCopy(int, PPHolder<Data>);
@@ -78,6 +80,15 @@ public:
   void callPerLeafFn(paratreet::PerLeafAble<Data>&, const CkCallback&);
   void callPerSubtreeFn(paratreet::PerSubtreeAble<Data>&, const CkCallback&);
   void upwardPass(const CkCallback&);
+  // Single-distribution movement (design/single-distribution-mode.md
+  // phase B): the Partition-resident kick/perturb/rebuild machinery on
+  // the Subtree's OWN particle storage, used when no Partition array
+  // exists. (Particle deletion — Partition::deleteParticleOfOrder — has
+  // no subtree-side equivalent yet; the collision-style apps that use it
+  // stay dual-distribution.)
+  void kick(Real, const CkCallback&);
+  void perturb(Real, const CkCallback&);
+  void rebucket(BoundingBox, bool);
   void recomputeData(Node<Data>*);
   void addNodeToFlatSubtree(Node<Data>* node);
   void pauseForLB(){
@@ -139,7 +150,12 @@ Subtree<Data>::Subtree(const CkCallback& cb, long n_total_particles_,
 
   //this->load = 0.0;
   //this->usesAutoMeasure = false;
-  //this->usesAtSync = true;
+  // Load-balancing participation: in single-distribution mode the
+  // Subtrees ARE the balanced array (Driver's LB block calls
+  // subtrees.pauseForLB). In dual mode they must NOT register for
+  // AtSync — the Partitions drive it and never-synching registered
+  // subtrees would stall the balancer's barrier.
+  this->usesAtSync = paratreet::getConfiguration().single_distribution;
 
   matching_decomps = matching_decomps_;
 
@@ -257,6 +273,36 @@ void Subtree<Data>::sendLeaves(CProxy_Partition<Data> part)
   thread_state_holder.ckLocalBranch()->countCopiesAndShares(num_copies, num_shares);
 }
 
+// Subtree-driven TRANSPOSED walk (single-distribution mode): the same
+// TransposedDownTraverser the Partitions run in dual-distribution mode,
+// with this subtree's own leaves as the target buckets — the walk
+// semantics (and the acceptance decisions an app like gravity makes) are
+// identical, only the driving chare differs.
+template <typename Data>
+template <typename Visitor>
+void Subtree<Data>::startDown(Visitor v) {
+  r_local = r_proxy.ckLocalBranch();
+  r_local->subtree_proxy = this->thisProxy;
+  r_local->use_subtree = true;
+  // Same resumer/cache cross-wiring as startDual below (no Partition
+  // elements exist to have done it).
+  auto* cml = cm_proxy.ckLocalBranch();
+  r_local->cm_local = cml;
+  cml->r_proxy = r_proxy;
+  traverser.reset(new TransposedDownTraverser<Data, Visitor, Subtree<Data>>(
+      v, 0, leaves, *this));
+  traverser->start();
+  // Pause protocol, mirrored from Partition::startNewTraverser: the
+  // transposed traverser defers work (paused_curr_nodes) once its
+  // outstanding-request/handle counters trip, and relies on its OWNER to
+  // reschedule through the self-perpetuating resumeAfterPause entry.
+  // Without this the paused work is silently abandoned (multi-process
+  // single-mode gravity lost most remote contributions, 2026-08-04).
+  if (traverser->wantsPause()) {
+    this->thisProxy[this->thisIndex].resumeAfterPause(0);
+  }
+}
+
 template <typename Data>
 template <typename Visitor>
 void Subtree<Data>::startDual(Visitor v) {
@@ -282,6 +328,15 @@ template <typename Data>
 void Subtree<Data>::goDown(size_t travIdx) {
   CkAssert(travIdx == 0); // cannot handle multiple dual tree traversals yet
   traverser->resumeTrav();
+}
+
+// Mirror of Partition::resumeAfterPause (see the note in startDown).
+template <typename Data>
+void Subtree<Data>::resumeAfterPause(size_t travIdx) {
+  traverser->resumeAfterPause();
+  if (traverser->wantsPause()) {
+    this->thisProxy[this->thisIndex].resumeAfterPause(travIdx);
+  }
 }
 
 template <typename Data>
@@ -491,6 +546,67 @@ void Subtree<Data>::recomputeData(Node<Data>* node) {
     recomputeData(child);
     node->data += child->data;
   }
+}
+
+// First leapfrog half-kick on this subtree's leaves (the single-
+// distribution twin of Partition::kick; under matching decompositions the
+// leaves are the same objects either way).
+template <typename Data>
+void Subtree<Data>::kick(Real timestep, const CkCallback& cb) {
+  for (auto && leaf : leaves) {
+    leaf->kick(timestep);
+  }
+  this->contribute(cb);
+}
+
+// Second leapfrog half-kick + drift on this subtree's owned particles,
+// contributing the moved bounding box (the single-distribution twin of
+// Partition::perturb, minus the deletion filter and the per-element load
+// user data — see the declaration comment).
+template <typename Data>
+void Subtree<Data>::perturb(Real timestep, const CkCallback& cb) {
+  BoundingBox box;
+  for (auto && p : particles) {
+    p.perturb(timestep);
+    box.grow(p.position);
+    box.mass += p.mass;
+    box.ke += 0.5 * p.mass * p.velocity.lengthSquared();
+    if (p.isGas()) box.n_sph++;
+    if (p.isDark()) box.n_dark++;
+    if (p.isStar()) box.n_star++;
+  }
+  box.n_particles = particles.size();
+  this->contribute(sizeof(BoundingBox), &box, BoundingBox::reducer(), cb);
+}
+
+// Re-home the moved particles (the single-distribution twin of
+// Partition::rebuild): adjustNewUniverse re-generates each particle's key
+// against the driver's re-made universe, then either every particle goes
+// back to the Readers for a full re-sorting decomposition (if_flush) or
+// straight to the subtree whose key range now contains it, through the
+// EXISTING splitters. Receivers append to incoming_particles (receive),
+// which the next buildTree swaps in — and which pup ships if load
+// balancing migrates this element afterwards (same safety argument as the
+// Partition path: the live tree is rebuilt from scratch every iteration).
+template <typename Data>
+void Subtree<Data>::rebucket(BoundingBox universe, bool if_flush) {
+  thread_state_holder.ckLocalBranch()->countPartitionParticles(particles.size());
+  for (auto && p : particles) {
+    p.adjustNewUniverse(universe.box);
+  }
+  if (if_flush) {
+    ParticleMsg* msg = new (particles.size()) ParticleMsg(
+      particles.data(), particles.size()
+      );
+    readers[CkMyPe()].receive(msg);
+  } else {
+    auto sendParticles = [&](int dest, int n_particles, Particle* parts) {
+      ParticleMsg* msg = new (n_particles) ParticleMsg(parts, n_particles);
+      this->thisProxy[dest].receive(msg);
+    };
+    treespec.ckLocalBranch()->getSubtreeDecomposition()->flush(particles, sendParticles);
+  }
+  particles.clear();
 }
 
 // Generic subtree-level hook (see paratreet::PerSubtreeAble): applies fn once

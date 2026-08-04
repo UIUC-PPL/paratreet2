@@ -127,12 +127,20 @@ module paratreet {
     entry void reset();
     entry void sendLeaves(CProxy_Partition<Data>);
     template <typename Visitor> entry void startDual(Visitor v);
+    template <typename Visitor> entry void startDown(Visitor v);
+    entry void resumeAfterPause(size_t travIdx);
     entry void goDown(size_t travIdx);
     entry void checkParticlesChanged(const CkCallback&);
     entry void collectMetaData(const CkCallback & cb);
     entry void callPerLeafFn(CkReference<paratreet::PerLeafAble<Data>>, const CkCallback&);
     entry void callPerSubtreeFn(CkReference<paratreet::PerSubtreeAble<Data>>, const CkCallback&);
     entry void upwardPass(const CkCallback&);
+    // Single-distribution movement (design/single-distribution-mode.md
+    // phase B): the kick/perturb/re-home cycle on the Subtrees when no
+    // Partition array exists.
+    entry void kick(Real, const CkCallback&);
+    entry void perturb(Real, const CkCallback&);
+    entry void rebucket(BoundingBox, bool);
     entry void pauseForLB();
   }
 
