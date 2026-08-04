@@ -56,7 +56,7 @@ module paratreet {
   template <typename Data>
   group Resumer {
     entry Resumer();
-    entry void process(Key);
+    entry void process(Key, const std::vector<uint64_t>&);
     entry void reset();
   };
 

@@ -285,6 +285,14 @@ public:
   // functions either as a boolean or as an indicator
   // as to whether it's requested on that pe
 
+  // Head of this placeholder's parked-waiter list (TreeCache::park /
+  // TreeCache::swapIn's drain): a lock-free push list of caller-opaque
+  // values, closed exactly once at install with a sentinel so the
+  // park-vs-install race resolves to ALREADY_INSTALLED for late parkers.
+  // Owned and interpreted by TreeCache; plain void* here to keep Node
+  // free of the entry type.
+  std::atomic<void*> parked_head = ATOMIC_VAR_INIT(nullptr);
+
 public:
   bool isCached() const {
     return type == Type::CachedRemote

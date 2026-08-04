@@ -5,10 +5,17 @@
 #include "common.h"
 #include "Partition.h"
 
-#include <unordered_map>
-#include <vector>
 #include <queue>
+#include <set>
+#include <vector>
 
+// Per-processor resumption POLICY for parked traversals (phase 2 of
+// design/smp-cache-extraction.md): the WAITING STATE now lives on the
+// cache placeholders themselves (TreeCache park/install), and this group
+// only decides what to do with the opaques an install hands back — queue
+// the resumed node per (traversal, element) and dispatch one goDown to
+// the walking chare (Subtree or Partition, per use_subtree). The old
+// waiting[key] side table is gone.
 template <typename Data>
 class Resumer : public CBase_Resumer<Data> {
 public: // these need to be seen by other local chares
@@ -16,7 +23,6 @@ public: // these need to be seen by other local chares
   CProxy_Subtree<Data> subtree_proxy;
   CacheManager<Data>* cm_local;
   std::map<std::pair<int, int>, std::queue<Node<Data>*>> all_resume_nodes;
-  std::unordered_map<Key, std::vector<std::pair<int, int>>> waiting;
   bool use_subtree = false;
 
   void reset() {
@@ -26,17 +32,22 @@ public: // these need to be seen by other local chares
     for (auto& trav : all_resume_nodes) {
       if (!trav.second.empty()) CkAbort("did not complete last traversal");
     }
-    CkAssert(waiting.empty()); // should have gotten rid of them
 #endif
     all_resume_nodes.clear();
   }
 
-  void process(Key key) {
-    auto it = waiting.find(key);
-    if (it == waiting.end()) return;
+  // Deliver an install's parked opaques for this lane: key identifies the
+  // installed node (looked up in the shared cache tree), each opaque names
+  // a (traversal, element) to resume. Duplicates within one delivery are
+  // collapsed (the old waiting list kept one entry per pair).
+  void process(Key key, const std::vector<uint64_t>& opaques) {
     auto node = cm_local->root->getDescendant(key);
     CkAssert(node && node->key == key);
-    for (auto pair : it->second) { // (trav_idx, part_idx)
+    std::set<uint64_t> seen;
+    for (auto o : opaques) {
+      if (!seen.insert(o).second) continue;
+      std::pair<int, int> pair(paratreet::parkedTravIdx(o),
+                               paratreet::parkedElemIdx(o));
       auto && resume_nodes = all_resume_nodes[pair];
       bool should_resume = resume_nodes.empty();
       resume_nodes.push(node);
@@ -45,7 +56,6 @@ public: // these need to be seen by other local chares
         else part_proxy[pair.second].goDown(pair.first);
       }
     }
-    waiting.erase(it);
   }
 };
 

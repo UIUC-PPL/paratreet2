@@ -104,10 +104,12 @@ inline double dualBoxMinDist2(const Node<Data>* a, const Node<Data>* b) {
 template <typename Data>
 // returns if_requested
 inline bool handleRemoteNode(Node<Data>* node, size_t trav_idx, size_t part_idx, CProxy_TreeCanopy<Data> tc_proxy, CProxy_CacheManager<Data> cm_proxy, CProxy_Resumer<Data> r_proxy) {
-  auto cm_index = cm_proxy.ckLocalBranch()->thisIndex;
-  auto mask = 1ull << CkMyRank();
-  auto prev = node->requested.fetch_or(mask);
-  bool changed = prev | mask == 0;
+  auto* cm_local = cm_proxy.ckLocalBranch();
+  auto cm_index = cm_local->thisIndex;
+  // The placeholder's atomic bitmask is now purely the issue-the-request-
+  // once latch (waiter identity lives in the parked list below): the first
+  // lane to set a bit sends the one request for this process.
+  auto prev = node->requested.fetch_or(1ull << CkMyRank());
   if (prev == 0) {
     if (node->type == Node<Data>::Type::Boundary || node->type == Node<Data>::Type::RemoteAboveTPKey) {
       // Ask TreeCanopy for data
@@ -121,12 +123,20 @@ inline bool handleRemoteNode(Node<Data>* node, size_t trav_idx, size_t part_idx,
       // The node is entirely remote, ask CacheManager for data
       cm_proxy[node->cm_index].requestNodes(std::make_pair(node->key, cm_index));
     }
-  // it is possible that the node has been substituted already. in this case, check if the placeholder is still the same
-  } else if (changed && node->parent && node->parent->getDescendant(node->key) != node) r_proxy.process(node->key);
-  // Add the Partition that initiated the traversal to the waiting list
-  // maintained in Resumer
-  auto& list = r_proxy.ckLocalBranch()->waiting[node->key];
-  if (list.empty() || list.back().first != trav_idx || list.back().second != part_idx) list.emplace_back(trav_idx, part_idx);
+  }
+  // Park this walker on the placeholder (TreeCache park/install contract).
+  // AlreadyInstalled means the install won the race after our type check:
+  // the data is published, nobody will drain our waiter — so self-wake
+  // through the normal resumption path (an async self-send, preserving
+  // entry-method semantics). This replaces the old substituted-placeholder
+  // re-check, whose `prev | mask == 0` condition was in any case always
+  // true in its reachable branch (operator-precedence bug, flagged
+  // 2026-08-03; the contract makes the case explicit instead).
+  auto opaque = paratreet::makeParkedOpaque(CkMyRank(), trav_idx, (int)part_idx);
+  if (cm_local->core.park(node, opaque) ==
+      TreeCache<Data>::ParkResult::AlreadyInstalled) {
+    r_proxy[CkMyPe()].process(node->key, std::vector<uint64_t>{opaque});
+  }
   return prev == 0;
 }
 

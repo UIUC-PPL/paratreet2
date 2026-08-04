@@ -19,6 +19,20 @@ template<typename T>
 class SpatialNode;
 
 namespace paratreet {
+    // Parked-opaque encoding for the TreeCache park/install contract.
+    // CALLER-side: the cache stores and returns these values without ever
+    // interpreting them. Layout: lane (worker thread / processor rank
+    // within the process) in the top byte for install-side routing, then
+    // the traversal index, then the walking chare element's array index.
+    inline uint64_t makeParkedOpaque(int lane, size_t trav_idx, int elem_idx) {
+      return ((uint64_t)(unsigned)lane << 56) |
+             (((uint64_t)trav_idx & 0xffffffull) << 32) |
+             (uint64_t)(unsigned)elem_idx;
+    }
+    inline int parkedLane(uint64_t o) { return (int)(o >> 56); }
+    inline int parkedTravIdx(uint64_t o) { return (int)((o >> 32) & 0xffffffull); }
+    inline int parkedElemIdx(uint64_t o) { return (int)(o & 0xffffffffull); }
+
     inline Real getTimestep(BoundingBox& box, Real real);
 
     template<typename T>

@@ -112,7 +112,7 @@ public:
   void connect(Node<Data>*);
 
 private:
-  void process(Node<Data>*);
+  void process(Node<Data>*, const std::vector<uint64_t>& parked);
 };
 
 template <typename Data>
@@ -142,10 +142,11 @@ void CacheManager<Data>::recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack
   CkPrintf("[CacheManager %d] receiving starter pack, size = %d\n", this->thisIndex, n);
 
   CkAssert(n == 0 || pack[0].first == Key(1));
+  std::vector<uint64_t> parked; // starter pack precedes all walks: stays empty
   for (int i = 0; i < n; i++) {
     // uncomment conditional if prefetch() is ever restored
     // if (!local_tps.count(pack[i].first))
-    core.installBoundary(CkMyRank(), pack[i]);
+    core.installBoundary(CkMyRank(), pack[i], parked);
   }
   if (n == 0) root = local_tps[1];
   CkAssert(root);
@@ -154,9 +155,10 @@ void CacheManager<Data>::recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack
 
 template <typename Data>
 void CacheManager<Data>::receiveSubtree(MultiData<Data> multidata, PPHolder<Data> pp_holder) {
+  std::vector<uint64_t> parked; // add_to_tps path never displaces a placeholder
   core.installSubtree(CkMyRank(), multidata.particles.data(), multidata.particles.size(),
                       multidata.nodes.data(), multidata.nodes.size(),
-                      multidata.cm_index, multidata.tp_index, true);
+                      multidata.cm_index, multidata.tp_index, true, parked);
   lockMaps();
   auto copy_out = subtree_copy_started[multidata.tp_index];
   unlockMaps();
@@ -177,11 +179,12 @@ void CacheManager<Data>::refreshSubtreeCopy(MultiData<Data> multidata) {
 
 template <typename Data>
 void CacheManager<Data>::addCache(MultiData<Data> multidata) {
+  std::vector<uint64_t> parked;
   Node<Data>* top_node =
       core.installSubtree(CkMyRank(), multidata.particles.data(), multidata.particles.size(),
                           multidata.nodes.data(), multidata.nodes.size(),
-                          multidata.cm_index, multidata.tp_index, false);
-  process(top_node);
+                          multidata.cm_index, multidata.tp_index, false, parked);
+  process(top_node, parked);
 }
 
 template <typename Data>
@@ -207,36 +210,26 @@ void CacheManager<Data>::serviceRequest(Node<Data>* node, int cm_index) {
 
 template <typename Data>
 void CacheManager<Data>::restoreData(std::pair<Key, SpatialNode<Data>> param) {
-  Node<Data>* node = core.installBoundary(CkMyRank(), param);
-  process(node);
+  std::vector<uint64_t> parked;
+  Node<Data>* node = core.installBoundary(CkMyRank(), param, parked);
+  process(node, parked);
 }
 
-// Wake exactly the lanes whose walkers parked on the just-installed node.
-// The Resumer wake-up POLICY stays here (outside the passive core): notify
-// only the PEs whose requested bit is set. Safe because every waiter sets
-// its bit BEFORE parking (handleRemoteNode: fetch_or, then waiting[]
-// insert), and a waiter that parks after the install finds the placeholder
-// already substituted and self-processes (the re-check in
-// handleRemoteNode's else-branch). Was `|` — a bug that broadcast
-// process() to every PE of the process for every install (~15x the needed
-// resumption messages at ppn 15; design/walk-uf2-overlap.md step 2).
+// Wake exactly the walkers that parked on the just-installed node: the
+// install drained their opaques from the placeholder, each opaque carries
+// its lane (paratreet::parkedLane), and one Resumer::process message per
+// waiting lane delivers that lane's opaques. This replaces the old
+// requested-bitmask filter (which notified whole lanes and made each
+// Resumer re-look the key up in its waiting[] side table); the
+// exactly-once guarantee now lives in TreeCache's park/install contract.
 template <typename Data>
-void CacheManager<Data>::process(Node<Data>* node) {
-  if (!this->isNodeGroup()) r_proxy[this->thisIndex].process(node->key);
-  else {
-    auto node_size = CmiNodeSize(CkMyNode());
-    auto first_pe = CmiNodeFirst(CkMyNode());
-    if (node_size > sizeof(node->requested) * 8) {
-      for (int i = 0; i < node_size; i++) {
-        r_proxy[first_pe + i].process(node->key);
-      }
-    }
-    else {
-      auto requested = node->requested.load();
-      for (int i = 0; i < node_size; i++) {
-        if ((1ull << i) & requested) r_proxy[first_pe + i].process(node->key);
-      }
-    }
+void CacheManager<Data>::process(Node<Data>* node, const std::vector<uint64_t>& parked) {
+  if (parked.empty()) return;
+  std::map<int, std::vector<uint64_t>> by_lane;
+  for (auto o : parked) by_lane[paratreet::parkedLane(o)].push_back(o);
+  auto first_pe = this->isNodeGroup() ? CmiNodeFirst(CkMyNode()) : this->thisIndex;
+  for (auto& lane : by_lane) {
+    r_proxy[first_pe + lane.first].process(node->key, lane.second);
   }
 }
 

@@ -117,6 +117,66 @@ public:
   using CachedP = typename CachedParticleOf<Data>::type;
   using NodeLookup = std::unordered_map<Key, Node<Data>*>;
 
+  // ---- park / install (phase 2 of the extraction design) ----
+  // A walker that must wait for a node's data PARKS an opaque value on the
+  // placeholder; install() (the swapIn drain) returns every parked opaque
+  // EXACTLY ONCE to the caller, which owns scheduling the resumptions. The
+  // race between a late park and the install is closed here — against
+  // install's atomic publication — by closing the list with a sentinel:
+  // a park that finds the sentinel returns AlreadyInstalled and the caller
+  // proceeds as if the data had been present (the lost-wakeup fix,
+  // provided once here instead of re-solved by every client).
+  struct ParkedEntry {
+    uint64_t opaque;
+    ParkedEntry* next;
+  };
+  static void* closedSentinel() {
+    static char sentinel_storage;
+    return (void*)&sentinel_storage;
+  }
+  enum class ParkResult { Parked, AlreadyInstalled };
+
+  ParkResult park(Node<Data>* slot, uint64_t opaque) {
+    // Consecutive-duplicate suppression, matching the old Resumer
+    // waiting-list behavior: one walker sweeping many payloads against the
+    // same placeholder parks once (a racing other-lane entry in between
+    // just costs a duplicate resumption, which the traverser tolerates).
+    void* head = slot->parked_head.load();
+    if (head != closedSentinel() && head != nullptr &&
+        ((ParkedEntry*)head)->opaque == opaque)
+      return ParkResult::Parked;
+    auto* entry = new ParkedEntry{opaque, nullptr};
+    while (true) {
+      head = slot->parked_head.load();
+      if (head == closedSentinel()) {
+        delete entry;
+        return ParkResult::AlreadyInstalled;
+      }
+      entry->next = (ParkedEntry*)head;
+      if (slot->parked_head.compare_exchange_weak(head, (void*)entry))
+        return ParkResult::Parked;
+    }
+  }
+
+private:
+  // Close a displaced placeholder's parked list and collect the opaques.
+  // Exactly-once: the exchange with the sentinel wins against concurrent
+  // parks (they either landed before — collected here — or see the
+  // sentinel and self-handle).
+  static void drainParked(Node<Data>* displaced, std::vector<uint64_t>& out) {
+    void* head = displaced->parked_head.exchange(closedSentinel());
+    if (head == closedSentinel()) return; // already drained
+    auto* entry = (ParkedEntry*)head;
+    while (entry) {
+      out.push_back(entry->opaque);
+      auto* next = entry->next;
+      delete entry;
+      entry = next;
+    }
+  }
+
+public:
+
   // Narrow structural lock for the registry maps only (local_tps /
   // leaf_lookup); NOT a data-path lock. See the header comment.
   std::mutex maps_lock;
@@ -311,10 +371,12 @@ public:
   // children/placeholders, and atomically publishes the top node in place
   // of its placeholder (swapIn) — concurrent lookups see the placeholder
   // or the complete subtree, never a partial state. Returns the installed
-  // top node; the CALLER owns waking whoever waited on it.
+  // top node and appends the displaced placeholder's parked waiters to
+  // `parked`; the CALLER owns waking them.
   Node<Data>* installSubtree(int lane, const CachedP* particles, int n_particles,
                              std::pair<Key, SpatialNode<Data>>* nodes, int n_nodes,
-                             int cm_index, int tp_index, bool add_to_tps) {
+                             int cm_index, int tp_index, bool add_to_tps,
+                             std::vector<uint64_t>& parked) {
     Node<Data>* first_node_placeholder_parent = nullptr;
     if (!add_to_tps) {
       auto first_node_placeholder = root->getDescendant(nodes[0].first);
@@ -349,20 +411,22 @@ public:
     else {
       auto && clv = cached_leaves[lane];
       clv.insert(clv.end(), leaves.begin(), leaves.end());
-      swapIn(first_node);
+      swapIn(first_node, parked);
     }
     return first_node;
   }
 
   // Install one boundary/canopy node (starter pack and canopy restore).
-  // Returns the installed node; caller owns any wake-up.
-  Node<Data>* installBoundary(int lane, std::pair<Key, SpatialNode<Data>>& param) {
+  // Returns the installed node and appends the displaced placeholder's
+  // parked waiters to `parked`; caller owns any wake-up.
+  Node<Data>* installBoundary(int lane, std::pair<Key, SpatialNode<Data>>& param,
+                              std::vector<uint64_t>& parked) {
     Key key = param.first;
     Node<Data>* parent = (key == Key(1)) ? nullptr : root->getDescendant(key / branch_factor);
     auto node = makeCachedNode(lane, key, Node<Data>::Type::CachedBoundary, param.second, parent, nullptr, -1, -1);
     insertNode(lane, node, true, false);
     CkAssert(node->type == Node<Data>::Type::CachedBoundary);
-    swapIn(node);
+    swapIn(node, parked);
     return node;
   }
 
@@ -469,24 +533,24 @@ public:
     return replaced;
   }
 
-  // Atomically publish an installed node in place of its placeholder. The
-  // displaced placeholder carries the per-lane `requested` waiter bitmask
-  // (set by handleRemoteNode BEFORE parking); hand it off so the caller's
-  // wake-up can notify exactly the waiting lanes. Waiters that parked
-  // before the exchange are captured here; one that arrives after sees the
-  // substituted node via getDescendant and self-processes, so no wakeup is
-  // lost (see the fanout-fix record, design/walk-uf2-overlap.md step 2).
-  void swapIn(Node<Data>* to_swap) {
+  // Atomically publish an installed node in place of its placeholder, and
+  // collect the placeholder's parked waiters into `parked` (each opaque
+  // handed back exactly once — the caller owns waking them). Waiters that
+  // parked before the exchange are drained here; one that parks after sees
+  // the closed list and gets AlreadyInstalled from park(), so no wakeup is
+  // lost (the same guarantee the old requested-bitmask handoff provided;
+  // see the fanout-fix record, design/walk-uf2-overlap.md step 2).
+  void swapIn(Node<Data>* to_swap, std::vector<uint64_t>& parked) {
     if (to_swap->key > 1) {
       auto which_child = to_swap->key % branch_factor;
       Node<Data>* displaced = to_swap->parent->exchangeChild(which_child, to_swap);
-      if (displaced) to_swap->requested.fetch_or(displaced->requested.load());
+      if (displaced) drainParked(displaced, parked);
     }
     else {
       std::swap(root, to_swap);
       // to_swap now holds the displaced old root; NULL on the very first
       // swap (the starter pack installing the initial root).
-      if (to_swap) root->requested.fetch_or(to_swap->requested.load());
+      if (to_swap) drainParked(to_swap, parked);
     }
   }
 
@@ -515,7 +579,13 @@ public:
       }
       node->exchangeChild(i, new_child);
     }
-    if (should_swap) swapIn(node);
+    if (should_swap) {
+      // Publication within a not-yet-published subtree (installSubtree's
+      // interior nodes): the displaced slot is a fresh placeholder no
+      // walker has ever seen, so nothing can be parked on it.
+      std::vector<uint64_t> none;
+      swapIn(node, none);
+    }
   }
 
 private:
