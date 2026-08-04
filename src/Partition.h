@@ -373,8 +373,11 @@ void Partition<Data>::erasePartition() {
 template <typename Data>
 void Partition<Data>::kick(Real timestep, CkCallback cb)
 {
+  // First leapfrog half-kick, on the LIVE leaf particles (aliased with the
+  // Subtree copies under matching decomps) so the perturb step's
+  // copyParticles snapshot below carries the kicked velocities.
   for (auto && leaf : leaves) {
-    //leaf->kick(timestep);
+    leaf->kick(timestep);
   }
   this->contribute(cb);
 }
@@ -411,7 +414,7 @@ void Partition<Data>::perturb(Real timestep, CkCallback cb)
   #endif
 
   for (auto && p : saved_particles) {
-    //p.perturb(timestep);
+    p.perturb(timestep);
     box.grow(p.position);
     box.mass += p.mass;
     box.ke += 0.5 * p.mass * p.velocity.lengthSquared();

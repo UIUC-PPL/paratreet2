@@ -4,21 +4,26 @@ Particle::Particle() : key(Key(0)) {
   reset();
 }
 
-/*void Particle::kick(Real timestep) {
+// Kick-drift-kick leapfrog step, restored 2026-08-04 for the gravity
+// example (design/barnes-hut-app.md) — both halves were commented out in
+// the inherited code, so perturb_particles apps computed forces but never
+// moved anything. Driver calls kick then (after postIterationFn) perturb,
+// so one iteration = half-kick + half-kick + drift; acceleration is zeroed
+// here for the next iteration's traversal to accumulate afresh. The
+// internal-energy (u) lines of the original body are dropped: the u field
+// itself is commented out of Particle (SPH-only; restore both together).
+void Particle::kick(Real timestep) {
   velocity += acceleration * timestep / 2;
 }
 
 void Particle::perturb(Real timestep) {
   velocity += (acceleration * timestep / 2);
   velocity_predicted = velocity + (acceleration * timestep);
-  acceleration = (0., 0., 0.);
+  acceleration = Vector3D<Real>(0.0, 0.0, 0.0);
   position += (velocity * timestep);
-  Real uDelta = 0.5e-7 * timestep;
-  u -= pressure_dVolume * uDelta; // for adiabatic, dU = -p dV
-  u_predicted = u - pressure_dVolume * uDelta;
   density = 0;
   pressure_dVolume = 0.;
-}*/
+}
 
 void Particle::adjustNewUniverse(OrientedBox<Real> universe) {
   for (int dim = 0; dim < 3; dim++) {

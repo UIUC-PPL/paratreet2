@@ -54,8 +54,8 @@ struct Particle {
   void reset();
   void finishInit();
 
-  //void kick(Real timestep);
-  //void perturb(Real timestep);
+  void kick(Real timestep);
+  void perturb(Real timestep);
   void adjustNewUniverse(OrientedBox<Real> universe);
 
   bool operator==(const Particle&) const;

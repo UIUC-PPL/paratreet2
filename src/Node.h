@@ -31,6 +31,11 @@ public:
   void applyAcceleration(int index, Vector3D<Real> accel) {
     particles_[index].acceleration += accel;
   }
+  // First leapfrog half-kick over this leaf's particles (Partition::kick;
+  // see Particle::kick — restored 2026-08-04 with the gravity example).
+  void kick(Real timestep) {
+    for (int i = 0; i < n_particles; i++) particles_[i].kick(timestep);
+  }
   void applyGasWork(int index, Real work) {
     particles_[index].pressure_dVolume += work;
   }
