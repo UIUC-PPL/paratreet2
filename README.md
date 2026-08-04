@@ -110,8 +110,8 @@ cd ../examples/fof3 && make    # -> FoF3
 cd ../../inputgen && make      # -> plummer, uniform, tipsyPlummer
 ```
 
-Non-FoF examples (`examples/annotate`, `examples/searchAlgos`) need only
-`src/`.
+Non-FoF examples (`examples/gravity` — monopole Barnes-Hut,
+`examples/annotate`, `examples/searchAlgos`) need only `src/`.
 
 `make test` in `examples/fof3` runs the standard 12-run small matrix
 ({100, 1k, 10k} x {+p1, +p2, 2 procs x 1 PE, 2 procs x 2 PEs}) against the

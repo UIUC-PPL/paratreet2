@@ -1,0 +1,16 @@
+mainmodule Main {
+    extern module paratreet;
+
+    readonly int peanoKey;
+    readonly CProxy_GravityCheck gravity_check;
+
+    initnode void initialize(void);
+
+    group GravityCheck {
+        entry GravityCheck();
+        entry void collect(const CkCallback&);
+    }
+
+    extern entry void Partition<GravityData> startDown<GravityVisitor> (GravityVisitor v);
+    extern entry void Partition<GravityData> callPerLeafFn(CkReference<paratreet::PerLeafAble<GravityData>>, const CkCallback&);
+}

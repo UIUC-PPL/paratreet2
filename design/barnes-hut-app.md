@@ -1,11 +1,57 @@
 # Barnes-Hut gravity: the second application (monopole-only)
 
-**STATUS: DESIGN FOR REVIEW (2026-08-04). Decisions from Kale: monopole
-only; UIUC-PPL/barnes is background reading, NOT an oracle (unvalidated);
-the exact reference is direct summation. Port source: old paratreet's
-gravity example (examples/GravityVisitor.h, Gravity.C, CentroidData.h,
+**STATUS: IMPLEMENTED (2026-08-04, examples/gravity). Kale's review
+decisions: name `gravity`; old defaults kept (theta 0.7,
+nMinParticleNode 6); FIXED timestep (-T, default 0.01) instead of the old
+adaptive rule. Decisions from Kale: monopole only; UIUC-PPL/barnes is
+background reading, NOT an oracle (unvalidated); the exact reference is
+direct summation. Port source: old paratreet's gravity example
+(examples/GravityVisitor.h, Gravity.C, CentroidData.h,
 MultipoleMoments.h) — the monopole path is exactly its `#ifdef BARNESHUT`
 configuration.**
+
+## Implementation deltas vs the plan below (what running it taught)
+
+1. **"theta -> 0 exactness" was structurally impossible as designed**: the
+   acceptance criterion is scale-relative, so for ANY positive theta some
+   deep small node is accepted against a distant target — no positive
+   theta degenerates the walk. Measured confirmation: the error follows
+   the theta^2 monopole law all the way down (1k: rms 4.3e-3 at theta
+   0.7 vs 6.4e-7 at 0.005; ratio ~ (0.005/0.7)^2). The exactness gate is
+   instead an explicit always-open mode, `-o 0`.
+2. **This build's Real is float** (USE_DOUBLE_FP unset), so even the
+   always-open walk differs from a same-precision reference by
+   accumulation order. The harness computes the reference in DOUBLE (a
+   true oracle; its antisymmetry residual is ~1e-16) and gates exact mode
+   at the float-accumulation band (max < 1e-4, rms < 1e-5; measured
+   max 4.3e-6 / 7.0e-6, rms 3.4e-7 / 1.1e-6 at 1k / 10k) — still ~100x
+   below any structural error (one missed or duplicated 12-particle leaf
+   shifts a neighbor by ~1e-2). A -DUSE_DOUBLE_FP stack build would allow
+   a true roundoff gate; recorded as a possible later arm.
+3. **The framework's kick/perturb were STUBS** — the per-particle calls
+   were commented out in the inherited code (old paratreet too), so
+   perturb_particles apps computed forces but never moved anything (the
+   "Perturbations" cost at 2B was the copy/box machinery only). Restored
+   as part of this work: Particle::kick/perturb (KDK leapfrog; the SPH
+   internal-energy lines stay out with the commented-out u field),
+   SpatialNode::kick, live loops in Partition::kick/perturb. Gated by
+   config.perturb_particles as before; full FoF/annotate/searchAlgos
+   regression unchanged (fof3 opts out; the others are single-iteration).
+4. Verified in vivo: 5-iteration 1k run shows the Plummer sphere
+   contracting (universe box shrinks each step, maxVelocity evolves,
+   timestep fixed at 0.01).
+
+## Measured baselines (2026-08-04, laptop, float build)
+
+- 1k theta 0.7: rms_rel 4.325e-3, max_rel 7.031e-2 (identical +p1/+p2
+  and 2-proc — same rms to the printed digits).
+- 10k theta 0.7: rms_rel 3.770e-3, max_rel 3.754e-2.
+- Exact mode (-o 0): see band above. Reference momentum residual ~1e-16
+  (double); tree-sum third-law violation ~2e-4 relative (reported, not
+  gated).
+- make test = 7 runs (theta 0.7 + exact mode, single/multi-process, 1k +
+  10k, plus a 5-iteration -i 5 smoke), all must print GRAVITY TEST
+  PASSED (the -i 5 run prints the iteration-0 check).
 
 ## Why now (role in the structural program)
 
