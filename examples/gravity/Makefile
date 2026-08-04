@@ -12,8 +12,8 @@ VISITORS = GravityVisitor.h
 Main.decl.h: Main.ci $(DATA)
 	$(CHARMC) $<
 
-Gravity: Main.decl.h Main.o $(PARATREET_PATH)/libparatreet.a
-	$(CHARMC) -language charm++ -module CommonLBs -o Gravity Main.o $(LD_LIBS)
+Gravity: Main.decl.h Main.o $(PARATREET_PATH)/libparatreet.a $(TRACE_STAMP)
+	$(CHARMC) -language charm++ -module CommonLBs -o Gravity Main.o $(TRACE_FLAGS) $(LD_LIBS)
 
 Main.o: Main.C Main.h $(VISITORS) $(DATA) Main.decl.h
 	$(CHARMC) -c $<
@@ -31,4 +31,8 @@ test: all
 	./charmrun ++local ./Gravity -f $(BASE_PATH)/inputs/1k.tipsy -d oct -i 5 +p4 ++ppn 2
 
 clean:
-	rm -f *.decl.h *.def.h conv-host *.o Gravity charmrun
+	rm -f *.decl.h *.def.h conv-host *.o Gravity charmrun $(TRACE_STAMP)
+
+# Trace logs only (see src/Makefile.common); deliberately not part of clean.
+cleanp:
+	rm -f $(TRACE_OUTPUTS)

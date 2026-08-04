@@ -12,8 +12,8 @@ VISITORS = CheckVisitor.h
 Main.decl.h: Main.ci $(DATA)
 	$(CHARMC) $<
 
-Annotate: Main.decl.h Main.o Annotate.o $(PARATREET_PATH)/libparatreet.a
-	$(CHARMC) -language charm++ -module CommonLBs -o Annotate Annotate.o Main.o $(LD_LIBS)
+Annotate: Main.decl.h Main.o Annotate.o $(PARATREET_PATH)/libparatreet.a $(TRACE_STAMP)
+	$(CHARMC) -language charm++ -module CommonLBs -o Annotate Annotate.o Main.o $(TRACE_FLAGS) $(LD_LIBS)
 
 Annotate.o: Annotate.C Main.h $(VISITORS) $(DATA) Main.decl.h
 	$(CHARMC) -c $<
@@ -28,4 +28,8 @@ test: all
 	./charmrun ++local ./Annotate -f $(BASE_PATH)/inputs/1k.tipsy -d oct +p4 ++ppn 2
 
 clean:
-	rm -f *.decl.h *.def.h conv-host *.o Annotate charmrun
+	rm -f *.decl.h *.def.h conv-host *.o Annotate charmrun $(TRACE_STAMP)
+
+# Trace logs only (see src/Makefile.common); deliberately not part of clean.
+cleanp:
+	rm -f $(TRACE_OUTPUTS)

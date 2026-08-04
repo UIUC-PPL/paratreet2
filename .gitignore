@@ -3,6 +3,16 @@
 *.decl.h
 *.def.h
 charmrun
+# Charm++ trace output (PROJECTIONS=1 / SUMMARY=1 builds) and the stamp
+# recording which tracemode is currently linked in. `make cleanp` removes
+# the logs.
+*.sts
+*.projrc
+*.[0-9]*.log
+*.[0-9]*.log.gz
+*.[0-9]*.sum
+*.[0-9]*.sumd
+.tracemode
 .DS_Store
 __.SYMDEF
 # Example binaries. Patterns are anchored to full paths: bare names like

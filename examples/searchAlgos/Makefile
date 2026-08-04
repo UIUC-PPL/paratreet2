@@ -16,8 +16,8 @@ debug:
 Main.decl.h: Main.ci $(DATA)
 	$(CHARMC) $<
 
-VisitAll: Main.decl.h Main.o VisitAll.o $(PARATREET_PATH)/libparatreet.a
-	$(CHARMC) -language charm++ -module CommonLBs -o VisitAll VisitAll.o Main.o $(LD_LIBS)
+VisitAll: Main.decl.h Main.o VisitAll.o $(PARATREET_PATH)/libparatreet.a $(TRACE_STAMP)
+	$(CHARMC) -language charm++ -module CommonLBs -o VisitAll VisitAll.o Main.o $(TRACE_FLAGS) $(LD_LIBS)
 
 VisitAll.o: VisitAll.C Main.h Main.decl.h
 	$(CHARMC) -c $<
@@ -30,4 +30,8 @@ test: all
 	./charmrun ++local ./VisitAll -f $(BASE_PATH)/inputs/1k.tipsy -d sfc +p4 ++ppn 2
 
 clean:
-	rm -f *.decl.h *.def.h conv-host *.o VisitAll charmrun
+	rm -f *.decl.h *.def.h conv-host *.o VisitAll charmrun $(TRACE_STAMP)
+
+# Trace logs only (see src/Makefile.common); deliberately not part of clean.
+cleanp:
+	rm -f $(TRACE_OUTPUTS)

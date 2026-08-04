@@ -11,6 +11,51 @@ CHARM_HOME ?= $(HOME)/charm_reconverse
 
 LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet
 
+# ---- Charm++ tracing (Projections / summary) ----
+# OFF by default. Tracing must be LINKED IN: charmc pulls in
+# lib/libtrace-<mode>.a and the (always-compiled) trace hooks in the runtime
+# and in generated .def.h code stop being no-ops. Enable per build:
+#   make PROJECTIONS=1   # -tracemode projections: full event log
+#   make SUMMARY=1       # -tracemode summary: compact per-PE utilization
+# Both may be set at once (charmc accepts repeated -tracemode). Because this
+# is link-only, toggling it does NOT require rebuilding libparatreet.a or
+# libfof.a — only the application relink. Passing an empty value
+# (PROJECTIONS=) is off, matching the AGGREGATION convention above.
+# See the README ("Tracing with Projections") for output files and the
+# runtime +trace* flags.
+TRACE_MODES :=
+ifneq ($(strip $(PROJECTIONS)),)
+	TRACE_MODES += projections
+endif
+ifneq ($(strip $(SUMMARY)),)
+	TRACE_MODES += summary
+endif
+TRACE_FLAGS := $(foreach m,$(TRACE_MODES),-tracemode $(m))
+
+# -tracemode changes ONLY the link line, so none of an application's
+# prerequisites (objects, libraries) change when it is toggled: a bare
+# `make PROJECTIONS=1` over an existing build would report "up to date" and
+# leave an untraced binary in place. Each application therefore lists
+# $(TRACE_STAMP) among its link prerequisites. The stamp records the mode
+# currently linked in and is only rewritten — i.e. its mtime only moves —
+# when the requested mode differs, so an unchanged setting never relinks.
+# Both target names start with '.', which keeps them out of the running for
+# make's default goal, so this rule is safe to define in an included file.
+TRACE_STAMP = .tracemode
+.PHONY: .FORCE
+.FORCE:
+$(TRACE_STAMP): .FORCE
+	@echo '$(TRACE_FLAGS)' | cmp -s - $@ || echo '$(TRACE_FLAGS)' > $@
+
+# Trace output written into the run directory: projections logs
+# (<prog>.<pe>.log[.gz], <prog>.sts, <prog>.projrc) and summary logs
+# (<prog>.<pe>.sum, <prog>.<pe>.sumd, <prog>.sum.sts). Removed by `make
+# cleanp`, which every example defines; kept out of `clean` so a rebuild
+# never silently discards collected traces.
+# The per-PE patterns are deliberately narrow (<prog>.<pe>.log, never a bare
+# *.log) so an unrelated run log sitting in the same directory survives.
+TRACE_OUTPUTS = *.sts *.projrc *.[0-9]*.log *.[0-9]*.log.gz *.[0-9]*.sum *.[0-9]*.sumd
+
 # ---- FoF module (fof/) and its sibling libraries ----
 # Only FoF applications (examples/fof1, examples/fof3) need any of this: the
 # fof module extern-references unionFindLib, so unionfind/prefix/htram are an

@@ -113,6 +113,10 @@ cd ../../inputgen && make      # -> plummer, uniform, tipsyPlummer
 Non-FoF examples (`examples/gravity` — monopole Barnes-Hut,
 `examples/annotate`, `examples/searchAlgos`) need only `src/`.
 
+Performance tracing is off by default and is a build-time choice
+(`make PROJECTIONS=1` / `make SUMMARY=1`) — see
+"[Tracing with Projections](#tracing-with-projections)" below.
+
 `make test` in `examples/fof3` runs the standard 12-run small matrix
 ({100, 1k, 10k} x {+p1, +p2, 2 procs x 1 PE, 2 procs x 2 PEs}) against the
 checked-in inputs; every run must print `FOF3 TEST PASSED`. Run it once on
@@ -260,6 +264,97 @@ Specifically:
    memory of roughly the same order). Force it with `-c full` where PE 0's
    memory permits; otherwise rely on stats mode plus the cross-config
    determinism check.
+
+## Tracing with Projections
+
+Charm++ ships two performance-tracing back ends, both **off by default** in
+this tree. They are not runtime switches: tracing has to be *linked in*
+(`charmc -tracemode <mode>` pulls in `lib/libtrace-<mode>.a`, which turns the
+runtime's and the generated `.def.h` code's trace hooks from no-ops into real
+instrumentation), so choosing a mode is a build-time decision.
+
+| Build | charmc option | Cost | Output |
+| --- | --- | --- | --- |
+| `make PROJECTIONS=1` | `-tracemode projections` | high — every event logged | per-PE event logs for the Projections GUI |
+| `make SUMMARY=1` | `-tracemode summary` | low — binned utilization only | small per-PE `.sum` profiles |
+
+Use **projections** when you need to see individual entry-method executions,
+message sends, and idle gaps on a timeline (finding a specific stall, e.g. in
+the FoF phase-3 walk). Use **summary** when you only need utilization over
+time — it writes a fixed number of time bins per PE instead of one record per
+event, so it survives long runs and high PE counts where a full event log
+would not.
+
+### Building a traced binary
+
+The knobs are defined once in `src/Makefile.common` and are honored by every
+application (`examples/gravity`, `annotate`, `searchAlgos`, `fof1`, `fof3`):
+
+```sh
+cd examples/fof3
+make PROJECTIONS=1              # full event log
+make SUMMARY=1                  # utilization profile
+make PROJECTIONS=1 SUMMARY=1    # both at once (charmc accepts both modes)
+make                            # back to untraced
+```
+
+Because `-tracemode` affects only the final link, `libparatreet.a` and
+`libfof.a` are unaffected — there is no need to rebuild `src/` or `fof/` when
+switching modes, and no separate "tracing build" of the libraries. The mode
+currently linked into a binary is recorded in a `.tracemode` stamp file next
+to it, which is what makes a bare `make PROJECTIONS=1` over an existing build
+relink instead of reporting "up to date"; an unchanged setting relinks
+nothing. `make clean` removes the stamp.
+
+Both variables follow the `AGGREGATION` convention: any non-empty value turns
+the mode on, an empty one (`make PROJECTIONS=`) leaves it off.
+
+### Running and collecting traces
+
+A traced binary runs exactly like an untraced one and writes its logs into the
+working directory at exit, named after the executable:
+
+- projections — `FoF3.<pe>.log[.gz]` per PE, plus `FoF3.sts` (the symbol
+  table the GUI needs) and `FoF3.projrc`
+- summary — `FoF3.<pe>.sum` per PE (`.sumd` with `+sumDetail`), plus
+  `FoF3.sum.sts`
+
+Useful runtime flags (they exist only in a traced binary; see the Charm++
+manual's Projections chapter for the full list):
+
+- `+traceroot <dir>` — write logs to `<dir>` instead of the launch directory.
+  Point this at parallel scratch for anything large; the per-PE log count
+  scales with PE count.
+- `+logsize <n>` — entries buffered per PE before a flush (default 1,000,000).
+  Raising it trades memory for fewer mid-run flush perturbations.
+- `+gz-trace` — gzip the projections logs as they are written.
+- `+traceoff` — start with tracing disabled, so only regions explicitly
+  re-enabled from the application are recorded.
+- `+trace-subdirs <n>` — scatter the logs over `n` subdirectories, for
+  filesystems that behave badly with thousands of files in one directory.
+- `+sumDetail` (summary only) — also record per-entry-method time in each bin,
+  written to `.sumd`; `+bincount <n>` sets the number of bins.
+
+Load the resulting `.sts` in the Projections GUI (`charm/tools/projections`,
+built separately — it is not part of the Charm++ build used here).
+
+Delete collected logs with `make cleanp` in the application directory; plain
+`make clean` deliberately leaves them alone so a rebuild never discards a
+trace you have not looked at yet.
+
+### Caveats
+
+1. **Traced runs are not timing runs.** Instrumentation inflates the per-phase
+   wall times in the `FOF3STAT` block, projections much more than summary.
+   Take reported timings from an untraced build and use traces only to
+   attribute time within a run.
+2. **Projections log volume grows with events, not with wall time.** A
+   fine-grained tree walk at high PE counts can produce gigabytes per run.
+   Prefer summary for first-look scaling questions, then re-run the
+   interesting configuration under projections, ideally at a smaller PE count
+   or with `+gz-trace` and a `+traceroot` on scratch.
+3. **Correctness output is unchanged.** Tracing does not alter the computed
+   partition; a traced `make test` must still print `FOF3 TEST PASSED`.
 
 ## License and provenance
 

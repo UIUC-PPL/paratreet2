@@ -14,8 +14,8 @@ VISITORS = FragCheckVisitor.h
 Main.decl.h: Main.ci $(DATA)
 	$(CHARMC) $<
 
-FoF1: Main.decl.h Main.o FoF1.o $(PARATREET_PATH)/libparatreet.a $(FOF_PATH)/libfof.a
-	$(CHARMC) -language charm++ -module CommonLBs -o FoF1 FoF1.o Main.o $(FOF_LD_LIBS) $(LD_LIBS)
+FoF1: Main.decl.h Main.o FoF1.o $(PARATREET_PATH)/libparatreet.a $(FOF_PATH)/libfof.a $(TRACE_STAMP)
+	$(CHARMC) -language charm++ -module CommonLBs -o FoF1 FoF1.o Main.o $(TRACE_FLAGS) $(FOF_LD_LIBS) $(LD_LIBS)
 
 FoF1.o: FoF1.C Main.h $(VISITORS) $(DATA) Main.decl.h
 	$(CHARMC) -c $<
@@ -39,4 +39,8 @@ test: all
 	./FoF1 -f $(BASE_PATH)/inputs/100.tipsy -d oct +p2
 
 clean:
-	rm -f *.decl.h *.def.h conv-host *.o FoF1 charmrun
+	rm -f *.decl.h *.def.h conv-host *.o FoF1 charmrun $(TRACE_STAMP)
+
+# Trace logs only (see src/Makefile.common); deliberately not part of clean.
+cleanp:
+	rm -f $(TRACE_OUTPUTS)
