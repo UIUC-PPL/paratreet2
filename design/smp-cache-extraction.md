@@ -1,7 +1,18 @@
 # Extracting the SMP cache as a standalone library (the local-only cut)
 
-**STATUS: DESIGN DIRECTION (Kale, 2026-07-28). Decision: Kale, with
-discussion with Ritvik, and Thomas Quinn (UW) for the ChaNGa side.
+**STATUS: PHASES 1-3 IMPLEMENTED (2026-08-04, branch smp-cache; plan in
+section 6). The passive core is src/TreeCache.h; CacheManager is the
+Charm shim; park/install is live with waiting state on the placeholders
+(Resumer::waiting deleted); the standalone concurrency unit test
+(tests/treecache — plain c++, no Charm headers, no Charm libraries)
+gates runtime independence and found+fixed one library-contract hole
+(park on an installed node is now AlreadyInstalled by construction:
+only placeholder types are born with an open parked list). The
+lookupChildren convenience wrapper of section 2 remains to be added
+when the first external client needs it — paratreet2's walkers use the
+underlying pieces (type check + requested latch + park) directly.
+Original design direction (Kale, 2026-07-28) below. Decision: Kale,
+with discussion with Ritvik, and Thomas Quinn (UW) for the ChaNGa side.
 (Joseph Hutter, the original ParaTreeT author, remains attached to the
 work but is in medical school.) The interface shape in
 Sec. 2 is Kale's; it supersedes an earlier framework-owner-interface
