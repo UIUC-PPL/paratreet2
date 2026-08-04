@@ -61,8 +61,14 @@ class ExMain: public paratreet::Main<FragData> {
   // -G <t>: occupancy threshold (expected particles per b/sqrt(6) cell at
   // a chare's root) above which phaseA solves that chare's self pair with
   // the cell grid instead of the tree walk. 0 disables the grid (the
-  // walk-only oracle for A/B). Default 1.0.
-  double fof_grid_threshold = 1.0;
+  // walk-only oracle for A/B). DEFAULT 4 since 2026-08-04 (Kale's go on
+  // the standing recommendation): the 80M/2B A/B on current main showed
+  // -G 4 does not hurt at 80M (mild win at ~21k particles/chare) and
+  // cuts 2B phaseA ~19-29% (design/phase1-scaling.md final round +
+  // ledger); counts are bit-identical by construction and re-verified at
+  // every scale. The old default 1.0 was behaviorally off at real
+  // dataset occupancies.
+  double fof_grid_threshold = 4.0;
   // -E <n>: stream phase-3 edge batches of n edges into UF_2 DURING the
   // walk (design/walk-uf2-overlap.md step 1), overlapping the union
   // cascades with the walk under one QD. 0 = classic post-walk injection

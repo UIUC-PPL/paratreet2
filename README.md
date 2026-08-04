@@ -178,11 +178,12 @@ The app-specific flags (all other flags are the framework's; see
   exceeds `threshold` expected particles per cell (cell side
   b/sqrt(6)) solves its internal linking with a cell grid (test-free
   same-cell and face-adjacent unions) instead of the tree walk.
-  `0` (default) = off. Measured at 80M LAMBS: `-G 4` cut the
-  slowest-PE phaseA time ~10% at 120 PEs, fading to a slight LOSS by
-  480 PEs (the grid accelerates only intra-chare linking, and
-  particles per chare shrink with PE count). Output is bit-identical
-  either way, so it is always safe to A/B; worth trying only when
+  DEFAULT 4 (since 2026-08-04); `0` = off (the walk-only oracle for
+  A/B). Measured: at 2B, `-G 4` cuts slowest-PE phaseA ~19-29%; at 80M
+  it is a mild win at ~21k particles/chare, fading as particles per
+  chare shrink with PE count (the grid accelerates only intra-chare
+  linking). Output is bit-identical either way, so it is always safe
+  to A/B; the effect is worth re-measuring when
   particles per chare (roughly N / (8 x total PEs)) is ~15k or more
   AND the dataset has dense cores. Thresholds 2 and 16 measured worse
   than 4.
