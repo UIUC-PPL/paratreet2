@@ -14,6 +14,12 @@ module fof {
   // without the siblings entirely.
   extern module unionFindLib;
 
+  // Keep-alive ring for the LCI idle-stall workaround (see FoF.C and
+  // WORKAROUND-lci-idle-stall.md): registered per PE, armed on one PE
+  // per process; raw Converse messages, invisible to quiescence
+  // detection by construction.
+  initproc void fofKeepAliveInit(void);
+
   // FoF phase 1 (see fof/FoFPhase1.h and design/phase1.md).
   // Per-process side: subtree registry for phaseB pair enumeration, boundary
   // edge collection, and the PE-tip -> process-tip merge map.
