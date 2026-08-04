@@ -12,6 +12,7 @@ examples/searchAlgos/VisitAll
 examples/annotate/Annotate
 examples/fof1/FoF1
 examples/fof3/FoF3
+examples/gravity/Gravity
 # Input generators (built binaries) and generated datasets. Raw .dat files
 # are intermediates; tipsy files >= 100 MB (1M+ particles) must never be
 # committed (small ones like 100k ~3.6 MB may be).
