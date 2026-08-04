@@ -119,7 +119,10 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t-c [correctness check mode: full, stats, auto (default);\n");
           CkPrintf("\t    auto = full if N <= %d, else stats]\n", kAutoFullMaxN);
           CkPrintf("\t-u [UF_2 implementation: dist (default, step 4 distributed\n");
-          CkPrintf("\t    UnionFindLib), serial (v1/3a gather-to-one, kept for A/B)]\n");
+          CkPrintf("\t    UnionFindLib), serial (gather all cross-process edges\n");
+          CkPrintf("\t    to processor 0, sequential union-find there, broadcast\n");
+          CkPrintf("\t    the label map back; no quiescence detection in that\n");
+          CkPrintf("\t    bracket, so it also sidesteps the LCI idle-stall)]\n");
           CkPrintf("\t-m [min component size for REPORTING (default 0 = report all);\n");
           CkPrintf("\t    when >0, also prints a FOF3STAT surviving line for\n");
           CkPrintf("\t    components with size >= m (a reporting filter only)]\n");
@@ -150,9 +153,10 @@ PARATREET_REGISTER_MAIN(ExMain);
     }
     delete m;
 
-    // Single distribution is the default; the transposed oracle walk (and
-    // with it -u serial) runs from the Partition array, so it selects dual
-    // distribution automatically.
+    // Single distribution is the default; the transposed oracle walk runs
+    // from the Partition array, so it selects dual distribution
+    // automatically. (-u serial works with either walk: with -w dual it
+    // runs under single distribution like the default configuration.)
     if (walk_mode == WalkMode::Transposed && single_distribution) {
       CkPrintf("Note: -w transposed runs from the Partition array; using "
                "dual distribution for this run\n");

@@ -351,13 +351,31 @@ struct FoFPhase3Result {
 };
 
 // Convenience driver for the full phase-3 sequence:
-//   verifySharedLeaves -> resetPhase3 -> startDown<FoFEdgeVisitor> + CkWaitQD
+//   verifySharedLeaves -> resetPhase3 -> walk + CkWaitQD
 //   -> flushPhase3Edges (concat reduction to this thread) -> serial UF_2 on
 //   PE 0 -> applyGlobalMap broadcast -> relabel barrier.
 // Must be called from a [threaded] entry method on PE 0 (the driver), after
 // runFoFPhase1 and Subtree::upwardPass (+ QD) and before the next tree
-// rebuild/reset. The gather-to-one UF_2 is v1 scaffolding (fine to ~1e6
-// edges); the distributed UF_2 replaces it in step 4.
+// rebuild/reset. The gather-to-one UF_2 is fine to about a million edges
+// (49k edges at 80M particles / 32 processes measured 2026-08-04); the
+// distributed UF_2 (-u dist, below) exists for beyond that, and for
+// future needs that want the union-find state to remain distributed.
+//
+// dual_walk: launch the boundary walk as the symmetric dual-tree
+// traversal from the Subtree array (required under single-distribution
+// mode, where no Partition array exists). Tips stay RAW (global particle
+// order) on this path in either walk: the serial union-find needs no
+// owner encoding, so the caller must NOT have run applyTipEncoding.
+//
+// Quiescence detection is used ONLY for the traversal (message counts
+// there are unpredictable: cache misses, forwards, resumptions). The
+// entire union-find bracket after the walk is QD-free by construction —
+// gather reduction in, map broadcast + relabel reduction out — which
+// also makes it a workaround for the LCI idle-stall (10-25 ms
+// first-message penalties on quiet connections, WORKAROUND-lci-idle-
+// stall.md): the -u dist bracket's dependent point-to-point chains and
+// closing QD each pay the penalty serially, while this bracket's two
+// concurrent bulk rounds pay it at most twice, overlapped.
 // Shared-leaf aliasing precondition: asserted via Partition::
 // verifySharedLeaves under dual distribution; under single-distribution
 // mode it holds BY CONSTRUCTION (traversal targets ARE the Subtree
@@ -371,7 +389,10 @@ inline void verifySharedLeavesUnlessSingle(
 inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
                                     CProxy_FoFPhase1<FragData> fof,
                                     double linking_length,
-                                    Vector3D<Real> period = Vector3D<Real>(0, 0, 0)) {
+                                    Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
+                                    bool dual_walk = false,
+                                    CProxy_Subtree<FragData> subtrees =
+                                        CProxy_Subtree<FragData>()) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
   verifySharedLeavesUnlessSingle(partitions);
@@ -379,13 +400,17 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   double b2 = linking_length * linking_length;
   fof.resetPhase3(CkCallbackResumeThread());
 
-  // The boundary walk: all Partitions against the global tree. QD covers
+  // The boundary walk (identical mechanics to the -u dist path). QD covers
   // the traversal including cache fetches and resumptions.
   double t0 = CkWallTimer();
-  if (paratreet::getConfiguration().single_distribution)
-    CkAbort("transposed phase-3 walk needs the Partition array; use the dual"
-            " walk (-w dual) under single_distribution");
-  partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+  if (dual_walk) {
+    subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+  } else {
+    if (paratreet::getConfiguration().single_distribution)
+      CkAbort("transposed phase-3 walk needs the Partition array; use the dual"
+              " walk (-w dual) under single_distribution");
+    partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+  }
   CkWaitQD();
   double t1 = CkWallTimer();
 
