@@ -988,6 +988,7 @@ public:
   // path (the fragments histogram, their only surviving consumer, is
   // optional reporting: fof3 -g).
   void applyTipEncoding(const CkCallback& cb) {
+    tips_encoded_ = true; // arms the debug same-process-edge tripwire
     int my_node = CkMyNode();
     for (auto& s : subtrees) {
       for (int i = 0; i < s.n; i++) {
@@ -1126,6 +1127,23 @@ public:
   // key (paratreet::TipPairKey) stores both endpoints in full, so it is
   // correct either way.
   void addPhase3Edge(long ti, long tj) {
+#if DEBUG
+    // Instrumented-build tripwire (Kale, 2026-08-04): a same-process edge
+    // here means phase 1 under-merged (its completeness invariant says
+    // different tips within b are on different processes) OR a cached
+    // copy carried stale tips. UF_2 would absorb such an edge silently
+    // and CORRECTLY (union_request's local_union fast path), masking the
+    // upstream bug — so debug builds abort loudly instead. Armed only
+    // once tips are owner-encoded (-u dist); serial-mode raw tips carry
+    // no owner bits to compare.
+    if (tips_encoded_ &&
+        (uint64_t(ti) >> paratreet::kUF2IdxBits) ==
+        (uint64_t(tj) >> paratreet::kUF2IdxBits)) {
+      CkAbort("FoF phase-3: same-process edge emitted (tips %ld, %ld on "
+              "process %ld) — phase 1 incomplete or stale cached tips",
+              ti, tj, (long)(uint64_t(ti) >> paratreet::kUF2IdxBits));
+    }
+#endif
     phase3_emitted++;
     long lo = std::min(ti, tj), hi = std::max(ti, tj);
     if (seen3.insert(paratreet::packTipPair(lo, hi)).second)
@@ -1200,6 +1218,7 @@ public:
   double density_x = 0.0;
 
   void resetPhase3(const CkCallback& cb) {
+    tips_encoded_ = false;
     edge_buf3.clear();
     seen3.clear();
     phase3_emitted = 0;
@@ -1924,6 +1943,9 @@ private:
   // Phase-3 cross-process buffers (kept separate from phaseB's, above).
   std::vector<std::pair<long, long>> edge_buf3;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;
+  // Set by applyTipEncoding, cleared by resetPhase3: gates the debug
+  // same-process-edge check above (meaningless on raw serial-mode tips).
+  bool tips_encoded_ = false;
   long phase3_emitted = 0;
   double b2_ = 0.0;
   // Occupancy gate for the per-chare grid (expected particles per cell of
