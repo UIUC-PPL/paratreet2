@@ -92,7 +92,7 @@ fixed the same way (do the rewrite before the thing that ships it):
 
 ```
 runFoFPhase1 (relabel)
-  -> fof.countFragments        (builds frag_counts: process-tip -> size)
+  -> fof.countFragments        (builds frag_counts: process-level tip -> size)
   -> fof_node.computeTipEncoding  (frag_counts keys -> encode_map + UF_2
                                     vertex array, dense-indexed)
   -> fof.applyTipEncoding      (owner-writes: particles' tips -> encoded)

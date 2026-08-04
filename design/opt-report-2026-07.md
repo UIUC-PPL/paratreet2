@@ -16,12 +16,12 @@ each process, the complete FoF restricted to that process's particles:
 per-PE union-find over frozen local trees (phaseA), cross-PE detection
 within the process (phaseB), a per-process merge, and a relabel. Each
 resulting process-local component is a **fragment**, identified by its
-**process-tip**: the global order of its minimum-order particle —
+**process-level tip**: the global order of its minimum-order particle —
 globally unique, computed with no communication. **Phase 3** discovers
-merge edges between process-tips of different processes by a tree walk
+merge edges between process-level tips of different processes by a tree walk
 over the distributed forest (any two particles within b holding
 different tips after phase 1 are necessarily on different processes),
-runs a distributed union-find (UF_2) over the touched process-tips,
+runs a distributed union-find (UF_2) over the touched process-level tips,
 and relabels. Between the phases, an upward pass refreshes per-node
 annotations (fragment-id intervals min_frag/max_frag) that the walk's
 certificates consult.
@@ -61,7 +61,7 @@ The phase-3 walk prunes on three certificates: negative (box gap
 mindist > b: no pair can link), positive (both boxes uniform — one
 fragment each — and maxdist <= b: every pair links, emit one edge
 without descending), and SEEN suppression (a process-level table of
-(g, f) process-tip pairs for which an edge already exists; first
+(g, f) process-level tip pairs for which an edge already exists; first
 witness wins). At 80M these fire at overwhelming ratios: 397.6M
 negative prunes and 105k suppressions funnel down to 22,326 emitted
 edges. The positive certificate proved structurally subsumed by
@@ -147,15 +147,15 @@ redundant re-proving of connectivity.
 
 After Sec. 5, a Projections trace showed the local phase dominated by
 bookkeeping that touched every fragment though almost none needed it:
-counting particles per process-tip (a per-PE map merged serially
+counting particles per process-level tip (a per-PE map merged serially
 under a process lock, ~1.5 s), enumerating ~3M fragments per process
 to assign dense UF_2 vertex indices (~0.7 s, one PE per process), a
 pre-allocated vertex array (~1-1.5 GB total), and O(V) scans inside
 the union-find library — all proportional to 23.7M fragments, when
-only ~7k process-tips are ever touched by a cross-process edge.
+only ~7k process-level tips are ever touched by a cross-process edge.
 
 The fix has two halves. **Enumeration-free tip encoding**: a
-process-tip is already globally unique, and every particle of a
+process-level tip is already globally unique, and every particle of a
 fragment lives in one process, so the owner-decodable UF_2 vertex id
 is a pure per-particle rewrite — (process << 43) | tip — no counting,
 no merge, no enumeration (43/20 bit split; the sign bit stays clear
@@ -314,7 +314,7 @@ choice stands.
   replaced a bare quiescence wait that would silently drop buffered
   unions.
 - **fof1 single-process guard**: the strict phase-1 exactness test is
-  only valid single-process (process-tips vs a global reference); it
+  only valid single-process (process-level tips vs a global reference); it
   now aborts multi-process runs with an explanation. Recorded because
   the distributed full check cannot catch phase-1 under-merges — the
   phase-3 edge predicate repairs them silently — so fof1 is the only

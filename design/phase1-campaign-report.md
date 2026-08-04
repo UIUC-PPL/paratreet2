@@ -53,8 +53,8 @@ of the same process, over frozen phaseA results, emitting merge edges;
 *relabel*. The result: every particle is labeled with the complete FoF
 component it belongs to *as restricted to its process*. We call such a
 process-local component a **fragment**, and we name it by its
-**process-tip**: the global order (input index) of its minimum-order
-particle. Two properties make process-tips powerful: they are globally
+**process-level tip**: the global order (input index) of its minimum-order
+particle. Two properties make process-level tips powerful: they are globally
 unique without any communication (a global order is unique by
 definition), and every particle of a fragment lives in exactly one
 process.
@@ -64,7 +64,7 @@ theorem keeps it simple: after phase 1, if two particles within b of
 each other carry different tips, they necessarily belong to different
 processes — so cross-tip proximity is exactly the definition of a merge
 edge, no ownership tests needed. A tree walk finds such pairs, a
-distributed union-find (UF_2) over the touched process-tips computes
+distributed union-find (UF_2) over the touched process-level tips computes
 the global components, and a relabel finishes. In between, an upward
 pass refreshes per-tree-node annotations (min/max fragment ids) that
 the walk's certificates consult.
@@ -152,7 +152,7 @@ against this and deferred: perfect placement would have recovered
 ## 5. Sparse UF_2: the bookkeeping that touched 23.7 million fragments so ~7,000 could matter
 
 A Projections trace then showed the local phase dominated not by
-linking but by *bookkeeping*: counting particles per process-tip (per-PE
+linking but by *bookkeeping*: counting particles per process-level tip (per-PE
 maps merged serially under a process lock, ~1.5 s), enumerating ~3M
 fragments per process to assign dense union-find vertex indices
 (~0.7 s, one PE per process), a pre-allocated vertex array (~1–1.5 GB),
@@ -161,7 +161,7 @@ and O(V) scans inside the union-find library. All of it proportional to
 a cross-process edge.
 
 The fix has two halves, and the first is an observation rather than
-code: a process-tip is *already* globally unique, and every particle of
+code: a process-level tip is *already* globally unique, and every particle of
 a fragment lives in one process — so the owner-decodable vertex id the
 distributed union-find needs is a pure per-particle bit operation,
 (process << 43) | tip. No counting, no lock, no enumeration. The second
@@ -333,7 +333,7 @@ Not speedups, but load-bearing:
   Tipsy's header remains int32 *by format* — beyond 2^31 particles the
   file format, not the code, is the wall.
 - **Test-harness lessons.** The strict phase-1 test is only valid
-  single-process (it compares process-tips against a global reference) —
+  single-process (it compares process-level tips against a global reference) —
   and, more subtly, the end-to-end check *cannot* catch phase-1
   under-merging, because phase 3's edge predicate silently repairs it.
   The narrow test now guards itself. And on SMP builds, `+pN` without

@@ -435,7 +435,7 @@ using namespace paratreet;
     }
     double tc1 = CkWallTimer();
 
-    // Phase-1 fragment (process-tip) histogram — design note §6.3e data;
+    // Phase-1 fragment (process-level tip) histogram — design note §6.3e data;
     // must run before the phase-3 relabel overwrites the tips. Distributed
     // (reduction-based), so it runs in both check modes. In dist mode it is
     // OPTIONAL (-g): countFragments is off the critical path since

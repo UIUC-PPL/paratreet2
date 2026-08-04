@@ -7,7 +7,7 @@
 // restricted to the process's own particles ("process-level tips"), writing
 // the tip id of every particle into Particle::group_number. Tip id = global
 // particle id (`order`) of the component's min-order particle, so PE-tips,
-// process-tips and later UF_2 vertices share one namespace.
+// process-level tips and later UF_2 vertices share one namespace.
 //
 // Structure (all barriers are reduction callbacks driven by the caller):
 //   (a) FoFPhase1 (group, per PE): serial union-find over the particles of
@@ -20,7 +20,7 @@
 //       buffer to the process-wide FoFPhase1Node.
 //   (c) FoFPhase1Node (nodegroup, per process): merge() runs a tiny serial
 //       union-find over the collected boundary edges and builds the
-//       PE-tip -> process-tip map.
+//       PE-tip -> process-level tip map.
 //   (d) FoFPhase1 relabel: each PE rewrites its own particles' group_number
 //       through the map (identity if absent). Owners write; no contention.
 //
@@ -74,7 +74,7 @@
 namespace paratreet {
 
 // Step 4 (distributed UF_2, design/step4.md "Tip encoding"): owner-encoded
-// vertex namespace for UF_2. A process-tip is renumbered to
+// vertex namespace for UF_2. A process-level tip is renumbered to
 // (owning_process << kUF2IdxBits) | dense_index, where dense_index is a
 // per-process-dense enumeration of that process's own fragments (assigned by
 // FoFPhase1Node::computeTipEncoding). Because the encoding happens BEFORE
@@ -278,7 +278,7 @@ struct FoFParticleRecord {
 // process-local, so each process knows its fragments' full sizes.
 struct FoFFragmentHistogram {
   long bins[64];    // bins[k] = #fragments with floor(log2(size)) == k
-  long n_fragments; // total fragment (process-tip) count
+  long n_fragments; // total fragment (process-level tip) count
   long max_size;    // largest fragment size
 };
 
@@ -317,7 +317,7 @@ struct FoFMemoryStats {
 
 // Per-process side of phase 1: collects the per-PE subtree registry (for
 // phaseB pair enumeration), the cross-PE boundary edges, and — after
-// merge() — the PE-tip -> process-tip map read by the group branches.
+// merge() — the PE-tip -> process-level tip map read by the group branches.
 template <typename Data>
 class FoFPhase1Node : public CBase_FoFPhase1Node<Data> {
 public:
@@ -331,17 +331,17 @@ public:
   // PE -> subtrees resident on that PE (this process's PEs only).
   std::map<int, std::vector<SubtreeRef>> pe_subtrees;
   std::vector<std::pair<long, long>> edges; // cross-PE (tip, tip) edges
-  std::unordered_map<long, long> tip_map;   // PE-tip -> process-tip
-  std::unordered_map<long, long> frag_counts; // process-tip -> exact size
+  std::unordered_map<long, long> tip_map;   // PE-tip -> process-level tip
+  std::unordered_map<long, long> frag_counts; // process-level tip -> exact size
 
   // Step 4 (distributed UF_2): built by computeTipEncoding() from
   // frag_counts (so it must run after countFragments). encode_map maps this
-  // process's own process-tips to their encoded UF_2 vertex ids
+  // process's own process-level tips to their encoded UF_2 vertex ids
   // (paratreet::uf2EncodeTip); uf2_vertices is the vertex array handed to
   // UnionFindLib::initialize_vertices by index (dense_index == its position
   // here) -- UnionFindLib mutates componentNumber/parent/size IN PLACE in
   // this same storage, so applyUF2Labels reads results straight out of it.
-  std::unordered_map<long, long> encode_map; // process-tip -> encoded tip
+  std::unordered_map<long, long> encode_map; // process-level tip -> encoded tip
   std::vector<unionFindVertex> uf2_vertices; // dense path only (unused by sparse-uf2)
   // Lazy-mode label readback buffer (collectUF2Labels -> applyUF2Labels):
   // localId -> componentNumber for every touched vertex of this process.
@@ -959,7 +959,7 @@ public:
   }
 
   // Fragment-size histogram, step 1 of 2 (run after relabel): count this
-  // PE's registered particles per process-tip and hand the counts to the
+  // PE's registered particles per process-level tip and hand the counts to the
   // process-wide FoFPhase1Node (synchronous local-branch call, like
   // submitEdges, so the counts are complete when the barrier fires).
   void countFragments(const CkCallback& cb) {

@@ -22,7 +22,7 @@ module fof {
 
   // FoF phase 1 (see fof/FoFPhase1.h and design/phase1.md).
   // Per-process side: subtree registry for phaseB pair enumeration, boundary
-  // edge collection, and the PE-tip -> process-tip merge map.
+  // edge collection, and the PE-tip -> process-level tip merge map.
   template <typename Data>
   nodegroup FoFPhase1Node {
     entry FoFPhase1Node();

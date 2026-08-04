@@ -29,7 +29,7 @@ distributed union-find (UF_2) later runs over tips, never particles.
   2. **Freeze + compress.** Full path compression; every particle stores
      its PE-tip id in `Particle::group_number`. Tip id = global particle
      id (`order`) of the component's min-order root — one namespace for
-     PE-tips, process-tips, and later UF_2 vertices.
+     PE-tips, process-level tips, and later UF_2 vertices.
   3. **Barrier** (reduction), then **(b) cross-PE edge emission.** For
      each subtree pair spanning two PEs of the same process, the
      lower-PE-id side walks the pair and emits `(tip_i, tip_j)` edges
@@ -37,7 +37,7 @@ distributed union-find (UF_2) later runs over tips, never particles.
      Reads only frozen data; writes only own buffer. No atomics.
   4. **Barrier, then serial merge.** One PE per process runs a small UF
      over the collected edge lists (touches only tips appearing in
-     boundary edges) producing the PE-tip -> process-tip map.
+     boundary edges) producing the PE-tip -> process-level tip map.
   5. **Parallel relabel.** Each PE rewrites its own particles'
      `group_number` through the map. Owners write; no contention.
 
@@ -80,7 +80,7 @@ later, in the phase-3 test.
   hereditary predicate phase 3 prunes on.
 - **Fragment-size histogram** (design note §6.3e, giant-fragment
   detection): after relabel, each PE counts its own particles per
-  process-tip; the nodegroup merges to exact per-fragment sizes (tips
+  process-level tip; the nodegroup merges to exact per-fragment sizes (tips
   are process-local, so per-process totals are exact), then contributes
   log2-binned counts + max size + fragment count via reduction to an
   app callback.
