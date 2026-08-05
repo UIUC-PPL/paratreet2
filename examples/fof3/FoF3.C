@@ -704,8 +704,12 @@ using namespace paratreet;
     // particle copies / N = average fraction of the whole dataset each
     // process ends up holding a copy of. max_MB flags a hot process (dense
     // region pulls more of the tree). Post-QD read: phase-separated from
-    // any fills, per the cache concurrency contract.
-    {
+    // any fills, per the cache concurrency contract. -C skips this block:
+    // the tally walks the whole cached tree on one processor per process
+    // (314 ms on the hot process at 80M/480 PEs) — after every timed
+    // bracket, so harmless to measurements, but clutter in traced
+    // timelines.
+    if (!fof_skip_cache_stats) {
       void* result = nullptr;
       proxy_pack.cache.cacheStats(CkCallbackResumeThread(result));
       CkReductionMsg* msg = (CkReductionMsg*)result;

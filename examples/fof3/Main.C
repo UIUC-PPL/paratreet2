@@ -55,7 +55,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:S")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SC")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -79,6 +79,9 @@ PARATREET_REGISTER_MAIN(ExMain);
           break;
         case 'g':
           fof_frag_histogram = true;
+          break;
+        case 'C':
+          fof_skip_cache_stats = true;
           break;
         case 'S':
           // Single-distribution mode (design/single-distribution-mode.md):
@@ -136,6 +139,10 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t    this (particles per b/sqrt(6) cell) is solved by the\n");
           CkPrintf("\t    cell grid instead of the tree walk; default 4;\n");
           CkPrintf("\t    0 = off (the walk-only oracle for A/B)]\n");
+          CkPrintf("\t-C [skip the cache memory accounting (FOF3STAT cache line);\n");
+          CkPrintf("\t    it walks the whole cached tree on one processor per\n");
+          CkPrintf("\t    process after the timed brackets -- harmless for\n");
+          CkPrintf("\t    measurements but clutter in traced timelines]\n");
           CkPrintf("\t-g [compute and print the phase-1 fragments histogram\n");
           CkPrintf("\t    (FOF3STAT fragments line); off by default in -u dist\n");
           CkPrintf("\t    since it adds a full countFragments pass]\n");
@@ -192,6 +199,8 @@ PARATREET_REGISTER_MAIN(ExMain);
              fof_uf2_stream_batch,
              fof_uf2_stream_batch > 0 ? "" : " (post-walk injection)");
     CkPrintf("Cache share depth (-D): %d\n", conf.cache_share_depth);
+    CkPrintf("Cache accounting (-C skips): %s\n",
+             fof_skip_cache_stats ? "off" : "on");
     // PBC (design/pbc.md). Note: -P (capital) does not collide with any
     // framework-registered CLI letter (the framework uses lowercase 'p' for
     // nPartitionsMin and the multi-char 'pbc'/'px'/'py'/'pz'), so no

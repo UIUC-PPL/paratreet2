@@ -81,6 +81,14 @@ class ExMain: public paratreet::Main<FragData> {
   // dist critical path (design/sparse-uf2-encoding.md). Serial mode (-u
   // serial) always prints it, as before.
   bool fof_frag_histogram = false;
+  // -C: skip the cache memory accounting (CacheManager::cacheStats and its
+  // FOF3STAT cache line). The accounting walks the process's entire cached
+  // tree on one processor per process — measured 314 ms on the hot process
+  // at 80M/480 PEs — AFTER all timed brackets, so it never affects
+  // measurements, but it clutters projections timelines. Use -C for traced
+  // runs unless the cache accounting itself is under investigation (Kale,
+  // 2026-08-04). The cheap process-RSS memory line is unaffected.
+  bool fof_skip_cache_stats = false;
   // Single-distribution mode (design/single-distribution-mode.md) — no
   // Partition array. DEFAULT since 2026-08-04 (80M gate job 19661057:
   // components bit-identical across 4 arms; decomposition ~25% faster —
