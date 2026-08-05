@@ -12,10 +12,11 @@ points at its design note where one exists. Started 2026-08-05.
    the phaseB offload); absorb the self-walk and PE-local drivers and
    shrink the phase-1 walk bodies to visitors afterward. Gate every
    step on bit-identical counts against existing baselines.
-2. Serial-mode credit-counter termination for the dual walk (replace
-   the traversal's quiescence detection; design agreed 2026-08-05 —
-   credit transfer across request/reply, parked-walker dispatch, and
-   the pause protocol; dist keeps the combined walk+union quiescence).
+2. DONE 2026-08-05 (commit 4a3b496): serial-mode credit-counter
+   termination for the dual walk. The serial pipeline now contains no
+   quiescence detection at all. FOF_WALK_QD=1 keeps the quiescence
+   path as the A/B oracle; Anvil-scale bracket measurement rides the
+   next measurement round.
 3. Steal-based phaseB cross-process offload (design/phaseb-offload.md),
    built against the framework pool from item 1.
 4. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
