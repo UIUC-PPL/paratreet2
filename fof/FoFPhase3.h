@@ -310,6 +310,13 @@ struct FoFPhase3Result {
   long peak_edge_buf;      // max over PEs of the edge-buffer high-water mark
   // Coarse wall-time brackets (design note §8 measurements; CkWallTimer on
   // the driving thread):
+  // Setup before the walk launches: resetPhase3 barrier, and on the
+  // distributed path also UnionFindLib + node-map creation, initUF2, and
+  // streaming arm-up. Untracked until 2026-08-04, when a projections
+  // timeline showed it as ~120 ms of unattributed (black) time between
+  // verifyEncodedTips and startDual at 480 PEs — chare-array creation and
+  // location registration are runtime bookkeeping, not entry methods.
+  double t_setup;
   double t_walk;    // startDown broadcast + CkWaitQD (the boundary walk)
   double t_gather;  // flushPhase3Edges concat reduction + phase3Stats
   double t_uf2;     // serial UF_2 + dedup + map construction on PE 0
@@ -395,6 +402,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
                                         CProxy_Subtree<FragData>()) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
+  double t_pre = CkWallTimer();
   verifySharedLeavesUnlessSingle(partitions);
 
   double b2 = linking_length * linking_length;
@@ -524,6 +532,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   // (owner-writes, identity if absent).
   fof.applyGlobalMap(map_vec, CkCallbackResumeThread());
   double t4 = CkWallTimer();
+  r.t_setup = t0 - t_pre;
   r.t_walk = t1 - t0;
   r.t_gather = t2 - t1;
   r.t_uf2 = t3 - t2;
@@ -577,6 +586,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         long uf2_stream_batch = 0) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
+  double t_pre = CkWallTimer();
   verifySharedLeavesUnlessSingle(partitions);
 
   double b2 = linking_length * linking_length;
@@ -732,6 +742,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   fof.applyUF2Labels(CkCallbackResumeThread());
   double t4 = CkWallTimer();
 
+  r.t_setup = t0 - t_pre; // resetPhase3 + UF lib/node-map creation + initUF2
   r.t_walk = t1 - t0;
   r.t_gather = t2 - t1;   // phase3Stats only on this path (no edge gather)
   r.t_uf2 = t3 - t2;      // initUF2 + fireUF2Edges + QD + find_components

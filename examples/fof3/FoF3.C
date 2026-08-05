@@ -502,9 +502,9 @@ using namespace paratreet;
              pr.edges_sent > 0 ? (double)pr.redundant_descents / pr.edges_sent
                                : 0.0,
              pr.peak_edge_buf);
-    CkPrintf("FOF3STAT time_s: phase3_walk %.3f edge_gather %.3f uf2 %.3f "
-             "relabel %.3f\n",
-             pr.t_walk, pr.t_gather, pr.t_uf2, pr.t_relabel);
+    CkPrintf("FOF3STAT time_s: uf2_setup %.3f phase3_walk %.3f "
+             "edge_gather %.3f uf2 %.3f relabel %.3f\n",
+             pr.t_setup, pr.t_walk, pr.t_gather, pr.t_uf2, pr.t_relabel);
     // Per-PE load-imbalance signals (min/avg/max over PEs), from the
     // phase3Stats tuple reduction: phase-1 entry-body times and the walk's
     // per-PE work distribution. max/avg >> 1 = imbalance.
