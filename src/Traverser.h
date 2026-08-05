@@ -80,6 +80,26 @@ constexpr auto dualSplitLargerOnly(int) -> decltype(V::SplitLargerOnly) {
 template <typename V>
 constexpr bool dualSplitLargerOnly(long) { return false; }
 
+// Opt-in DualTraverser ownership prune (same opt-in idiom): a visitor that
+// declares `static constexpr bool SkipLocalSource = true` promises that a
+// pair whose SOURCE node is this process's own live data (types Leaf,
+// EmptyLeaf, Internal — as opposed to the shared canopy above process
+// boundaries or fetched/placeholder remote nodes) can never produce
+// output, so the traverser discards such pairs without descending them.
+// The targets of a dual walk are always process-local, so this removes
+// the entire local-versus-local sweep. FoF phase 3 declares it: after
+// phase 1, two particles within the linking length holding different
+// tips are necessarily on different processes (the completeness
+// invariant the DEBUG-build tripwire in addPhase3Edge asserts), so
+// local-local pairs can only re-prove same-tip or out-of-range facts.
+// Visitors without the trait keep the historical behavior bit-for-bit.
+template <typename V>
+constexpr auto dualSkipLocalSource(int) -> decltype(V::SkipLocalSource) {
+  return V::SkipLocalSource;
+}
+template <typename V>
+constexpr bool dualSkipLocalSource(long) { return false; }
+
 // Squared min distance between two nodes' bounding boxes (every paratreet
 // Data carries `box`; see the Data-concept requirement). Used only to ORDER
 // child exploration (closest first), so open-boundary distance is fine even
@@ -712,6 +732,15 @@ public:
       CkPrintf("tp %d, target key = %d, type = %d, source key = %d, type = %d, pe %d\n", tp.thisIndex, node->key, (int)node->type, curr_payload->key, (int)curr_payload->type, CkMyPe());
 #endif
       if (curr_payload->type == Node<Data>::Type::EmptyLeaf) {
+        continue;
+      }
+      // Ownership prune (see dualSkipLocalSource above): a source node that
+      // is this process's own live data cannot produce output for a visitor
+      // that declared the trait; discard the pair before any descent.
+      if (dualSkipLocalSource<Visitor>(0) &&
+          (node->type == Node<Data>::Type::Leaf ||
+           node->type == Node<Data>::Type::EmptyLeaf ||
+           node->type == Node<Data>::Type::Internal)) {
         continue;
       }
       switch (node->type) {

@@ -97,6 +97,18 @@ public:
   // tests for far less leaf-level chaff, and closest-first exploration finds
   // witnesses early so SEEN suppression covers the rest of the expansion.
   static constexpr const bool SplitLargerOnly = true;
+  // Ownership prune (Traverser.h dualSkipLocalSource; Kale, 2026-08-05):
+  // discard any pair whose source node is this process's own live data
+  // before descending it. Correct by phase-1 completeness: two particles
+  // within the linking length holding different tips are necessarily on
+  // different processes, so a local-source-versus-local-target pair can
+  // never emit an edge — walking it only re-proves same-tip and
+  // out-of-range facts. This removes the local-versus-local certificate
+  // sweep that dominated the walk's start (the long startDual region in
+  // the 80M timelines); what remains is the canopy descent and the
+  // boundary fetches. The transposed walk (the standing oracle) does NOT
+  // consult this trait, so oracle comparisons independently re-check it.
+  static constexpr const bool SkipLocalSource = true;
 
   CProxy_FoFPhase1<FragData> fof;
   double b2 = 0.0;
