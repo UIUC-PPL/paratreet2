@@ -55,6 +55,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <atomic>
@@ -1243,6 +1244,17 @@ public:
   // callback on PE 0. The reduction is the completion detection -- no
   // message counting, no broadcast/point-to-point ordering hazards.
   void flushPhase3Edges(const CkCallback& cb) {
+    // Gather-integrity diagnostic (FOF_EDGE_CHECK=1): per-contribution
+    // checksums to compare against what the root receives.
+    if (std::getenv("FOF_EDGE_CHECK")) {
+      long n = (long)edge_buf3.size(), slo = 0, shi = 0, zeros = 0;
+      for (auto& e : edge_buf3) {
+        slo += e.first; shi += e.second;
+        if (e.first == 0 && e.second == 0) zeros++;
+      }
+      CkPrintf("edge-check contrib: pe %d n %ld sum_lo %ld sum_hi %ld zeros %ld\n",
+               CkMyPe(), n, slo, shi, zeros);
+    }
     this->contribute(edge_buf3.size() * sizeof(std::pair<long, long>),
                      edge_buf3.data(), CkReduction::concat, cb);
   }

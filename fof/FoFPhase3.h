@@ -60,6 +60,8 @@
 #include "FoFPhase1.h"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <unordered_map>
@@ -428,6 +430,22 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   CkReductionMsg* msg = (CkReductionMsg*)result;
   int n_edges = msg->getSize() / sizeof(std::pair<long, long>);
   const auto* edges = (const std::pair<long, long>*)msg->getData();
+  // Gather-integrity diagnostic (FOF_EDGE_CHECK=1): totals over the
+  // received concatenation, to compare with the per-contribution sums.
+  if (std::getenv("FOF_EDGE_CHECK")) {
+    long slo = 0, shi = 0, zeros = 0;
+    for (int e = 0; e < n_edges; e++) {
+      slo += edges[e].first; shi += edges[e].second;
+      if (edges[e].first == 0 && edges[e].second == 0) zeros++;
+    }
+    CkPrintf("edge-check root: n %d sum_lo %ld sum_hi %ld zeros %ld\n",
+             n_edges, slo, shi, zeros);
+    const char* dump = std::getenv("FOF_EDGE_DUMP");
+    if (dump) {
+      FILE* f = fopen(dump, "wb");
+      if (f) { fwrite(edges, sizeof(std::pair<long, long>), n_edges, f); fclose(f); }
+    }
+  }
 
   // Deposit per-PE redundant counts into per-process totals before the stats
   // reduction reads them (design/step3.md §6d).
@@ -518,14 +536,26 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   delete stats_msg;
   r.edges_unique = n_unique;
 
-  // tip -> globalRoot map, remapped tips only (identity omitted); every tip
-  // not appearing in any edge stays its own root.
+  // tip -> final-label map. SIGN CONVENTION shared with the distributed
+  // path's applyUF2Labels, and REQUIRED by the distributed component
+  // counter (FoFPhase1::depositLabelCounts/histogramShard): a NEGATIVE
+  // label marks a component touched by a cross-process merge edge (its
+  // per-process piece sizes need global summing); a POSITIVE label marks
+  // an untouched fragment, which is guaranteed process-local. Therefore
+  // EVERY tip that appears in any edge — including each component's root
+  // tip itself — maps to the negative form -(root + 2); leaving the root
+  // tip positive on its home process while other processes go negative
+  // would split the component in the counter (found 2026-08-05: the
+  // counter reported +15,230 phantom components at 80M/32 processes,
+  // one per extra process sharing a positive merged label, while the
+  // particle labels themselves were correct).
   std::vector<std::pair<long, long>> map_vec;
+  r.tips_remapped = 0;
   for (auto& kv : parent) {
     long root = find(kv.first);
-    if (root != kv.first) map_vec.emplace_back(kv.first, root);
+    map_vec.emplace_back(kv.first, -(root + 2));
+    if (root != kv.first) r.tips_remapped++;
   }
-  r.tips_remapped = (long)map_vec.size();
   double t3 = CkWallTimer();
 
   // Broadcast the map; each PE relabels its own registered particles
