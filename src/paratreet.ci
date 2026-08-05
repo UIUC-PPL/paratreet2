@@ -43,6 +43,9 @@ module paratreet {
     entry void addCache(MultiData<Data>);
     entry void restoreData(std::pair<Key, SpatialNode<Data>>);
     entry void receiveSubtree(MultiData<Data>, PPHolder<Data>);
+    entry void armWalkCompletion(const CkCallback&, const CkCallback&);
+    entry void releaseOpenCredit();
+    entry void fireWalkDone();
     entry void refreshSubtreeCopy(MultiData<Data>);
     entry void cacheStats(const CkCallback&);
     template <typename Visitor>

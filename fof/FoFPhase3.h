@@ -430,7 +430,14 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
                                     Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
                                     bool dual_walk = false,
                                     CProxy_Subtree<FragData> subtrees =
-                                        CProxy_Subtree<FragData>()) {
+                                        CProxy_Subtree<FragData>(),
+                                    // Cache proxy for the credit-counter walk
+                                    // termination (Kale's scheme, 2026-08-05;
+                                    // see TreeCache::walk_credits). Default
+                                    // (null proxy) or FOF_WALK_QD=1 falls back
+                                    // to quiescence detection.
+                                    CProxy_CacheManager<FragData> cache =
+                                        CProxy_CacheManager<FragData>()) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
   double t_pre = CkWallTimer();
@@ -439,18 +446,35 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   double b2 = linking_length * linking_length;
   fof.resetPhase3(CkCallbackResumeThread());
 
-  // The boundary walk (identical mechanics to the -u dist path). QD covers
-  // the traversal including cache fetches and resumptions.
+  // The boundary walk (identical mechanics to the -u dist path). On the
+  // dual walk, completion is the credit-counter reduction (no quiescence
+  // detection anywhere in the serial pipeline once this fires); the
+  // transposed oracle keeps CkWaitQD, and FOF_WALK_QD=1 forces it on the
+  // dual walk too (the A/B oracle for the counter itself).
   double t0 = CkWallTimer();
+  bool counter_done = dual_walk && !std::getenv("FOF_WALK_QD") &&
+                      !cache.ckGetGroupID().isZero();
   if (dual_walk) {
-    subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+    if (counter_done) {
+      CkCallbackResumeThread walk_done;
+      {
+        CkCallbackResumeThread armed;
+        cache.armWalkCompletion(walk_done, armed);
+      } // every process armed before any walk entry can run
+      subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+      // walk_done's destructor blocks here until every process's credit
+      // counter has reached zero and the done reduction has fired.
+    } else {
+      subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+      CkWaitQD();
+    }
   } else {
     if (paratreet::getConfiguration().single_distribution)
       CkAbort("transposed phase-3 walk needs the Partition array; use the dual"
               " walk (-w dual) under single_distribution");
     partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+    CkWaitQD();
   }
-  CkWaitQD();
   double t1 = CkWallTimer();
 
   // Gather the per-PE deduplicated buffers to this (PE 0, driver) thread.

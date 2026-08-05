@@ -153,6 +153,9 @@ inline bool handleRemoteNode(Node<Data>* node, size_t trav_idx, size_t part_idx,
   // lane to set a bit sends the one request for this process.
   auto prev = node->requested.fetch_or(1ull << CkMyRank());
   if (prev == 0) {
+    // Walk credit for the request (removed when the reply's install
+    // completes in addCache/restoreData).
+    cm_local->walkCreditInc(1);
     if (node->type == Node<Data>::Type::Boundary || node->type == Node<Data>::Type::RemoteAboveTPKey) {
       // Ask TreeCanopy for data
       // If the canopy is at the same level as a TP, it asks the TP
@@ -177,6 +180,7 @@ inline bool handleRemoteNode(Node<Data>* node, size_t trav_idx, size_t part_idx,
   auto opaque = paratreet::makeParkedOpaque(CkMyRank(), trav_idx, (int)part_idx);
   if (cm_local->core.park(node, opaque) ==
       TreeCache<Data>::ParkResult::AlreadyInstalled) {
+    cm_local->walkCreditInc(1); // credit for the self-wake resume message
     r_proxy[CkMyPe()].process(node->key, std::vector<uint64_t>{opaque});
   }
   return prev == 0;

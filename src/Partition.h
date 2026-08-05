@@ -209,6 +209,9 @@ template <typename Data>
 void Partition<Data>::goDown(size_t travIdx)
 {
   traversers[travIdx]->resumeTrav();
+  // Walk credit of this goDown message (no-op unless a counter-terminated
+  // walk armed it; the transposed oracle keeps quiescence detection).
+  cm_proxy.ckLocalBranch()->walkCreditDec(1);
 }
 
 template <typename Data>

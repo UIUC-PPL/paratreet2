@@ -322,12 +322,24 @@ void Subtree<Data>::startDual(Visitor v) {
   cml->r_proxy = r_proxy;
   traverser.reset(new DualTraverser<Data, Visitor>(v, 0, *this));
   traverser->start();
+  // Walk-completion counting (armed only in the serial-mode FoF walk):
+  // every element contributes here after its seeding descent; the array
+  // reduction broadcasts releaseOpenCredit, which removes the per-process
+  // open credit -- so the counter cannot reach zero before every element
+  // has seeded. New requests issued during start() took their own credits.
+  if (cml->walkArmed()) {
+    this->contribute(CkCallback(
+        CkIndex_CacheManager<Data>::releaseOpenCredit(), cm_proxy));
+  }
 }
 
 template <typename Data>
 void Subtree<Data>::goDown(size_t travIdx) {
   CkAssert(travIdx == 0); // cannot handle multiple dual tree traversals yet
   traverser->resumeTrav();
+  // This goDown message's walk credit (added by Resumer::process before
+  // the send); requests issued during the drained segments took their own.
+  cm_proxy.ckLocalBranch()->walkCreditDec(1);
 }
 
 // Mirror of Partition::resumeAfterPause (see the note in startDown).

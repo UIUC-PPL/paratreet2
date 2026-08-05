@@ -188,6 +188,20 @@ public:
   std::vector<std::vector<Node<Data>*>> cached_leaves; // cached leaves left over
   std::vector<std::vector<Node<Data>*>> displaced_leaves; // leaves split between >1 Partitions
   std::vector<std::unique_ptr<NodePool<Data>>> pools;
+
+  // Walk-completion credit counter (Kale's scheme, 2026-08-05): a
+  // process-wide count of outstanding walk continuations. Every message
+  // that carries walk continuation holds a credit -- added strictly
+  // BEFORE the message that will consume it is sent, removed only AFTER
+  // the synchronous work it triggered has completed -- so the count can
+  // never read zero while work is pending. Zero (once armed and the
+  // seeding open credit is released) means this process's walk is done;
+  // a reduction over processes then replaces quiescence detection.
+  // walk_state: 0 idle, 1 armed, 2 fired. Consumed by the serial-mode
+  // FoF walk (runFoFPhase3); the distributed path keeps the combined
+  // walk+union quiescence instead.
+  std::atomic<long> walk_credits{0};
+  std::atomic<int> walk_state{0};
   Data nodewide_data;
 
   TreeCache() = default;
@@ -284,6 +298,8 @@ public:
     for (auto& pool : pools) pool->cleanup();
     local_tps.clear();
     leaf_lookup.clear();
+    walk_credits.store(0);
+    walk_state.store(0);
     subtree_copy_started.clear();
     prefetch_set.clear();
 

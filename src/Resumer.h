@@ -52,10 +52,17 @@ public: // these need to be seen by other local chares
       bool should_resume = resume_nodes.empty();
       resume_nodes.push(node);
       if (should_resume) {
+        // Credit for the goDown message (an in-flight goDown drains the
+        // whole queue, so entries pushed onto a non-empty queue ride the
+        // credit that goDown already holds).
+        cm_local->walkCreditInc(1);
         if (use_subtree) subtree_proxy[pair.second].goDown(pair.first);
         else part_proxy[pair.second].goDown(pair.first);
       }
     }
+    // This process() message's own credit (added by the sender before
+    // the send); any continuation was transferred above.
+    cm_local->walkCreditDec(1);
   }
 };
 

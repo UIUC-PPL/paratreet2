@@ -484,7 +484,7 @@ using namespace paratreet;
                                       fof_uf2_stream_batch)
         : paratreet::runFoFPhase3(proxy_pack.partition, fof, b, pbc,
                                   walk_mode == WalkMode::Dual,
-                                  proxy_pack.subtree);
+                                  proxy_pack.subtree, proxy_pack.cache);
     CkPrintf("FOF3STAT edges: emitted %ld sent %ld unique %ld tips_remapped %ld\n",
              pr.edges_emitted, pr.edges_sent, pr.edges_unique, pr.tips_remapped);
     // 3a counters (design/step3.md §6). Redundancy ratio = both-uniform

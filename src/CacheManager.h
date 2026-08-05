@@ -111,7 +111,39 @@ public:
   void restoreData(std::pair<Key, SpatialNode<Data>>);
   void connect(Node<Data>*);
 
+  // --- Walk-completion credit counter (see TreeCache::walk_credits).
+  // armWalkCompletion runs on every process BEFORE the walk broadcast
+  // (the caller waits on `ack`): counter := 1 (the seeding open credit),
+  // done callback stored. Each walk element contributes to an array
+  // reduction after its seeding descent; that reduction broadcasts
+  // releaseOpenCredit, so zero is unreachable until every element has
+  // seeded. fireWalkDone contributes each process's branch into the
+  // done reduction exactly once (the armed->fired exchange guards it).
+  void armWalkCompletion(const CkCallback& done, const CkCallback& ack) {
+    walk_done_cb_ = done;
+    core.walk_credits.store(1, std::memory_order_relaxed);
+    core.walk_state.store(1, std::memory_order_release);
+    this->contribute(ack);
+  }
+  void releaseOpenCredit() { walkCreditDec(1); }
+  void fireWalkDone() { this->contribute(walk_done_cb_); }
+  bool walkArmed() const {
+    return core.walk_state.load(std::memory_order_acquire) == 1;
+  }
+  void walkCreditInc(long n) {
+    if (walkArmed()) core.walk_credits.fetch_add(n, std::memory_order_acq_rel);
+  }
+  void walkCreditDec(long n) {
+    if (!walkArmed()) return;
+    if (core.walk_credits.fetch_sub(n, std::memory_order_acq_rel) == n) {
+      int expect = 1;
+      if (core.walk_state.compare_exchange_strong(expect, 2))
+        this->thisProxy[this->thisIndex].fireWalkDone();
+    }
+  }
+
 private:
+  CkCallback walk_done_cb_;
   void process(Node<Data>*, const std::vector<uint64_t>& parked);
 };
 
@@ -185,6 +217,11 @@ void CacheManager<Data>::addCache(MultiData<Data> multidata) {
                           multidata.nodes.data(), multidata.nodes.size(),
                           multidata.cm_index, multidata.tp_index, false, parked);
   process(top_node, parked);
+  // The request that this reply answers held one walk credit (added at
+  // issue in handleRemoteNode); the waiters' resume credits were added
+  // inside process() above, so removing the request credit here cannot
+  // expose a transient zero.
+  walkCreditDec(1);
 }
 
 template <typename Data>
@@ -213,6 +250,7 @@ void CacheManager<Data>::restoreData(std::pair<Key, SpatialNode<Data>> param) {
   std::vector<uint64_t> parked;
   Node<Data>* node = core.installBoundary(CkMyRank(), param, parked);
   process(node, parked);
+  walkCreditDec(1); // request credit, as in addCache above
 }
 
 // Wake exactly the walkers that parked on the just-installed node: the
@@ -229,6 +267,7 @@ void CacheManager<Data>::process(Node<Data>* node, const std::vector<uint64_t>& 
   for (auto o : parked) by_lane[paratreet::parkedLane(o)].push_back(o);
   auto first_pe = this->isNodeGroup() ? CmiNodeFirst(CkMyNode()) : this->thisIndex;
   for (auto& lane : by_lane) {
+    walkCreditInc(1); // one credit per resume message, added before the send
     r_proxy[first_pe + lane.first].process(node->key, lane.second);
   }
 }
