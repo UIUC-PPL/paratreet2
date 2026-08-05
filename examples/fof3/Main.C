@@ -144,8 +144,10 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t    process after the timed brackets -- harmless for\n");
           CkPrintf("\t    measurements but clutter in traced timelines]\n");
           CkPrintf("\t-g [compute and print the phase-1 fragments histogram\n");
-          CkPrintf("\t    (FOF3STAT fragments line); off by default in -u dist\n");
-          CkPrintf("\t    since it adds a full countFragments pass]\n");
+          CkPrintf("\t    (FOF3STAT fragments line); off by default in BOTH\n");
+          CkPrintf("\t    modes: it is phase-1 diagnostics only and costs a\n");
+          CkPrintf("\t    full pass over all particles. At one process the\n");
+          CkPrintf("\t    fragments line is the complete answer (ground truth)]\n");
           CkPrintf("Framework options (see src/Configuration.h):\n");
           CkPrintf("\t-f [input file]\n");
           CkPrintf("\t-n [number of treepieces]\n");
@@ -192,7 +194,7 @@ PARATREET_REGISTER_MAIN(ExMain);
              fof_min_component_size,
              fof_min_component_size == 0 ? " (report all)" : "");
     CkPrintf("Fragments histogram (-g): %s\n",
-             fof_frag_histogram ? "on" : "off (serial mode prints it regardless)");
+             fof_frag_histogram ? "on" : "off");
     CkPrintf("phaseA grid threshold (-G): %g%s\n",
              fof_grid_threshold, fof_grid_threshold > 0 ? "" : " (grid off)");
     CkPrintf("UF_2 mid-walk stream batch (-E): %ld%s\n",

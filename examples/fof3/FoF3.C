@@ -443,7 +443,19 @@ using namespace paratreet;
     // preTraversalFn (before tip encoding); read it back via
     // runFoFFragmentHistogramNode rather than re-invoking countFragments
     // (which would double-count against encoded tips -- see preTraversalFn).
-    if (uf2_mode != UF2Mode::Dist || fof_frag_histogram) {
+    // Fragments histogram: -g ONLY, in BOTH modes (2026-08-05, Kale). It
+    // counts by phase-1 TIP, before anyone knows which tips will acquire
+    // cross-process edges, so it feeds nothing downstream — the final
+    // component histogram is a separate post-relabel pass keyed on final
+    // labels (positive = process-contained, counted locally; negative =
+    // edge-touched, globally summed). This line is phase-1 diagnostics
+    // (fragment-size distribution; at one process it doubles as the
+    // complete-FoF ground truth), a full pass over all particles plus a
+    // locked per-process merge — too expensive to run unconditionally at
+    // two billion particles for a report line. Serial mode used to
+    // compute it unconditionally (v1 behavior, never revisited when
+    // sparse-uf2 made it optional for dist).
+    if (fof_frag_histogram) {
       auto h = uf2_mode == UF2Mode::Dist
                    ? paratreet::runFoFFragmentHistogramNode(fof_node)
                    : paratreet::runFoFFragmentHistogram(fof, fof_node);
