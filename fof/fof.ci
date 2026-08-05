@@ -1,4 +1,5 @@
 module fof {
+  include "FoFStealTypes.h";
   // Friends-of-Friends application module, extracted from the paratreet core
   // module (2026-08; see design/fof-module.md). The core toolkit carries no
   // FoF code: this module consumes the core's generic hooks (Subtree::
@@ -53,6 +54,11 @@ module fof {
     entry void setPeriod(Vector3D<Real> period, const CkCallback&);
     entry void startPhase1Chain(double b2, double grid_thresh, const CkCallback&);
     entry void phaseBChained();
+    entry void startHelping();
+    entry void requestSteal(int helper_pe);
+    entry void stealDenied(int victim_node);
+    entry void receiveSteal(const paratreet::StealShipment<Data>&);
+    entry void returnStolenEdges(const std::vector<long>&);
     entry void relabelChained(double tA, double tB, double tM);
     entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);

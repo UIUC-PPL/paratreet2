@@ -39,6 +39,7 @@
 // tree build until the next rebuild/reset; run the whole sequence inside
 // that window.
 
+#include "FoFStealTypes.h"
 #include "fof.decl.h"
 // Template definitions of this module's generated code (CBase_/closure/proxy
 // templates from fof.def.h) must be visible before any concrete-Data use of
@@ -263,6 +264,7 @@ inline TipPairKey packTipPair(long a, long b) {
   uint64_t ua = uint64_t(a), ub = uint64_t(b);
   return ua < ub ? TipPairKey{ua, ub} : TipPairKey{ub, ua};
 }
+
 
 // Record emitted by FoFPhase1::collect (validation/debugging helper).
 // Uses Real for the position so a serial checker can reproduce the
@@ -489,6 +491,51 @@ public:
   std::atomic<int> a_done{0};
   std::atomic<int> b_done{0};
   double chain_t0 = 0, stage_tA = 0, stage_tB = 0, stage_tM = 0;
+
+  // --- phaseB cross-process stealing (design/phaseb-offload.md stages
+  // 1-2, same-machine tier; Kale, 2026-08-05). A pool unit is a pure
+  // function over frozen data (subtree pair snapshots -> tip edges), so
+  // an idle process can execute it and return the edges. The victim's
+  // merge must wait for both its own PEs' deposits AND every stolen
+  // batch's return; tryTriggerMerge is the single gate. ORDER MATTERS on
+  // the steal-server side: steal_outstanding is incremented BEFORE
+  // claiming from the cursor, so the last local depositor can never see
+  // a drained pool with claimed-but-unaccounted units.
+  std::atomic<long> steal_outstanding{0};
+  std::atomic<bool> phaseb_pool_ready{false}; // pool built (phaseA complete)
+  std::atomic<bool> pool_deposits_done{false};
+  std::atomic<bool> merge_fired{false};
+  std::atomic<long> stolen_out_units{0};   // units shipped to helpers
+  std::atomic<long> stolen_in_units{0};    // units executed for others
+  std::atomic<long> steal_denials{0};      // requests answered empty
+  CProxy_FoFPhase1<Data> group_proxy;      // set at chain start (for the fan)
+
+  // Fire the merge + relabel fan exactly once, when local deposits are
+  // complete and no stolen batch is outstanding. Callable from the last
+  // depositor, from every returned batch, and from the deny path.
+  void tryTriggerMerge() {
+    if (!pool_deposits_done.load(std::memory_order_acquire)) return;
+    if (steal_outstanding.load(std::memory_order_acquire) != 0) return;
+    // The pool must also be fully CLAIMED: implied by local deposits in
+    // normal runs (a PE deposits only after cursor exhaustion), but made
+    // explicit so a pool drained partly (or, in the FOF_STEAL_TEST debug
+    // mode, entirely) by helpers cannot merge before its last unit's
+    // edges are home.
+    if (phaseb_next.load(std::memory_order_acquire) < phaseb_pool.size())
+      return;
+    if (merge_fired.exchange(true)) return;
+    if (stolen_out_units.load() > 0 || stolen_in_units.load() > 0) {
+      CkPrintf("FOF3STAT steal: process %d out %ld in %ld denials %ld\n",
+               CkMyNode(), stolen_out_units.load(), stolen_in_units.load(),
+               steal_denials.load());
+    }
+    double tm0 = CkWallTimer();
+    mergeBody();
+    stage_tM = CkWallTimer() - tm0;
+    int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      group_proxy[pe].relabelChained(stage_tA, stage_tB, stage_tM);
+  }
   // PhaseB dynamic pool (branch phaseb-pool): every cross-PE subtree pair
   // of this process, enumerated once by the last phaseA finisher and
   // CLAIMED IN CHUNKS by whichever PEs are free — replacing the static
@@ -514,6 +561,13 @@ public:
     a_done = 0;
     b_done = 0;
     chain_t0 = stage_tA = stage_tB = stage_tM = 0;
+    steal_outstanding = 0;
+    phaseb_pool_ready = false;
+    pool_deposits_done = false;
+    merge_fired = false;
+    stolen_out_units = 0;
+    stolen_in_units = 0;
+    steal_denials = 0;
     pe_subtrees.clear();
     edges.clear();
     tip_map.clear();
@@ -775,8 +829,16 @@ public:
     // the pool is LPT-sorted, so consecutive units are the costliest —
     // chunked claims would stack them on one PE. Atomic traffic is one
     // fetch_add per unit, a few thousand per PE.
+    // Validation mode (FOF_STEAL_TEST=1, debug only): odd processes skip
+    // local claiming so their pools drain ONLY through steals — forces
+    // the ship/rebuild/return path and the merge's outstanding-wait.
+    static const bool steal_test = [] {
+      const char* e = std::getenv("FOF_STEAL_TEST");
+      return e && std::atoi(e) != 0;
+    }();
+    const bool skip_local = steal_test && (CkMyNode() % 2 == 1);
     const size_t CHUNK = 1;
-    for (;;) {
+    for (; !skip_local;) {
       size_t start = nb->phaseb_next.fetch_add(CHUNK);
       if (start >= nb->phaseb_pool.size()) break;
       size_t end = std::min(start + CHUNK, nb->phaseb_pool.size());
@@ -846,6 +908,7 @@ public:
     grid_thresh_ = grid_thresh;
     auto* nb = node_proxy.ckLocalBranch();
     if (nb->chain_started.fetch_add(1) == 0) nb->chain_t0 = CkWallTimer();
+    nb->group_proxy = this->thisProxy; // for the merge-time relabel fan
     phaseABody(b2);
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
@@ -927,6 +990,7 @@ public:
                           const typename FoFPhase1Node<Data>::PoolUnit& y) {
                          return x.key < y.key;
                        });
+      nb->phaseb_pool_ready.store(true, std::memory_order_release);
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].phaseBChained();
@@ -938,14 +1002,251 @@ public:
     phaseBBody(b2_); // b2_ set by phaseABody on this PE
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
-      double tm0 = CkWallTimer();
-      nb->mergeBody();
-      nb->stage_tM = CkWallTimer() - tm0;
-      int first = CkNodeFirst(CkMyNode());
-      for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
-        this->thisProxy[pe].relabelChained(nb->stage_tA, nb->stage_tB,
-                                           nb->stage_tM);
+      nb->pool_deposits_done.store(true, std::memory_order_release);
+      nb->tryTriggerMerge(); // fires now unless stolen batches are out
     }
+    // This PE's own pool work is done and deposited; offer to help other
+    // processes in the steal group (same physical machine by the
+    // FOF_STEAL_GROUP convention). Self-send so this entry returns first.
+    if (stealEnabled() && CkNumNodes() > 1)
+      this->thisProxy[CkMyPe()].startHelping();
+  }
+
+  // --- phaseB stealing (design/phaseb-offload.md stages 1-2). Statics
+  // configured by environment: FOF_STEAL=0 disables; FOF_STEAL_GROUP is
+  // the number of consecutive processes per physical machine (SLURM block
+  // placement; 8 on Anvil wholenode); FOF_STEAL_K is units per request.
+  static bool stealEnabled() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_STEAL");
+      return !(e && std::atoi(e) == 0);
+    }();
+    return on;
+  }
+  static int stealGroup() {
+    static const int g = [] {
+      const char* e = std::getenv("FOF_STEAL_GROUP");
+      int v = e ? std::atoi(e) : 8;
+      return v > 0 ? v : 8;
+    }();
+    return g;
+  }
+  static int stealK() {
+    static const int k = [] {
+      const char* e = std::getenv("FOF_STEAL_K");
+      int v = e ? std::atoi(e) : 4;
+      return v > 0 ? v : 4;
+    }();
+    return k;
+  }
+
+  // Helper-side state: victims left to try in my steal group.
+  std::vector<int> steal_victims;
+  size_t steal_victim_i = 0;
+
+  void startHelping() {
+    steal_victims.clear();
+    steal_victim_i = 0;
+    int mine = CkMyNode();
+    int g = stealGroup();
+    int lo = (mine / g) * g;
+    int hi = std::min(lo + g, CkNumNodes());
+    for (int j = mine + 1; j < hi; j++) steal_victims.push_back(j);
+    for (int j = lo; j < mine; j++) steal_victims.push_back(j);
+    askNextVictim();
+  }
+
+  void askNextVictim() {
+    if (steal_victim_i >= steal_victims.size()) return; // nothing left; idle
+    int victim = steal_victims[steal_victim_i];
+    this->thisProxy[CkNodeFirst(victim)].requestSteal(CkMyPe());
+  }
+
+  // Victim side: claim up to K units for the helper. outstanding++ comes
+  // BEFORE the cursor claim (see the node-branch comment); the deny path
+  // undoes it and re-checks the merge gate.
+  void requestSteal(int helper_pe) {
+    auto* nb = node_proxy.ckLocalBranch();
+    if (!nb->phaseb_pool_ready.load(std::memory_order_acquire)) {
+      // Not "drained" — phaseA has not finished here, so the pool does
+      // not exist yet. The heavy process is typically also the slow one
+      // through phaseA, so helpers must retry rather than give up (a
+      // fast process can finish its whole phaseB before a slow one
+      // builds its pool).
+      this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1)); // retry code
+      return;
+    }
+    int k = stealK();
+    nb->steal_outstanding.fetch_add(1, std::memory_order_acq_rel);
+    size_t start = nb->phaseb_next.fetch_add((size_t)k);
+    size_t pool = nb->phaseb_pool.size();
+    if (start >= pool || nb->merge_fired.load()) {
+      nb->steal_denials.fetch_add(1);
+      nb->steal_outstanding.fetch_sub(1, std::memory_order_acq_rel);
+      nb->tryTriggerMerge();
+      this->thisProxy[helper_pe].stealDenied(CkMyNode());
+      return;
+    }
+    size_t end = std::min(start + (size_t)k, pool);
+    paratreet::StealShipment<Data> ship;
+    ship.victim_node = CkMyNode();
+    for (size_t u = start; u < end; u++) {
+      ship.trees.emplace_back();
+      flattenStealTree(nb->phaseb_pool[u].a, ship.trees.back());
+      ship.trees.emplace_back();
+      flattenStealTree(nb->phaseb_pool[u].b, ship.trees.back());
+    }
+    nb->stolen_out_units.fetch_add((long)(end - start));
+    this->thisProxy[helper_pe].receiveSteal(ship);
+  }
+
+  void stealDenied(int victim_node) {
+    if (victim_node < 0) {
+      // Victim's pool is not built yet; retry the same victim after a
+      // short delay (timer-paced so the retries do not spin).
+      CcdCallFnAfter([](void* arg, double) {
+        auto* self = (FoFPhase1<Data>*)arg;
+        self->askNextVictim();
+      }, this, 1.0 /* ms */);
+      return;
+    }
+    steal_victim_i++;
+    askNextVictim();
+  }
+
+  // Helper side: rebuild the shipped trees, run each unit with the same
+  // walk and certificate semantics as phaseBBody but into LOCAL buffers
+  // (this PE's own phaseB members are long done; locals keep it
+  // re-entrant), return the edges, then ask the same victim again.
+  void receiveSteal(const paratreet::StealShipment<Data>& ship) {
+    std::vector<long> edges_flat;
+    std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> lseen;
+    std::unordered_map<Node<Data>*, long> lmemo;
+    auto emitLocal = [&](long ti, long tj) {
+      if (ti == tj) return;
+      long lo = std::min(ti, tj), hi = std::max(ti, tj);
+      if (lseen.insert(paratreet::packTipPair(lo, hi)).second) {
+        edges_flat.push_back(lo);
+        edges_flat.push_back(hi);
+      }
+    };
+    std::function<void(Node<Data>*, long)> starLocal =
+        [&](Node<Data>* n, long rep) {
+      if (n == nullptr || n->n_particles == 0) return;
+      if (n->isLeaf()) {
+        const Particle* p = n->particles();
+        for (int i = 0; i < n->n_particles; i++) emitLocal(rep, p[i].group_number);
+        return;
+      }
+      for (int i = 0; i < n->n_children; i++) starLocal(n->getChild(i), rep);
+    };
+    auto certLocal = [&](Node<Data>* n) -> long {
+      auto it = lmemo.find(n);
+      if (it != lmemo.end()) return it->second;
+      long rep = firstTip(n);
+      starLocal(n, rep);
+      lmemo.emplace(n, rep);
+      return rep;
+    };
+    long units = 0;
+    for (size_t t = 0; t + 1 < ship.trees.size(); t += 2) {
+      std::vector<Particle> pa = ship.trees[t].particles;
+      std::vector<Particle> pb = ship.trees[t + 1].particles;
+      Node<Data>* a = buildStealTree(ship.trees[t], pa);
+      Node<Data>* b = buildStealTree(ship.trees[t + 1], pb);
+      walk(a, b,
+           [&](Node<Data>* x, Node<Data>* y) {
+             const Particle* px = x->particles();
+             const Particle* py = y->particles();
+             for (int i = 0; i < x->n_particles; i++)
+               for (int j = 0; j < y->n_particles; j++) {
+                 if (paratreet::periodicDistSq(px[i].position, py[j].position,
+                                               period_) > b2_) continue;
+                 emitLocal(px[i].group_number, py[j].group_number);
+               }
+           },
+           [&](Node<Data>* x, Node<Data>* y) {
+             long tx = certLocal(x);
+             long ty = certLocal(y);
+             emitLocal(tx, ty);
+           },
+           [](Node<Data>*, Node<Data>*) { return false; });
+      deleteStealTree(a);
+      deleteStealTree(b);
+      units++;
+    }
+    node_proxy.ckLocalBranch()->stolen_in_units.fetch_add(units);
+    this->thisProxy[CkNodeFirst(ship.victim_node)].returnStolenEdges(edges_flat);
+    askNextVictim(); // same victim again (steal_victim_i unchanged)
+  }
+
+  // Victim side: merge a helper's edges and settle the batch.
+  void returnStolenEdges(const std::vector<long>& edges_flat) {
+    auto* nb = node_proxy.ckLocalBranch();
+    std::vector<std::pair<long, long>> es;
+    es.reserve(edges_flat.size() / 2);
+    for (size_t i = 0; i + 1 < edges_flat.size(); i += 2)
+      es.emplace_back(edges_flat[i], edges_flat[i + 1]);
+    nb->submitEdges(std::move(es));
+    nb->steal_outstanding.fetch_sub(1, std::memory_order_acq_rel);
+    nb->tryTriggerMerge();
+  }
+
+  // Preorder flatten of a pool-unit node's subtree: (key, spatial node)
+  // per node, leaf particles appended in the same preorder.
+  void flattenStealTree(Node<Data>* n, paratreet::StealTree<Data>& out) {
+    if (n == nullptr) {
+      // Absent child slot: key 0 marks it (real keys start at 1), so the
+      // preorder rebuild stays aligned without any key arithmetic.
+      out.nodes.emplace_back(Key(0), SpatialNode<Data>());
+      return;
+    }
+    out.nodes.emplace_back(n->key, SpatialNode<Data>(*n));
+    if (n->isLeaf()) {
+      const Particle* p = n->particles();
+      for (int i = 0; i < n->n_particles; i++) out.particles.push_back(p[i]);
+      return;
+    }
+    for (int i = 0; i < n->n_children; i++) flattenStealTree(n->getChild(i), out);
+  }
+
+  // Rebuild a shipped tree as private FullNodes over the (caller-owned)
+  // particle vector. FoF is oct-only (enforced at startup), so the branch
+  // factor is 8. Children are reconstructed by preorder position.
+  Node<Data>* buildStealTree(const paratreet::StealTree<Data>& t,
+                             std::vector<Particle>& parts) {
+    size_t ni = 0, pi = 0;
+    return buildStealNode(t, parts, ni, pi, nullptr);
+  }
+  Node<Data>* buildStealNode(const paratreet::StealTree<Data>& t,
+                             std::vector<Particle>& parts, size_t& ni,
+                             size_t& pi, Node<Data>* parent) {
+    if (ni >= t.nodes.size()) return nullptr;
+    const auto& kv = t.nodes[ni++];
+    if (kv.first == Key(0)) return nullptr; // absent child slot marker
+    const SpatialNode<Data>& sn = kv.second;
+    bool leaf = sn.n_particles >= 0;
+    auto type = leaf ? (sn.n_particles == 0 ? Node<Data>::Type::EmptyLeaf
+                                            : Node<Data>::Type::Leaf)
+                     : Node<Data>::Type::Internal;
+    Particle* pp = nullptr;
+    if (leaf && sn.n_particles > 0) {
+      pp = parts.data() + pi;
+      pi += sn.n_particles;
+    }
+    auto* node = new FullNode<Data, 8>(kv.first, type, sn, pp, parent, -1, -1);
+    if (!leaf) {
+      for (int i = 0; i < node->n_children; i++) {
+        Node<Data>* c = buildStealNode(t, parts, ni, pi, node);
+        node->exchangeChild(i, c);
+      }
+    }
+    return node;
+  }
+  void deleteStealTree(Node<Data>* n) {
+    if (n == nullptr) return;
+    for (int i = 0; i < n->n_children; i++) deleteStealTree(n->getChild(i));
+    delete n;
   }
 
   void relabelChained(double tA, double tB, double tM) {
