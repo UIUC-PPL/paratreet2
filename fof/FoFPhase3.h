@@ -109,6 +109,23 @@ public:
   // boundary fetches. The transposed walk (the standing oracle) does NOT
   // consult this trait, so oracle comparisons independently re-check it.
   static constexpr const bool SkipLocalSource = true;
+  // Symmetry prune (Traverser.h dualSkipMirroredPairs; Kale, 2026-08-05):
+  // the dual walk otherwise processes every tree-piece pair from both
+  // sides, and since the FoF edge set is symmetric in the pair, every
+  // cross-process edge was discovered twice (the gather's exact 2:1
+  // sent-to-unique ratio). Keep each pair on one side only. Correct
+  // because every witness particle pair lives in some tree-piece pair,
+  // exactly one side keeps that pair, and that side's process emits the
+  // edge — so every true adjacency is still represented at least once
+  // globally; the gather root and the union-find library both absorb
+  // any remaining multiplicity. (The alternative — both sides walk,
+  // emission filtered by a parity rule on the tip pair — would save
+  // only the duplicate edge transport, not the duplicated walk and
+  // cache fetches, and does NOT compose with this prune: with pair
+  // pruning active, a tip pair may be discoverable on only one side,
+  // and a parity filter could select the other. One mechanism, not
+  // both.)
+  static constexpr const bool SkipMirroredPairs = true;
 
   CProxy_FoFPhase1<FragData> fof;
   double b2 = 0.0;

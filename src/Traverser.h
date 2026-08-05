@@ -100,6 +100,28 @@ constexpr auto dualSkipLocalSource(int) -> decltype(V::SkipLocalSource) {
 template <typename V>
 constexpr bool dualSkipLocalSource(long) { return false; }
 
+// Opt-in DualTraverser symmetry prune (same opt-in idiom): the dual walk
+// processes every tree-piece pair (A, B) twice — once with A as the
+// target on A's processor, once with B as the target on B's — so a
+// visitor whose output is symmetric in the pair (declares
+// `static constexpr bool SkipMirroredPairs = true`) does every pairwise
+// discovery twice (measured: the FoF edge gather receives exactly two
+// copies of every edge). The prune keeps exactly one side per pair with
+// a balanced tie-break: when the index sum is even the LOWER-indexed
+// target keeps the pair, when odd the HIGHER-indexed one does — so each
+// tree piece keeps about half of its counterpart set, instead of
+// low-indexed pieces keeping everything. Applied only once the source
+// node is known to belong to a single tree piece (tp_index >= 0: the
+// subtree root and below, where the real work is); undecided regions
+// descend as before. Self pairs (source piece == target piece) are
+// never dropped here — they keep their historical handling.
+template <typename V>
+constexpr auto dualSkipMirroredPairs(int) -> decltype(V::SkipMirroredPairs) {
+  return V::SkipMirroredPairs;
+}
+template <typename V>
+constexpr bool dualSkipMirroredPairs(long) { return false; }
+
 // Squared min distance between two nodes' bounding boxes (every paratreet
 // Data carries `box`; see the Data-concept requirement). Used only to ORDER
 // child exploration (closest first), so open-boundary distance is fine even
@@ -742,6 +764,18 @@ public:
            node->type == Node<Data>::Type::EmptyLeaf ||
            node->type == Node<Data>::Type::Internal)) {
         continue;
+      }
+      // Symmetry prune (see dualSkipMirroredPairs above): once the source
+      // is known to belong to a single tree piece, keep the pair on
+      // exactly one of its two owners (balanced tie-break), discard the
+      // mirror.
+      if (dualSkipMirroredPairs<Visitor>(0) && node->tp_index >= 0 &&
+          node->tp_index != tp.thisIndex) {
+        int target_piece = tp.thisIndex, source_piece = node->tp_index;
+        bool keep = (((target_piece + source_piece) & 1) == 0)
+                        ? (target_piece < source_piece)
+                        : (target_piece > source_piece);
+        if (!keep) continue;
       }
       switch (node->type) {
         case Node<Data>::Type::Leaf:
