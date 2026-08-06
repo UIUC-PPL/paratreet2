@@ -1023,14 +1023,13 @@ public:
   // the number of consecutive processes per physical machine (SLURM block
   // placement; 8 on Anvil wholenode); FOF_STEAL_K is units per request.
   static bool stealEnabled() {
-    // OPT-IN until the 80M-scale discrepancy is diagnosed (2026-08-06: a
-    // traced 480-PE run with steals active produced two spurious merges
-    // of large components — 23,707,195 instead of 23,707,197 — while
-    // every laptop-scale forced-steal validation passes; the defect is
-    // probabilistic in which units are stolen). FOF_STEAL=1 enables.
+    // Default ON (restored 2026-08-06 after the stale-memo fix, commit
+    // 82de369, was validated at the scale that exposed it: four
+    // steals-active runs at 80M/480 processors, serial and distributed,
+    // all bit-exact against ground truth). FOF_STEAL=0 disables.
     static const bool on = [] {
       const char* e = std::getenv("FOF_STEAL");
-      return e && std::atoi(e) == 1;
+      return !(e && std::atoi(e) == 0);
     }();
     return on;
   }
