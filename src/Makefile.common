@@ -89,9 +89,14 @@ FOF_LD_LIBS = -L$(FOF_PATH) -lfof -L$(UNION_FIND_DIR) -lunionFind -L${PREFIX_LIB
 HAS_SYSTEM_XDR := $(shell printf '\043include <rpc/xdr.h>\n' | $(CC) -E - >/dev/null 2>&1 && echo yes)
 ifeq ($(HAS_SYSTEM_XDR),yes)
 	# Use system RPC XDR library
-	# Try different library names depending on the system
-	HAS_LIBRPC := $(shell $(CC) -lrpc -xc /dev/null -o /dev/null >/dev/null 2>&1 && echo yes)
-	HAS_LIBTIRPC := $(shell $(CC) -ltirpc -xc /dev/null -o /dev/null >/dev/null 2>&1 && echo yes)
+	# Try different library names depending on the system.
+	# NOTE: link a real main() here, not /dev/null — an empty translation
+	# unit has no main symbol, and strict linkers (e.g. lld, as used by the
+	# Cray cc wrapper) fail such a link with "undefined symbol: main"
+	# regardless of whether the requested library resolves, producing a
+	# false "not found" for libraries that actually work.
+	HAS_LIBRPC := $(shell echo 'int main(){return 0;}' | $(CC) -xc - -lrpc -o /dev/null >/dev/null 2>&1 && echo yes)
+	HAS_LIBTIRPC := $(shell echo 'int main(){return 0;}' | $(CC) -xc - -ltirpc -o /dev/null >/dev/null 2>&1 && echo yes)
 	ifeq ($(HAS_LIBRPC),yes)
 		LD_LIBS:=$(LD_LIBS) -lrpc
 	else ifeq ($(HAS_LIBTIRPC),yes)
