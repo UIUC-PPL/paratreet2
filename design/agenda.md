@@ -34,7 +34,15 @@ points at its design note where one exists. Started 2026-08-05.
    nodes (refill_recvs deadlock alerts then poll_comp_impl assert
    during the input flush); the idle-stall itself (dist uf2 3.7 s at
    80M/16 nodes with the keep-alive ring on).
-9. Distributed union-find mode: batch the component-labeling requests
+9. IN PROGRESS 2026-08-06: eliminate the component counter's particle
+   pass (Kale's design, 2026-08-06). Count per union-find root during
+   the phaseA freeze pass (dense array increment beside the existing
+   find()); carry the per-processor tip-count map through every label
+   rewrite the particles undergo; depositLabelCounts then deposits the
+   map instead of re-counting all particles. Removes the 60 ms band at
+   80M (projected ~300 ms per processor at 2B); debug flag keeps the
+   old particle loop as a cross-check.
+10. Distributed union-find mode: batch the component-labeling requests
    per destination chare. The labeling scatter (boss_count_prefix_done ->
    insertDataNeedBoss, observed ~1400 sends from one chare at 2B) already
    deduplicates by parent through a cache; flushing per destination would
@@ -42,8 +50,8 @@ points at its design note where one exists. Started 2026-08-05.
    important (Kale, 2026-08-05) and has been competitive — this and its
    quiescence-closed labeling phase are its main remaining fine-grained
    patterns.
-10. Load-balancing benefit study (GreedyRefine path is validated;
+11. Load-balancing benefit study (GreedyRefine path is validated;
    deferred by Kale until "much later").
-11. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
+12. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
     only as an explicit study, e.g. >16-node dist campaigns.
-12. ChaNGa integration: waiting on Kale's go.
+13. ChaNGa integration: waiting on Kale's go.
