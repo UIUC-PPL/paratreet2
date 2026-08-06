@@ -844,6 +844,12 @@ public:
       size_t end = std::min(start + CHUNK, nb->phaseb_pool.size());
       for (size_t k = start; k < end; k++) {
           t_phaseB_units++;
+          static const bool steal_selftest = [] {
+            const char* e = std::getenv("FOF_STEAL_SELFTEST");
+            return e && std::atoi(e) != 0;
+          }();
+          if (steal_selftest)
+            selftestStolenUnit(nb->phaseb_pool[k].a, nb->phaseb_pool[k].b);
           double tp0 = CkWallTimer();
           walk(nb->phaseb_pool[k].a, nb->phaseb_pool[k].b,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
@@ -1123,17 +1129,19 @@ public:
   // walk and certificate semantics as phaseBBody but into LOCAL buffers
   // (this PE's own phaseB members are long done; locals keep it
   // re-entrant), return the edges, then ask the same victim again.
-  void receiveSteal(const paratreet::StealShipment<Data>& ship) {
-    std::vector<long> edges_flat;
+  // Execute one unit over any node pair (live or rebuilt) into a local,
+  // per-call edge set — the identical walk, certificate, and dedup
+  // semantics as phaseBBody, with no shared state. Used by the helper
+  // executor and by the self-test.
+  void walkUnitEdges(Node<Data>* a, Node<Data>* b,
+                     std::vector<std::pair<long, long>>& out) {
     std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> lseen;
     std::unordered_map<Node<Data>*, long> lmemo;
     auto emitLocal = [&](long ti, long tj) {
       if (ti == tj) return;
       long lo = std::min(ti, tj), hi = std::max(ti, tj);
-      if (lseen.insert(paratreet::packTipPair(lo, hi)).second) {
-        edges_flat.push_back(lo);
-        edges_flat.push_back(hi);
-      }
+      if (lseen.insert(paratreet::packTipPair(lo, hi)).second)
+        out.emplace_back(lo, hi);
     };
     std::function<void(Node<Data>*, long)> starLocal =
         [&](Node<Data>* n, long rep) {
@@ -1153,29 +1161,39 @@ public:
       lmemo.emplace(n, rep);
       return rep;
     };
+    walk(a, b,
+         [&](Node<Data>* x, Node<Data>* y) {
+           const Particle* px = x->particles();
+           const Particle* py = y->particles();
+           for (int i = 0; i < x->n_particles; i++)
+             for (int j = 0; j < y->n_particles; j++) {
+               if (paratreet::periodicDistSq(px[i].position, py[j].position,
+                                             period_) > b2_) continue;
+               emitLocal(px[i].group_number, py[j].group_number);
+             }
+         },
+         [&](Node<Data>* x, Node<Data>* y) {
+           long tx = certLocal(x);
+           long ty = certLocal(y);
+           emitLocal(tx, ty);
+         },
+         [](Node<Data>*, Node<Data>*) { return false; });
+  }
+
+  void receiveSteal(const paratreet::StealShipment<Data>& ship) {
+    std::vector<long> edges_flat;
     long units = 0;
     for (size_t t = 0; t + 1 < ship.trees.size(); t += 2) {
       std::vector<Particle> pa = ship.trees[t].particles;
       std::vector<Particle> pb = ship.trees[t + 1].particles;
       Node<Data>* a = buildStealTree(ship.trees[t], pa);
       Node<Data>* b = buildStealTree(ship.trees[t + 1], pb);
-      walk(a, b,
-           [&](Node<Data>* x, Node<Data>* y) {
-             const Particle* px = x->particles();
-             const Particle* py = y->particles();
-             for (int i = 0; i < x->n_particles; i++)
-               for (int j = 0; j < y->n_particles; j++) {
-                 if (paratreet::periodicDistSq(px[i].position, py[j].position,
-                                               period_) > b2_) continue;
-                 emitLocal(px[i].group_number, py[j].group_number);
-               }
-           },
-           [&](Node<Data>* x, Node<Data>* y) {
-             long tx = certLocal(x);
-             long ty = certLocal(y);
-             emitLocal(tx, ty);
-           },
-           [](Node<Data>*, Node<Data>*) { return false; });
+      std::vector<std::pair<long, long>> es;
+      walkUnitEdges(a, b, es);
+      for (auto& e : es) {
+        edges_flat.push_back(e.first);
+        edges_flat.push_back(e.second);
+      }
       deleteStealTree(a);
       deleteStealTree(b);
       units++;
@@ -1183,6 +1201,59 @@ public:
     node_proxy.ckLocalBranch()->stolen_in_units.fetch_add(units);
     this->thisProxy[CkNodeFirst(ship.victim_node)].returnStolenEdges(edges_flat);
     askNextVictim(); // same victim again (steal_victim_i unchanged)
+  }
+
+  // Self-test (FOF_STEAL_SELFTEST=1, debug): for every locally claimed
+  // pool unit, run the direct walk AND the full ship-path replica —
+  // flatten, serialize and deserialize through memory (the same pup code
+  // marshalled messages use), rebuild, walk — and abort on the first
+  // difference between the two edge sets. Covers every unit of every
+  // process, orders of magnitude more than real steals exercise.
+  void selftestStolenUnit(Node<Data>* a, Node<Data>* b) {
+    std::vector<std::pair<long, long>> direct;
+    walkUnitEdges(a, b, direct);
+    paratreet::StealShipment<Data> ship;
+    ship.trees.emplace_back();
+    flattenStealTree(a, ship.trees.back());
+    ship.trees.emplace_back();
+    flattenStealTree(b, ship.trees.back());
+    PUP::sizer sz;
+    ship.pup(sz);
+    std::vector<char> buf(sz.size());
+    PUP::toMem tm(buf.data());
+    ship.pup(tm);
+    paratreet::StealShipment<Data> ship2;
+    PUP::fromMem fm(buf.data());
+    ship2.pup(fm);
+    std::vector<Particle> pa = ship2.trees[0].particles;
+    std::vector<Particle> pb = ship2.trees[1].particles;
+    Node<Data>* ra = buildStealTree(ship2.trees[0], pa);
+    Node<Data>* rb = buildStealTree(ship2.trees[1], pb);
+    std::vector<std::pair<long, long>> rebuilt;
+    walkUnitEdges(ra, rb, rebuilt);
+    deleteStealTree(ra);
+    deleteStealTree(rb);
+    std::sort(direct.begin(), direct.end());
+    std::sort(rebuilt.begin(), rebuilt.end());
+    if (direct != rebuilt) {
+      CkPrintf("STEAL SELFTEST MISMATCH pe %d: direct %zu edges, rebuilt "
+               "%zu edges (unit roots %llx %llx)\n",
+               CkMyPe(), direct.size(), rebuilt.size(),
+               (unsigned long long)a->key, (unsigned long long)b->key);
+      for (size_t i = 0; i < std::max(direct.size(), rebuilt.size()); i++) {
+        if (i >= direct.size() || i >= rebuilt.size() ||
+            direct[i] != rebuilt[i]) {
+          CkPrintf("  first difference at %zu: direct (%ld,%ld) rebuilt "
+                   "(%ld,%ld)\n", i,
+                   i < direct.size() ? direct[i].first : -1,
+                   i < direct.size() ? direct[i].second : -1,
+                   i < rebuilt.size() ? rebuilt[i].first : -1,
+                   i < rebuilt.size() ? rebuilt[i].second : -1);
+          break;
+        }
+      }
+      CkAbort("steal self-test mismatch");
+    }
   }
 
   // Victim side: merge a helper's edges and settle the batch.
