@@ -1042,10 +1042,12 @@ public:
     return g;
   }
   static int stealK() {
+    // Default 16 (2026-08-06): the 2B A/B showed grant throughput, not
+    // helper time, bounds stealing — bigger batches per round trip.
     static const int k = [] {
       const char* e = std::getenv("FOF_STEAL_K");
-      int v = e ? std::atoi(e) : 4;
-      return v > 0 ? v : 4;
+      int v = e ? std::atoi(e) : 16;
+      return v > 0 ? v : 16;
     }();
     return k;
   }
@@ -1069,7 +1071,13 @@ public:
   void askNextVictim() {
     if (steal_victim_i >= steal_victims.size()) return; // nothing left; idle
     int victim = steal_victims[steal_victim_i];
-    this->thisProxy[CkNodeFirst(victim)].requestSteal(CkMyPe());
+    // Serve from ALL of the victim's processors, spread by requester: the
+    // pool cursor is atomic and the shipped trees are frozen, so any PE
+    // can serve. The 2B A/B measured the single-PE server as the grant
+    // bottleneck (65 grants in a 3-second window while it also walked its
+    // own units).
+    int serve_pe = CkNodeFirst(victim) + (CkMyPe() % CmiNodeSize(victim));
+    this->thisProxy[serve_pe].requestSteal(CkMyPe());
   }
 
   // Victim side: claim up to K units for the helper. outstanding++ comes
@@ -1180,6 +1188,9 @@ public:
   }
 
   void receiveSteal(const paratreet::StealShipment<Data>& ship) {
+    // Pipeline: request the next batch BEFORE walking this one, so the
+    // victim prepares the next shipment while this processor works.
+    askNextVictim();
     std::vector<long> edges_flat;
     long units = 0;
     for (size_t t = 0; t + 1 < ship.trees.size(); t += 2) {
@@ -1199,7 +1210,6 @@ public:
     }
     node_proxy.ckLocalBranch()->stolen_in_units.fetch_add(units);
     this->thisProxy[CkNodeFirst(ship.victim_node)].returnStolenEdges(edges_flat);
-    askNextVictim(); // same victim again (steal_victim_i unchanged)
   }
 
   // Self-test (FOF_STEAL_SELFTEST=1, debug): for every locally claimed
