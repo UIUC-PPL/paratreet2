@@ -34,7 +34,7 @@ points at its design note where one exists. Started 2026-08-05.
    nodes (refill_recvs deadlock alerts then poll_comp_impl assert
    during the input flush); the idle-stall itself (dist uf2 3.7 s at
    80M/16 nodes with the keep-alive ring on).
-9. IN PROGRESS 2026-08-06: eliminate the component counter's particle
+9. DONE 2026-08-06 (freeze-pass counting commit): eliminated the component counter's particle
    pass (Kale's design, 2026-08-06). Count per union-find root during
    the phaseA freeze pass (dense array increment beside the existing
    find()); carry the per-processor tip-count map through every label
