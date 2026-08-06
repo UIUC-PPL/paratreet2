@@ -34,8 +34,16 @@ points at its design note where one exists. Started 2026-08-05.
    nodes (refill_recvs deadlock alerts then poll_comp_impl assert
    during the input flush); the idle-stall itself (dist uf2 3.7 s at
    80M/16 nodes with the keep-alive ring on).
-9. Load-balancing benefit study (GreedyRefine path is validated;
+9. Distributed union-find mode: batch the component-labeling requests
+   per destination chare. The labeling scatter (boss_count_prefix_done ->
+   insertDataNeedBoss, observed ~1400 sends from one chare at 2B) already
+   deduplicates by parent through a cache; flushing per destination would
+   collapse it to at most one message per peer chare. Dist mode remains
+   important (Kale, 2026-08-05) and has been competitive — this and its
+   quiescence-closed labeling phase are its main remaining fine-grained
+   patterns.
+10. Load-balancing benefit study (GreedyRefine path is validated;
    deferred by Kale until "much later").
-10. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
+11. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
     only as an explicit study, e.g. >16-node dist campaigns.
-11. ChaNGa integration: waiting on Kale's go.
+12. ChaNGa integration: waiting on Kale's go.
