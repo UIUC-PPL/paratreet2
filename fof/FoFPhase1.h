@@ -747,10 +747,24 @@ public:
     }
 
     // Freeze + compress: write tip id (order of the component's min-order
-    // root particle) into every particle.
+    // root particle) into every particle. Component counting rides this
+    // pass (Kale's design, 2026-08-06): one dense-array increment per
+    // particle beside the find() that already runs, replacing the
+    // component counter's separate full-particle hashing pass. The
+    // per-tip counts then mirror every label rewrite the particles
+    // undergo (relabelBody, applyTipEncoding, applyGlobalMap,
+    // applyUF2Labels), so depositLabelCounts can deposit this map
+    // directly.
+    std::vector<long> root_counts(uf_parent.size(), 0);
     for (auto& s : subtrees)
-      for (int i = 0; i < s.n; i++)
-        s.parts[i].group_number = flat_order[find(s.offset + i)];
+      for (int i = 0; i < s.n; i++) {
+        int r = find(s.offset + i);
+        s.parts[i].group_number = flat_order[r];
+        root_counts[r]++;
+      }
+    tip_counts.clear();
+    for (size_t r = 0; r < root_counts.size(); r++)
+      if (root_counts[r] > 0) tip_counts[flat_order[r]] = root_counts[r];
 
     t_phaseA = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
   }
@@ -825,6 +839,21 @@ public:
         if (it != tip_map.end()) s.parts[i].group_number = it->second;
       }
     }
+    rekeyTipCounts(tip_map);
+  }
+
+  // Rewrite the counting map's keys through a label map, merging counts
+  // when several old labels land on one new label — the counting-side
+  // mirror of a particle relabel (identity where absent).
+  void rekeyTipCounts(const std::unordered_map<long, long>& label_map) {
+    if (label_map.empty() || tip_counts.empty()) return;
+    std::unordered_map<long, long> next;
+    next.reserve(tip_counts.size());
+    for (auto& kv : tip_counts) {
+      auto it = label_map.find(kv.first);
+      next[it != label_map.end() ? it->second : kv.first] += kv.second;
+    }
+    tip_counts.swap(next);
   }
 
   // --- Within-process chain (design/phase1-scaling.md, 2026-07-25).
@@ -998,6 +1027,12 @@ public:
         s.parts[i].group_number = (long)paratreet::uf2EncodeTip(my_node, tip);
       }
     }
+    // Counting-side mirror of the encoding rewrite.
+    std::unordered_map<long, long> next;
+    next.reserve(tip_counts.size());
+    for (auto& kv : tip_counts)
+      next[(long)paratreet::uf2EncodeTip(my_node, kv.first)] = kv.second;
+    tip_counts.swap(next);
     this->contribute(cb);
   }
 
@@ -1111,6 +1146,17 @@ public:
           s.parts[i].group_number = -(it->second + 2);
         } // else: untouched fragment keeps its encoded tip
       }
+    }
+    // Counting-side mirror of the label application.
+    {
+      std::unordered_map<long, long> next;
+      next.reserve(tip_counts.size());
+      for (auto& kv : tip_counts) {
+        uint64_t local_id = (uint64_t)kv.first & paratreet::kUF2IdxMask;
+        auto it = labels.find(local_id);
+        next[it != labels.end() ? -(it->second + 2) : kv.first] += kv.second;
+      }
+      tip_counts.swap(next);
     }
     this->contribute(cb);
   }
@@ -1426,9 +1472,25 @@ public:
     int n_shards = CkNodeSize(CkMyNode());
     auto* nb = node_proxy.ckLocalBranch();
     nb->ensureLabelShards(n_shards);
-    std::unordered_map<long, long> counts;
-    for (auto& s : subtrees)
-      for (int i = 0; i < s.n; i++) counts[s.parts[i].group_number]++;
+    // The counts were maintained through every label rewrite since the
+    // phaseA freeze (Kale's design, 2026-08-06) — no particle pass here.
+    // FOF_COUNT_VERIFY=1 recomputes from the particles and compares.
+    static const bool count_verify = [] {
+      const char* e = std::getenv("FOF_COUNT_VERIFY");
+      return e && std::atoi(e) != 0;
+    }();
+    if (count_verify) {
+      std::unordered_map<long, long> check;
+      for (auto& s : subtrees)
+        for (int i = 0; i < s.n; i++) check[s.parts[i].group_number]++;
+      if (check != tip_counts) {
+        CkPrintf("COUNT VERIFY MISMATCH pe %d: maintained %zu labels, "
+                 "recount %zu labels\n", CkMyPe(), tip_counts.size(),
+                 check.size());
+        CkAbort("freeze-time component counts diverge from particle labels");
+      }
+    }
+    std::unordered_map<long, long>& counts = tip_counts;
     std::vector<std::vector<std::pair<long, long>>> buckets(n_shards);
     for (auto& kv : counts)
       buckets[labelShardMix(kv.first) % n_shards].emplace_back(kv.first,
@@ -1506,6 +1568,7 @@ public:
         if (it != tip_map.end()) s.parts[i].group_number = it->second;
       }
     }
+    rekeyTipCounts(tip_map);
     this->contribute(cb);
   }
 
@@ -1952,6 +2015,9 @@ private:
   std::vector<long> flat_order; // flat index -> global particle order
   std::vector<std::pair<long, long>> edge_buf;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen;
+  // Per-PE component sizes keyed by the CURRENT label of each component
+  // (maintained through every label rewrite; see the freeze pass).
+  std::unordered_map<long, long> tip_counts;
   // Phase-3 cross-process buffers (kept separate from phaseB's, above).
   std::vector<std::pair<long, long>> edge_buf3;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;
