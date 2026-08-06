@@ -1081,8 +1081,11 @@ public:
     return k;
   }
 
-  // Helper-side state: victims left to try in my steal group.
+  // Helper-side state: victims in my steal group, with done flags; the
+  // helper cycles passes over the not-done victims until every one has
+  // finally denied (drained or merged).
   std::vector<int> steal_victims;
+  std::vector<char> steal_victim_done;
   size_t steal_victim_i = 0;
 
   void startHelping() {
@@ -1094,11 +1097,21 @@ public:
     int hi = std::min(lo + g, CkNumNodes());
     for (int j = mine + 1; j < hi; j++) steal_victims.push_back(j);
     for (int j = lo; j < mine; j++) steal_victims.push_back(j);
+    steal_victim_done.assign(steal_victims.size(), 0);
     askNextVictim();
   }
 
   void askNextVictim() {
-    if (steal_victim_i >= steal_victims.size()) return; // nothing left; idle
+    // Advance to the next not-done victim, wrapping; stop only when all
+    // are done. Wrap passes are paced by the not-ready/not-needy retry
+    // delays, so this does not spin.
+    size_t n = steal_victims.size();
+    for (size_t step = 0; step < n; step++) {
+      size_t i = (steal_victim_i + step) % n;
+      if (!steal_victim_done[i]) { steal_victim_i = i; break; }
+      if (step + 1 == n) return; // every victim finished; idle
+    }
+    if (n == 0) return;
     int victim = steal_victims[steal_victim_i];
     // Serve from ALL of the victim's processors, spread by requester: the
     // pool cursor is atomic and the shipped trees are frozen, so any PE
@@ -1114,6 +1127,13 @@ public:
   // undoes it and re-checks the merge gate.
   void requestSteal(int helper_pe) {
     auto* nb = node_proxy.ckLocalBranch();
+    // Need gate (v3, 2026-08-06): grant only when the remaining pool
+    // exceeds a couple of rounds of this process's own local claiming —
+    // otherwise the pool drains fine without help, and grants to light
+    // victims just divert helpers from the heavy one (measured in the
+    // v2 round: shipments tripled but scattered across all victims, and
+    // the heavy process's share never rose). A busy-but-not-needy deny
+    // keeps this victim on the helper's list for a later pass.
     if (!nb->phaseb_pool_ready.load(std::memory_order_acquire)) {
       // Not "drained" — phaseA has not finished here, so the pool does
       // not exist yet. The heavy process is typically also the slow one
@@ -1122,6 +1142,18 @@ public:
       // builds its pool).
       this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1)); // retry code
       return;
+    }
+    {
+      size_t cursor = nb->phaseb_next.load(std::memory_order_relaxed);
+      size_t pool = nb->phaseb_pool.size();
+      size_t need_floor = (size_t)CkNodeSize(CkMyNode()) * 2;
+      if (cursor < pool && pool - cursor <= need_floor &&
+          !nb->merge_fired.load()) {
+        // Not needy right now: the tail drains locally. Retryable-lite:
+        // the helper moves on but keeps this victim for another pass.
+        this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1 + (1 << 20)));
+        return;
+      }
     }
     int k = stealK();
     nb->steal_outstanding.fetch_add(1, std::memory_order_acq_rel);
@@ -1149,15 +1181,29 @@ public:
 
   void stealDenied(int victim_node) {
     if (victim_node < 0) {
-      // Victim's pool is not built yet; retry the same victim after a
-      // short delay (timer-paced so the retries do not spin).
+      bool not_needy = (-victim_node) > (1 << 20);
+      if (not_needy) {
+        // Busy but self-sufficient right now: move on, but keep it on
+        // the list — a later pass re-checks (its tail may grow long, or
+        // this was the heavy victim mid-drain and the gate reopens).
+        steal_victim_i = (steal_victim_i + 1) % std::max<size_t>(steal_victims.size(), 1);
+        CcdCallFnAfter([](void* arg, double) {
+          auto* self = (FoFPhase1<Data>*)arg;
+          self->askNextVictim();
+        }, this, 2.0 /* ms */);
+        return;
+      }
+      // Pool not built yet; retry the same victim after a short delay.
       CcdCallFnAfter([](void* arg, double) {
         auto* self = (FoFPhase1<Data>*)arg;
         self->askNextVictim();
       }, this, 1.0 /* ms */);
       return;
     }
-    steal_victim_i++;
+    // Final deny: drained or merged — this victim is done for the phase.
+    if (steal_victim_i < steal_victim_done.size())
+      steal_victim_done[steal_victim_i] = 1;
+    steal_victim_i = (steal_victim_i + 1) % std::max<size_t>(steal_victims.size(), 1);
     askNextVictim();
   }
 
