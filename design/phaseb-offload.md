@@ -162,3 +162,27 @@ Readout lines: "FOF3STAT steal: process P out U in V denials D" per
 involved process at its merge; "FOF3STAT balance: phaseB_s min/avg/max"
 for the wall; the components line is the correctness gate (80M
 lambb.00500: 23,707,197; 2B cosmo25cmb: 424,897,832).
+
+## 8. v3 verdict (2026-08-06 late, 2B on 16 Anvil nodes)
+
+Correctness exact in all six runs. The need gate concentrated grants
+(single victims shipped up to 496 units — 43 percent of a heavy-sized
+pool — against v2's scatter), and the wall still did not move (off
+3.12-3.47 s, on 3.17-3.26 s). The contradiction with drain arithmetic
+is the finding: if that share of the heavy pool had really executed
+elsewhere, the wall must fall. Conclusion: the 2-rounds-of-local-work
+admission threshold is far too permissive — mid-weight victims with a
+few hundred units still grant freely, and the top shipper was likely
+not the wall-owning process at all.
+
+v4 requirements (the original stage-1 design, no longer optional):
+1. Publish the remaining-work metric (pool size minus cursor, and its
+   cost sum) so helpers target the MAXIMUM, instead of gating admission
+   locally at each victim.
+2. Per-process instrumentation first: one line per process at merge
+   (pool size, phaseB stage wall, units granted) so the heavy process
+   and its actual grant share are identified from one run, not
+   inferred. The three nulls so far were each diagnosed indirectly;
+   this line ends that.
+3. Re-examine the admission threshold in time units (projected
+   remaining seconds at the victim's own drain rate), not unit counts.

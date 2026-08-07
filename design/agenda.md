@@ -17,8 +17,12 @@ points at its design note where one exists. Started 2026-08-05.
    quiescence detection at all. FOF_WALK_QD=1 keeps the quiescence
    path as the A/B oracle; Anvil-scale bracket measurement rides the
    next measurement round.
-3. Steal-based phaseB cross-process offload (design/phaseb-offload.md),
-   built against the framework pool from item 1.
+3. Steal-based phaseB cross-process offload (design/phaseb-offload.md
+   sections 6-8): v1-v3 measured at 2B — correct at every round, wall
+   unmoved at ~3.1 s. v4 needs the published remaining-work metric with
+   helpers targeting the maximum, per-process merge-time
+   instrumentation, and a time-based admission threshold; then the
+   framework-pool rebuild (item 1).
 4. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
    1.65 s at 16; design/speedup-campaign-2026-08-05.md follow-up 2):
    profile splitter computation and particle flush at 1920 PEs.
