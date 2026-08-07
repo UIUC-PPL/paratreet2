@@ -1033,15 +1033,20 @@ public:
           const char* e = std::getenv("FOF_POOL_SPLIT_SIZE");
           return e ? std::atof(e) : 0.0;
         }();
-        bool stop_here;
-        if (split_size > 0) {
+        // The size rule is ADDITIVE: it may only split MORE than the
+        // depth rule, never less. Measured 2026-08-07 at 80M with the
+        // first (replacing) version, C=12 produced a LARGER largest unit
+        // than the baseline (0.115 s against 0.063 s) because a pair
+        // whose boxes were already under the threshold stopped
+        // immediately, including pairs the depth rule would have split.
+        bool depth_stop = depth >= max_depth || (depth == 1 && d2 > 0) ||
+                          a->isLeaf() || b->isLeaf();
+        bool stop_here = depth_stop;
+        if (split_size > 0 && !a->isLeaf() && !b->isLeaf() && depth < 6) {
           const double blen = std::sqrt(b2_);
           bool still_big = boxMeasure(a) > split_size * blen ||
                            boxMeasure(b) > split_size * blen;
-          stop_here = depth >= 6 || a->isLeaf() || b->isLeaf() || !still_big;
-        } else {
-          stop_here = depth >= max_depth || (depth == 1 && d2 > 0) ||
-                      a->isLeaf() || b->isLeaf();
+          if (still_big) stop_here = false;   // keep splitting big pairs
         }
         if (stop_here) {
           // LPT key, pure geometry (no thresholds): overlapping pairs
