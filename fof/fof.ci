@@ -53,6 +53,7 @@ module fof {
     entry void setPeriod(Vector3D<Real> period, const CkCallback&);
     entry void startPhase1Chain(double b2, double grid_thresh, const CkCallback&);
     entry void phaseBChained();
+    entry void buildPoolSlice();
     entry void relabelChained(double tA, double tB, double tM);
     entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);
