@@ -221,3 +221,35 @@ Amendments (Kale, 2026-08-07, second round):
   or binding exists on the donor side; convergence of many helpers on
   the neediest donor is the intended many-to-one shape, on the helper
   side only.
+
+## 10. v4 implemented (2026-08-07, commit 44edf47)
+
+Scheme as specified in sections 8-9, with the grant gate at MORE THAN
+TWO BATCHES remaining (Kale). Helpers probe every machine-mate, target
+the maximum remaining, take a batch, re-probe; donors serve any number
+of helpers concurrently via independent atomic claims.
+
+Two protocol lessons from bringing it up, both of which cost a hang:
+
+1. ONE AUTHORITY PER DECISION. The first draft filtered victims on the
+   helper side using its own copy of the two-batch threshold, so a
+   donor with a small remainder was never asked — and the donor is the
+   only party that knows whether its own threads are still draining
+   that remainder. Result: a stranded tail and a phase that never
+   merged. Helpers now rank; donors decide. The donor also skips its
+   own gate once its threads have deposited, because only helpers can
+   drain what is left at that point.
+2. PACE EVERY RETRY. An immediate re-probe after a denial turned
+   helper and donor into a deny/probe message storm — the machine ran
+   at full load with no forward progress. Both retry paths (not-ready,
+   not-needy) are timer-paced at 1-2 ms.
+
+Measured by the new accounting, answering section 9.2's open item:
+flattening costs about 0.09 ms per unit (110.6 ms for 1178 units), so
+a 16-unit batch costs ~1.5 ms to prepare and ~1 ms on the wire against
+~0.6 s of moved walk work. Steal overhead is not a factor at any
+threshold we would plausibly choose.
+
+Accounting line (printed after the phase, one per participating
+process): FOF3STAT stealacct: process P pool U wallB S out X in Y
+denials D flatten_ms F.
