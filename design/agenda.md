@@ -50,8 +50,13 @@ points at its design note where one exists. Started 2026-08-05.
    important (Kale, 2026-08-05) and has been competitive — this and its
    quiescence-closed labeling phase are its main remaining fine-grained
    patterns.
-11. Load-balancing benefit study (GreedyRefine path is validated;
+11. loadCache anti-scaling (Ritvik's Frontier 2B sweep, design/
+    fof3-2b-scaling.md): the starter-pack load grows ~49x from 8 to 128
+    nodes (0.022 -> 1.073 s) as pack size tracks subtree count — batch
+    or coarsen the starter-pack shipment. The Anvil 80M tables show the
+    same shape in miniature (0.002 -> 0.048 s over 1 -> 16 nodes).
+12. Load-balancing benefit study (GreedyRefine path is validated;
    deferred by Kale until "much later").
-12. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
+13. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
     only as an explicit study, e.g. >16-node dist campaigns.
-13. ChaNGa integration: waiting on Kale's go.
+14. ChaNGa integration: waiting on Kale's go.
