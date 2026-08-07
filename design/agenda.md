@@ -17,8 +17,12 @@ points at its design note where one exists. Started 2026-08-05.
    quiescence detection at all. FOF_WALK_QD=1 keeps the quiescence
    path as the A/B oracle; Anvil-scale bracket measurement rides the
    next measurement round.
-3. Steal-based phaseB cross-process offload (design/phaseb-offload.md),
-   built against the framework pool from item 1.
+3. Steal-based phaseB cross-process offload (design/phaseb-offload.md
+   sections 6-8): v1-v3 measured at 2B — correct at every round, wall
+   unmoved at ~3.1 s. v4 needs the published remaining-work metric with
+   helpers targeting the maximum, per-process merge-time
+   instrumentation, and a time-based admission threshold; then the
+   framework-pool rebuild (item 1).
 4. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
    1.65 s at 16; design/speedup-campaign-2026-08-05.md follow-up 2):
    profile splitter computation and particle flush at 1920 PEs.
@@ -50,13 +54,24 @@ points at its design note where one exists. Started 2026-08-05.
    important (Kale, 2026-08-05) and has been competitive — this and its
    quiescence-closed labeling phase are its main remaining fine-grained
    patterns.
-11. loadCache anti-scaling (Ritvik's Frontier 2B sweep, design/
+11. Representative-indirect relabeling (Kale, 2026-08-06): keep the
+    compressed per-processor union-find array from the phaseA freeze
+    (uf_parent[i] = flat index of i's representative). Apply every
+    label map — phase-1 merge, tip encoding, the phase-3 map in either
+    union-find mode — at representative granularity only (thousands of
+    hash lookups per processor), then materialize per-particle labels
+    as one indexed load through the representative: no hash lookup in
+    any per-particle relabel loop. The sign convention (or an untouched
+    positive tip) is the "local fragment" marker. Companion to the
+    freeze-pass counting; together they remove every per-particle hash
+    pass after phaseA.
+12. loadCache anti-scaling (Ritvik's Frontier 2B sweep, design/
     fof3-2b-scaling.md): the starter-pack load grows ~49x from 8 to 128
     nodes (0.022 -> 1.073 s) as pack size tracks subtree count — batch
     or coarsen the starter-pack shipment. The Anvil 80M tables show the
     same shape in miniature (0.002 -> 0.048 s over 1 -> 16 nodes).
-12. Load-balancing benefit study (GreedyRefine path is validated;
+13. Load-balancing benefit study (GreedyRefine path is validated;
    deferred by Kale until "much later").
-13. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
+14. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
     only as an explicit study, e.g. >16-node dist campaigns.
-14. ChaNGa integration: waiting on Kale's go.
+15. ChaNGa integration: waiting on Kale's go.
