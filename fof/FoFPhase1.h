@@ -980,9 +980,11 @@ public:
   // stage walls (max-reduced) to the driver. A dense process no longer
   // holds every other process at each stage boundary.
 
-  void startPhase1Chain(double b2, double grid_thresh, const CkCallback& done) {
+  void startPhase1Chain(double b2, double grid_thresh, double pool_split,
+                        const CkCallback& done) {
     done_cb_ = done;
     grid_thresh_ = grid_thresh;
+    pool_split_size_ = pool_split;
     auto* nb = node_proxy.ckLocalBranch();
     if (nb->chain_started.fetch_add(1) == 0) nb->chain_t0 = CkWallTimer();
     nb->group_proxy = this->thisProxy; // for the merge-time relabel fan
@@ -1052,10 +1054,13 @@ public:
       // is still large compared with the linking length, whatever its
       // depth or separation, so unit cost is bounded by geometry
       // instead of by an assumption.
-      static const double split_size = [] {
-        const char* e = std::getenv("FOF_POOL_SPLIT_SIZE");
-        return e ? std::atof(e) : 0.0;
-      }();
+      // Delivered by the phase-1 broadcast, NOT read from the
+      // environment here: a command-line flag is parsed in main() on one
+      // processor, and a value stashed in that process's environment is
+      // invisible to every other process — measured as exactly half the
+      // expected units in a two-process run. The application supplies
+      // the environment default and passes one value in.
+      const double split_size = pool_split_size_;
       // The size rule is ADDITIVE: it may only split MORE than the
       // depth rule, never less. Measured 2026-08-07 at 80M with the
       // first (replacing) version, C=12 produced a LARGER largest unit
@@ -2693,6 +2698,7 @@ private:
   // laptop A/B showed parity-to-slightly-worse at reachable densities;
   // the deep-overdensity payoff regime needs the Anvil A/B).
   double grid_thresh_ = 0.0;
+  double pool_split_size_ = 0.0;   // phaseB pool unit split size (-Z)
   // Final-reduction callback of the within-process chain (startPhase1Chain).
   CkCallback done_cb_;
   // Touched-component (negative-label) per-process totals held between
@@ -2806,7 +2812,10 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
                   // root); <= 0 (default) disables the grid — enable via
                   // fof3 -G for the density-regime A/B (see
                   // design/phase1-scaling.md).
-                  double grid_occupancy_threshold = 0.0) {
+                  double grid_occupancy_threshold = 0.0,
+                  // phaseB pool unit split size (fof3 -Z /
+                  // FOF_POOL_SPLIT_SIZE); 0 disables.
+                  double pool_split_size = 0.0) {
   double b2 = linking_length * linking_length;
   FoFPhase1Stages local;
   double t = CkWallTimer();
@@ -2826,7 +2835,7 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
   // One broadcast starts the within-process chain; the single global
   // reduction at its end delivers the max-reduced stage walls.
   void* result = nullptr;
-  fof.startPhase1Chain(b2, grid_occupancy_threshold,
+  fof.startPhase1Chain(b2, grid_occupancy_threshold, pool_split_size,
                        CkCallbackResumeThread(result));
   {
     CkReductionMsg* m = (CkReductionMsg*)result;

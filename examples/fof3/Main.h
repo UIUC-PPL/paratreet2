@@ -89,6 +89,11 @@ class ExMain: public paratreet::Main<FragData> {
   // runs unless the cache accounting itself is under investigation (Kale,
   // 2026-08-04). The cheap process-RSS memory line is unaffected.
   bool fof_skip_cache_stats = false;
+  // phaseB pool/steal knobs, also settable through the environment
+  // (FOF_POOL_SPLIT_SIZE, FOF_STEAL_GROUP); the flags set the
+  // environment so the framework-side readers see one source of truth.
+  double fof_pool_split_size = 0.0;
+  int fof_steal_group = 8;
   // Single-distribution mode (design/single-distribution-mode.md) — no
   // Partition array. DEFAULT since 2026-08-04 (80M gate job 19661057:
   // components bit-identical across 4 arms; decomposition ~25% faster —

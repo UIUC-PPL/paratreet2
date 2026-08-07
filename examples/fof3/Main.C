@@ -55,7 +55,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SC")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SCZ:H:")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -82,6 +82,25 @@ PARATREET_REGISTER_MAIN(ExMain);
           break;
         case 'C':
           fof_skip_cache_stats = true;
+          break;
+        case 'Z':
+          // phaseB pool unit splitting; also settable as
+          // FOF_POOL_SPLIT_SIZE. A command-line flag exists because
+          // environment propagation through srun differs by site, and a
+          // variable that silently fails to reach the ranks looks
+          // exactly like an optimization that did not help.
+          fof_pool_split_size = atof(optarg);
+          if (fof_pool_split_size < 0)
+            CkAbort("-Z requires a split size >= 0 (0 = off)");
+          break;
+        case 'H':
+          // Processes per physical machine for the phaseB steal group;
+          // also settable as FOF_STEAL_GROUP. MUST match the launch
+          // configuration's tasks per node.
+          fof_steal_group = atoi(optarg);
+          if (fof_steal_group < 1)
+            CkAbort("-H requires a steal group size >= 1");
+          setenv("FOF_STEAL_GROUP", optarg, 1);
           break;
         case 'S':
           // Single-distribution mode (design/single-distribution-mode.md):
@@ -139,6 +158,13 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t    this (particles per b/sqrt(6) cell) is solved by the\n");
           CkPrintf("\t    cell grid instead of the tree walk; default 4;\n");
           CkPrintf("\t    0 = off (the walk-only oracle for A/B)]\n");
+          CkPrintf("\t-Z [phaseB pool unit split size: keep splitting a pair while\n");
+          CkPrintf("\t    either box exceeds this multiple of the linking length;\n");
+          CkPrintf("\t    0 = off (default). Breaks up the indivisible units that\n");
+          CkPrintf("\t    otherwise set the phaseB wall. Env: FOF_POOL_SPLIT_SIZE]\n");
+          CkPrintf("\t-H [processes per physical machine for phaseB work stealing;\n");
+          CkPrintf("\t    must match the launcher's tasks-per-node (default 8).\n");
+          CkPrintf("\t    Env: FOF_STEAL_GROUP]\n");
           CkPrintf("\t-C [skip the cache memory accounting (FOF3STAT cache line);\n");
           CkPrintf("\t    it walks the whole cached tree on one processor per\n");
           CkPrintf("\t    process after the timed brackets -- harmless for\n");
@@ -203,6 +229,21 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("Cache share depth (-D): %d\n", conf.cache_share_depth);
     CkPrintf("Cache accounting (-C skips): %s\n",
              fof_skip_cache_stats ? "off" : "on");
+    // Echo the effective values (flag or environment) so a run's log
+    // always records what it actually used.
+    {
+      // Environment supplies the default; the flag overrides it. Echoed
+      // so a run's log always records what it actually used.
+      const char* zenv = std::getenv("FOF_POOL_SPLIT_SIZE");
+      if (fof_pool_split_size == 0.0 && zenv) fof_pool_split_size = atof(zenv);
+      char zbuf[32]; snprintf(zbuf, sizeof(zbuf), "%g", fof_pool_split_size);
+      const char* z = zbuf;
+      const char* h = std::getenv("FOF_STEAL_GROUP");
+      const char* st = std::getenv("FOF_STEAL");
+      CkPrintf("phaseB pool split size (-Z): %s\n", z ? z : "0 (off)");
+      CkPrintf("phaseB steal group (-H): %s%s\n", h ? h : "8",
+               (st && atoi(st) == 0) ? "  [stealing disabled]" : "");
+    }
     // PBC (design/pbc.md). Note: -P (capital) does not collide with any
     // framework-registered CLI letter (the framework uses lowercase 'p' for
     // nPartitionsMin and the multi-char 'pbc'/'px'/'py'/'pz'), so no

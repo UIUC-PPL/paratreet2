@@ -76,7 +76,7 @@ using namespace paratreet;
     double t0 = CkWallTimer();
     paratreet::FoFPhase1Stages p1s;
     paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b, pbc,
-                            &p1s, fof_grid_threshold);
+                            &p1s, fof_grid_threshold, fof_pool_split_size);
     double t1 = CkWallTimer();
     // Stage decomposition of the phase1 total. reset/register are
     // barrier-to-barrier; phaseA/phaseB/merge/relabel are process-local

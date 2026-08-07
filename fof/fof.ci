@@ -52,7 +52,7 @@ module fof {
     // Periodic boundary conditions (design/pbc.md): broadcast the box period
     // (0 per axis = open, the default = exact current behavior) before phaseA.
     entry void setPeriod(Vector3D<Real> period, const CkCallback&);
-    entry void startPhase1Chain(double b2, double grid_thresh, const CkCallback&);
+    entry void startPhase1Chain(double b2, double grid_thresh, double pool_split, const CkCallback&);
     entry void phaseBChained();
     entry void buildPoolSlice();
     entry void startHelping();
