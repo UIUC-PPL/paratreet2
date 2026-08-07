@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <numeric>
 #include <string>
+#include <mutex>
 
 #include "CoreFunctions.h"
 
@@ -213,6 +214,13 @@ namespace paratreet {
     }
 
     inline void setConfiguration(std::shared_ptr<Configuration>&& cfg) {
+        // main_ is a Csv (per-process, shared across every PE of the process).
+        // TreeSpec::receiveConfiguration is a group broadcast, so every PE of a
+        // process calls this concurrently; without serializing the assignment,
+        // concurrent shared_ptr::operator= on the same instance is a data race
+        // that can double-free the outgoing Configuration.
+        static std::mutex config_mutex;
+        std::lock_guard<std::mutex> lock(config_mutex);
         CsvAccess(main_)->setConfiguration(std::move(cfg));
     }
 
