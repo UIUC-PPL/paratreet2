@@ -905,7 +905,20 @@ public:
         // grandchild granularity measurably inflated the per-unit fixed
         // costs (phaseB avg 0.014 -> 0.020 on the laptop). Separated
         // pairs stay at depth-1 granularity. Still pure geometry.
-        if (depth >= 2 || (depth == 1 && d2 > 0) || a->isLeaf() ||
+        // Split depth for OVERLAPPING pairs (gap zero) is tunable
+        // (FOF_POOL_DEPTH, default 2). Measured 2026-08-07 at 80M: from
+        // 1 to 4 nodes the whole phaseB stage IS one indivisible unit
+        // (stage 0.109/0.134/0.073 s against a largest-unit 0.109/0.134/
+        // 0.073 s) — a fragment of the densest region that no number of
+        // threads or nodes can divide. Separated pairs still stop at
+        // depth 1: they are cheap and splitting them only multiplies
+        // per-unit overhead.
+        static const int max_depth = [] {
+          const char* e = std::getenv("FOF_POOL_DEPTH");
+          int v = e ? std::atoi(e) : 2;
+          return v >= 1 ? v : 2;
+        }();
+        if (depth >= max_depth || (depth == 1 && d2 > 0) || a->isLeaf() ||
             b->isLeaf()) {
           // LPT key, pure geometry (no thresholds): overlapping pairs
           // (gap 0) are the expensive ones, ordered by DESCENDING box
