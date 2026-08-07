@@ -253,3 +253,36 @@ threshold we would plausibly choose.
 Accounting line (printed after the phase, one per participating
 process): FOF3STAT stealacct: process P pool U wallB S out X in Y
 denials D flatten_ms F.
+
+## 11. Round 4 (v4) verdict: the donor's shipping cost is the ceiling
+
+2B, 16 Anvil nodes, three interleaved pairs. Correctness exact. Wall
+unmoved again (off 3.11/3.11/3.15 s, on 3.15/3.17/3.15 s) — but the
+new per-process accounting finally shows WHY, and it is not targeting,
+throughput, or timing:
+
+    donor flatten cost, measured: 1.27 - 5.64 ms per unit shipped
+    donor execution cost, derived: ~0.33 ms/unit (light process:
+      8596 units, 0.19 s wall, 15 threads)
+                          ~5.2 ms/unit (heavy process: ~9000 units,
+      3.1 s wall, 15 threads)
+
+Shipping a unit costs the donor as much as executing it (heavy), or
+more than ten times as much (light). The donor is the serializing
+resource: it cannot shed load faster than it can drain it, so no
+number of helpers can move the wall. Every previous round's null
+follows from this, and the protocol work (targeting, batching,
+persistence) was necessary but could never have been sufficient.
+
+Root cause in the implementation: units are flattened INDIVIDUALLY at
+grant time. Since pool units are 8x8 (and depth-2) fragments of
+subtree pairs, one child subtree appears in up to eight units and is
+re-flattened every time — precisely the waste section 2 named
+("ship-once, use-many") and this implementation never took.
+
+v5: memoize flattened subtrees on the donor, keyed by node, and ship
+deduplicated blobs plus per-unit index pairs. Expected: up to 8x fewer
+flattens within one shipment, and free re-use across grants to
+different helpers, taking the donor's per-unit shipping cost well
+below its per-unit execution cost — which is the precondition for any
+of the protocol work to matter.
