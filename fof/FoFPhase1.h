@@ -1145,12 +1145,18 @@ public:
     for (int j = lo; j < hi; j++)
       if (j != mine) steal_mates.push_back(j);
     steal_mate_merged.assign(steal_mates.size(), 0);
+    watchdog_seq = -1;
+    probeWatchdog();
     if (stealDebug())
       CkPrintf("[steal] pe %d startHelping mates=%zu\n", CkMyPe(), steal_mates.size());
     probeRound();
   }
 
   void probeRound() {
+    // One round at a time. A round in flight will either issue a request
+    // or schedule the next round when it completes; starting another now
+    // would supersede it and discard its replies (see the note above).
+    if (probe_pending > 0) return;
     node_proxy.ckLocalBranch()->helper_rounds.fetch_add(1);
     probe_seq++;
     probe_pending = 0;
@@ -1201,9 +1207,24 @@ public:
       CcdCallFnAfter([](void* arg, double) {
         auto* self = (FoFPhase1<Data>*)arg;
         self->probeRound();
-      }, this, 2.0 /* ms */);
+      }, this, 5.0 /* ms */);
     }
   }
+
+  void probeWatchdog() {
+    if (probe_pending > 0 && probe_seq == watchdog_seq) {
+      probe_pending = 0;   // release the stuck round
+      probeRound();
+      return;
+    }
+    watchdog_seq = probe_seq;
+    if (!steal_mates.empty())
+      CcdCallFnAfter([](void* arg, double) {
+        auto* self = (FoFPhase1<Data>*)arg;
+        self->probeWatchdog();
+      }, this, 50.0 /* ms */);
+  }
+  int watchdog_seq = -1;
 
   void stealDenied(int victim_node) {
     // Any denial (not ready, not needy, or drained under our feet):
