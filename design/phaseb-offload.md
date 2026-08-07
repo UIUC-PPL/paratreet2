@@ -209,3 +209,15 @@ v4 requirements (the original stage-1 design, no longer optional):
    the branch and delivered by one concat reduction at the end of
    phase 1, printed by the driver after the phase. The current
    merge-time steal print is replaced by this mechanism.
+
+Amendments (Kale, 2026-08-07, second round):
+- The admission gate is a UNIT-COUNT floor only (remaining units above
+  roughly one batch), given the measured milliseconds-scale steal
+  overhead. No time projection in the gate; projection survives only in
+  the helper-side ranking, where error is harmless.
+- Donors serve any number of helpers concurrently: every grant is an
+  independent atomic claim on the shared cursor, served in parallel by
+  whichever donor processor received the request. No helper selection
+  or binding exists on the donor side; convergence of many helpers on
+  the neediest donor is the intended many-to-one shape, on the helper
+  side only.
