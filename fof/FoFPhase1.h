@@ -1019,8 +1019,31 @@ public:
           int v = e ? std::atoi(e) : 2;
           return v >= 1 ? v : 2;
         }();
-        if (depth >= max_depth || (depth == 1 && d2 > 0) || a->isLeaf() ||
-            b->isLeaf()) {
+        // Size-based splitting (FOF_POOL_SPLIT_SIZE=C, default 0 = the
+        // depth rule below, unchanged). Measured 2026-08-07 at 80M: the
+        // depth knob above is inert — the unit that IS the whole phaseB
+        // stage at 1-4 nodes is a SEPARATED pair stopped at depth 1 by
+        // the d2 > 0 clause, on the assumption that separated pairs are
+        // cheap. Two large boxes a hair apart in the densest region are
+        // not cheap. With C > 0 a pair keeps splitting while either box
+        // is still large compared with the linking length, whatever its
+        // depth or separation, so unit cost is bounded by geometry
+        // instead of by an assumption.
+        static const double split_size = [] {
+          const char* e = std::getenv("FOF_POOL_SPLIT_SIZE");
+          return e ? std::atof(e) : 0.0;
+        }();
+        bool stop_here;
+        if (split_size > 0) {
+          const double blen = std::sqrt(b2_);
+          bool still_big = boxMeasure(a) > split_size * blen ||
+                           boxMeasure(b) > split_size * blen;
+          stop_here = depth >= 6 || a->isLeaf() || b->isLeaf() || !still_big;
+        } else {
+          stop_here = depth >= max_depth || (depth == 1 && d2 > 0) ||
+                      a->isLeaf() || b->isLeaf();
+        }
+        if (stop_here) {
           // LPT key, pure geometry (no thresholds): overlapping pairs
           // (gap 0) are the expensive ones, ordered by DESCENDING box
           // overlap volume; separated pairs follow by ascending gap.
