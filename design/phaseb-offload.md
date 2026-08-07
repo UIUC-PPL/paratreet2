@@ -116,3 +116,49 @@ Scheme sketch:
 3. Buddy-node tier with the c-regular random-graph wiring + the
    steal-worthiness bar.
 4. Affinity re-steals (subtree-tracking on the victim).
+
+## 6. Measured (2026-08-06, 2B on 16 Anvil nodes; three protocol rounds)
+
+Stage 1-2 are IMPLEMENTED on main (same-machine tier). History, each
+round one interleaved off/on job, correctness bit-exact in every run:
+
+- v1 (single serving processor, 4 units per grant): heavy process
+  shipped 260 of ~1,150 units; phaseB wall unmoved at ~3.1 s. Grant
+  throughput was the bottleneck, and the heavy process's pool exists
+  only after its own (also-slowest) dense phase.
+- v2 (grants from all 15 of the victim's processors, 16 units per
+  grant, pipelined helpers): shipped units tripled (848-1,072) but
+  scattered across every victim — round-robin helpers steal from
+  whoever has a pool, so self-sufficient victims absorbed the grants.
+  Wall still ~3.1 s. Targeting, not throughput, is the constraint.
+- v3 (need-gated serving + persistent helpers, commit 23f0248): a
+  victim grants only when its remaining pool exceeds two rounds of its
+  own local claiming; light victims deny instantly (kept on the
+  helper's list for later passes), so helpers converge on the heavy
+  process without any global knowledge. At-scale verdict pending
+  (queued); the floor remains the largest indivisible unit (~0.68 s)
+  and the heavy process's dense-phase skew (~3x) is the next item
+  behind it.
+
+## 7. Running the steals elsewhere (for Ritvik; larger machines)
+
+Everything is on main. Build with clusterfinding/build-stack.sh
+(aggregation off is the default). Environment knobs:
+
+- FOF_STEAL=0 disables (default on).
+- FOF_STEAL_GROUP = number of consecutive processes per physical
+  machine — MUST match the machine's tasks-per-node (8 on Anvil
+  wholenode; set it for the target machine or the "same machine" tier
+  steals across machines).
+- FOF_STEAL_K = units per grant (default 16).
+- FOF_STEAL_TEST=1 (debug): odd processes skip local claiming so their
+  pools drain only through steals — end-to-end forcing.
+- FOF_COUNT_VERIFY=1 (debug): recompute component counts from the
+  particles and abort on divergence.
+- FOF_WALK_QD=1: quiescence detection instead of the credit counter on
+  the serial-mode walk (the A/B oracle).
+
+Readout lines: "FOF3STAT steal: process P out U in V denials D" per
+involved process at its merge; "FOF3STAT balance: phaseB_s min/avg/max"
+for the wall; the components line is the correctness gate (80M
+lambb.00500: 23,707,197; 2B cosmo25cmb: 424,897,832).
