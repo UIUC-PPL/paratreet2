@@ -1,134 +1,133 @@
-# FoF3 2B-particle node-count scaling (2026-08-07, rerun with FOF_STEAL=1/FOF_STEAL_GROUP=8 explicit)
+# FoF3 2B-particle node-count scaling (2026-08-07, rerun against v4 phaseB stealing rebuild)
 
 Cosmo25 dataset (`cosmo25cmb.768g2_dm.001024`, N = 1,981,808,640 particles),
 OctDecomp, `-u dist`, b_factor 0.2, 8 processes/node, 14 PEs/process
 (1792 PEs at 16 nodes, scaling linearly with node count). Frontier, LCI/CXI
 `reconverse` backend, `job_vni` + `cray_shasta`, `+lci_ndevices 7`,
-`+backend_poll_thread 2`. Auto mode falls back to STATS MODE at this N
-(> 20M threshold for the O(n^2) crosscheck), so these runs report component
-counts without full brute-force verification; determinism (below) is the
-substitute correctness check.
+`+backend_poll_thread 2`, `FOF_STEAL=1 FOF_STEAL_GROUP=8` explicit. Auto
+mode falls back to STATS MODE at this N (> 20M threshold for the O(n^2)
+crosscheck), so these runs report component counts without full
+brute-force verification; determinism (below) is the substitute
+correctness check.
 
 Loading/decomposition time is excluded below (I/O-bound, not representative
 of the algorithm) — all phases from tree build onward.
 
-This is a rerun of the 2026-08-06 sweep, this time with `FOF_STEAL=1` and
-`FOF_STEAL_GROUP=8` set explicitly on every run (per design/phaseb-offload.md
-section 7). `git pull origin main` in paratreet2 reported "Already up to
-date" (HEAD `18bdcc4`); the FoF3 binary was already built against this exact
-commit, so no rebuild was needed — the source (last touched at `23f0248`,
-the v3 need-gated-serving stealing commit) hadn't moved since the prior
-rerun. `FOF_STEAL_GROUP` was already confirmed defaulting to 8 in
-`fof/FoFPhase1.h`, and `FOF_STEAL=0 disables (default on)` per the doc, so
-setting both explicitly makes the previously-implicit configuration
-explicit rather than changing behavior. `FOF3STAT steal:` lines confirm
-grant activity fired in every 2B run (0 in the lambb.00500 run — single
-node, 8 processes, apparently no idle-before-drain window at this size).
+This is a rerun after the user rebuilt paratreet2 with new source changes:
+`git log` shows the paratreet2 HEAD moved to `7a1b8c5` (built 11:18), one
+source commit ahead of the previous rerun's HEAD (`18bdcc4`):
+`44edf47 phaseB stealing v4: probe-and-target helpers, two-batch grant
+gate, buffered accounting` — this is exactly the v4 implementation that
+design/phaseb-offload.md section 8 called for after the v3 verdict (grants
+concentrated but the wall didn't move). Same 6-job sweep as the last two
+reruns: 8/16/32/64/128-node 2B scaling (`+traceoff` except 16 nodes, which
+keeps projections tracing) plus the 1-node lambb.00500 run with projections.
+Prior projections directories were moved aside (not deleted) before this
+run: `fof3_projections.pre_v4_*`, `fof3_projections_lambb500.pre_v4_*`.
 
-All runs used `+traceoff` except the 16-node point, which carries full
-projections tracing (`+traceroot fof3_projections +logsize 100000000`) —
-kept as the one detailed-trace reference point per run instructions.
+**Note on stat lines**: the v4 rebuild's "buffered accounting" changed what
+FOF3STAT reports — the previous `FOF3STAT steal: process P out U in V
+denials D` per-process line (used to confirm grant activity in the last two
+reruns) is gone from this build's output entirely; no line with "steal" in
+it appears anywhere in stdout for any of the 6 runs. `phaseB_units` and
+`phaseB_s` balance lines are still present and are what the comparison
+below relies on. This is worth flagging back if per-process steal
+visibility was still wanted — it may have been intentionally moved into the
+new buffered/probe accounting rather than removed outright, but nothing in
+this run's stdout exposes it under the old name.
 
 ## Correctness
 
 **424,897,832 components, identical at every node count (8/16/32/64/128)**
-— unchanged from both prior sweeps. Bit-for-bit determinism across a 16x
-range of parallelism, with stealing now explicitly enabled, is the
-crosscheck substitute that STATS MODE calls for at this N.
+— unchanged from all three prior sweeps. lambb.00500: **23,707,197**,
+also unchanged. Bit-for-bit determinism holds against the v4 rebuild.
 
 ## Top-line scaling
 
 | Nodes | PEs | Tree build (ms) | phase1 total (s) | TreeCanopy cache loading (ms) | Tree traversal (ms) | Iteration 0 total (ms) |
 |------:|-----:|------:|------:|------:|------:|------:|
-| 8   | 896   | 2306.3 | 11.04 | 12033.1 | 2022.3 | 16873.1 |
-| 16  | 1792  | 977.0  | 8.70  | 9222.7  | 1443.9 | 11947.4 |
-| 32  | 3584  | 408.3  | 8.13  | 8484.1  | 1260.6 | 10352.0 |
-| 64  | 7168  | 205.5  | 6.56  | 7002.6  | 1318.8 | 8679.7  |
-| 128 | 14336 | 181.4  | 5.95  | 7217.3  | 1415.0 | 8947.2  |
+| 8   | 896   | 2307.3 | 11.47 | 12459.8 | 2054.8 | 17332.4 |
+| 16  | 1792  | 987.3  | 9.37  | 9898.5  | 1632.9 | 12838.0 |
+| 32  | 3584  | 410.3  | 8.54  | 8901.3  | 1292.2 | 10806.1 |
+| 64  | 7168  | 211.5  | 7.04  | 7506.0  | 1291.9 | 9162.6  |
+| 128 | 14336 | 201.4  | 6.31  | 7537.6  | 1431.1 | 9301.2  |
 
-Same shape as both prior sweeps: tree build scales cleanly (~13x over the
-16x node range); phase1 total and TreeCanopy cache loading flatten hard past
-32 nodes; tree traversal and iteration-0 total bottom out around 64 nodes.
-The explicit steal config does not change the qualitative picture.
+Same shape as all three prior sweeps, and within run-to-run noise of the
+immediately preceding (FOF_STEAL=1/GROUP=8 explicit, pre-v4) numbers —
+e.g. 16-node phase1 total 8.70s -> 9.37s, 128-node 5.95s -> 6.31s. No
+regression, no clear improvement either.
 
 ## phase1_stages breakdown (seconds)
 
 | Nodes | reset | register | phaseA | phaseB | merge | relabel |
 |------:|------:|---------:|-------:|-------:|------:|--------:|
-| 8   | 0.001 | 0.001 | 5.165 | 6.027 | 0.014 | 0.686 |
-| 16  | 0.001 | 0.001 | 2.601 | 6.308 | 0.011 | 0.303 |
-| 32  | 0.001 | 0.001 | 1.325 | 7.285 | 0.008 | 0.148 |
-| 64  | 0.003 | 0.001 | 0.614 | 6.239 | 0.007 | 0.067 |
-| 128 | 0.006 | 0.002 | 0.305 | 5.791 | 0.004 | 0.031 |
+| 8   | 0.001 | 0.000 | 5.232 | 6.346 | 0.014 | 0.693 |
+| 16  | 0.001 | 0.001 | 2.718 | 6.839 | 0.011 | 0.307 |
+| 32  | 0.002 | 0.001 | 1.398 | 7.733 | 0.007 | 0.145 |
+| 64  | 0.003 | 0.001 | 0.634 | 6.703 | 0.006 | 0.067 |
+| 128 | 0.006 | 0.002 | 0.486 | 6.104 | 0.004 | 0.031 |
 
-phaseA still scales cleanly (5.17 -> 0.31 s). **phaseB is still flat
-(5.8-7.3 s) and still dominates phase1_stages past 8 nodes, within noise of
-the previous sweep's phaseB numbers (6.1-7.6 s) that had FOF_STEAL only at
-its implicit default.** This directly reproduces design/phaseb-offload.md
-section 8's v3 verdict on Frontier: grant activity is real (see steal
-activity below) but the wall does not move, which is the same contradiction
-the doc's v4 requirements were written to resolve (target the actual
-maximum via a published remaining-work metric, not local admission gating).
-
-### Steal activity (FOF3STAT steal: lines, aggregated per run)
-
-| Nodes | processes reporting a steal line | total units shipped out | total denials |
-|------:|----------------------------------:|-------------------------:|---------------:|
-| 8   | 3  | 96  | 285  |
-| 16  | 3  | 96  | 279  |
-| 32  | 9  | 208 | 580  |
-| 64  | 24 | 928 | 1580 |
-| 128 | 34 | 928 | 2359 |
-
-Grants and denials both grow with node count (more processes, more steal
-attempts), but as section 8 of phaseb-offload.md found, the shipped-unit
-counts here (a few hundred to ~1k units, out of phaseB pools that run into
-the hundreds of thousands to millions of units per `phaseB_units` totals
-below) are far too small a share of the work to move a multi-second wall —
-consistent with the "top shipper was likely not the wall-owning process"
-diagnosis in that doc, which v4's per-process pool-size/wall instrumentation
-is meant to settle directly instead of inferring indirectly.
+**phaseB is still flat (6.1-7.7 s) and still the dominant, non-scaling term
+past 8 nodes — the v4 probe-and-target/two-batch-grant/buffered-accounting
+rebuild does not move this number relative to the pre-v4 explicit-steal
+sweep (5.8-7.3 s) or the original implicit-default sweep (6.1-7.6 s).** All
+three sweeps agree within noise. phaseA still scales cleanly (5.23 -> 0.49 s).
 
 ## phase1 detail and phase3 (uf2/walk) breakdown (seconds)
 
 | Nodes | tip_encode | upwardPass | loadCache | uf2_setup | phase3_walk | edge_gather | uf2 | relabel(p3) | component_histogram |
 |------:|-----------:|-----------:|----------:|----------:|------------:|------------:|----:|------------:|---------------------:|
-| 8   | 0.543 | 0.976 | 0.012 | 0.012 | 0.381 | 0.001 | 0.544 | 0.367 | 0.605 |
-| 16  | 0.268 | 0.493 | 0.028 | 0.023 | 0.288 | 0.001 | 0.559 | 0.186 | 0.328 |
-| 32  | 0.133 | 0.274 | 0.074 | 0.047 | 0.264 | 0.002 | 0.630 | 0.099 | 0.188 |
-| 64  | 0.057 | 0.191 | 0.243 | 0.092 | 0.278 | 0.003 | 0.739 | 0.056 | 0.131 |
-| 128 | 0.035 | 0.224 | 1.015 | 0.189 | 0.255 | 0.006 | 0.806 | 0.030 | 0.114 |
+| 8   | 0.541 | 0.974 | 0.011 | 0.012 | 0.398 | 0.001 | 0.558 | 0.367 | 0.609 |
+| 16  | 0.269 | 0.497 | 0.025 | 0.024 | 0.324 | 0.001 | 0.714 | 0.183 | 0.330 |
+| 32  | 0.132 | 0.277 | 0.079 | 0.048 | 0.266 | 0.002 | 0.656 | 0.101 | 0.189 |
+| 64  | 0.058 | 0.199 | 0.258 | 0.095 | 0.268 | 0.003 | 0.718 | 0.055 | 0.134 |
+| 128 | 0.031 | 0.235 | 0.971 | 0.197 | 0.245 | 0.006 | 0.819 | 0.032 | 0.118 |
 
-Same pattern as both prior sweeps: tip_encode scales cleanly. loadCache
-still grows with node count (0.012 -> 1.015 s), still tracked in
+Same pattern as all prior sweeps: tip_encode scales cleanly. loadCache still
+grows with node count (0.011 -> 0.971 s), still tracked in
 design/agenda.md's loadCache anti-scaling item. uf2 grows mildly. Everything
 else shrinks or is flat.
 
 ## lambb.00500 (80M particles), 1 physical node, with projections tracing
 
 Same machine/config (8 procs/node, 14 PEs/process, 112 PEs total),
-`--network=single_node_vni` (1-node run, not `job_vni`), `FOF_STEAL=1`
-`FOF_STEAL_GROUP=8` explicit. Full projections tracing:
-`+traceroot fof3_projections_lambb500 +logsize 100000000`.
+`--network=single_node_vni`, `FOF_STEAL=1 FOF_STEAL_GROUP=8` explicit. Full
+projections tracing: `+traceroot fof3_projections_lambb500 +logsize
+100000000`.
 
 **Components: 23,707,197** — matches the correctness gate value in
 design/phaseb-offload.md section 7 exactly.
 
 | Tree build (ms) | phase1 total (s) | TreeCanopy cache loading (ms) | Tree traversal (ms) | Iteration 0 total (ms) |
 |------:|------:|------:|------:|------:|
-| 547.0 | 1.723 | 2025.2 | 485.5 | 3212.2 |
+| 552.6 | 1.766 | 2065.5 | 505.2 | 3276.7 |
 
-phase1_stages (s): reset 0.000, register 0.000, phaseA 1.521, phaseB 0.171,
-merge 0.003, relabel 0.166. phase1 detail/phase3 (s): tip_encode 0.152,
-upwardPass 0.300, loadCache 0.001, uf2_setup 0.002, phase3_walk 0.118,
-edge_gather 0.000, uf2 0.054, relabel(p3) 0.113, component_histogram 0.161.
+phase1_stages (s): reset 0.000, register 0.000, phaseA 1.565, phaseB 0.181,
+merge 0.002, relabel 0.165. phase1 detail/phase3 (s): tip_encode 0.152,
+upwardPass 0.298, loadCache 0.001, uf2_setup 0.002, phase3_walk 0.129,
+edge_gather 0.000, uf2 0.066, relabel(p3) 0.112, component_histogram 0.160.
 
-No `FOF3STAT steal:` lines fired at all in this run — with only 8 processes
-on one physical node, every process apparently kept a nonempty pool through
-the whole phaseB window, so no idle-before-drain steal request ever
-triggered. phaseB (0.171 s) is again a small fraction of phase1_stages here,
-consistent with the framing in phaseb-offload.md that the floor being
-attacked only bites at 2B-scale cross-process skew, not at this size.
+phaseB (0.181 s) remains a small fraction of phase1_stages at this scale,
+consistent with all prior runs — single node, no cross-process skew large
+enough to make stealing matter.
+
+## Cross-run comparison, phaseB wall (seconds), all sweeps on this machine
+
+| Nodes | Original (implicit steal default) | FOF_STEAL=1/GROUP=8 explicit (v3 code) | v4 rebuild (probe-and-target, this run) |
+|------:|------:|------:|------:|
+| 8   | 6.301 | 6.027 | 6.346 |
+| 16  | 6.544 | 6.308 | 6.839 |
+| 32  | 7.562 | 7.285 | 7.733 |
+| 64  | 6.664 | 6.239 | 6.703 |
+| 128 | 6.074 | 5.791 | 6.104 |
+
+Three independent sweeps, three different steal configurations/code
+versions, same flat 6-8 second band. This is the strongest evidence yet
+that phaseB's floor at 2B scale is not being moved by any steal-tuning
+variant tried so far — supports design/phaseb-offload.md's own reading
+that the wall isn't explained by stealing throughput at all, and something
+else (the heavy process's own dense-phase cost, or a bottleneck the
+buffered-accounting change didn't address) is the real floor.
 
 ## Raw command (per node count N, procs/node = 8 fixed)
 
@@ -142,6 +141,6 @@ srun --mpi=cray_shasta --network=<job_vni | single_node_vni for N=1> --unbuffere
   +lci_ndevices 7 +backend_poll_thread 2 [+traceroot <dir> +logsize 100000000 | +traceoff]
 ```
 
-Job IDs (2B sweep, this rerun): 8n=5187457, 16n=5187465 (only run with
-projections tracing), 32n=5187467, 64n=5187471, 128n=5187484.
-lambb.00500 1-node run (projections): 5187490.
+Job IDs (2B sweep, this rerun): 8n=5190754, 16n=5190770 (only run with
+projections tracing), 32n=5190782, 64n=5190788, 128n=5190798.
+lambb.00500 1-node run (projections): 5190805.
