@@ -38,6 +38,17 @@ struct StealShipment {
   }
 };
 
+// Per-process phaseB accounting record (gathered after the phase).
+struct StealAcct {
+  int process = -1;
+  long pool_units = 0;
+  double wall_b = 0;
+  long out_units = 0;
+  long in_units = 0;
+  long denials = 0;
+  double flatten_ms = 0;
+};
+
 } // namespace paratreet
 
 #endif // PARATREET_FOFSTEALTYPES_H_

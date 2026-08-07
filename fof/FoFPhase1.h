@@ -508,12 +508,19 @@ public:
   std::atomic<long> stolen_out_units{0};   // units shipped to helpers
   std::atomic<long> stolen_in_units{0};    // units executed for others
   std::atomic<long> steal_denials{0};      // requests answered empty
+  std::atomic<long> steal_flatten_us{0};   // victim-side flatten+pack time
+  long pool_units_total = 0;               // set once at pool build
   CProxy_FoFPhase1<Data> group_proxy;      // set at chain start (for the fan)
 
   // Fire the merge + relabel fan exactly once, when local deposits are
   // complete and no stolen batch is outstanding. Callable from the last
   // depositor, from every returned batch, and from the deny path.
   void tryTriggerMerge() {
+    if (FoFPhase1<Data>::stealDebug())
+      CkPrintf("[steal] node %d tryMerge deposits %d outstanding %ld cursor %zu pool %zu fired %d\n",
+               CkMyNode(), (int)pool_deposits_done.load(),
+               steal_outstanding.load(), phaseb_next.load(),
+               phaseb_pool.size(), (int)merge_fired.load());
     if (!pool_deposits_done.load(std::memory_order_acquire)) return;
     if (steal_outstanding.load(std::memory_order_acquire) != 0) return;
     // The pool must also be fully CLAIMED: implied by local deposits in
@@ -524,11 +531,9 @@ public:
     if (phaseb_next.load(std::memory_order_acquire) < phaseb_pool.size())
       return;
     if (merge_fired.exchange(true)) return;
-    if (stolen_out_units.load() > 0 || stolen_in_units.load() > 0) {
-      CkPrintf("FOF3STAT steal: process %d out %ld in %ld denials %ld\n",
-               CkMyNode(), stolen_out_units.load(), stolen_in_units.load(),
-               steal_denials.load());
-    }
+    // Accounting is buffered (Kale, 2026-08-07): no output inside timed
+    // regions. The per-process record is gathered by stealStats after
+    // the phase and printed by the driver.
     double tm0 = CkWallTimer();
     mergeBody();
     stage_tM = CkWallTimer() - tm0;
@@ -562,6 +567,8 @@ public:
     b_done = 0;
     chain_t0 = stage_tA = stage_tB = stage_tM = 0;
     steal_outstanding = 0;
+    steal_flatten_us = 0;
+    pool_units_total = 0;
     phaseb_pool_ready = false;
     pool_deposits_done = false;
     merge_fired = false;
@@ -1025,6 +1032,7 @@ public:
                           const typename FoFPhase1Node<Data>::PoolUnit& y) {
                          return x.key < y.key;
                        });
+      nb->pool_units_total = (long)nb->phaseb_pool.size();
       nb->phaseb_pool_ready.store(true, std::memory_order_release);
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
@@ -1051,6 +1059,13 @@ public:
   // configured by environment: FOF_STEAL=0 disables; FOF_STEAL_GROUP is
   // the number of consecutive processes per physical machine (SLURM block
   // placement; 8 on Anvil wholenode); FOF_STEAL_K is units per request.
+  static bool stealDebug() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_STEAL_DEBUG");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
   static bool stealEnabled() {
     // Default ON (restored 2026-08-06 after the stale-memo fix, commit
     // 82de369, was validated at the scale that exposed it: four
@@ -1081,81 +1096,129 @@ public:
     return k;
   }
 
-  // Helper-side state: victims in my steal group, with done flags; the
-  // helper cycles passes over the not-done victims until every one has
-  // finally denied (drained or merged).
-  std::vector<int> steal_victims;
-  std::vector<char> steal_victim_done;
-  size_t steal_victim_i = 0;
+  // v4 helper (Kale's scheme, 2026-08-07): probe all machine-mates for
+  // remaining units, target the MAXIMUM, take one batch, re-probe.
+  // Donors serve any number of helpers concurrently (independent atomic
+  // claims); the many-to-one convergence is on the helper side only.
+  std::vector<int> steal_mates;
+  std::vector<char> steal_mate_merged;
+  int probe_pending = 0;
+  int probe_best_victim = -1;
+  long probe_best_remaining = 0;
+  // Round sequence: a helper can have several probe rounds triggered
+  // close together (a denial and a returned batch); reports from any
+  // round but the current one are ignored so the pending count stays
+  // exact.
+  int probe_seq = 0;
 
   void startHelping() {
-    steal_victims.clear();
-    steal_victim_i = 0;
+    steal_mates.clear();
     int mine = CkMyNode();
     int g = stealGroup();
     int lo = (mine / g) * g;
     int hi = std::min(lo + g, CkNumNodes());
-    for (int j = mine + 1; j < hi; j++) steal_victims.push_back(j);
-    for (int j = lo; j < mine; j++) steal_victims.push_back(j);
-    steal_victim_done.assign(steal_victims.size(), 0);
-    askNextVictim();
+    for (int j = lo; j < hi; j++)
+      if (j != mine) steal_mates.push_back(j);
+    steal_mate_merged.assign(steal_mates.size(), 0);
+    if (stealDebug())
+      CkPrintf("[steal] pe %d startHelping mates=%zu\n", CkMyPe(), steal_mates.size());
+    probeRound();
   }
 
-  void askNextVictim() {
-    // Advance to the next not-done victim, wrapping; stop only when all
-    // are done. Wrap passes are paced by the not-ready/not-needy retry
-    // delays, so this does not spin.
-    size_t n = steal_victims.size();
-    for (size_t step = 0; step < n; step++) {
-      size_t i = (steal_victim_i + step) % n;
-      if (!steal_victim_done[i]) { steal_victim_i = i; break; }
-      if (step + 1 == n) return; // every victim finished; idle
+  void probeRound() {
+    probe_seq++;
+    probe_pending = 0;
+    probe_best_victim = -1;
+    probe_best_remaining = 0;
+    for (size_t i = 0; i < steal_mates.size(); i++) {
+      if (steal_mate_merged[i]) continue;
+      probe_pending++;
+      int victim = steal_mates[i];
+      int serve_pe = CkNodeFirst(victim) + (CkMyPe() % CmiNodeSize(victim));
+      this->thisProxy[serve_pe].probeRemaining(CkMyPe(), probe_seq);
     }
-    if (n == 0) return;
-    int victim = steal_victims[steal_victim_i];
-    // Serve from ALL of the victim's processors, spread by requester: the
-    // pool cursor is atomic and the shipped trees are frozen, so any PE
-    // can serve. The 2B A/B measured the single-PE server as the grant
-    // bottleneck (65 grants in a 3-second window while it also walked its
-    // own units).
-    int serve_pe = CkNodeFirst(victim) + (CkMyPe() % CmiNodeSize(victim));
-    this->thisProxy[serve_pe].requestSteal(CkMyPe());
+    // probe_pending == 0: every machine-mate has merged; this helper is
+    // done for the phase.
   }
 
-  // Victim side: claim up to K units for the helper. outstanding++ comes
-  // BEFORE the cursor claim (see the node-branch comment); the deny path
-  // undoes it and re-checks the merge gate.
-  void requestSteal(int helper_pe) {
-    auto* nb = node_proxy.ckLocalBranch();
-    // Need gate (v3, 2026-08-06): grant only when the remaining pool
-    // exceeds a couple of rounds of this process's own local claiming —
-    // otherwise the pool drains fine without help, and grants to light
-    // victims just divert helpers from the heavy one (measured in the
-    // v2 round: shipments tripled but scattered across all victims, and
-    // the heavy process's share never rose). A busy-but-not-needy deny
-    // keeps this victim on the helper's list for a later pass.
-    if (!nb->phaseb_pool_ready.load(std::memory_order_acquire)) {
-      // Not "drained" — phaseA has not finished here, so the pool does
-      // not exist yet. The heavy process is typically also the slow one
-      // through phaseA, so helpers must retry rather than give up (a
-      // fast process can finish its whole phaseB before a slow one
-      // builds its pool).
-      this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1)); // retry code
+  void remainingReport(int victim_node, long remaining, int merged, int seq) {
+    // A merged report is durable information regardless of round.
+    for (size_t i = 0; i < steal_mates.size(); i++)
+      if (steal_mates[i] == victim_node && merged) steal_mate_merged[i] = 1;
+    if (seq != probe_seq) return; // stale round
+    // Eligibility is simply "has work left"; the RANKING picks the
+    // neediest. The admission policy (grant while more than two batches
+    // remain) lives at the victim, which alone knows whether its own
+    // threads are still claiming — a helper-side copy of that threshold
+    // stranded the tail of a pool nobody local was draining.
+    if (!merged && remaining > 0 && remaining > probe_best_remaining) {
+      probe_best_remaining = remaining;
+      probe_best_victim = victim_node;
+    }
+    if (stealDebug())
+      CkPrintf("[steal] pe %d report victim %d remaining %ld merged %d pending %d\n",
+               CkMyPe(), victim_node, remaining, merged, probe_pending);
+    if (--probe_pending > 0) return;
+    if (probe_best_victim >= 0) {
+      int victim = probe_best_victim;
+      int serve_pe = CkNodeFirst(victim) + (CkMyPe() % CmiNodeSize(victim));
+      this->thisProxy[serve_pe].requestSteal(CkMyPe());
       return;
     }
+    // Nobody needy right now, but not everyone merged: pause briefly and
+    // probe again (covers late-building pools and shifting need).
+    bool any_open = false;
+    for (size_t i = 0; i < steal_mates.size(); i++)
+      if (!steal_mate_merged[i]) { any_open = true; break; }
+    if (any_open) {
+      CcdCallFnAfter([](void* arg, double) {
+        auto* self = (FoFPhase1<Data>*)arg;
+        self->probeRound();
+      }, this, 2.0 /* ms */);
+    }
+  }
+
+  void stealDenied(int victim_node) {
+    // Any denial (not ready, not needy, or drained under our feet):
+    // re-derive the target with a fresh probe round — but PACED. An
+    // immediate re-probe turns helper and victim into a deny/probe
+    // message storm (measured: the forced-steal validation hung with
+    // the machine at full load and no progress), which is exactly the
+    // work-starvation the scheme exists to avoid.
+    CcdCallFnAfter([](void* arg, double) {
+      auto* self = (FoFPhase1<Data>*)arg;
+      self->probeRound();
+    }, this, 1.0 /* ms */);
+  }
+
+  void requestSteal(int helper_pe) {
+    auto* nb = node_proxy.ckLocalBranch();
+    if (!nb->phaseb_pool_ready.load(std::memory_order_acquire)) {
+      this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1)); // not ready
+      return;
+    }
+    int k = stealK();
+    // v4 admission (Kale, 2026-08-07): grant as long as MORE THAN TWO
+    // BATCHES remain; below that the tail drains faster locally than a
+    // shipment round trip. No time projection anywhere in the gate.
     {
       size_t cursor = nb->phaseb_next.load(std::memory_order_relaxed);
       size_t pool = nb->phaseb_pool.size();
-      size_t need_floor = (size_t)CkNodeSize(CkMyNode()) * 2;
-      if (cursor < pool && pool - cursor <= need_floor &&
-          !nb->merge_fired.load()) {
-        // Not needy right now: the tail drains locally. Retryable-lite:
-        // the helper moves on but keeps this victim for another pass.
+      // The gate applies ONLY while this process's own threads are still
+      // claiming: once they have all deposited, any remaining units can
+      // be drained by helpers alone, so a denial there would strand them
+      // and the merge would never fire. (Vacuous in production, where a
+      // thread deposits only after the cursor is exhausted; load-bearing
+      // under FOF_STEAL_TEST, where the victim deliberately skips local
+      // claiming — that is how this deadlock surfaced.)
+      bool local_still_claiming =
+          !nb->pool_deposits_done.load(std::memory_order_acquire);
+      if (local_still_claiming && cursor < pool &&
+          pool - cursor <= (size_t)(2 * k) && !nb->merge_fired.load()) {
         this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1 + (1 << 20)));
         return;
       }
     }
-    int k = stealK();
     nb->steal_outstanding.fetch_add(1, std::memory_order_acq_rel);
     size_t start = nb->phaseb_next.fetch_add((size_t)k);
     size_t pool = nb->phaseb_pool.size();
@@ -1167,6 +1230,7 @@ public:
       return;
     }
     size_t end = std::min(start + (size_t)k, pool);
+    double f0 = CkWallTimer();
     paratreet::StealShipment<Data> ship;
     ship.victim_node = CkMyNode();
     for (size_t u = start; u < end; u++) {
@@ -1175,42 +1239,31 @@ public:
       ship.trees.emplace_back();
       flattenStealTree(nb->phaseb_pool[u].b, ship.trees.back());
     }
+    nb->steal_flatten_us.fetch_add(
+        (long)((CkWallTimer() - f0) * 1e6));
     nb->stolen_out_units.fetch_add((long)(end - start));
     this->thisProxy[helper_pe].receiveSteal(ship);
   }
 
-  void stealDenied(int victim_node) {
-    if (victim_node < 0) {
-      bool not_needy = (-victim_node) > (1 << 20);
-      if (not_needy) {
-        // Busy but self-sufficient right now: move on, but keep it on
-        // the list — a later pass re-checks (its tail may grow long, or
-        // this was the heavy victim mid-drain and the gate reopens).
-        steal_victim_i = (steal_victim_i + 1) % std::max<size_t>(steal_victims.size(), 1);
-        CcdCallFnAfter([](void* arg, double) {
-          auto* self = (FoFPhase1<Data>*)arg;
-          self->askNextVictim();
-        }, this, 2.0 /* ms */);
-        return;
-      }
-      // Pool not built yet; retry the same victim after a short delay.
-      CcdCallFnAfter([](void* arg, double) {
-        auto* self = (FoFPhase1<Data>*)arg;
-        self->askNextVictim();
-      }, this, 1.0 /* ms */);
-      return;
+  // v4 visibility probe: any processor of a process answers with its
+  // remaining unit count and state. Cheap enough that helpers poll all
+  // machine-mates directly; the monitor chare waits for the buddy tier.
+  void probeRemaining(int helper_pe, int seq) {
+    auto* nb = node_proxy.ckLocalBranch();
+    long remaining = -1; // pool not built yet
+    if (nb->phaseb_pool_ready.load(std::memory_order_acquire)) {
+      size_t cursor = nb->phaseb_next.load(std::memory_order_relaxed);
+      size_t pool = nb->phaseb_pool.size();
+      remaining = cursor >= pool ? 0 : (long)(pool - cursor);
     }
-    // Final deny: drained or merged — this victim is done for the phase.
-    if (steal_victim_i < steal_victim_done.size())
-      steal_victim_done[steal_victim_i] = 1;
-    steal_victim_i = (steal_victim_i + 1) % std::max<size_t>(steal_victims.size(), 1);
-    askNextVictim();
+    this->thisProxy[helper_pe].remainingReport(
+        CkMyNode(), remaining, nb->merge_fired.load() ? 1 : 0, seq);
   }
 
   // Helper side: rebuild the shipped trees, run each unit with the same
   // walk and certificate semantics as phaseBBody but into LOCAL buffers
   // (this PE's own phaseB members are long done; locals keep it
-  // re-entrant), return the edges, then ask the same victim again.
+  // re-entrant), return the edges, then re-probe for the next target.
   // Execute one unit over any node pair (live or rebuilt) into a local,
   // per-call edge set — the identical walk, certificate, and dedup
   // semantics as phaseBBody, with no shared state. Used by the helper
@@ -1263,9 +1316,6 @@ public:
   }
 
   void receiveSteal(const paratreet::StealShipment<Data>& ship) {
-    // Pipeline: request the next batch BEFORE walking this one, so the
-    // victim prepares the next shipment while this processor works.
-    askNextVictim();
     std::vector<long> edges_flat;
     long units = 0;
     for (size_t t = 0; t + 1 < ship.trees.size(); t += 2) {
@@ -1285,6 +1335,7 @@ public:
     }
     node_proxy.ckLocalBranch()->stolen_in_units.fetch_add(units);
     this->thisProxy[CkNodeFirst(ship.victim_node)].returnStolenEdges(edges_flat);
+    probeRound(); // re-derive the target for the next batch
   }
 
   // Self-test (FOF_STEAL_SELFTEST=1, debug): for every locally claimed
@@ -1350,6 +1401,27 @@ public:
     nb->submitEdges(std::move(es));
     nb->steal_outstanding.fetch_sub(1, std::memory_order_acq_rel);
     nb->tryTriggerMerge();
+  }
+
+  // Post-phase accounting gather (buffered per Kale, 2026-08-07): the
+  // process's first processor contributes one fixed-size record; the
+  // driver prints after the phase. No output inside timed regions.
+  void stealStats(const CkCallback& cb) {
+    paratreet::StealAcct rec;
+    int n = 0;
+    if (CkMyPe() == CkNodeFirst(CkMyNode())) {
+      auto* nb = node_proxy.ckLocalBranch();
+      rec.process = CkMyNode();
+      rec.pool_units = nb->pool_units_total;
+      rec.wall_b = nb->stage_tB;
+      rec.out_units = nb->stolen_out_units.load();
+      rec.in_units = nb->stolen_in_units.load();
+      rec.denials = nb->steal_denials.load();
+      rec.flatten_ms = nb->steal_flatten_us.load() / 1000.0;
+      n = 1;
+    }
+    this->contribute(n * sizeof(paratreet::StealAcct), &rec,
+                     CkReduction::concat, cb);
   }
 
   // Preorder flatten of a pool-unit node's subtree: (key, spatial node)
@@ -2606,6 +2678,26 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
     local.merge = v[2];
     local.relabel = v[3];
     delete m;
+  }
+  // Post-phase steal accounting (buffered; Kale, 2026-08-07): one record
+  // per process, printed here — after the phase, outside every timed
+  // stage. Only processes that participated (granted, received, or were
+  // asked) print.
+  if (FoFPhase1<Data>::stealEnabled() && CkNumNodes() > 1) {
+    void* acct = nullptr;
+    fof.stealStats(CkCallbackResumeThread(acct));
+    CkReductionMsg* am = (CkReductionMsg*)acct;
+    int n = am->getSize() / (int)sizeof(paratreet::StealAcct);
+    const auto* recs = (const paratreet::StealAcct*)am->getData();
+    for (int i = 0; i < n; i++) {
+      const auto& r = recs[i];
+      if (r.out_units == 0 && r.in_units == 0 && r.denials == 0) continue;
+      CkPrintf("FOF3STAT stealacct: process %d pool %ld wallB %.3f out %ld "
+               "in %ld denials %ld flatten_ms %.1f\n",
+               r.process, r.pool_units, r.wall_b, r.out_units, r.in_units,
+               r.denials, r.flatten_ms);
+    }
+    delete am;
   }
   if (stages) *stages = local;
 }

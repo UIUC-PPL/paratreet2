@@ -59,6 +59,9 @@ module fof {
     entry void stealDenied(int victim_node);
     entry void receiveSteal(const paratreet::StealShipment<Data>&);
     entry void returnStolenEdges(const std::vector<long>&);
+    entry void probeRemaining(int helper_pe, int seq);
+    entry void remainingReport(int victim_node, long remaining, int merged, int seq);
+    entry void stealStats(const CkCallback&);
     entry void relabelChained(double tA, double tB, double tM);
     entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);
