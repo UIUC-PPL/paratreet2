@@ -508,6 +508,12 @@ public:
   std::atomic<long> stolen_out_units{0};   // units shipped to helpers
   std::atomic<long> stolen_in_units{0};    // units executed for others
   std::atomic<long> steal_denials{0};      // requests answered empty
+  std::atomic<long> deny_not_ready{0};     // pool not built when asked
+  std::atomic<long> deny_not_needy{0};     // gate: at or below two batches
+  std::atomic<long> grants{0};             // requests actually served
+  std::atomic<long> probes_served{0};      // visibility probes answered
+  std::atomic<long> helper_rounds{0};      // probe rounds issued here
+  std::atomic<long> helper_requests{0};    // steal requests issued here
   std::atomic<long> steal_flatten_us{0};   // victim-side flatten+pack time
   long pool_units_total = 0;               // set once at pool build
   // Flattened-subtree memo (ship-once, use-many): a pool unit's two
@@ -578,6 +584,12 @@ public:
     chain_t0 = stage_tA = stage_tB = stage_tM = 0;
     steal_outstanding = 0;
     steal_flatten_us = 0;
+    deny_not_ready = 0;
+    deny_not_needy = 0;
+    grants = 0;
+    probes_served = 0;
+    helper_rounds = 0;
+    helper_requests = 0;
     pool_units_total = 0;
     { std::lock_guard<std::mutex> g(flat_memo_lock); flat_memo.clear(); }
     flat_memo_hits = 0;
@@ -1139,6 +1151,7 @@ public:
   }
 
   void probeRound() {
+    node_proxy.ckLocalBranch()->helper_rounds.fetch_add(1);
     probe_seq++;
     probe_pending = 0;
     probe_best_victim = -1;
@@ -1175,6 +1188,7 @@ public:
     if (probe_best_victim >= 0) {
       int victim = probe_best_victim;
       int serve_pe = CkNodeFirst(victim) + (CkMyPe() % CmiNodeSize(victim));
+      node_proxy.ckLocalBranch()->helper_requests.fetch_add(1);
       this->thisProxy[serve_pe].requestSteal(CkMyPe());
       return;
     }
@@ -1207,6 +1221,7 @@ public:
   void requestSteal(int helper_pe) {
     auto* nb = node_proxy.ckLocalBranch();
     if (!nb->phaseb_pool_ready.load(std::memory_order_acquire)) {
+      nb->deny_not_ready.fetch_add(1);
       this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1)); // not ready
       return;
     }
@@ -1228,6 +1243,7 @@ public:
           !nb->pool_deposits_done.load(std::memory_order_acquire);
       if (local_still_claiming && cursor < pool &&
           pool - cursor <= (size_t)(2 * k) && !nb->merge_fired.load()) {
+        nb->deny_not_needy.fetch_add(1);
         this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1 + (1 << 20)));
         return;
       }
@@ -1284,6 +1300,7 @@ public:
     nb->steal_flatten_us.fetch_add(
         (long)((CkWallTimer() - f0) * 1e6));
     nb->stolen_out_units.fetch_add((long)(end - start));
+    nb->grants.fetch_add(1);
     this->thisProxy[helper_pe].receiveSteal(ship);
   }
 
@@ -1298,6 +1315,7 @@ public:
       size_t pool = nb->phaseb_pool.size();
       remaining = cursor >= pool ? 0 : (long)(pool - cursor);
     }
+    nb->probes_served.fetch_add(1);
     this->thisProxy[helper_pe].remainingReport(
         CkMyNode(), remaining, nb->merge_fired.load() ? 1 : 0, seq);
   }
@@ -1469,6 +1487,12 @@ public:
       rec.flatten_ms = nb->steal_flatten_us.load() / 1000.0;
       rec.flat_hits = nb->flat_memo_hits.load();
       rec.flat_misses = nb->flat_memo_misses.load();
+      rec.deny_not_ready = nb->deny_not_ready.load();
+      rec.deny_not_needy = nb->deny_not_needy.load();
+      rec.grants = nb->grants.load();
+      rec.probes_served = nb->probes_served.load();
+      rec.helper_rounds = nb->helper_rounds.load();
+      rec.helper_requests = nb->helper_requests.load();
       n = 1;
     }
     this->contribute(n * sizeof(paratreet::StealAcct), &rec,
@@ -2742,11 +2766,18 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
     const auto* recs = (const paratreet::StealAcct*)am->getData();
     for (int i = 0; i < n; i++) {
       const auto& r = recs[i];
-      if (r.out_units == 0 && r.in_units == 0 && r.denials == 0) continue;
+      // Every process with a pool reports: the one that owns the wall is
+      // exactly the one with no steal activity, so filtering by activity
+      // hides the process the measurement is about.
+      if (r.pool_units == 0) continue;
       CkPrintf("FOF3STAT stealacct: process %d pool %ld wallB %.3f out %ld "
-               "in %ld denials %ld flatten_ms %.1f blobs %ld reused %ld\n",
+               "in %ld grants %ld deny(ready %ld needy %ld drained %ld) "
+               "probes %ld hrounds %ld hreq %ld flatten_ms %.1f blobs %ld "
+               "reused %ld\n",
                r.process, r.pool_units, r.wall_b, r.out_units, r.in_units,
-               r.denials, r.flatten_ms, r.flat_misses, r.flat_hits);
+               r.grants, r.deny_not_ready, r.deny_not_needy, r.denials,
+               r.probes_served, r.helper_rounds, r.helper_requests,
+               r.flatten_ms, r.flat_misses, r.flat_hits);
     }
     delete am;
   }

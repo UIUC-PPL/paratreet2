@@ -57,6 +57,12 @@ struct StealAcct {
   double flatten_ms = 0;
   long flat_hits = 0;    // shipments served from the flatten memo
   long flat_misses = 0;  // distinct subtrees actually flattened
+  long deny_not_ready = 0;
+  long deny_not_needy = 0;
+  long grants = 0;
+  long probes_served = 0;
+  long helper_rounds = 0;
+  long helper_requests = 0;
 };
 
 } // namespace paratreet
