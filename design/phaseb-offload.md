@@ -186,3 +186,26 @@ v4 requirements (the original stage-1 design, no longer optional):
    this line ends that.
 3. Re-examine the admission threshold in time units (projected
    remaining seconds at the victim's own drain rate), not unit counts.
+
+## 9. v4 refinements (Kale, 2026-08-07)
+
+1. Load estimates are RANKINGS, not gates. The remaining-cost prefix
+   sum and the observed drain rate rank victims for helpers; prediction
+   error there only sends help to the second-neediest. The deny gate is
+   set so low it almost never fires (remaining time below ~50 ms —
+   genuinely trivial tails only). Err in favor of granting: an
+   unnecessary grant wastes milliseconds of shipment, a wrong denial
+   preserves a multi-second wall. (History: the density predictor's
+   correlation with real phase times collapsed at scale; no admission
+   decision may depend on prediction accuracy.)
+2. Steal overhead is small and mostly measured: on-machine transport
+   ~15 GB/s / 1.3 us latency (lci_multipeer sweep) puts a multi-
+   megabyte batch at ~1 ms wire time; flatten and rebuild are
+   memory-copy passes estimated at a few ms — the v4 accounting must
+   time them so the estimate becomes a measurement. The helper's walk
+   time is moved work, not overhead.
+3. No output inside timed regions: per-process accounting (pool size
+   and cost, wall, granted/received, flatten/ship timings) is stored on
+   the branch and delivered by one concat reduction at the end of
+   phase 1, printed by the driver after the phase. The current
+   merge-time steal print is replaced by this mechanism.
