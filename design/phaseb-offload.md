@@ -286,3 +286,35 @@ flattens within one shipment, and free re-use across grants to
 different helpers, taking the donor's per-unit shipping cost well
 below its per-unit execution cost — which is the precondition for any
 of the protocol work to matter.
+
+## 12. Round 8 verdict: the wall is indivisible work, not misplaced work
+
+2B, 16 nodes, direct-ask helpers (no probe phase). Helpers now issue
+requests in volume — 230,094 job-wide against zero in round 7 — and the
+denial breakdown ends the investigation:
+
+    not-ready 216,633 (94%) | drained 13,440 | not-needy 0 | grants 21
+
+Two facts, both from the same run:
+
+1. Helpers spend almost the entire window asking a process whose pool
+   does not exist yet. A pool can only be built after its own process
+   finishes phaseA, and phaseA is itself skewed (0.395 / 0.990 / 2.427 s
+   min/avg/max), so the process that will own the phaseB wall is often
+   still in phaseA while its would-be helpers are already idle.
+2. When the pool finally appears, the process's own 15 threads claim
+   every unit within roughly 200 ms — mean unit cost is 0.26 ms — and
+   after that there is nothing left to give away, even though 2.5 s of
+   work is still in flight. The stage runs 2.735 s because a few threads
+   are grinding units up to 0.58 s each that they already own.
+
+Claiming is not doing. Work becomes unstealable the instant it is
+claimed, and claiming runs orders of magnitude faster than execution.
+
+So the phaseB wall at 2B is the same phenomenon measured at 80M: a
+handful of units that no scheme can divide after the fact. Stealing
+cannot fix indivisible work. The lever is making units divisible
+(design/agenda.md items 4 and the FOF_POOL_SPLIT_SIZE rule), which the
+parallel pool build now makes affordable. Stealing remains correct,
+cheap, and useful once units are fine enough to be worth moving — it is
+no longer the primary lever.
