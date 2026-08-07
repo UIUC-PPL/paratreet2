@@ -510,6 +510,16 @@ public:
   std::atomic<long> steal_denials{0};      // requests answered empty
   std::atomic<long> steal_flatten_us{0};   // victim-side flatten+pack time
   long pool_units_total = 0;               // set once at pool build
+  // Flattened-subtree memo (ship-once, use-many): a pool unit's two
+  // sides are child-level nodes shared by up to eight units, and the
+  // memo also serves repeat grants to different helpers. Guarded
+  // because several of this process's processors serve grants
+  // concurrently; the flatten itself runs OUTSIDE the lock.
+  std::unordered_map<Node<Data>*, std::shared_ptr<paratreet::StealTree<Data>>>
+      flat_memo;
+  std::mutex flat_memo_lock;
+  std::atomic<long> flat_memo_hits{0};
+  std::atomic<long> flat_memo_misses{0};
   CProxy_FoFPhase1<Data> group_proxy;      // set at chain start (for the fan)
 
   // Fire the merge + relabel fan exactly once, when local deposits are
@@ -569,6 +579,9 @@ public:
     steal_outstanding = 0;
     steal_flatten_us = 0;
     pool_units_total = 0;
+    { std::lock_guard<std::mutex> g(flat_memo_lock); flat_memo.clear(); }
+    flat_memo_hits = 0;
+    flat_memo_misses = 0;
     phaseb_pool_ready = false;
     pool_deposits_done = false;
     merge_fired = false;
@@ -1233,11 +1246,40 @@ public:
     double f0 = CkWallTimer();
     paratreet::StealShipment<Data> ship;
     ship.victim_node = CkMyNode();
+    // Ship-once, use-many: each distinct subtree is flattened at most
+    // once per phase (memo) and appears once per shipment; units are
+    // index pairs into that list.
+    std::unordered_map<Node<Data>*, int> in_ship;
+    auto placeTree = [&](Node<Data>* n) -> int {
+      auto it = in_ship.find(n);
+      if (it != in_ship.end()) return it->second;
+      std::shared_ptr<paratreet::StealTree<Data>> blob;
+      {
+        std::lock_guard<std::mutex> g(nb->flat_memo_lock);
+        auto mi = nb->flat_memo.find(n);
+        if (mi != nb->flat_memo.end()) blob = mi->second;
+      }
+      if (!blob) {
+        // Flatten outside the lock; a concurrent duplicate is harmless
+        // (both blobs are identical, one wins the insert).
+        auto fresh = std::make_shared<paratreet::StealTree<Data>>();
+        flattenStealTree(n, *fresh);
+        std::lock_guard<std::mutex> g(nb->flat_memo_lock);
+        auto ins = nb->flat_memo.emplace(n, fresh);
+        blob = ins.first->second;
+        nb->flat_memo_misses.fetch_add(1);
+      } else {
+        nb->flat_memo_hits.fetch_add(1);
+      }
+      int idx = (int)ship.trees.size();
+      ship.trees.push_back(*blob);
+      in_ship.emplace(n, idx);
+      return idx;
+    };
     for (size_t u = start; u < end; u++) {
-      ship.trees.emplace_back();
-      flattenStealTree(nb->phaseb_pool[u].a, ship.trees.back());
-      ship.trees.emplace_back();
-      flattenStealTree(nb->phaseb_pool[u].b, ship.trees.back());
+      int ia = placeTree(nb->phaseb_pool[u].a);
+      int ib = placeTree(nb->phaseb_pool[u].b);
+      ship.unit_pairs.emplace_back(ia, ib);
     }
     nb->steal_flatten_us.fetch_add(
         (long)((CkWallTimer() - f0) * 1e6));
@@ -1318,21 +1360,27 @@ public:
   void receiveSteal(const paratreet::StealShipment<Data>& ship) {
     std::vector<long> edges_flat;
     long units = 0;
-    for (size_t t = 0; t + 1 < ship.trees.size(); t += 2) {
-      std::vector<Particle> pa = ship.trees[t].particles;
-      std::vector<Particle> pb = ship.trees[t + 1].particles;
-      Node<Data>* a = buildStealTree(ship.trees[t], pa);
-      Node<Data>* b = buildStealTree(ship.trees[t + 1], pb);
+    // Rebuild each distinct subtree once; units index into that list, so
+    // a subtree shared by several units is rebuilt once too.
+    std::vector<std::vector<Particle>> parts(ship.trees.size());
+    std::vector<Node<Data>*> roots(ship.trees.size(), nullptr);
+    for (size_t t = 0; t < ship.trees.size(); t++) {
+      parts[t] = ship.trees[t].particles;
+      roots[t] = buildStealTree(ship.trees[t], parts[t]);
+    }
+    for (auto& up : ship.unit_pairs) {
+      if (up.first < 0 || up.second < 0 ||
+          up.first >= (int)roots.size() || up.second >= (int)roots.size())
+        continue;
       std::vector<std::pair<long, long>> es;
-      walkUnitEdges(a, b, es);
+      walkUnitEdges(roots[up.first], roots[up.second], es);
       for (auto& e : es) {
         edges_flat.push_back(e.first);
         edges_flat.push_back(e.second);
       }
-      deleteStealTree(a);
-      deleteStealTree(b);
       units++;
     }
+    for (auto* r : roots) deleteStealTree(r);
     node_proxy.ckLocalBranch()->stolen_in_units.fetch_add(units);
     this->thisProxy[CkNodeFirst(ship.victim_node)].returnStolenEdges(edges_flat);
     probeRound(); // re-derive the target for the next batch
@@ -1352,6 +1400,7 @@ public:
     flattenStealTree(a, ship.trees.back());
     ship.trees.emplace_back();
     flattenStealTree(b, ship.trees.back());
+    ship.unit_pairs.emplace_back(0, 1);
     PUP::sizer sz;
     ship.pup(sz);
     std::vector<char> buf(sz.size());
@@ -1418,6 +1467,8 @@ public:
       rec.in_units = nb->stolen_in_units.load();
       rec.denials = nb->steal_denials.load();
       rec.flatten_ms = nb->steal_flatten_us.load() / 1000.0;
+      rec.flat_hits = nb->flat_memo_hits.load();
+      rec.flat_misses = nb->flat_memo_misses.load();
       n = 1;
     }
     this->contribute(n * sizeof(paratreet::StealAcct), &rec,
@@ -2693,9 +2744,9 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
       const auto& r = recs[i];
       if (r.out_units == 0 && r.in_units == 0 && r.denials == 0) continue;
       CkPrintf("FOF3STAT stealacct: process %d pool %ld wallB %.3f out %ld "
-               "in %ld denials %ld flatten_ms %.1f\n",
+               "in %ld denials %ld flatten_ms %.1f blobs %ld reused %ld\n",
                r.process, r.pool_units, r.wall_b, r.out_units, r.in_units,
-               r.denials, r.flatten_ms);
+               r.denials, r.flatten_ms, r.flat_misses, r.flat_hits);
     }
     delete am;
   }

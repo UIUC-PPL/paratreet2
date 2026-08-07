@@ -28,13 +28,21 @@ struct StealTree {
   }
 };
 
+// A shipment carries DEDUPLICATED subtree blobs plus one index pair per
+// unit (ship-once, use-many). Pool units are child-level fragments of
+// subtree pairs, so one child appears in up to eight units; flattening
+// per unit re-serialized it every time, and that cost — 1.3 to 5.6 ms
+// per unit, measured 2026-08-06 — was the ceiling on how fast a donor
+// could shed work (design note section 11).
 template <typename Data>
 struct StealShipment {
   int victim_node = -1;
-  std::vector<StealTree<Data>> trees; // 2 per unit
+  std::vector<StealTree<Data>> trees;             // distinct subtrees
+  std::vector<std::pair<int, int>> unit_pairs;    // indices into trees
   void pup(PUP::er& p) {
     p | victim_node;
     p | trees;
+    p | unit_pairs;
   }
 };
 
@@ -47,6 +55,8 @@ struct StealAcct {
   long in_units = 0;
   long denials = 0;
   double flatten_ms = 0;
+  long flat_hits = 0;    // shipments served from the flatten memo
+  long flat_misses = 0;  // distinct subtrees actually flattened
 };
 
 } // namespace paratreet
