@@ -1193,13 +1193,19 @@ public:
     return on;
   }
   static bool stealEnabled() {
-    // Default ON (restored 2026-08-06 after the stale-memo fix, commit
-    // 82de369, was validated at the scale that exposed it: four
-    // steals-active runs at 80M/480 processors, serial and distributed,
-    // all bit-exact against ground truth). FOF_STEAL=0 disables.
+    // Default OFF (2026-08-07). Stealing is correct and cheap per
+    // message, but it has produced no measurable benefit in eight
+    // rounds at 80M and 2B, and its retry loop is a per-thread poll:
+    // a helper asks every 1-2 ms while a target's pool does not exist
+    // yet, and 94% of requests at 2B were exactly those retries. At
+    // 1,920 threads that was tolerable; at Frontier's 14,336 it is
+    // 7.5x more pollers with a longer phaseA skew to spin through, and
+    // the reported symptom there was everything running slow. An
+    // opt-in that has never paid should not be able to cost anything.
+    // FOF_STEAL=1 enables.
     static const bool on = [] {
       const char* e = std::getenv("FOF_STEAL");
-      return !(e && std::atoi(e) == 0);
+      return e && std::atoi(e) == 1;
     }();
     return on;
   }
