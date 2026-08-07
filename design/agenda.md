@@ -17,24 +17,39 @@ points at its design note where one exists. Started 2026-08-05.
    quiescence detection at all. FOF_WALK_QD=1 keeps the quiescence
    path as the A/B oracle; Anvil-scale bracket measurement rides the
    next measurement round.
-3. Steal-based phaseB cross-process offload (design/phaseb-offload.md),
-   built against the framework pool from item 1.
-4. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
+3. Steal-based phaseB cross-process offload. The implementation and its
+   measurements live on the phaseb-steal branch, not here: correct at
+   every round but the wall barely moved, and the branch records why
+   (design/phaseb-offload.md there). Reconsider against item 4 and
+   against simply running fewer, larger processes, which measured
+   better than moving work between processes.
+4. Parallelize the phaseB pool build across the process's threads. It
+   is currently a serial per-process enumeration and LPT sort performed
+   by the last phaseA depositor while the other 14 threads wait, and it
+   is what blocks finer unit splitting: at 80M/4 nodes,
+   FOF_POOL_SPLIT_SIZE=6 cuts the largest unit 0.063 -> 0.039 s and the
+   slowest thread 0.063 -> 0.053 s, but the stage still regresses
+   0.067 -> 0.121 s because the build now enumerates 2.34M units instead
+   of 199k. The enumeration is embarrassingly parallel over subtree
+   pairs; the sort can be per-thread with a merge. Once it is parallel,
+   size-based splitting should be turned on by default and phaseB should
+   scale from one node instead of waiting until eight.
+5. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
    1.65 s at 16; design/speedup-campaign-2026-08-05.md follow-up 2):
    profile splitter computation and particle flush at 1920 PEs.
-5. -u serial as the production default; retire the keep-alive ring
+6. -u serial as the production default; retire the keep-alive ring
    (the serial bracket is quiescence-free and stall-immune; the ring
    measurably does not suppress the stall in the dist pattern).
-6. Slim the serial-mode relabel broadcast to per-process map slices
+7. Slim the serial-mode relabel broadcast to per-process map slices
    (2.84 s at 2B/16 nodes for the full-map broadcast).
-7. Rename Subtree -> TreePiece (code + documentation dedicated pass,
+8. Rename Subtree -> TreePiece (code + documentation dedicated pass,
    before or during report/paper writing; "subtree" collides with the
    generic word in prose).
-8. LCI items for the handover: packet-pool exhaustion at 2B on 4-8
+9. LCI items for the handover: packet-pool exhaustion at 2B on 4-8
    nodes (refill_recvs deadlock alerts then poll_comp_impl assert
    during the input flush); the idle-stall itself (dist uf2 3.7 s at
    80M/16 nodes with the keep-alive ring on).
-9. DONE 2026-08-06 (freeze-pass counting commit): eliminated the component counter's particle
+10. DONE 2026-08-06 (freeze-pass counting commit): eliminated the component counter's particle
    pass (Kale's design, 2026-08-06). Count per union-find root during
    the phaseA freeze pass (dense array increment beside the existing
    find()); carry the per-processor tip-count map through every label
@@ -42,7 +57,7 @@ points at its design note where one exists. Started 2026-08-05.
    map instead of re-counting all particles. Removes the 60 ms band at
    80M (projected ~300 ms per processor at 2B); debug flag keeps the
    old particle loop as a cross-check.
-10. Distributed union-find mode: batch the component-labeling requests
+11. Distributed union-find mode: batch the component-labeling requests
    per destination chare. The labeling scatter (boss_count_prefix_done ->
    insertDataNeedBoss, observed ~1400 sends from one chare at 2B) already
    deduplicates by parent through a cache; flushing per destination would
@@ -50,7 +65,7 @@ points at its design note where one exists. Started 2026-08-05.
    important (Kale, 2026-08-05) and has been competitive — this and its
    quiescence-closed labeling phase are its main remaining fine-grained
    patterns.
-11. Representative-indirect relabeling (Kale, 2026-08-06): keep the
+12. Representative-indirect relabeling (Kale, 2026-08-06): keep the
     compressed per-processor union-find array from the phaseA freeze
     (uf_parent[i] = flat index of i's representative). Apply every
     label map — phase-1 merge, tip encoding, the phase-3 map in either
@@ -61,13 +76,13 @@ points at its design note where one exists. Started 2026-08-05.
     positive tip) is the "local fragment" marker. Companion to the
     freeze-pass counting; together they remove every per-particle hash
     pass after phaseA.
-12. loadCache anti-scaling (Ritvik's Frontier 2B sweep, design/
+13. loadCache anti-scaling (Ritvik's Frontier 2B sweep, design/
     fof3-2b-scaling.md): the starter-pack load grows ~49x from 8 to 128
     nodes (0.022 -> 1.073 s) as pack size tracks subtree count — batch
     or coarsen the starter-pack shipment. The Anvil 80M tables show the
     same shape in miniature (0.002 -> 0.048 s over 1 -> 16 nodes).
-13. Load-balancing benefit study (GreedyRefine path is validated;
+14. Load-balancing benefit study (GreedyRefine path is validated;
    deferred by Kale until "much later").
-14. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
+15. htram: OFF by default since 2026-08-05 (build-stack.sh); revisit
     only as an explicit study, e.g. >16-node dist campaigns.
-15. ChaNGa integration: waiting on Kale's go.
+16. ChaNGa integration: waiting on Kale's go.
