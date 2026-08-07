@@ -573,11 +573,21 @@ public:
   };
   std::vector<PoolUnit> phaseb_pool;
   std::atomic<size_t> phaseb_next{0};
+  // Parallel pool build (2026-08-07): each of the process's threads
+  // enumerates a stripe of the subtree-pair space into its own slice —
+  // no lock, no sharing — and the last one to finish concatenates and
+  // sorts. The build used to run entirely on the thread that finished
+  // phaseA last while the other fourteen waited, which is what made
+  // finer unit splitting cost more than it saved.
+  std::vector<std::vector<PoolUnit>> pool_slices;
+  std::atomic<int> slice_done{0};
 
   void reset(const CkCallback& cb) {
     label_shards.clear();
     phaseb_pool.clear();
     phaseb_next = 0;
+    pool_slices.clear();
+    slice_done = 0;
     chain_started = 0;
     a_done = 0;
     b_done = 0;
@@ -997,107 +1007,152 @@ public:
       // perfectly-leveled process share, so grandchild granularity is
       // warranted. Each level is mindist-filtered, so only interacting
       // pairs multiply.
-      std::function<void(Node<Data>*, Node<Data>*, int)> poolPush =
-          [&](Node<Data>* a, Node<Data>* b, int depth) {
-        double d2 = paratreet::mindist2(a->data.box, b->data.box, period_);
-        if (d2 > b2_) return;
-        // Depth 2 is reserved for OVERLAPPING pairs (gap 0): only dense
-        // shared boundaries can hide a giant unit, and unconditional
-        // grandchild granularity measurably inflated the per-unit fixed
-        // costs (phaseB avg 0.014 -> 0.020 on the laptop). Separated
-        // pairs stay at depth-1 granularity. Still pure geometry.
-        // Split depth for OVERLAPPING pairs (gap zero) is tunable
-        // (FOF_POOL_DEPTH, default 2). Measured 2026-08-07 at 80M: from
-        // 1 to 4 nodes the whole phaseB stage IS one indivisible unit
-        // (stage 0.109/0.134/0.073 s against a largest-unit 0.109/0.134/
-        // 0.073 s) — a fragment of the densest region that no number of
-        // threads or nodes can divide. Separated pairs still stop at
-        // depth 1: they are cheap and splitting them only multiplies
-        // per-unit overhead.
-        static const int max_depth = [] {
-          const char* e = std::getenv("FOF_POOL_DEPTH");
-          int v = e ? std::atoi(e) : 2;
-          return v >= 1 ? v : 2;
-        }();
-        // Size-based splitting (FOF_POOL_SPLIT_SIZE=C, default 0 = the
-        // depth rule below, unchanged). Measured 2026-08-07 at 80M: the
-        // depth knob above is inert — the unit that IS the whole phaseB
-        // stage at 1-4 nodes is a SEPARATED pair stopped at depth 1 by
-        // the d2 > 0 clause, on the assumption that separated pairs are
-        // cheap. Two large boxes a hair apart in the densest region are
-        // not cheap. With C > 0 a pair keeps splitting while either box
-        // is still large compared with the linking length, whatever its
-        // depth or separation, so unit cost is bounded by geometry
-        // instead of by an assumption.
-        static const double split_size = [] {
-          const char* e = std::getenv("FOF_POOL_SPLIT_SIZE");
-          return e ? std::atof(e) : 0.0;
-        }();
-        // The size rule is ADDITIVE: it may only split MORE than the
-        // depth rule, never less. Measured 2026-08-07 at 80M with the
-        // first (replacing) version, C=12 produced a LARGER largest unit
-        // than the baseline (0.115 s against 0.063 s) because a pair
-        // whose boxes were already under the threshold stopped
-        // immediately, including pairs the depth rule would have split.
-        bool depth_stop = depth >= max_depth || (depth == 1 && d2 > 0) ||
-                          a->isLeaf() || b->isLeaf();
-        bool stop_here = depth_stop;
-        if (split_size > 0 && !a->isLeaf() && !b->isLeaf() && depth < 6) {
-          const double blen = std::sqrt(b2_);
-          bool still_big = boxMeasure(a) > split_size * blen ||
-                           boxMeasure(b) > split_size * blen;
-          if (still_big) stop_here = false;   // keep splitting big pairs
-        }
-        if (stop_here) {
-          // LPT key, pure geometry (no thresholds): overlapping pairs
-          // (gap 0) are the expensive ones, ordered by DESCENDING box
-          // overlap volume; separated pairs follow by ascending gap.
-          // Ascending sort then claims costliest-first, so the pool's
-          // tail is cheap units and the last claim cannot be a giant.
-          double key;
-          if (d2 > 0) {
-            key = d2;
-          } else {
-            const auto& ba = a->data.box;
-            const auto& bb = b->data.box;
-            double ov = 1;
-            ov *= std::max(0.0,
-                (double)std::min(ba.greater_corner.x, bb.greater_corner.x) -
-                (double)std::max(ba.lesser_corner.x, bb.lesser_corner.x));
-            ov *= std::max(0.0,
-                (double)std::min(ba.greater_corner.y, bb.greater_corner.y) -
-                (double)std::max(ba.lesser_corner.y, bb.lesser_corner.y));
-            ov *= std::max(0.0,
-                (double)std::min(ba.greater_corner.z, bb.greater_corner.z) -
-                (double)std::max(ba.lesser_corner.z, bb.lesser_corner.z));
-            key = -ov;
-          }
-          nb->phaseb_pool.push_back({key, a, b});
-          return;
-        }
-        for (int ci = 0; ci < a->n_children; ci++) {
-          Node<Data>* ca = a->getChild(ci);
-          if (ca == nullptr || ca->n_particles == 0) continue;
-          for (int cj = 0; cj < b->n_children; cj++) {
-            Node<Data>* cb = b->getChild(cj);
-            if (cb == nullptr || cb->n_particles == 0) continue;
-            poolPush(ca, cb, depth + 1);
-          }
-        }
-      };
-      for (auto ita = nb->pe_subtrees.begin(); ita != nb->pe_subtrees.end();
-           ++ita) {
-        auto itb = ita;
-        for (++itb; itb != nb->pe_subtrees.end(); ++itb)
-          for (auto& sa : ita->second)
-            for (auto& sb : itb->second)
-              poolPush(sa.root, sb.root, 0);
+      // Hand the enumeration to every thread of this process; the last
+      // one to finish assembles the pool and starts phaseB.
+      nb->pool_slices.assign(CkNodeSize(CkMyNode()), {});
+      nb->slice_done.store(0);
+      int first = CkNodeFirst(CkMyNode());
+      for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+        this->thisProxy[pe].buildPoolSlice();
+    }
+  }
+
+  // One pool unit enumeration, writing into a caller-owned slice.
+  // Extracted from the build lambda so every thread of the process can
+  // run it concurrently on its own stripe (see buildPoolSlice).
+  void poolPushInto(std::vector<typename FoFPhase1Node<Data>::PoolUnit>& out,
+                    Node<Data>* a, Node<Data>* b, int depth = 0) {
+      double d2 = paratreet::mindist2(a->data.box, b->data.box, period_);
+      if (d2 > b2_) return;
+      // Depth 2 is reserved for OVERLAPPING pairs (gap 0): only dense
+      // shared boundaries can hide a giant unit, and unconditional
+      // grandchild granularity measurably inflated the per-unit fixed
+      // costs (phaseB avg 0.014 -> 0.020 on the laptop). Separated
+      // pairs stay at depth-1 granularity. Still pure geometry.
+      // Split depth for OVERLAPPING pairs (gap zero) is tunable
+      // (FOF_POOL_DEPTH, default 2). Measured 2026-08-07 at 80M: from
+      // 1 to 4 nodes the whole phaseB stage IS one indivisible unit
+      // (stage 0.109/0.134/0.073 s against a largest-unit 0.109/0.134/
+      // 0.073 s) — a fragment of the densest region that no number of
+      // threads or nodes can divide. Separated pairs still stop at
+      // depth 1: they are cheap and splitting them only multiplies
+      // per-unit overhead.
+      static const int max_depth = [] {
+        const char* e = std::getenv("FOF_POOL_DEPTH");
+        int v = e ? std::atoi(e) : 2;
+        return v >= 1 ? v : 2;
+      }();
+      // Size-based splitting (FOF_POOL_SPLIT_SIZE=C, default 0 = the
+      // depth rule below, unchanged). Measured 2026-08-07 at 80M: the
+      // depth knob above is inert — the unit that IS the whole phaseB
+      // stage at 1-4 nodes is a SEPARATED pair stopped at depth 1 by
+      // the d2 > 0 clause, on the assumption that separated pairs are
+      // cheap. Two large boxes a hair apart in the densest region are
+      // not cheap. With C > 0 a pair keeps splitting while either box
+      // is still large compared with the linking length, whatever its
+      // depth or separation, so unit cost is bounded by geometry
+      // instead of by an assumption.
+      static const double split_size = [] {
+        const char* e = std::getenv("FOF_POOL_SPLIT_SIZE");
+        return e ? std::atof(e) : 0.0;
+      }();
+      // The size rule is ADDITIVE: it may only split MORE than the
+      // depth rule, never less. Measured 2026-08-07 at 80M with the
+      // first (replacing) version, C=12 produced a LARGER largest unit
+      // than the baseline (0.115 s against 0.063 s) because a pair
+      // whose boxes were already under the threshold stopped
+      // immediately, including pairs the depth rule would have split.
+      bool depth_stop = depth >= max_depth || (depth == 1 && d2 > 0) ||
+                        a->isLeaf() || b->isLeaf();
+      bool stop_here = depth_stop;
+      if (split_size > 0 && !a->isLeaf() && !b->isLeaf() && depth < 6) {
+        const double blen = std::sqrt(b2_);
+        bool still_big = boxMeasure(a) > split_size * blen ||
+                         boxMeasure(b) > split_size * blen;
+        if (still_big) stop_here = false;   // keep splitting big pairs
       }
-      std::stable_sort(nb->phaseb_pool.begin(), nb->phaseb_pool.end(),
-                       [](const typename FoFPhase1Node<Data>::PoolUnit& x,
-                          const typename FoFPhase1Node<Data>::PoolUnit& y) {
-                         return x.key < y.key;
-                       });
+      if (stop_here) {
+        // LPT key, pure geometry (no thresholds): overlapping pairs
+        // (gap 0) are the expensive ones, ordered by DESCENDING box
+        // overlap volume; separated pairs follow by ascending gap.
+        // Ascending sort then claims costliest-first, so the pool's
+        // tail is cheap units and the last claim cannot be a giant.
+        double key;
+        if (d2 > 0) {
+          key = d2;
+        } else {
+          const auto& ba = a->data.box;
+          const auto& bb = b->data.box;
+          double ov = 1;
+          ov *= std::max(0.0,
+              (double)std::min(ba.greater_corner.x, bb.greater_corner.x) -
+              (double)std::max(ba.lesser_corner.x, bb.lesser_corner.x));
+          ov *= std::max(0.0,
+              (double)std::min(ba.greater_corner.y, bb.greater_corner.y) -
+              (double)std::max(ba.lesser_corner.y, bb.lesser_corner.y));
+          ov *= std::max(0.0,
+              (double)std::min(ba.greater_corner.z, bb.greater_corner.z) -
+              (double)std::max(ba.lesser_corner.z, bb.lesser_corner.z));
+          key = -ov;
+        }
+        out.push_back({key, a, b});
+        return;
+      }
+      for (int ci = 0; ci < a->n_children; ci++) {
+        Node<Data>* ca = a->getChild(ci);
+        if (ca == nullptr || ca->n_particles == 0) continue;
+        for (int cj = 0; cj < b->n_children; cj++) {
+          Node<Data>* cb = b->getChild(cj);
+          if (cb == nullptr || cb->n_particles == 0) continue;
+          poolPushInto(out, ca, cb, depth + 1);
+        }
+      }
+  }
+  // One thread's stripe of the pool enumeration. Subtree pairs are taken
+  // from the flattened (thread-pair, subtree-pair) space by stride, so
+  // every thread walks a comparable share of the geometry without any
+  // coordination. Writes only its own slice.
+  void buildPoolSlice() {
+    auto* nb = node_proxy.ckLocalBranch();
+    int rank = CkMyRank(), nranks = CkNodeSize(CkMyNode());
+    auto& slice = nb->pool_slices[rank];
+    long idx = 0;
+    for (auto ita = nb->pe_subtrees.begin(); ita != nb->pe_subtrees.end();
+         ++ita) {
+      auto itb = ita;
+      for (++itb; itb != nb->pe_subtrees.end(); ++itb)
+        for (auto& sa : ita->second)
+          for (auto& sb : itb->second)
+            if ((idx++ % nranks) == rank) poolPushInto(slice, sa.root, sb.root);
+    }
+    // Sort this thread's own slice (in parallel with the others), so the
+    // assembly below never runs a global comparison sort — that sort
+    // would otherwise become the new serial bottleneck as unit counts
+    // grow (Kale, 2026-08-07).
+    std::stable_sort(slice.begin(), slice.end(),
+                     [](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                        const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                       return x.key < y.key;
+                     });
+    if (nb->slice_done.fetch_add(1) + 1 == nranks) {
+      size_t total = 0, longest = 0;
+      for (auto& sl : nb->pool_slices) {
+        total += sl.size();
+        longest = std::max(longest, sl.size());
+      }
+      nb->phaseb_pool.clear();
+      nb->phaseb_pool.reserve(total);
+      // Round-robin merge of sorted slices: comparison-free and linear.
+      // Claiming is costliest-first, and every slice is ordered that way,
+      // so taking one unit from each slice in turn keeps the expensive
+      // units at the front where the claim cursor reaches them first.
+      // Exact global order is not needed — the pool is a scheduling
+      // heuristic, not a result.
+      for (size_t i = 0; i < longest; i++)
+        for (auto& sl : nb->pool_slices)
+          if (i < sl.size()) nb->phaseb_pool.push_back(sl[i]);
+      for (auto& sl : nb->pool_slices)
+        std::vector<typename FoFPhase1Node<Data>::PoolUnit>().swap(sl);
       nb->pool_units_total = (long)nb->phaseb_pool.size();
       nb->phaseb_pool_ready.store(true, std::memory_order_release);
       int first = CkNodeFirst(CkMyNode());
