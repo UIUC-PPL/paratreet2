@@ -1134,122 +1134,88 @@ public:
     return k;
   }
 
-  // v4 helper (Kale's scheme, 2026-08-07): probe all machine-mates for
-  // remaining units, target the MAXIMUM, take one batch, re-probe.
-  // Donors serve any number of helpers concurrently (independent atomic
-  // claims); the many-to-one convergence is on the helper side only.
+  // Helper flow: ASK, do not probe first (2026-08-07). The two-phase
+  // probe-then-request design doubled the round trips and, worse, its
+  // rounds stalled: a probe sits behind whatever unit the donor's
+  // processor is walking, and at two billion particles that unit can run
+  // 0.67 s — so rounds rarely completed and helpers issued essentially no
+  // requests (measured: the wall-owning process served 314 probes and
+  // granted nothing, with zero requests issued job-wide). The donor
+  // already owns the grant decision, so the probe only ever bought a
+  // ranking; asking directly costs one round trip and the denial reason
+  // carries the same information. Light donors refuse immediately, so
+  // helpers converge on the heavy one by trial.
   std::vector<int> steal_mates;
   std::vector<char> steal_mate_merged;
-  int probe_pending = 0;
-  int probe_best_victim = -1;
-  long probe_best_remaining = 0;
-  // Round sequence: a helper can have several probe rounds triggered
-  // close together (a denial and a returned batch); reports from any
-  // round but the current one are ignored so the pending count stays
-  // exact.
-  int probe_seq = 0;
+  size_t steal_victim_i = 0;
 
   void startHelping() {
     steal_mates.clear();
+    steal_victim_i = 0;
     int mine = CkMyNode();
     int g = stealGroup();
     int lo = (mine / g) * g;
     int hi = std::min(lo + g, CkNumNodes());
-    for (int j = lo; j < hi; j++)
-      if (j != mine) steal_mates.push_back(j);
+    for (int j = mine + 1; j < hi; j++) steal_mates.push_back(j);
+    for (int j = lo; j < mine; j++) steal_mates.push_back(j);
     steal_mate_merged.assign(steal_mates.size(), 0);
-    watchdog_seq = -1;
-    probeWatchdog();
     if (stealDebug())
-      CkPrintf("[steal] pe %d startHelping mates=%zu\n", CkMyPe(), steal_mates.size());
-    probeRound();
+      CkPrintf("[steal] pe %d startHelping mates=%zu\n", CkMyPe(),
+               steal_mates.size());
+    askVictim();
   }
 
-  void probeRound() {
-    // One round at a time. A round in flight will either issue a request
-    // or schedule the next round when it completes; starting another now
-    // would supersede it and discard its replies (see the note above).
-    if (probe_pending > 0) return;
-    node_proxy.ckLocalBranch()->helper_rounds.fetch_add(1);
-    probe_seq++;
-    probe_pending = 0;
-    probe_best_victim = -1;
-    probe_best_remaining = 0;
-    for (size_t i = 0; i < steal_mates.size(); i++) {
+  void askVictim() {
+    size_t n = steal_mates.size();
+    if (n == 0) return;
+    for (size_t step = 0; step < n; step++) {
+      size_t i = (steal_victim_i + step) % n;
       if (steal_mate_merged[i]) continue;
-      probe_pending++;
+      steal_victim_i = i;
       int victim = steal_mates[i];
-      int serve_pe = CkNodeFirst(victim) + (CkMyPe() % CmiNodeSize(victim));
-      this->thisProxy[serve_pe].probeRemaining(CkMyPe(), probe_seq);
-    }
-    // probe_pending == 0: every machine-mate has merged; this helper is
-    // done for the phase.
-  }
-
-  void remainingReport(int victim_node, long remaining, int merged, int seq) {
-    // A merged report is durable information regardless of round.
-    for (size_t i = 0; i < steal_mates.size(); i++)
-      if (steal_mates[i] == victim_node && merged) steal_mate_merged[i] = 1;
-    if (seq != probe_seq) return; // stale round
-    // Eligibility is simply "has work left"; the RANKING picks the
-    // neediest. The admission policy (grant while more than two batches
-    // remain) lives at the victim, which alone knows whether its own
-    // threads are still claiming — a helper-side copy of that threshold
-    // stranded the tail of a pool nobody local was draining.
-    if (!merged && remaining > 0 && remaining > probe_best_remaining) {
-      probe_best_remaining = remaining;
-      probe_best_victim = victim_node;
-    }
-    if (stealDebug())
-      CkPrintf("[steal] pe %d report victim %d remaining %ld merged %d pending %d\n",
-               CkMyPe(), victim_node, remaining, merged, probe_pending);
-    if (--probe_pending > 0) return;
-    if (probe_best_victim >= 0) {
-      int victim = probe_best_victim;
       int serve_pe = CkNodeFirst(victim) + (CkMyPe() % CmiNodeSize(victim));
       node_proxy.ckLocalBranch()->helper_requests.fetch_add(1);
       this->thisProxy[serve_pe].requestSteal(CkMyPe());
       return;
     }
-    // Nobody needy right now, but not everyone merged: pause briefly and
-    // probe again (covers late-building pools and shifting need).
-    bool any_open = false;
-    for (size_t i = 0; i < steal_mates.size(); i++)
-      if (!steal_mate_merged[i]) { any_open = true; break; }
-    if (any_open) {
-      CcdCallFnAfter([](void* arg, double) {
-        auto* self = (FoFPhase1<Data>*)arg;
-        self->probeRound();
-      }, this, 5.0 /* ms */);
-    }
+    // Every mate has finished; nothing left to help with this phase.
   }
 
-  void probeWatchdog() {
-    if (probe_pending > 0 && probe_seq == watchdog_seq) {
-      probe_pending = 0;   // release the stuck round
-      probeRound();
-      return;
-    }
-    watchdog_seq = probe_seq;
-    if (!steal_mates.empty())
-      CcdCallFnAfter([](void* arg, double) {
-        auto* self = (FoFPhase1<Data>*)arg;
-        self->probeWatchdog();
-      }, this, 50.0 /* ms */);
-  }
-  int watchdog_seq = -1;
-
-  void stealDenied(int victim_node) {
-    // Any denial (not ready, not needy, or drained under our feet):
-    // re-derive the target with a fresh probe round — but PACED. An
-    // immediate re-probe turns helper and victim into a deny/probe
-    // message storm (measured: the forced-steal validation hung with
-    // the machine at full load and no progress), which is exactly the
-    // work-starvation the scheme exists to avoid.
+  void retryAfter(double ms) {
     CcdCallFnAfter([](void* arg, double) {
       auto* self = (FoFPhase1<Data>*)arg;
-      self->probeRound();
-    }, this, 1.0 /* ms */);
+      self->askVictim();
+    }, this, ms);
+  }
+
+  // Kept for the future node-level monitor; the helper flow no longer
+  // consults it.
+  void remainingReport(int victim_node, long remaining, int merged, int seq) {
+    (void)victim_node; (void)remaining; (void)merged; (void)seq;
+  }
+
+  void stealDenied(int victim_node) {
+    if (victim_node < 0) {
+      bool not_needy = (-victim_node) > (1 << 20);
+      if (not_needy) {
+        // Busy but self-sufficient: try the next mate, and come back to
+        // this one later — its tail can still grow.
+        steal_victim_i = (steal_victim_i + 1) %
+                         std::max<size_t>(steal_mates.size(), 1);
+        retryAfter(2.0);
+      } else {
+        // Pool not built yet: the heavy donor is typically the last to
+        // finish its own phaseA, so wait for it rather than moving on.
+        retryAfter(1.0);
+      }
+      return;
+    }
+    // Drained or already merged: this mate is finished for the phase.
+    if (steal_victim_i < steal_mate_merged.size())
+      steal_mate_merged[steal_victim_i] = 1;
+    steal_victim_i = (steal_victim_i + 1) %
+                     std::max<size_t>(steal_mates.size(), 1);
+    askVictim();
   }
 
   void requestSteal(int helper_pe) {
@@ -1435,7 +1401,7 @@ public:
     for (auto* r : roots) deleteStealTree(r);
     node_proxy.ckLocalBranch()->stolen_in_units.fetch_add(units);
     this->thisProxy[CkNodeFirst(ship.victim_node)].returnStolenEdges(edges_flat);
-    probeRound(); // re-derive the target for the next batch
+    askVictim(); // same victim: it had work a moment ago
   }
 
   // Self-test (FOF_STEAL_SELFTEST=1, debug): for every locally claimed
