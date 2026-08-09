@@ -525,6 +525,19 @@ public:
   std::unordered_map<Node<Data>*, std::shared_ptr<paratreet::StealTree<Data>>>
       flat_memo;
   std::mutex flat_memo_lock;
+  // Local versus borrowed execution, to answer whether a unit costs more
+  // to run away from home and if so why (design/phaseb-offload.md).
+  std::atomic<long> ex_units[2] = {{0}, {0}};      // [0] own, [1] borrowed
+  std::atomic<long> ex_walk_us[2] = {{0}, {0}};
+  std::atomic<long> ex_edges[2] = {{0}, {0}};      // edges kept
+  std::atomic<long> ex_dupes[2] = {{0}, {0}};      // edges suppressed as seen
+  std::atomic<long> ex_cert_hit[2] = {{0}, {0}};   // certificate memo
+  std::atomic<long> ex_cert_miss[2] = {{0}, {0}};
+  std::atomic<long> ex_star_parts[2] = {{0}, {0}}; // particles walked by the
+                                                   // certificate star emit
+  std::atomic<long> ex_shortcut[2] = {{0}, {0}};   // repeats caught without
+                                                   // touching the hash map
+  std::atomic<long> seen_resets{0};                // dedup sets thrown away
   std::atomic<long> flat_memo_hits{0};
   std::atomic<long> flat_memo_misses{0};
   CProxy_FoFPhase1<Data> group_proxy;      // set at chain start (for the fan)
@@ -686,6 +699,12 @@ public:
     b_done = 0;
     chain_t0 = stage_tA = stage_tB = stage_tM = 0;
     steal_outstanding = 0;
+    for (int i = 0; i < 2; i++) {
+      ex_units[i] = 0; ex_walk_us[i] = 0; ex_edges[i] = 0; ex_dupes[i] = 0;
+      ex_cert_hit[i] = 0; ex_cert_miss[i] = 0; ex_star_parts[i] = 0;
+      ex_shortcut[i] = 0;
+    }
+    seen_resets = 0;
     steal_flatten_us = 0;
     deny_not_ready = 0;
     deny_not_needy = 0;
@@ -1347,11 +1366,34 @@ public:
       double tp0 = CkWallTimer();
       auto& out_seen = (u.origin < 0) ? seen : foreign_seen_[u.origin];
       auto& out_buf  = (u.origin < 0) ? edge_buf : foreign_buf_[u.origin];
+      const int w = (u.origin < 0) ? 0 : 1;   // own work, or borrowed
+      // Counters are per processor and folded into the process's record
+      // when the stage ends. An earlier version incremented shared
+      // atomics here and, at 8.5 billion emissions in a 2B run, cost far
+      // more than the stage it was measuring.
+      long& c_edges = pe_edges_[w];
+      long& c_dupes = pe_dupes_[w];
+      // Consecutive particle pairs in one leaf-leaf visit usually carry
+      // the same pair of tips, so remembering the last one answers most
+      // repeats without touching the hash map at all.
+      long& last_lo = pe_last_lo_[w];
+      long& last_hi = pe_last_hi_[w];
+      last_lo = last_hi = -1;   // see the note on origins below
       auto emit = [&](long ti, long tj) {
         if (ti == tj) return;
         long lo = std::min(ti, tj), hi = std::max(ti, tj);
-        if (out_seen.insert(paratreet::packTipPair(lo, hi)).second)
+        if (lastPairShortcut() && lo == last_lo && hi == last_hi) {
+          ++c_dupes;
+          ++pe_shortcut_[w];
+          return;
+        }
+        last_lo = lo; last_hi = hi;
+        if (out_seen.insert(paratreet::packTipPair(lo, hi)).second) {
           out_buf.emplace_back(lo, hi);
+          ++c_edges;
+        } else {
+          ++c_dupes;
+        }
       };
       walk(u.a, u.b,
            [&](Node<Data>* x, Node<Data>* y) {
@@ -1365,12 +1407,14 @@ public:
                }
            },
            [&](Node<Data>* x, Node<Data>* y) {
-             emit(certTipRep(x, out_seen, out_buf),
-                  certTipRep(y, out_seen, out_buf));
+             emit(certTipRep(x, out_seen, out_buf, w),
+                  certTipRep(y, out_seen, out_buf, w));
            },
            [](Node<Data>*, Node<Data>*) { return false; });
       double tp = CkWallTimer() - tp0;
       if (tp > t_phaseB_maxpair) t_phaseB_maxpair = tp;
+      pe_units_[w]++;
+      pe_walk_us_[w] += (long)(tp * 1e6);
       if (u.origin >= 0) foreignUnitDone(u.origin);
       nb->pb_in_flight.fetch_sub(1);
       if (CkWallTimer() >= deadline) {       // slice over; let the
@@ -1403,7 +1447,15 @@ public:
       for (auto& e : src) { flat.push_back(e.first); flat.push_back(e.second); }
       src.clear();
     }
-    foreign_seen_.erase(origin);
+    // Throwing the duplicate-edge set away at every settlement is what
+    // makes borrowed work lose its deduplication: with one chunk per
+    // answer the count reaches zero after every unit. Keeping it is safe
+    // - an edge already delivered never needs delivering again - so this
+    // is a switch only to measure the difference.
+    if (dropSeenOnSettle()) {
+      foreign_seen_.erase(origin);
+      nb->seen_resets.fetch_add(1, std::memory_order_relaxed);
+    }
     if (FoFPhase1<Data>::stealDebug())
       CkPrintf("[steal] node %d RETURN %ld units, %zu edges to node %d\n",
                CkMyNode(), owed, flat.size() / 2, origin);
@@ -1425,6 +1477,16 @@ public:
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
     edge_buf.clear();
     seen.clear();
+    for (int i = 0; i < 2; i++) {
+      nb->ex_units[i] += pe_units_[i];
+      nb->ex_walk_us[i] += pe_walk_us_[i];
+      nb->ex_edges[i] += pe_edges_[i];
+      nb->ex_dupes[i] += pe_dupes_[i];
+      nb->ex_cert_hit[i] += pe_cert_hit_[i];
+      nb->ex_cert_miss[i] += pe_cert_miss_[i];
+      nb->ex_star_parts[i] += pe_star_parts_[i];
+      nb->ex_shortcut[i] += pe_shortcut_[i];
+    }
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
       nb->pool_deposits_done.store(true, std::memory_order_release);
@@ -1671,6 +1733,12 @@ public:
       edge_buf.clear();
       seen.clear();
       cert_tip.clear();
+      for (int i = 0; i < 2; i++) {
+        pe_units_[i] = pe_walk_us_[i] = pe_edges_[i] = pe_dupes_[i] = 0;
+        pe_cert_hit_[i] = pe_cert_miss_[i] = pe_star_parts_[i] = 0;
+        pe_shortcut_[i] = 0;
+        pe_last_lo_[i] = pe_last_hi_[i] = -1;
+      }
       pb_done_ = false;
       pb_test_fallback_ = false;
       phaseBStep();
@@ -1729,6 +1797,33 @@ public:
   // before answering. One by default: the division already leaves this
   // process better supplied, and a small answer keeps the coarse units
   // available for whoever asks next.
+  // The emit loop runs billions of times at 2B and nearly every call is
+  // a repeat of the pair before it. Default on; the switch exists to
+  // measure what it saves.
+  static bool lastPairShortcut() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_LASTPAIR");
+      return !e || std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  // Units held back for this process's own threads when answering a
+  // request. Zero when dividing on request, since that adds units.
+  static size_t stealKeep() {
+    static const long v = [] {
+      const char* e = std::getenv("FOF_STEAL_KEEP");
+      return e ? std::atol(e) : -1;    // -1 selects the rule below
+    }();
+    if (v >= 0) return (size_t)v;
+    return stealRefine() ? 0 : (size_t)CkNodeSize(CkMyNode());
+  }
+  static bool dropSeenOnSettle() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_DROP_SEEN");
+      return e && std::atoi(e) != 0;    // default: keep the set
+    }();
+    return on;
+  }
   static int stealChunk() {
     static const int k = [] {
       const char* e = std::getenv("FOF_STEAL_CHUNK");
@@ -1869,9 +1964,18 @@ public:
         const char* e = std::getenv("FOF_STEAL_TEST");
         return e && std::atoi(e) != 0;
       }();
-      size_t keep = (steal_test && CkMyNode() % 2 == 1)
-                        ? 0
-                        : (size_t)CkNodeSize(CkMyNode());
+      // The reserve is what refused nearly every request: measured
+      // 2026-08-09, 585,694 requests produced 146 grants and 12,023
+      // refusals for an empty queue, because a busy process's queue sits
+      // below the reserve almost all the time - its threads pull units
+      // out as fast as refinement publishes them. Worse, the division on
+      // request below sits INSIDE this loop, so the one mechanism that
+      // could have created units to give never ran.
+      // When dividing on request the reserve is pointless by
+      // construction: opening a unit yields several, so the process ends
+      // the exchange holding more than it started with.
+      size_t keep = stealKeep();
+      if (steal_test && CkMyNode() % 2 == 1) keep = 0;
       // Units borrowed from a third process stay here. Passing one on
       // would send its edges home to us rather than to the process whose
       // particles they describe, and that process would never learn the
@@ -2158,6 +2262,17 @@ public:
       rec.probes_served = nb->probes_served.load();
       rec.helper_rounds = nb->helper_rounds.load();
       rec.helper_requests = nb->helper_requests.load();
+      for (int i = 0; i < 2; i++) {
+        rec.ex_units[i] = nb->ex_units[i].load();
+        rec.ex_walk_us[i] = nb->ex_walk_us[i].load();
+        rec.ex_edges[i] = nb->ex_edges[i].load();
+        rec.ex_dupes[i] = nb->ex_dupes[i].load();
+        rec.ex_cert_hit[i] = nb->ex_cert_hit[i].load();
+        rec.ex_cert_miss[i] = nb->ex_cert_miss[i].load();
+        rec.ex_star_parts[i] = nb->ex_star_parts[i].load();
+        rec.ex_shortcut[i] = nb->ex_shortcut[i].load();
+      }
+      rec.seen_resets = nb->seen_resets.load();
       n = 1;
     }
     this->contribute(n * sizeof(paratreet::StealAcct), &rec,
@@ -3142,9 +3257,14 @@ private:
   // process must put its edges in that process's buffer: they name that
   // process's particles, and this process's union-find cannot use them.
   template <typename Seen, typename Buf>
-  long certTipRep(Node<Data>* n, Seen& out_seen, Buf& out_buf) {
+  long certTipRep(Node<Data>* n, Seen& out_seen, Buf& out_buf, int w = 0) {
     auto it = cert_tip.find(n);
-    if (it != cert_tip.end()) return it->second;
+    if (it != cert_tip.end()) {
+      pe_cert_hit_[w]++;
+      return it->second;
+    }
+    pe_cert_miss_[w]++;
+    pe_star_parts_[w] += n->data.n_below;
     long rep = firstTip(n);
     emitSubtreeTips(n, rep, out_seen, out_buf);
     cert_tip.emplace(n, rep);
@@ -3272,6 +3392,18 @@ private:
   std::unordered_map<long, long> tip_counts;
   // Per-origin edge buffers and duplicate filters for stolen work.
   std::vector<typename FoFPhase1Node<Data>::PoolUnit> pb_mine_;
+  // Per-processor tallies, index 0 own work and 1 borrowed; folded into
+  // the process record at the end of the stage.
+  long pe_units_[2] = {0, 0};
+  long pe_walk_us_[2] = {0, 0};
+  long pe_edges_[2] = {0, 0};
+  long pe_dupes_[2] = {0, 0};
+  long pe_cert_hit_[2] = {0, 0};
+  long pe_cert_miss_[2] = {0, 0};
+  long pe_star_parts_[2] = {0, 0};
+  long pe_shortcut_[2] = {0, 0};
+  long pe_last_lo_[2] = {-1, -1};
+  long pe_last_hi_[2] = {-1, -1};
   bool pb_done_ = false;      // this processor has deposited its phaseB
   bool pb_test_fallback_ = false;  // validation mode only, see phaseBStep
   bool steal_awaiting_ = false;
@@ -3472,6 +3604,19 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
                r.grants, r.deny_not_ready, r.deny_not_needy, r.denials,
                r.probes_served, r.helper_rounds, r.helper_requests,
                r.flatten_ms, r.flat_misses, r.flat_hits);
+      // Own work against borrowed work, the comparison that says whether
+      // a unit costs more to run away from home, and why.
+      for (int w = 0; w < 2; w++) {
+        if (r.ex_units[w] == 0) continue;
+        CkPrintf("FOF3STAT execacct: process %d %s units %ld walk_ms %.1f "
+                 "us_per_unit %.1f edges %ld dupes %ld certhit %ld "
+                 "certmiss %ld starparts %ld shortcut %ld resets %ld\n",
+                 r.process, w == 0 ? "own     " : "borrowed",
+                 r.ex_units[w], r.ex_walk_us[w] / 1000.0,
+                 (double)r.ex_walk_us[w] / r.ex_units[w], r.ex_edges[w],
+                 r.ex_dupes[w], r.ex_cert_hit[w], r.ex_cert_miss[w],
+                 r.ex_star_parts[w], r.ex_shortcut[w], r.seen_resets);
+      }
     }
     delete am;
   }

@@ -63,6 +63,16 @@ struct StealAcct {
   long probes_served = 0;
   long helper_rounds = 0;
   long helper_requests = 0;
+  // Own work versus borrowed work, index 0 and 1 (design note section 16).
+  long ex_units[2] = {0, 0};
+  long ex_walk_us[2] = {0, 0};
+  long ex_edges[2] = {0, 0};
+  long ex_dupes[2] = {0, 0};
+  long ex_cert_hit[2] = {0, 0};
+  long ex_cert_miss[2] = {0, 0};
+  long ex_star_parts[2] = {0, 0};
+  long ex_shortcut[2] = {0, 0};
+  long seen_resets = 0;
 };
 
 } // namespace paratreet
