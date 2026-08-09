@@ -87,6 +87,11 @@ using namespace paratreet;
              "phaseA %.3f phaseB %.3f merge %.3f relabel %.3f\n",
              p1s.reset, p1s.register_s, p1s.phaseA, p1s.phaseB, p1s.merge,
              p1s.relabel);
+    // phaseB split into its two halves plus the edge count, so a flat
+    // phaseB can be attributed to pool construction, unit walking, or
+    // sheer interface work rather than inferred.
+    CkPrintf("FOF3STAT phaseB_detail: pool_build %.3f drain %.3f edges %ld\n",
+             p1s.pool_build, p1s.phaseB - p1s.pool_build, p1s.phaseb_edges);
 
     // Step 4 (-u dist; design/step4.md "Tip encoding" as revised by
     // design/sparse-uf2-encoding.md): rewrite every tip to the
