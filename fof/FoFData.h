@@ -36,6 +36,13 @@ struct FragData {
   OrientedBox<Real> box; // required by the Data concept (grown from positions)
   long min_frag;
   long max_frag;
+  // Particles beneath this node. Node::n_particles is -1 on internal
+  // nodes by design, so this is the only count available above the leaf
+  // level — and unit cost is driven by particles in the interaction
+  // region, not by box geometry (measured 2026-08-07: a geometric split
+  // criterion multiplied units 24x at 2B without touching the largest
+  // unit, because a small box in a dense core holds enormous work).
+  long n_below = 0;
 
   FragData()
     : min_frag(std::numeric_limits<long>::max()),
@@ -46,6 +53,7 @@ struct FragData {
   // from cache-shipped particles — ship exactly those (~20 of ~112 bytes).
 
   FragData(const Particle* particles, int n_particles, int depth) : FragData() {
+    n_below = n_particles > 0 ? n_particles : 0;
     for (int i = 0; i < n_particles; i++) {
       box.grow(particles[i].position);
       long g = particles[i].group_number;
@@ -62,6 +70,7 @@ struct FragData {
     box.grow(other.box);
     if (other.min_frag < min_frag) min_frag = other.min_frag;
     if (other.max_frag > max_frag) max_frag = other.max_frag;
+    n_below += other.n_below;
     return *this;
   }
 
@@ -71,6 +80,7 @@ struct FragData {
     p | box;
     p | min_frag;
     p | max_frag;
+    p | n_below;
   }
 };
 
