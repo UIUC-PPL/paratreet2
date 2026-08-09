@@ -318,3 +318,304 @@ cannot fix indivisible work. The lever is making units divisible
 parallel pool build now makes affordable. Stealing remains correct,
 cheap, and useful once units are fine enough to be worth moving — it is
 no longer the primary lever.
+
+## 13. Connecting the steal protocol to the two-queue deque, and the four
+## correctness defects that surfaced (2026-08-08)
+
+The two-queue scheme (section 12's conclusion: make units divisible)
+replaced the pre-enumerated pool with a shared deque that threads refine
+on demand. The steal protocol still pointed at the old pool, so with the
+new scheme switched on no work could move between processes at all —
+Kale: "I thought the whole point of 2B jobs is the steal across
+processes." Connecting it needed four changes on top of the transport
+that already existed:
+
+- `requestSteal` serves whole units from the BACK of the deque, where
+  the coarsest unrefined pairs sit, and keeps one unit per local thread.
+- `receiveSteal` rebuilds the shipped subtrees, keeps them alive for the
+  phase, pushes the units into the local deque tagged with the owning
+  process, and wakes every processor of this process.
+- The helper returns the edges to the owner, which absorbs them and
+  settles its account.
+- Termination is steal-aware: a processor with nothing to do polls
+  instead of finishing, until every mate reports it has nothing to give.
+
+Four defects showed up in validation, in this order. All four are the
+same shape: work or edges belonging to one process being handled as if
+they belonged to another, or being counted twice.
+
+1. **Circular wait (8M hung).** The helper returned borrowed edges only
+   when it finished its own phaseB, but it does not finish while it is
+   still polling for more work, and the owner cannot merge until those
+   edges arrive. Fixed by counting, per origin, how much derived work is
+   still queued or in a thread's hand: when that count reaches zero the
+   edges go home immediately, whatever the helper does next. Split
+   children inherit the origin and raise its count, so a unit that
+   becomes eight is still settled exactly once.
+
+2. **Edges left behind on sibling processors (126 components too many at
+   1M).** Each processor buffered borrowed edges privately, so whichever
+   processor happened to see the origin's count reach zero reported only
+   its own. Fixed by moving the buffer to the process level: a processor
+   deposits its edges there BEFORE decrementing the count, under the same
+   lock, so seeing zero means seeing everything.
+
+3. **Borrowed work passed on to a third process.** The steal server took
+   units from the deque without checking their origin, so a process could
+   hand on units it had itself borrowed. Their edges would then be
+   returned to the intermediary rather than to the process whose
+   particles they describe, and that process would never learn the work
+   was done. The server now serves only its own units.
+
+4. **The certificate path wrote to the wrong buffer.** When a node pair
+   passes the positive certificate test, `emitSubtreeTips` emits a star
+   of edges through a representative tip. It wrote into the executing
+   processor's own edge buffer unconditionally. For a borrowed unit those
+   edges name the owner's particles, so they were submitted to a union-
+   find that has no such tips. The destination is now a parameter that
+   follows the unit's origin.
+
+5. **A processor depositing its phaseB result twice.** This was the last
+   one and the hardest to see, because the symptom was identical to the
+   others: a handful of missing merges, varying run to run. A processor
+   can be sent into the work loop from three places at once — its own
+   slice hand-off, its poll timer, and the wake that follows an arriving
+   shipment. Two of those could reach the finish path, and the second
+   deposit let the process merge while another processor's edges were
+   still unsubmitted; those edges were then dropped. The deposit is now
+   once per processor.
+
+What found each one matters for the next person. Defects 1 and 2 came
+from reasoning about the protocol. Defect 3 came from asking what a
+borrowed unit means when it is stolen again. Defect 4 and 5 needed
+measurement: the existing self-test (`FOF_STEAL_SELFTEST=1`, which
+compares every unit's direct walk against the full flatten, serialize,
+rebuild and walk replica) passed on every unit, which ruled out the
+transport and the rebuilt-tree walk and pointed at the plumbing around
+them. A leftover-work check at merge time — queued units, unsettled
+borrowed work, undelivered edges — ruled out stranded work as well.
+
+The validation mode was extended to the two-queue path
+(`FOF_STEAL_TEST=1`: odd processes run nothing of their own, so their
+work can only leave through a steal). It needed one adjustment: a process
+that refuses its own work can sit idle holding a full queue, which the
+real scheme never does, and it then deposited with work undone. The
+restriction is now released at the point where the processor would
+otherwise finish.
+
+Local validation after the fixes, netlrts SMP, 2 processes of 2 threads:
+
+| configuration | runs | result |
+|---|---|---|
+| 1M legacy pool, full verification | 2 | 333889, passed |
+| 1M two-queue, no stealing, full verification | 2 | 333889, passed |
+| 1M two-queue, stealing, full verification | 3 | 333889, passed |
+| 1M forced steal, full verification | 4 | 333889, passed |
+| 8M two-queue, no stealing | 3 | 7865983 |
+| 8M two-queue, stealing | 6 | 7865983 |
+| 8M forced steal | 3 | 7865983 |
+
+Before the fixes the 8M stealing arm was wrong in all six runs, by one
+to eleven components, and never wrong in the same way twice.
+
+One measurement to keep in view: at 8M the stealing arm spends about 1.2
+seconds in phaseB against 0.004 seconds without it, on a stage that has
+almost no work to move. That is the polling cost of a process waiting to
+be told there is nothing left. It does not matter at 2B, where phaseB is
+several seconds, but it rules stealing out as a default at small scales.
+
+## 14. Two more defects, found only at scale, and the first measurement
+## where work actually moves (2026-08-08)
+
+The five defects in section 13 were all found on the laptop with two
+processes. Two more appeared only on Anvil, and both were liveness, not
+correctness. The 2B run on 16 nodes produced no stage output in eleven
+minutes where the same binary without movement finished in fifty seconds.
+Reproducing it cheaply mattered: 80M on 4 nodes showed the same stall in
+under two minutes, and everything below was diagnosed there.
+
+6. **A request in flight when the asking process runs out of mates.** The
+   trace made it plain: 24 shipments granted, 24 received, 21 returned.
+   Three helpers took work and never reported, and their owners waited
+   forever with `outstanding 16`. The order of events on the helper was
+   its own phaseB completing, and only then the shipment arriving. Its
+   processors had already deposited, and the guard added for defect 5
+   made them ignore the wake, so the units sat in the queue.
+
+   The fix is a semantic one rather than another guard. A processor that
+   has deposited may still run BORROWED work: those edges go to the
+   owner's buffer, so running them changes nothing about a result this
+   process has already submitted. What it must not do is deposit a second
+   time, or run one of its OWN units, whose edges are already gone. With
+   that, a late shipment is simply work, and the whole class of "the
+   request arrived after we stopped listening" disappears. Refusing late
+   work instead would have needed the owner to take it back, which means
+   the owner keeping every shipped unit in case it returns.
+
+7. **Every processor polling.** While waiting for an answer, all fifteen
+   processors of a process ran a half-millisecond timer, which is fifteen
+   times the timer and message traffic to learn one process's worth of
+   information. Only the processor that asks now polls; the others stop
+   and are woken either by the arrival of work or by the asker once it
+   learns there is no more to be had. This did not fix the stall — defect
+   6 did — and it did not measurably change the phaseB time either.
+
+### Measurement: 2B, 16 nodes, 128 processes, 1920 processors
+
+Component count exact (424,897,832) in every run, no leftover-work
+reports, and units out equals units in on every process.
+
+| arm | phaseB, two runs | units moved | grants |
+|---|---|---|---|
+| threshold 250k, no movement | 3.164, 3.423 | — | — |
+| threshold 250k, movement | 2.636, 2.071 | 2320, 2527 | 145, 158 |
+| threshold 25M, no movement | 3.052, 3.050 | — | — |
+| threshold 25M, movement | 3.292, 2.500 | 2145, 2429 | 135, 154 |
+| threshold 250k, movement, group 32 | 2.157 | 2972 | 186 |
+
+Work moves, and at the 250k threshold it buys roughly a third off the
+phaseB wall. The 25M threshold gains nothing reliable: its units are too
+coarse for the amount that can be shifted to matter. Widening the group
+of processes a request may reach from 8 to 32 moved the most work of any
+arm and gave the single best phaseB time.
+
+Two cautions on reading this table. Run-to-run variation is large —
+phaseA ranged 1.75 to 3.11 s across these same runs — so a 30 percent
+difference is not settled by two runs, which is why a four-repetition
+round follows. And the per-process phaseB timer now includes the time a
+process spends waiting to be given work, so the average over processes
+(0.58 to 0.70 s against a 2 to 3 s maximum) is no longer a measure of
+work; only the maximum is comparable to the earlier no-movement numbers.
+
+### Four repetitions each (2B, 16 nodes), job 19748037
+
+phaseB seconds, exact component count in all twelve runs:
+
+| arm | rep1 | rep2 | rep3 | rep4 | mean | units moved |
+|---|---|---|---|---|---|---|
+| 250k, no movement | 4.156 | 3.372 | 3.168 | 4.213 | 3.73 | — |
+| 250k, movement, group 8 | 2.284 | 2.232 | 2.417 | 2.823 | 2.44 | 2384-2552 |
+| 250k, movement, group 32 | 2.010 | 2.709 | 2.640 | 3.681 | 2.76 | 2784-2983 |
+
+Movement is worth about 35 percent of the phaseB wall at 2B on 16 nodes:
+3.73 s down to 2.44 s. The four repetitions matter — the no-movement arm
+alone spans 3.17 to 4.21 s, so the two-run round in section 14 could not
+have separated these.
+
+Widening the group to 32 moves more work and produced the single fastest
+run (2.010 s) but the worst mean, and its spread is the largest of the
+three arms. Reaching further costs more to reach: a request to a process
+on another node is a longer round trip, and the shipment that answers it
+is larger. Group 8 — the processes sharing a node — is the better default
+on this machine; group 32 is worth revisiting only if a cost model
+decides per request how far to reach.
+
+What movement does NOT do is make phaseB scale. The average process still
+spends 0.6 s where the busiest spends 2.4 s, so roughly three quarters of
+the imbalance survives. The limit now is that a process cannot give away
+what it has not yet reached: it seeds its queue with subtree-root pairs
+and refines them on demand, so early in the stage the coarse units are
+few and enormous, and by the time refinement has produced many movable
+units the stage is nearly over. Making the busiest process refine ahead
+of its own consumption, rather than on demand, is the next lever.
+
+## 15. Making units earlier: three changes, all of which cost time
+## (2026-08-08, Kale's proposals)
+
+The section 14 measurement left one explanation for the surviving
+imbalance: a process cannot give away what it has not yet reached. It
+seeds its queue with subtree-root pairs and opens them only as its own
+threads consume them, so early in the stage the only units in the queue
+are a handful of enormous ones. Two changes were proposed to fix that,
+and a third followed from a question about them:
+
+- **Seed refinement** (`FOF_SEED_SPLIT`): open every seeded pair once
+  when the queue is built, so the stage starts with many more units.
+- **Division on request** (`FOF_STEAL_REFINE`): when a request arrives,
+  open one unit at the coarse end before answering and hand over one of
+  its parts, so answering leaves this process holding MORE chunks than
+  before, not fewer.
+- **Cost ordering** (`FOF_SEED_SORT`): order the refined seeds by the
+  particle-pair estimate, largest at the end requests are served from.
+  Asked for after noticing the deque was in enumeration order with the
+  key field unused — the per-thread cost sort that exists sorts the
+  legacy pool, which the two-queue scheme does not use.
+
+2B, 16 nodes, three repetitions each, all correct (424,897,832):
+
+| arm | phaseB mean | starting units per process | units moved |
+|---|---|---|---|
+| all three off (control) | 2.55 | 1570 | 2326-2479 |
+| seed refinement | 2.77 | 3520 | 4852-5104 |
+| seed refinement + cost ordering | 3.65 | 3520 | 1152-1216 |
+| division on request | 3.23 | 1570 | 15372-20301 |
+| all three | 3.94 | 3520 | 15147-19082 |
+
+Every one of them costs time. The control reproduces the earlier 2.44 s
+mean, so the binary itself did not change anything.
+
+The mechanisms did work as designed — that is what makes the result
+informative rather than a bug. Seed refinement did produce more units
+(1570 to 3520 per process, a bit over twice rather than eight times,
+because most products of an opened pair are too far apart to link and
+are dropped on the spot). Division on request did move far more work:
+15,000 to 20,000 units against 2,400. The extra work moved simply did
+not pay for what it cost to move it.
+
+Two candidate reasons, being measured next:
+
+1. Answering with ONE chunk costs a full round trip per unit. Moving
+   20,000 units that way is 20,000 requests, each with a flatten, a
+   shipment and a reply. Answering with 4 or 8 parts of the unit just
+   divided would amortise that over one round trip.
+2. Cost ordering was applied in the direction that helps movement and
+   hurts local progress: largest units at the end requests are served
+   from means this process's own threads take the SMALLEST first, which
+   is the wrong order for finishing early and leaves the big units for
+   the tail if nobody asks for them. It moved half as much work as the
+   control while being the slowest single change, which fits that
+   reading. The other direction is now selectable (`FOF_SEED_SORT=2`).
+
+Until those are settled, all three default to on in the code but are
+NOT part of the configuration that measured best. The best measured
+configuration remains: two-queue on, movement on, threshold 250k,
+requests limited to the eight processes sharing a node, and these three
+switched off.
+
+### The tuning round settles it: moving work is the cost (2026-08-08)
+
+Both explanations for section 15's losses were measured, and neither
+holds. 2B, 16 nodes, three repetitions:
+
+| arm | phaseB mean | units moved | answers |
+|---|---|---|---|
+| control (all three off) | 2.48 | 2417-2549 | ~155 |
+| division, 4 parts per answer | 3.49 | 43k-69k | 11k-17k |
+| division, 8 parts per answer | 3.24 | 61k-68k | 7.6k-8.5k |
+| cost order reversed | 3.26 | ~11000 | ~700 |
+
+Eight parts per answer cut the round trips from twenty thousand to eight
+thousand and still lost 0.8 s against the control. Reversing the order so
+this process's own threads take the largest units first lost the same
+amount. Across all seven arms measured this day the relationship is
+monotone in the wrong direction: **every configuration that moved more
+work was slower.** The control moves about 2,400 units and gains 1.2 s
+against no movement at all; moving twenty times more loses 0.8 s.
+
+So finding units to move is not the constraint, and neither is the number
+of round trips. What costs is moving a unit: flattening its two subtrees,
+shipping them, rebuilding them on the other side, and sending the edges
+home. Section 11 reached the same conclusion about the donor's shipping
+cost at a different operating point; this fixes it as the property that
+governs the whole scheme.
+
+The three switches therefore DEFAULT OFF, and the shipped configuration
+is the one measured best: two-queue on, movement on, threshold 250k,
+requests limited to the processes sharing a physical node.
+
+What follows from it is a different lever. Threads inside one process
+share the queue and ship nothing, so the way to need less movement is a
+bigger process. The standing layout on Anvil is 8 processes of 15 threads
+per node; 4 of 31 and 2 of 63 use the same cores while turning
+cross-process movement into ordinary queue sharing. That comparison, with
+and without movement at each layout, is job 19748939.
