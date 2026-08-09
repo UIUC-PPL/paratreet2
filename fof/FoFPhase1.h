@@ -54,6 +54,7 @@
 #include "unionFindLib.h"
 
 #include <cmath>
+#define FOF_UNUSED(x) ((void)(x))
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -547,6 +548,26 @@ public:
     if (phaseb_next.load(std::memory_order_acquire) < phaseb_pool.size())
       return;
     if (merge_fired.exchange(true)) return;
+    // Nothing may be left behind when the process merges: an unexecuted
+    // unit or an undelivered edge is a missing union, which shows up as
+    // extra components. Report rather than fail silently.
+    {
+      size_t left_q = 0;
+      { std::lock_guard<std::mutex> g(coarse_lock); left_q = coarse_q.size(); }
+      long left_units = 0, left_edges = 0;
+      {
+        std::lock_guard<std::mutex> g(foreign_lock);
+        for (auto& kv : foreign_pending) left_units += kv.second;
+        for (auto& kv : foreign_edges) left_edges += (long)kv.second.size();
+      }
+      if (left_q || left_units || left_edges)
+        CkPrintf("FOF3STAT stealleak: process %d queued %zu borrowed_open %ld "
+                 "undelivered_edges %ld\n",
+                 CkMyNode(), left_q, left_units, left_edges);
+      if (FoFPhase1<Data>::stealDebug())
+        CkPrintf("FOF3STAT edgetally: process %d edges %zu\n",
+                 CkMyNode(), edges.size());
+    }
     // Accounting is buffered (Kale, 2026-08-07): no output inside timed
     // regions. The per-process record is gathered by stealStats after
     // the phase and printed by the driver.
@@ -570,6 +591,13 @@ public:
     double key; // LPT order: ascending = costliest-first (see poolPush)
     Node<Data>* a;
     Node<Data>* b;
+    // Process whose tip namespace these edges belong to: -1 for our own
+    // work, otherwise the process this unit was taken from. Scheduling
+    // ignores it; edge routing does not, because a stolen unit's edges
+    // must reach the owner's merge, not ours. Split children inherit it.
+    // No default initializer: this build is C++11, where that would make
+    // the struct a non-aggregate and break brace initialization.
+    int origin;
   };
   std::vector<PoolUnit> phaseb_pool;
   std::atomic<size_t> phaseb_next{0};
@@ -582,12 +610,77 @@ public:
   std::vector<std::vector<PoolUnit>> pool_slices;
   std::atomic<int> slice_done{0};
 
+  // --- Two-queue on-demand scheme (Kale, 2026-08-08; FOF_POOL_2Q=1).
+  // COARSE holds unsplit subtree-root pairs under a lock: local threads
+  // take from the front when they run dry, remote steals will take from
+  // the back (whole, so one shipment buys a lot of work). FINE holds
+  // already-split units for local consumption with lock-free claims —
+  // the lock is touched once per split, not once per unit, and the
+  // splitting work is done by the thread that needs it rather than by a
+  // central coordinator. Nothing is enumerated or sorted upfront.
+  // One shared deque holds every unit that is not currently in a
+  // thread's hand. Local threads take a small batch from the front (so
+  // the lock is touched once per batch, not once per unit) and push the
+  // products of a split back; a stealer takes whole unsplit units from
+  // the back. The earlier design kept split pieces in a thread-local
+  // atomic queue, which trapped them: once a heavy unit was popped, all
+  // of its descendants stayed on that process and no stealer could ever
+  // reach them (Kale, 2026-08-08).
+  std::deque<PoolUnit> coarse_q;
+  std::mutex coarse_lock;
+  std::atomic<int> pb_in_flight{0};   // units held by a thread right now
+  std::atomic<bool> steal_exhausted{false};  // no mate has work left
+  long pool_coarse_initial = 0;       // how coarse the starting work was
+  // Trees rebuilt from stolen shipments stay alive until the phase ends,
+  // because units derived from them are refined and executed over time.
+  std::vector<Node<Data>*> stolen_roots;
+  std::vector<std::vector<Particle>> stolen_particles;
+  std::mutex stolen_lock;
+  // Edges produced for other processes, and how many shipments each of
+  // those contributions covers, so the owner can close its merge gate.
+  // Per-origin accounting. foreign_pending counts units of that origin
+  // still queued or in a thread's hand (split children included);
+  // foreign_owed counts the ORIGINAL units received, which is what the
+  // owner decrements when we report. When pending reaches zero every
+  // piece of that origin's work is done, so the edges can go home
+  // immediately — waiting until this process finishes would deadlock,
+  // because it does not finish while it is still trying to steal.
+  std::map<int, long> foreign_pending;
+  std::map<int, long> foreign_owed;
+  // Edges for that origin produced by any processor of this process. A
+  // processor moves its own buffer in here before decrementing pending,
+  // so whichever processor sees the count reach zero also sees every
+  // edge; a per-processor buffer alone would leave other processors'
+  // edges behind when the owner is told the work is settled.
+  std::map<int, std::vector<std::pair<long, long>>> foreign_edges;
+  std::mutex foreign_lock;
+  // Separating the two halves of the phaseB stage (Kale, 2026-08-07):
+  // pool_build_s is enumeration + per-slice sort + assembly; the rest of
+  // the stage is the drain (walking units). phaseb_edges is how many
+  // deduplicated cross-thread edges this process actually emitted, which
+  // distinguishes "fixed descent overhead per unit" from "more interface
+  // work than geometry predicts".
+  double pool_build_t0 = 0, pool_build_s = 0;
+  long phaseb_edges = 0;
+
   void reset(const CkCallback& cb) {
     label_shards.clear();
     phaseb_pool.clear();
     phaseb_next = 0;
     pool_slices.clear();
     slice_done = 0;
+    coarse_q.clear();
+    pb_in_flight = 0;
+    steal_exhausted = false;
+    for (auto* r : stolen_roots) { /* freed by the owner's pool teardown */ }
+    stolen_roots.clear();
+    stolen_particles.clear();
+    foreign_pending.clear();
+    foreign_owed.clear();
+    foreign_edges.clear();
+    pool_coarse_initial = 0;
+    pool_build_t0 = pool_build_s = 0;
+    phaseb_edges = 0;
     chain_started = 0;
     a_done = 0;
     b_done = 0;
@@ -682,6 +775,7 @@ public:
   // to finish phaseB (all edge buffers are in, so access is exclusive);
   // no longer a broadcast entry.
   void mergeBody() {
+    phaseb_edges = (long)edges.size();
     std::unordered_map<long, long> parent;
     for (auto& e : edges) {
       long ra = findRoot(parent, e.first);
@@ -913,8 +1007,8 @@ public:
                  // Positive certificate over frozen tips, memoized: each
                  // node star-emits once; the pair contributes one edge
                  // (a != b always here — the pair spans two PEs).
-                 long ta = certTipRep(a);
-                 long tb = certTipRep(b);
+                 long ta = certTipRep(a, seen, edge_buf);
+                 long tb = certTipRep(b, seen, edge_buf);
                  if (ta != tb) {
                    long lo = std::min(ta, tb), hi = std::max(ta, tb);
                    if (seen.insert(paratreet::packTipPair(lo, hi)).second)
@@ -1013,6 +1107,7 @@ public:
       // one to finish assembles the pool and starts phaseB.
       nb->pool_slices.assign(CkNodeSize(CkMyNode()), {});
       nb->slice_done.store(0);
+      nb->pool_build_t0 = CkWallTimer();
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].buildPoolSlice();
@@ -1077,11 +1172,13 @@ public:
         if (still_big) stop_here = false;   // keep splitting big pairs
       }
       if (stop_here) {
-        // LPT key, pure geometry (no thresholds): overlapping pairs
-        // (gap 0) are the expensive ones, ordered by DESCENDING box
-        // overlap volume; separated pairs follow by ascending gap.
-        // Ascending sort then claims costliest-first, so the pool's
-        // tail is cheap units and the last claim cannot be a giant.
+        // LPT key, pure geometry: overlapping pairs (gap 0) ordered by
+        // DESCENDING box overlap volume, separated pairs after them by
+        // ascending gap. (A box-extent cost ordering was tried and
+        // reverted 2026-08-08: the 2B measurement showed box geometry
+        // does not predict cost in dense regions, so it would have been
+        // no better than this and is unmeasured. The two-queue scheme
+        // does not sort at all.)
         double key;
         if (d2 > 0) {
           key = d2;
@@ -1100,7 +1197,7 @@ public:
               (double)std::max(ba.lesser_corner.z, bb.lesser_corner.z));
           key = -ov;
         }
-        out.push_back({key, a, b});
+        out.push_back({key, a, b, -1});
         return;
       }
       for (int ci = 0; ci < a->n_children; ci++) {
@@ -1113,6 +1210,350 @@ public:
         }
       }
   }
+  // phaseB worker for the on-demand scheme, as a SLICE rather than a
+  // loop that runs to completion. Each invocation executes work for a
+  // bounded time and then returns to the scheduler.
+  //
+  // The reason is broader than stealing (Kale, 2026-08-08): the Converse
+  // scheduler is what calls the network backend's progress function, so
+  // a processor inside a long entry method is not polling the network at
+  // all. At two billion particles the heaviest processor spent 2.778 s
+  // inside one invocation of phaseB; if every processor of a node is in
+  // that state at once, the node makes no network progress for that
+  // whole period, which affects every message in flight and not merely
+  // steal traffic. A thread with nothing to do likewise returns rather
+  // than waiting on another thread.
+  static double phaseBSliceSeconds() {
+    static const double v = [] {
+      const char* e = std::getenv("FOF_PHASEB_SLICE_MS");
+      double ms = e ? std::atof(e) : 2.0;
+      return (ms > 0 ? ms : 2.0) / 1000.0;
+    }();
+    return v;
+  }
+
+  void phaseBStep() {
+    // A processor that has already deposited may still run work borrowed
+    // from another process: those edges go to that process's buffer, not
+    // ours, so running them changes nothing here. It must not deposit a
+    // second time, and it must not run one of OUR units, whose edges we
+    // have already submitted. Late shipments do arrive — a request can
+    // still be in flight when this process runs out of mates to ask, and
+    // refusing the work then would strand it and leave its owner waiting
+    // forever.
+    const bool deposited = pb_done_;
+    auto* nb = node_proxy.ckLocalBranch();
+    const double deadline = CkWallTimer() + phaseBSliceSeconds();
+    for (;;) {
+      // One unit per dequeue. Batching was holding up to eight units in
+      // a processor's hand where no stealer could see them — the same
+      // trapping, at smaller scale — and the lock it saved is far below
+      // the per-unit work at every measured size (roughly 1,500 units
+      // per process over 2.9 s at 2B).
+      // Validation mode (FOF_STEAL_TEST=1): odd processes never run
+      // their own units, so their work can only leave through a steal.
+      // This drives the ship, rebuild and return path on every unit
+      // instead of the handful a timing-dependent real steal moves.
+      static const bool steal_test = [] {
+        const char* e = std::getenv("FOF_STEAL_TEST");
+        return e && std::atoi(e) != 0;
+      }();
+      // The restriction is dropped once this processor would otherwise
+      // finish with work still queued. Without that release the mode
+      // invents a state the real scheme cannot reach — a process sitting
+      // idle on a full queue — and the phase ends with work undone.
+      const bool borrowed_only =
+          steal_test && (CkMyNode() % 2 == 1) && !pb_test_fallback_;
+      bool have = false;
+      {
+        std::lock_guard<std::mutex> g(nb->coarse_lock);
+        if (!nb->coarse_q.empty()) {
+          const bool borrowed = nb->coarse_q.front().origin >= 0;
+          if ((!borrowed_only || borrowed) && (!deposited || borrowed)) {
+            pb_mine_.push_back(nb->coarse_q.front());
+            nb->coarse_q.pop_front();
+            have = true;
+          }
+        }
+      }
+      (void)have;
+      if (pb_mine_.empty()) {
+        // Already deposited: nothing borrowed is waiting, so stop without
+        // depositing again and without joining the search for more work.
+        if (deposited) return;
+        // Out of work locally. A sibling thread may still publish more.
+        if (nb->pb_in_flight.load(std::memory_order_acquire) > 0) {
+          this->thisProxy[CkMyPe()].phaseBStep();
+          return;
+        }
+        // Nothing left on this process. Before finishing, try to take
+        // work from a machine-mate: one thread per process does the
+        // asking (so a request is one message, not fifteen), and the
+        // others stay available to run whatever it brings back.
+        if (stealEnabled() && CkNumNodes() > 1 &&
+            !nb->steal_exhausted.load(std::memory_order_acquire)) {
+          // Only one processor per process polls. The others simply stop
+          // and are woken by the arrival of work (receiveSteal wakes every
+          // processor) or by the asker when it learns there is no more.
+          // With fifteen processors per process, polling on all of them
+          // was fifteen times the timer and message traffic for one
+          // process's worth of information.
+          if (CkMyRank() != 0) return;
+          if (!steal_awaiting_) {
+            if (steal_mates.empty()) startHelping();   // build mate list
+            steal_awaiting_ = true;
+            askVictim();
+          }
+          // Come back through the scheduler; a reply, or another thread's
+          // split products, may give us work. Paced so this is a poll,
+          // not a busy loop.
+          CcdCallFnAfter([](void* arg, double) {
+            auto* self = (FoFPhase1<Data>*)arg;
+            self->thisProxy[CkMyPe()].phaseBStep();
+          }, this, 0.5 /* ms */);
+          return;
+        }
+        if (steal_test) {
+          bool left;
+          { std::lock_guard<std::mutex> g(nb->coarse_lock);
+            left = !nb->coarse_q.empty(); }
+          if (left) { pb_test_fallback_ = true; continue; }
+        }
+        phaseBFinish();
+        return;
+      }
+      typename FoFPhase1Node<Data>::PoolUnit u = pb_mine_.back();
+      pb_mine_.pop_back();
+      nb->pb_in_flight.fetch_add(1);
+      while (unitCost(u.a, u.b) > poolUnitMax() &&
+             !(u.a->isLeaf() && u.b->isLeaf())) {
+        typename FoFPhase1Node<Data>::PoolUnit next{0.0, nullptr, nullptr, -1};
+        if (!splitUnit(u, next)) { u.a = nullptr; break; }
+        u = next;
+      }
+      if (u.a == nullptr) {
+        if (u.origin >= 0) foreignUnitDone(u.origin);
+        nb->pb_in_flight.fetch_sub(1);
+        continue;
+      }
+      t_phaseB_units++;
+      {
+        static const bool selftest = [] {
+          const char* e = std::getenv("FOF_STEAL_SELFTEST");
+          return e && std::atoi(e) != 0;
+        }();
+        if (selftest && u.origin < 0) selftestStolenUnit(u.a, u.b);
+      }
+      double tp0 = CkWallTimer();
+      auto& out_seen = (u.origin < 0) ? seen : foreign_seen_[u.origin];
+      auto& out_buf  = (u.origin < 0) ? edge_buf : foreign_buf_[u.origin];
+      auto emit = [&](long ti, long tj) {
+        if (ti == tj) return;
+        long lo = std::min(ti, tj), hi = std::max(ti, tj);
+        if (out_seen.insert(paratreet::packTipPair(lo, hi)).second)
+          out_buf.emplace_back(lo, hi);
+      };
+      walk(u.a, u.b,
+           [&](Node<Data>* x, Node<Data>* y) {
+             const Particle* px = x->particles();
+             const Particle* py = y->particles();
+             for (int i = 0; i < x->n_particles; i++)
+               for (int j = 0; j < y->n_particles; j++) {
+                 if (paratreet::periodicDistSq(px[i].position, py[j].position,
+                                               period_) > b2_) continue;
+                 emit(px[i].group_number, py[j].group_number);
+               }
+           },
+           [&](Node<Data>* x, Node<Data>* y) {
+             emit(certTipRep(x, out_seen, out_buf),
+                  certTipRep(y, out_seen, out_buf));
+           },
+           [](Node<Data>*, Node<Data>*) { return false; });
+      double tp = CkWallTimer() - tp0;
+      if (tp > t_phaseB_maxpair) t_phaseB_maxpair = tp;
+      if (u.origin >= 0) foreignUnitDone(u.origin);
+      nb->pb_in_flight.fetch_sub(1);
+      if (CkWallTimer() >= deadline) {       // slice over; let the
+        this->thisProxy[CkMyPe()].phaseBStep();  // scheduler run
+        return;
+      }
+    }
+  }
+
+  // One unit of a stolen origin is complete. When none of that origin's
+  // work remains anywhere on this process, send the edges home and let
+  // the owner settle that many original units.
+  void foreignUnitDone(int origin) {
+    auto* nb = node_proxy.ckLocalBranch();
+    std::vector<long> flat;
+    long owed = 0;
+    {
+      std::lock_guard<std::mutex> g(nb->foreign_lock);
+      auto it = foreign_buf_.find(origin);
+      if (it != foreign_buf_.end() && !it->second.empty()) {
+        auto& dst = nb->foreign_edges[origin];
+        dst.insert(dst.end(), it->second.begin(), it->second.end());
+        it->second.clear();
+      }
+      if (--nb->foreign_pending[origin] > 0) return;
+      owed = nb->foreign_owed[origin];
+      nb->foreign_owed[origin] = 0;
+      auto& src = nb->foreign_edges[origin];
+      flat.reserve(src.size() * 2);
+      for (auto& e : src) { flat.push_back(e.first); flat.push_back(e.second); }
+      src.clear();
+    }
+    foreign_seen_.erase(origin);
+    if (FoFPhase1<Data>::stealDebug())
+      CkPrintf("[steal] node %d RETURN %ld units, %zu edges to node %d\n",
+               CkMyNode(), owed, flat.size() / 2, origin);
+    this->thisProxy[CkNodeFirst(origin)].returnStolenEdges2(CkMyNode(), flat, owed);
+  }
+
+  // End of this processor's phaseB: hand over the edges and deposit.
+  void phaseBFinish() {
+    // A processor can be sent into the work loop from several places at
+    // once: its own slice hand-off, its poll timer, and the wake that
+    // follows an arriving shipment. Only the first arrival at the end
+    // may deposit; a second deposit would let the process merge while
+    // another processor's edges were still unsubmitted, and those edges
+    // would be dropped.
+    if (pb_done_) return;
+    pb_done_ = true;
+    auto* nb = node_proxy.ckLocalBranch();
+    t_phaseB = CkWallTimer() - pb_t0_;
+    if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
+    edge_buf.clear();
+    seen.clear();
+    if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+      nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
+      nb->pool_deposits_done.store(true, std::memory_order_release);
+      nb->tryTriggerMerge();
+    }
+  }
+
+  // --- Two-queue scheme helpers (FOF_POOL_2Q=1) -------------------------
+  static bool poolTwoQueue() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_POOL_2Q");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  // A unit is fine enough when its particle-pair bound is below this.
+  // Particle counts, not box geometry: a small box in a dense core holds
+  // enormous work, which is why the geometric criterion failed at 2B.
+  static long poolUnitMax() {
+    static const long t = [] {
+      const char* e = std::getenv("FOF_POOL_UNIT_MAX");
+      long v = e ? std::atol(e) : 250000;
+      return v > 0 ? v : 250000;
+    }();
+    return t;
+  }
+  static long unitCost(Node<Data>* a, Node<Data>* b) {
+    return (long)a->data.n_below * (long)b->data.n_below;
+  }
+
+  // Split one unit by opening the side holding more particles. Every
+  // product except the one the caller runs next goes back to the SHARED
+  // deque, so nothing a thread splits becomes unreachable to a stealer.
+  // Products go to the front: local refinement stays depth-first while
+  // the original unsplit pairs remain at the back for stealing.
+  // Open one level of a unit: the side with more particles is replaced by
+  // its children, giving up to eight pairs where there was one. Pairs too
+  // far apart to link are dropped here rather than later. Returns false
+  // when there is nothing to open (both sides are leaves) or when every
+  // product is out of range.
+  bool refineUnit(const typename FoFPhase1Node<Data>::PoolUnit& u,
+                  std::vector<typename FoFPhase1Node<Data>::PoolUnit>& out) {
+    Node<Data>* a = u.a;
+    Node<Data>* b = u.b;
+    bool split_a = a->data.n_below >= b->data.n_below;
+    Node<Data>* open_side = split_a ? a : b;
+    Node<Data>* fixed = split_a ? b : a;
+    if (open_side->isLeaf()) return false;
+    for (int i = 0; i < open_side->n_children; i++) {
+      Node<Data>* c = open_side->getChild(i);
+      if (c == nullptr || c->n_particles == 0) continue;
+      Node<Data>* pa = split_a ? c : fixed;
+      Node<Data>* pb = split_a ? fixed : c;
+      if (paratreet::mindist2(pa->data.box, pb->data.box, period_) > b2_) continue;
+      out.push_back({0.0, pa, pb, u.origin});   // origin is inherited
+    }
+    return !out.empty();
+  }
+
+  // Seed refinement (FOF_SEED_SPLIT, default on): open every seeded pair
+  // once when the queue is built, so the stage starts with roughly eight
+  // times as many units. A process cannot give away what it has not yet
+  // reached, and with unrefined seeds the only units in the queue early
+  // on are a handful of enormous ones.
+  // DEFAULT OFF since the 2026-08-08 measurement: it produced the units
+  // it promised (1570 to 3520 per process) and cost 0.2 s of phaseB at
+  // 2B on 16 nodes. See design/phaseb-offload.md section 15.
+  static bool seedSplit() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_SEED_SPLIT");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  // Order the refined seeds by estimated cost (FOF_SEED_SORT, default
+  // on). Only meaningful together with seed refinement, which is what
+  // produces enough units for an order to matter.
+  // 0 off, 1 largest at the end requests are served from, 2 largest at
+  // the end this process's own threads consume from. Which end should
+  // hold the big units is not obvious: putting them where requests are
+  // served moves more work per request, but leaves this process's own
+  // threads taking the smallest first, which is the wrong order for
+  // finishing early.
+  // DEFAULT OFF: both directions were measured and both cost about 0.8 s.
+  static int seedSort() {
+    static const int m = [] {
+      const char* e = std::getenv("FOF_SEED_SORT");
+      return e ? std::atoi(e) : 0;
+    }();
+    return m;
+  }
+  // Refine when a request arrives (FOF_STEAL_REFINE, default on): divide
+  // a coarse unit before answering, so the answer costs the asker one
+  // chunk while leaving this process more chunks than it had.
+  // DEFAULT OFF: it moved eight to thirty times more work and lost time
+  // at every answer size measured (1, 4 and 8 parts per answer). What it
+  // showed is that moving work, not finding work to move, is the cost.
+  static bool stealRefine() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_STEAL_REFINE");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+
+  bool splitUnit(const typename FoFPhase1Node<Data>::PoolUnit& u,
+                 typename FoFPhase1Node<Data>::PoolUnit& mine) {
+    auto* nb = node_proxy.ckLocalBranch();
+    if (u.a->isLeaf() && u.b->isLeaf()) { mine = u; return true; }
+    if ((u.a->data.n_below >= u.b->data.n_below ? u.a : u.b)->isLeaf()) {
+      mine = u;
+      return true;
+    }
+    std::vector<typename FoFPhase1Node<Data>::PoolUnit> pieces;
+    if (!refineUnit(u, pieces)) return false;
+    if (u.origin >= 0) {
+      // One unit became several; the origin's pending count follows.
+      std::lock_guard<std::mutex> g(nb->foreign_lock);
+      nb->foreign_pending[u.origin] += (long)pieces.size() - 1;
+    }
+    mine = pieces.back();
+    pieces.pop_back();
+    if (!pieces.empty()) {
+      std::lock_guard<std::mutex> g(nb->coarse_lock);
+      for (auto& p : pieces) nb->coarse_q.push_front(p);
+    }
+    return true;
+  }
+
   // One thread's stripe of the pool enumeration. Subtree pairs are taken
   // from the flattened (thread-pair, subtree-pair) space by stride, so
   // every thread walks a comparable share of the geometry without any
@@ -1122,6 +1563,9 @@ public:
     int rank = CkMyRank(), nranks = CkNodeSize(CkMyNode());
     auto& slice = nb->pool_slices[rank];
     long idx = 0;
+    // With the two-queue scheme nothing is enumerated or sorted upfront;
+    // the coarse queue is seeded below and demand does the rest.
+    if (!poolTwoQueue())
     for (auto ita = nb->pe_subtrees.begin(); ita != nb->pe_subtrees.end();
          ++ita) {
       auto itb = ita;
@@ -1139,6 +1583,55 @@ public:
                         const typename FoFPhase1Node<Data>::PoolUnit& y) {
                        return x.key < y.key;
                      });
+    if (poolTwoQueue() && rank == 0) {
+      // Two-queue scheme: no enumeration, no splitting, no sort. Seed the
+      // coarse queue with the surviving subtree-root pairs and let demand
+      // do the rest. One thread does this because it is a few hundred
+      // geometric tests.
+      std::lock_guard<std::mutex> g(nb->coarse_lock);
+      for (auto ita = nb->pe_subtrees.begin(); ita != nb->pe_subtrees.end(); ++ita) {
+        auto itb = ita;
+        for (++itb; itb != nb->pe_subtrees.end(); ++itb)
+          for (auto& sa : ita->second)
+            for (auto& sb : itb->second) {
+              if (paratreet::mindist2(sa.root->data.box, sb.root->data.box,
+                                      period_) > b2_) continue;
+              nb->coarse_q.push_back({0.0, sa.root, sb.root, -1});
+            }
+      }
+      if (seedSplit()) {
+        std::deque<typename FoFPhase1Node<Data>::PoolUnit> refined;
+        std::vector<typename FoFPhase1Node<Data>::PoolUnit> pieces;
+        for (auto& u : nb->coarse_q) {
+          pieces.clear();
+          if (refineUnit(u, pieces))
+            for (auto& p : pieces) refined.push_back(p);
+          else
+            refined.push_back(u);   // nothing left to open
+        }
+        if (seedSort()) {
+          // Order the refined seeds by estimated cost, largest at the
+          // end the steal server and the on-request division both work
+          // from. The estimate is the particle-pair count, the same one
+          // the refinement threshold uses. Local threads consume from the
+          // other end, so the biggest units stay available to move for as
+          // long as possible, which is the point when one process holds
+          // most of the work.
+          std::vector<typename FoFPhase1Node<Data>::PoolUnit> v(refined.begin(),
+                                                                refined.end());
+          for (auto& u : v) u.key = (double)unitCost(u.a, u.b);
+          const bool asc = seedSort() != 2;
+          std::stable_sort(v.begin(), v.end(),
+                           [asc](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                                 const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                             return asc ? x.key < y.key : x.key > y.key;
+                           });
+          refined.assign(v.begin(), v.end());
+        }
+        nb->coarse_q.swap(refined);
+      }
+      nb->pool_coarse_initial = (long)nb->coarse_q.size();
+    }
     if (nb->slice_done.fetch_add(1) + 1 == nranks) {
       size_t total = 0, longest = 0;
       for (auto& sl : nb->pool_slices) {
@@ -1159,6 +1652,7 @@ public:
       for (auto& sl : nb->pool_slices)
         std::vector<typename FoFPhase1Node<Data>::PoolUnit>().swap(sl);
       nb->pool_units_total = (long)nb->phaseb_pool.size();
+      nb->pool_build_s = CkWallTimer() - nb->pool_build_t0;
       nb->phaseb_pool_ready.store(true, std::memory_order_release);
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
@@ -1168,6 +1662,20 @@ public:
 
   void phaseBChained() {
     auto* nb = node_proxy.ckLocalBranch();
+    if (poolTwoQueue()) {
+      // Sliced worker: it deposits itself when this processor runs out
+      // of work (phaseBFinish), so nothing more happens here.
+      pb_t0_ = CkWallTimer();
+      t_phaseB_maxpair = 0.0;
+      t_phaseB_units = 0;
+      edge_buf.clear();
+      seen.clear();
+      cert_tip.clear();
+      pb_done_ = false;
+      pb_test_fallback_ = false;
+      phaseBStep();
+      return;
+    }
     phaseBBody(b2_); // b2_ set by phaseABody on this PE
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
@@ -1216,6 +1724,18 @@ public:
       return v > 0 ? v : 8;
     }();
     return g;
+  }
+  // How many chunks one request is answered with when the server divides
+  // before answering. One by default: the division already leaves this
+  // process better supplied, and a small answer keeps the coarse units
+  // available for whoever asks next.
+  static int stealChunk() {
+    static const int k = [] {
+      const char* e = std::getenv("FOF_STEAL_CHUNK");
+      int v = e ? std::atoi(e) : 1;
+      return v > 0 ? v : 1;
+    }();
+    return k;
   }
   static int stealK() {
     // Default 16 (2026-08-06): the 2B A/B showed grant throughput, not
@@ -1272,7 +1792,16 @@ public:
       this->thisProxy[serve_pe].requestSteal(CkMyPe());
       return;
     }
-    // Every mate has finished; nothing left to help with this phase.
+    // Every mate has finally denied: no work is available anywhere in
+    // this machine group, so stop asking and let the threads finish.
+    node_proxy.ckLocalBranch()->steal_exhausted.store(
+        true, std::memory_order_release);
+    steal_awaiting_ = false;
+    // The other processors stopped instead of polling, so they have to be
+    // told that the waiting is over; otherwise they never finish.
+    int first = CkNodeFirst(CkMyNode()), npe = CkNodeSize(CkMyNode());
+    for (int pe = first; pe < first + npe; pe++)
+      this->thisProxy[pe].phaseBStep();
   }
 
   void retryAfter(double ms) {
@@ -1289,6 +1818,7 @@ public:
   }
 
   void stealDenied(int victim_node) {
+    steal_awaiting_ = false;
     if (victim_node < 0) {
       bool not_needy = (-victim_node) > (1 << 20);
       if (not_needy) {
@@ -1316,85 +1846,89 @@ public:
     auto* nb = node_proxy.ckLocalBranch();
     if (!nb->phaseb_pool_ready.load(std::memory_order_acquire)) {
       nb->deny_not_ready.fetch_add(1);
-      this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1)); // not ready
+      this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1));
       return;
     }
-    int k = stealK();
-    // v4 admission (Kale, 2026-08-07): grant as long as MORE THAN TWO
-    // BATCHES remain; below that the tail drains faster locally than a
-    // shipment round trip. No time projection anywhere in the gate.
+    // Take whole units from the BACK, which under the on-demand scheme
+    // are the coarsest available: unsplit subtree-root pairs, or the
+    // largest products so far. One shipment therefore carries a lot of
+    // work, which is what makes the flatten cost worth paying.
+    // A request is also an opportunity to make more work movable. The
+    // coarse end of the queue is opened one level before anything is
+    // handed over, so this process answers with one chunk and is left
+    // holding MORE chunks than before, not fewer. Without this a process
+    // can only give away what its own threads have already refined, which
+    // early in the stage is almost nothing.
+    int k = stealRefine() ? stealChunk() : stealK();
+    std::vector<typename FoFPhase1Node<Data>::PoolUnit> taken;
     {
-      size_t cursor = nb->phaseb_next.load(std::memory_order_relaxed);
-      size_t pool = nb->phaseb_pool.size();
-      // The gate applies ONLY while this process's own threads are still
-      // claiming: once they have all deposited, any remaining units can
-      // be drained by helpers alone, so a denial there would strand them
-      // and the merge would never fire. (Vacuous in production, where a
-      // thread deposits only after the cursor is exhausted; load-bearing
-      // under FOF_STEAL_TEST, where the victim deliberately skips local
-      // claiming — that is how this deadlock surfaced.)
-      bool local_still_claiming =
-          !nb->pool_deposits_done.load(std::memory_order_acquire);
-      if (local_still_claiming && cursor < pool &&
-          pool - cursor <= (size_t)(2 * k) && !nb->merge_fired.load()) {
-        nb->deny_not_needy.fetch_add(1);
-        this->thisProxy[helper_pe].stealDenied(-(CkMyNode() + 1 + (1 << 20)));
-        return;
+      std::lock_guard<std::mutex> g(nb->coarse_lock);
+      // Under the validation mode this process runs nothing itself, so
+      // holding units back for its own threads would strand them.
+      static const bool steal_test = [] {
+        const char* e = std::getenv("FOF_STEAL_TEST");
+        return e && std::atoi(e) != 0;
+      }();
+      size_t keep = (steal_test && CkMyNode() % 2 == 1)
+                        ? 0
+                        : (size_t)CkNodeSize(CkMyNode());
+      // Units borrowed from a third process stay here. Passing one on
+      // would send its edges home to us rather than to the process whose
+      // particles they describe, and that process would never learn the
+      // work was done.
+      std::vector<typename FoFPhase1Node<Data>::PoolUnit> borrowed;
+      std::vector<typename FoFPhase1Node<Data>::PoolUnit> pieces;
+      while ((int)taken.size() < k &&
+             nb->coarse_q.size() + borrowed.size() > keep &&
+             !nb->coarse_q.empty()) {
+        auto u = nb->coarse_q.back();
+        nb->coarse_q.pop_back();
+        if (u.origin >= 0) { borrowed.push_back(u); continue; }
+        if (stealRefine()) {
+          pieces.clear();
+          if (refineUnit(u, pieces)) {
+            // Everything the division produced goes back to the coarse
+            // end; one of them is then taken as the answer, so the queue
+            // grows by the rest.
+            for (auto& p : pieces) nb->coarse_q.push_back(p);
+            taken.push_back(nb->coarse_q.back());
+            nb->coarse_q.pop_back();
+            continue;
+          }
+        }
+        taken.push_back(u);   // nothing left to open; hand it over whole
       }
+      for (auto it = borrowed.rbegin(); it != borrowed.rend(); ++it)
+        nb->coarse_q.push_back(*it);
     }
-    nb->steal_outstanding.fetch_add(1, std::memory_order_acq_rel);
-    size_t start = nb->phaseb_next.fetch_add((size_t)k);
-    size_t pool = nb->phaseb_pool.size();
-    if (start >= pool || nb->merge_fired.load()) {
+    if (taken.empty()) {
       nb->steal_denials.fetch_add(1);
-      nb->steal_outstanding.fetch_sub(1, std::memory_order_acq_rel);
-      nb->tryTriggerMerge();
       this->thisProxy[helper_pe].stealDenied(CkMyNode());
       return;
     }
-    size_t end = std::min(start + (size_t)k, pool);
+    nb->steal_outstanding.fetch_add((long)taken.size(),
+                                    std::memory_order_acq_rel);
     double f0 = CkWallTimer();
     paratreet::StealShipment<Data> ship;
     ship.victim_node = CkMyNode();
-    // Ship-once, use-many: each distinct subtree is flattened at most
-    // once per phase (memo) and appears once per shipment; units are
-    // index pairs into that list.
     std::unordered_map<Node<Data>*, int> in_ship;
-    auto placeTree = [&](Node<Data>* n) -> int {
+    auto place = [&](Node<Data>* n) -> int {
       auto it = in_ship.find(n);
       if (it != in_ship.end()) return it->second;
-      std::shared_ptr<paratreet::StealTree<Data>> blob;
-      {
-        std::lock_guard<std::mutex> g(nb->flat_memo_lock);
-        auto mi = nb->flat_memo.find(n);
-        if (mi != nb->flat_memo.end()) blob = mi->second;
-      }
-      if (!blob) {
-        // Flatten outside the lock; a concurrent duplicate is harmless
-        // (both blobs are identical, one wins the insert).
-        auto fresh = std::make_shared<paratreet::StealTree<Data>>();
-        flattenStealTree(n, *fresh);
-        std::lock_guard<std::mutex> g(nb->flat_memo_lock);
-        auto ins = nb->flat_memo.emplace(n, fresh);
-        blob = ins.first->second;
-        nb->flat_memo_misses.fetch_add(1);
-      } else {
-        nb->flat_memo_hits.fetch_add(1);
-      }
       int idx = (int)ship.trees.size();
-      ship.trees.push_back(*blob);
+      ship.trees.emplace_back();
+      flattenStealTree(n, ship.trees.back());
       in_ship.emplace(n, idx);
       return idx;
     };
-    for (size_t u = start; u < end; u++) {
-      int ia = placeTree(nb->phaseb_pool[u].a);
-      int ib = placeTree(nb->phaseb_pool[u].b);
-      ship.unit_pairs.emplace_back(ia, ib);
-    }
-    nb->steal_flatten_us.fetch_add(
-        (long)((CkWallTimer() - f0) * 1e6));
-    nb->stolen_out_units.fetch_add((long)(end - start));
+    for (auto& u : taken) ship.unit_pairs.emplace_back(place(u.a), place(u.b));
+    nb->steal_flatten_us.fetch_add((long)((CkWallTimer() - f0) * 1e6));
+    nb->stolen_out_units.fetch_add((long)taken.size());
     nb->grants.fetch_add(1);
+    if (FoFPhase1<Data>::stealDebug())
+      CkPrintf("[steal] node %d GRANT %zu units to pe %d, outstanding now %ld\n",
+               CkMyNode(), taken.size(), helper_pe,
+               nb->steal_outstanding.load());
     this->thisProxy[helper_pe].receiveSteal(ship);
   }
 
@@ -1470,32 +2004,65 @@ public:
   }
 
   void receiveSteal(const paratreet::StealShipment<Data>& ship) {
-    std::vector<long> edges_flat;
-    long units = 0;
-    // Rebuild each distinct subtree once; units index into that list, so
-    // a subtree shared by several units is rebuilt once too.
-    std::vector<std::vector<Particle>> parts(ship.trees.size());
+    auto* nb = node_proxy.ckLocalBranch();
+    steal_awaiting_ = false;
+    // Rebuild once and keep the trees alive: units derived from them are
+    // refined and executed over the rest of the phase, so they cannot be
+    // freed when this entry method returns.
     std::vector<Node<Data>*> roots(ship.trees.size(), nullptr);
-    for (size_t t = 0; t < ship.trees.size(); t++) {
-      parts[t] = ship.trees[t].particles;
-      roots[t] = buildStealTree(ship.trees[t], parts[t]);
-    }
-    for (auto& up : ship.unit_pairs) {
-      if (up.first < 0 || up.second < 0 ||
-          up.first >= (int)roots.size() || up.second >= (int)roots.size())
-        continue;
-      std::vector<std::pair<long, long>> es;
-      walkUnitEdges(roots[up.first], roots[up.second], es);
-      for (auto& e : es) {
-        edges_flat.push_back(e.first);
-        edges_flat.push_back(e.second);
+    {
+      std::lock_guard<std::mutex> g(nb->stolen_lock);
+      size_t base = nb->stolen_particles.size();
+      for (size_t t = 0; t < ship.trees.size(); t++) {
+        nb->stolen_particles.push_back(ship.trees[t].particles);
+        roots[t] = buildStealTree(ship.trees[t], nb->stolen_particles[base + t]);
+        nb->stolen_roots.push_back(roots[t]);
       }
-      units++;
     }
-    for (auto* r : roots) deleteStealTree(r);
-    node_proxy.ckLocalBranch()->stolen_in_units.fetch_add(units);
-    this->thisProxy[CkNodeFirst(ship.victim_node)].returnStolenEdges(edges_flat);
-    askVictim(); // same victim: it had work a moment ago
+    long units = 0;
+    {
+      std::lock_guard<std::mutex> g(nb->coarse_lock);
+      for (auto& up : ship.unit_pairs) {
+        if (up.first < 0 || up.second < 0) continue;
+        // Stolen work joins our own queue and is scheduled identically;
+        // only the origin tag distinguishes it, and only for routing the
+        // edges back to the process whose tips they describe.
+        nb->coarse_q.push_back({0.0, roots[up.first], roots[up.second],
+                                ship.victim_node});
+        units++;
+      }
+    }
+    nb->stolen_in_units.fetch_add(units);
+    {
+      std::lock_guard<std::mutex> g(nb->foreign_lock);
+      nb->foreign_pending[ship.victim_node] += units;
+      nb->foreign_owed[ship.victim_node] += units;
+    }
+    if (FoFPhase1<Data>::stealDebug())
+      CkPrintf("[steal] node %d RECEIVE %ld units (%zu offered) from node %d\n",
+               CkMyNode(), units, ship.unit_pairs.size(), ship.victim_node);
+    // Wake every thread of this process: they may have run dry.
+    int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      this->thisProxy[pe].phaseBStep();
+  }
+
+  // Victim: absorb returned edges and settle one shipment.
+  void returnStolenEdges2(int helper_node, const std::vector<long>& flat,
+                          long shipments) {
+    auto* nb = node_proxy.ckLocalBranch();
+    std::vector<std::pair<long, long>> es;
+    es.reserve(flat.size() / 2);
+    for (size_t i = 0; i + 1 < flat.size(); i += 2)
+      es.emplace_back(flat[i], flat[i + 1]);
+    if (!es.empty()) nb->submitEdges(std::move(es));
+    long left = nb->steal_outstanding.fetch_sub(shipments,
+                                                std::memory_order_acq_rel) -
+                shipments;
+    if (FoFPhase1<Data>::stealDebug())
+      CkPrintf("[steal] node %d SETTLE %ld units from node %d, outstanding now %ld\n",
+               CkMyNode(), shipments, helper_node, left);
+    nb->tryTriggerMerge();
   }
 
   // Self-test (FOF_STEAL_SELFTEST=1, debug): for every locally claimed
@@ -1573,7 +2140,11 @@ public:
     if (CkMyPe() == CkNodeFirst(CkMyNode())) {
       auto* nb = node_proxy.ckLocalBranch();
       rec.process = CkMyNode();
-      rec.pool_units = nb->pool_units_total;
+      // Under the two-queue scheme the legacy pool is unused, so report
+      // the deque's starting size instead; otherwise every process looks
+      // like it had no work and the whole record is suppressed.
+      rec.pool_units = poolTwoQueue() ? nb->pool_coarse_initial
+                                      : nb->pool_units_total;
       rec.wall_b = nb->stage_tB;
       rec.out_units = nb->stolen_out_units.load();
       rec.in_units = nb->stolen_in_units.load();
@@ -1656,8 +2227,10 @@ public:
     // Stage walls to the driver: process-local values, max-reduced over
     // all PEs (every PE of a process contributes its process's identical
     // tA/tB/tM plus its own relabel time).
-    double vals[4] = {tA, tB, tM, CkWallTimer() - t0};
-    this->contribute(4 * sizeof(double), vals, CkReduction::max_double,
+    auto* nb = node_proxy.ckLocalBranch();
+    double vals[6] = {tA, tB, tM, CkWallTimer() - t0,
+                      nb->pool_build_s, (double)nb->phaseb_edges};
+    this->contribute(6 * sizeof(double), vals, CkReduction::max_double,
                      done_cb_);
   }
 
@@ -2565,11 +3138,15 @@ private:
   // star-emits n's tips once; later certificates emit one (rep, rep) edge.
   // Cleared at the start of each phaseB.
   std::unordered_map<Node<Data>*, long> cert_tip;
-  long certTipRep(Node<Data>* n) {
+  // The destination is a parameter because a unit borrowed from another
+  // process must put its edges in that process's buffer: they name that
+  // process's particles, and this process's union-find cannot use them.
+  template <typename Seen, typename Buf>
+  long certTipRep(Node<Data>* n, Seen& out_seen, Buf& out_buf) {
     auto it = cert_tip.find(n);
     if (it != cert_tip.end()) return it->second;
     long rep = firstTip(n);
-    emitSubtreeTips(n, rep);
+    emitSubtreeTips(n, rep, out_seen, out_buf);
     cert_tip.emplace(n, rep);
     return rep;
   }
@@ -2578,7 +3155,8 @@ private:
   // (rep_tip, tip) edges for every particle under n. Correct without any
   // internal-connectivity assumption: all CROSS pairs are true links, so a
   // spanning star through rep connects every tip present in a and b.
-  void emitSubtreeTips(Node<Data>* n, long rep_tip) {
+  template <typename Seen, typename Buf>
+  void emitSubtreeTips(Node<Data>* n, long rep_tip, Seen& out_seen, Buf& out_buf) {
     if (n == nullptr || n->n_particles == 0) return;
     if (n->isLeaf()) {
       const Particle* p = n->particles();
@@ -2586,12 +3164,13 @@ private:
         long t = p[i].group_number;
         if (t == rep_tip) continue;
         long lo = std::min(rep_tip, t), hi = std::max(rep_tip, t);
-        if (seen.insert(paratreet::packTipPair(lo, hi)).second)
-          edge_buf.emplace_back(lo, hi);
+        if (out_seen.insert(paratreet::packTipPair(lo, hi)).second)
+          out_buf.emplace_back(lo, hi);
       }
       return;
     }
-    for (int i = 0; i < n->n_children; i++) emitSubtreeTips(n->getChild(i), rep_tip);
+    for (int i = 0; i < n->n_children; i++)
+      emitSubtreeTips(n->getChild(i), rep_tip, out_seen, out_buf);
   }
 
   // First (any) particle tip under n; n non-empty. Same != 0 rule as
@@ -2691,6 +3270,15 @@ private:
   // Per-PE component sizes keyed by the CURRENT label of each component
   // (maintained through every label rewrite; see the freeze pass).
   std::unordered_map<long, long> tip_counts;
+  // Per-origin edge buffers and duplicate filters for stolen work.
+  std::vector<typename FoFPhase1Node<Data>::PoolUnit> pb_mine_;
+  bool pb_done_ = false;      // this processor has deposited its phaseB
+  bool pb_test_fallback_ = false;  // validation mode only, see phaseBStep
+  bool steal_awaiting_ = false;
+  double pb_t0_ = 0;
+  std::map<int, std::vector<std::pair<long, long>>> foreign_buf_;
+  std::map<int, std::unordered_set<paratreet::TipPairKey,
+                                   paratreet::TipPairKeyHash>> foreign_seen_;
   // Phase-3 cross-process buffers (kept separate from phaseB's, above).
   std::vector<std::pair<long, long>> edge_buf3;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;
@@ -2800,6 +3388,12 @@ namespace paratreet {
 struct FoFPhase1Stages {
   double reset = 0, register_s = 0, phaseA = 0, phaseB = 0, merge = 0,
          relabel = 0;
+  // Split of the phaseB stage: pool_build is enumeration + per-thread
+  // sort + assembly (the rest of phaseB is walking units); phaseb_edges
+  // is the deduplicated cross-thread edge count of the heaviest process.
+  // Both max-reduced over processes, like the stage walls.
+  double pool_build = 0;
+  long phaseb_edges = 0;
 };
 
 // Convenience driver for the full phase-1 sequence. Must be called from a
@@ -2850,6 +3444,8 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
     local.phaseB = v[1];
     local.merge = v[2];
     local.relabel = v[3];
+    local.pool_build = v[4];
+    local.phaseb_edges = (long)v[5];
     delete m;
   }
   // Post-phase steal accounting (buffered; Kale, 2026-08-07): one record
