@@ -619,3 +619,135 @@ bigger process. The standing layout on Anvil is 8 processes of 15 threads
 per node; 4 of 31 and 2 of 63 use the same cores while turning
 cross-process movement into ordinary queue sharing. That comparison, with
 and without movement at each layout, is job 19748939.
+
+## 16. What actually makes moving work expensive (2026-08-08, Kale's question)
+
+Kale asked whether the cost of sending work to another process is the
+shipping itself, or the fact that the deduplication and pruning — both
+hash maps — do not work for shipped units. The shipping half was already
+measured: `steal_flatten_us` has been counting the donor's serialization
+all along. Summed over the 128 processes of a 2B run on 16 nodes:
+
+| arm | units shipped | flatten total | per unit | phaseB |
+|---|---|---|---|---|
+| coarse units, 16 per answer | 2384 | 5.13 s | 2.151 ms | 2.28 s |
+| divided on request, 1 per answer | 15372 | 0.96 s | 0.062 ms | 3.17 s |
+| divided on request, 8 per answer | 67992 | 1.71 s | 0.025 ms | 3.19 s |
+
+The arms that LOSE time ship six to thirty times more units, at one
+thirty-fifth to one eighty-fifth the serialization cost each, for less
+total serialization. Section 15's conclusion — "the cost is moving a
+unit" — was the wrong reading of the same experiments.
+
+To answer the other half, every counter was split by whether the unit was
+this process's own or borrowed. The first version of that instrumentation
+put a shared atomic increment on the emit path, which runs 8.5 billion
+times in a 2B run, and took phaseB from 2.4 s to 13-58 s; the counters
+are now per processor and folded into the process record at the end of
+the stage. With them cheap enough to trust:
+
+| | own work | borrowed work |
+|---|---|---|
+| units | 7,367,472 | 139,807 |
+| per unit | 36.1 us | 96.8 us |
+| emissions per unit | 1055 | 3618 |
+| per emission | 0.034 us | 0.027 us |
+| certificate hit rate | 93.1% | 96.3% |
+| duplicates suppressed | 100.0% | 100.0% |
+
+Borrowed units take longer only because they are bigger: they come from
+the coarse end of the queue and carry three and a half times the particle
+pairs. Per pair examined they are marginally cheaper, and their
+certificate memo hits MORE often, not less.
+
+The one place the hypothesis does bite: the borrowed duplicate set was
+erased whenever an origin's outstanding count reached zero, which with
+one chunk per answer is after every unit, so borrowed work restarted
+deduplication from empty over and over. Measured, that costs about ten
+thousand extra edges shipped out of 1.09 million — a percent, not the
+missing factor. It is fixed anyway (an edge already delivered never needs
+delivering again), with the old behaviour behind FOF_DROP_SEEN.
+
+Two things the same instrumentation showed that matter more:
+
+**phaseB is 94 percent waiting.** The whole stage does about 280
+core-seconds of work spread over 1,920 processors: 0.15 s if it were
+perfectly balanced, against a 2.3 s wall.
+
+**The walk emits 8.48 billion candidate edges to keep 1.09 million.**
+The deduplication hash map absorbs 99.99 percent of them, which makes
+that map, not shipping, the busiest structure in the stage. Consecutive
+particle pairs in one leaf-leaf visit usually carry the same pair of
+tips, so a one-entry check in front of the map now catches repeats
+without hashing: 96 percent of duplicates at 1M, identical results. It
+saves about 7 percent of aggregate walk time and does not move the wall,
+which is consistent with the wall being waiting rather than work.
+
+## 17. The grant rate, and why the division on request never ran (2026-08-09)
+
+Almost nothing moves, and not for want of asking. In one 2B run,
+585,694 requests produced 146 grants and 12,023 refusals for an empty
+queue. Only 4 to 6 percent of the work is ever borrowed. A busy process
+is not unwilling to share; at the moment a request arrives its queue is
+below the reserve of one unit per thread, because its threads pull units
+out as fast as refinement publishes them.
+
+That reserve is also what made section 15's division on request look like
+a bad idea. The dividing code sits INSIDE the loop the reserve guards, so
+when the queue is short — which is nearly always — it never executes. The
+one mechanism built to manufacture something to hand over could not run,
+and what little it moved came from the rare moments the queue was long
+enough, paying settlement overhead without ever doing its job.
+
+Removing the reserve when dividing (dividing adds units, so holding back
+is pointless) confirms the diagnosis and exposes the next problem.
+2B, 16 nodes, three repetitions:
+
+| arm | grants | work moved | phaseB |
+|---|---|---|---|
+| reserve 15 (the shipped default) | 137-146 | 4-6% | 2.10, 2.79, 3.99 |
+| reserve 0 | 140-148 | 3-6% | 2.01, 2.12, 2.36 |
+| divide on request, reserve 0 | 17303-22339 | 0.0% | 3.09, 3.09, 3.55 |
+| divide, four parts per answer | 8793-11747 | 0.1% | 3.46, 4.98 |
+
+Dividing raises the grant rate by a factor of 120, exactly as intended,
+and moves no work at all: 24,464 units handed over with under a
+microsecond of walking each. The units it manufactures are empty. Two
+reasons, both fixable: the answer takes `coarse_q.back()` after pushing
+the products, which is whichever child happened to be pushed last rather
+than the largest; and opening one level of a pair yields up to eight
+children of which most contain few particle pairs actually within the
+linking length. Handing over the costliest product, rather than an
+arbitrary one, is the obvious next thing to try.
+
+Removing the reserve without dividing is a small win on its own (median
+2.12 against 2.79) and is the better default of the two.
+
+### A bigger process beats moving work between processes
+
+Same 16 nodes, three layouts, movement on and off, with the layout set at
+the allocation level so srun uses the idiom that gives healthy runs. (An
+earlier attempt overrode -N and --cpus-per-task on the srun line and ran
+phaseA at 20 to 47 s against the usual 2.4 s in every arm, including the
+standing layout — a CPU binding effect that hit the memory-heavy first
+pass and left phaseB alone. Those numbers are void.)
+
+| layout | phaseB, no movement | phaseB, movement |
+|---|---|---|
+| 8 processes x 15 threads | 3.00, 2.98 | 2.24, 2.16 |
+| 4 x 31 | 2.33, 2.77 | 3.16, 2.42 |
+| 2 x 63 | 1.94, 1.78 | 1.67, 2.94 |
+
+Two processes of 63 threads with NO movement at all (1.86 mean) beats
+eight processes of 15 with movement (2.20). Threads inside a process
+share the queue and ship nothing, so making the process bigger converts
+cross-process movement into ordinary queue sharing and removes the
+problem instead of solving it. Movement still helps at 8x15, where there
+are eight separate queues per node; by 2x63 it is within noise.
+
+This is the cheapest available lever and needs no new mechanism, only a
+launch-layout change. What it costs elsewhere — cache duplication is per
+process, so fewer processes means less of it, while decomposition and
+phase 3 behave differently — has not been measured, and the whole
+iteration, not phaseB alone, has to be the judge before the standing
+configuration changes.
