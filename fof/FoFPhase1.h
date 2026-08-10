@@ -766,17 +766,126 @@ public:
     // applyUF2Labels), so depositLabelCounts can deposit this map
     // directly.
     std::vector<long> root_counts(uf_parent.size(), 0);
-    for (auto& s : subtrees)
-      for (int i = 0; i < s.n; i++) {
-        int r = find(s.offset + i);
-        s.parts[i].group_number = flat_order[r];
-        root_counts[r]++;
+    if (tipAnnotate()) {
+      // Fused: the freeze and the node annotation both touch every
+      // particle, and the annotation reads back the group_number the
+      // freeze has just written, so they are one walk. Iterating leaves
+      // rather than the flat block is the only difference - a leaf's
+      // particles are a contiguous slice of the block, so the flat index
+      // the union-find needs is offset + (slice base) + j.
+      for (auto& s : subtrees) {
+        long covered = freezeAndAnnotate(s.root, s, root_counts);
+        // Every particle of the block must belong to exactly one leaf,
+        // or the tips and the component counts that ride this loop would
+        // both be short. Cheap to check, and it protects Kale's
+        // freeze-pass component counting.
+        CkEnforce(covered == (long)s.n);
       }
+    } else {
+      for (auto& s : subtrees)
+        for (int i = 0; i < s.n; i++) {
+          int r = find(s.offset + i);
+          s.parts[i].group_number = flat_order[r];
+          root_counts[r]++;
+        }
+    }
     tip_counts.clear();
     for (size_t r = 0; r < root_counts.size(); r++)
       if (root_counts[r] > 0) tip_counts[flat_order[r]] = root_counts[r];
 
+    // Write the frozen tips into the node annotation, bottom up.
+    //
+    // phaseA cannot use min_frag/max_frag itself: its tips are LIVE, the
+    // union-find merges fragments as the walk proceeds, so a value stored
+    // in a node is stale at the next union. That is why phaseA answers
+    // "is this node internally connected" through cert_rep, a memo over
+    // union-find roots whose entries stay valid across merges.
+    //
+    // phaseB has no such constraint. The freeze pass above wrote a final
+    // group_number into every particle and nothing changes it until the
+    // merge, so from here the annotation is simply data: constant time to
+    // test, hereditary, and carried in the node rather than in a
+    // per-processor map keyed by node address.
+    //
+    // Superseded by Subtree::upwardPass after relabel, which is what
+    // phase 3 reads. Uniformity is monotone across the merge, so a node
+    // uniform here is still uniform there.
+    // (The annotation is written by the fused freeze walk above; it used
+    // to be a second pass over every particle, which cost about 0.10 s
+    // at 8M and made the change a net loss at small scale.)
     t_phaseA = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
+  }
+
+  static bool tipAnnotate() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_TIP_ANNOTATE");
+      return !e || std::atoi(e) != 0;   // FOF_TIP_ANNOTATE=0 for the A/B
+    }();
+    return on;
+  }
+  double t_tip_annotate = 0.0;
+  // Empty nodes keep the identity range, so uniform() stays false for
+  // them, exactly as FragData's own constructor intends.
+  // Freeze and annotate in one walk. Returns how many particles it
+  // covered so the caller can confirm the leaves account for the whole
+  // block. Writes each particle's final tip, feeds root_counts for the
+  // component counting that rides this pass, and leaves every node
+  // carrying the min and max tip beneath it.
+  long freezeAndAnnotate(Node<Data>* n, const SubtreeRef& s,
+                         std::vector<long>& root_counts) {
+    const long kMin = std::numeric_limits<long>::max();
+    const long kMax = std::numeric_limits<long>::min();
+    if (n == nullptr) return 0;
+    long mn = kMin, mx = kMax, covered = 0;
+    if (n->isLeaf()) {
+      const int base = (int)(n->particles() - s.parts);
+      for (int j = 0; j < n->n_particles; j++) {
+        int r = find(s.offset + base + j);
+        long g = flat_order[r];
+        s.parts[base + j].group_number = g;
+        root_counts[r]++;
+        if (g < mn) mn = g;
+        if (g > mx) mx = g;
+      }
+      covered = n->n_particles;
+    } else {
+      for (int i = 0; i < n->n_children; i++) {
+        Node<Data>* c = n->getChild(i);
+        if (c == nullptr) continue;
+        covered += freezeAndAnnotate(c, s, root_counts);
+        if (c->data.min_frag < mn) mn = c->data.min_frag;
+        if (c->data.max_frag > mx) mx = c->data.max_frag;
+      }
+    }
+    n->data.min_frag = mn;
+    n->data.max_frag = mx;
+    return covered;
+  }
+
+  // Kept for reference and for any caller that needs the annotation
+  // without the freeze; the production path uses the fused walk above.
+  std::pair<long, long> annotateFrozenTips(Node<Data>* n) {
+    const long kMin = std::numeric_limits<long>::max();
+    const long kMax = std::numeric_limits<long>::min();
+    if (n == nullptr) return {kMin, kMax};
+    long mn = kMin, mx = kMax;
+    if (n->isLeaf()) {
+      const Particle* p = n->particles();
+      for (int i = 0; i < n->n_particles; i++) {
+        long g = p[i].group_number;
+        if (g < mn) mn = g;
+        if (g > mx) mx = g;
+      }
+    } else {
+      for (int i = 0; i < n->n_children; i++) {
+        auto r = annotateFrozenTips(n->getChild(i));
+        if (r.first < mn) mn = r.first;
+        if (r.second > mx) mx = r.second;
+      }
+    }
+    n->data.min_frag = mn;
+    n->data.max_frag = mx;
+    return {mn, mx};
   }
 
   // (b) Cross-PE edge emission. For each subtree pair spanning this PE and a
@@ -1989,6 +2098,10 @@ private:
   // Cleared at the start of each phaseB.
   std::unordered_map<Node<Data>*, long> cert_tip;
   long certTipRep(Node<Data>* n) {
+    // One fragment under this node: the star through the representative
+    // has no edges to add, so neither the subtree walk nor a memo entry
+    // is needed. This is the case the memo was paying for.
+    if (tipAnnotate() && n->data.uniform()) return n->data.min_frag;
     auto it = cert_tip.find(n);
     if (it != cert_tip.end()) return it->second;
     long rep = firstTip(n);
@@ -2067,6 +2180,16 @@ private:
 
   // phaseB leaf action: pairwise distance checks -> deduplicated tip edges.
   void leafLeafEmit(Node<Data>* a, Node<Data>* b) {
+    // When each leaf holds a single fragment, every particle pair in this
+    // visit can only ever produce the SAME edge: if the two fragments are
+    // already one, there is no edge to find at all; otherwise the first
+    // pair within range is the only one worth finding. Without this the
+    // loop emits that one edge once per particle pair and the seen-set
+    // throws all but the first away - measured at 2B, 7.8 billion
+    // emissions to keep 1.1 million edges.
+    const bool both_uniform =
+        tipAnnotate() && a->data.uniform() && b->data.uniform();
+    if (both_uniform && a->data.min_frag == b->data.min_frag) return;
     const Particle* pa = a->particles();
     const Particle* pb = b->particles();
     for (int i = 0; i < a->n_particles; i++) {
@@ -2080,6 +2203,7 @@ private:
         // 4.29e9 particles, silently suppressing real edges.
         if (seen.insert(paratreet::packTipPair(lo, hi)).second)
           edge_buf.emplace_back(lo, hi);
+        if (both_uniform) return;   // one edge is all this pair can yield
       }
     }
   }
