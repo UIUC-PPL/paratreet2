@@ -319,6 +319,32 @@ struct FoFMemoryStats {
 // Per-process side of phase 1: collects the per-PE subtree registry (for
 // phaseB pair enumeration), the cross-PE boundary edges, and — after
 // merge() — the PE-tip -> process-level tip map read by the group branches.
+// Cost-model probe accumulator (throwaway branch): normal equations for
+// a linear fit, so a process can fit its own model in place instead of
+// shipping records off the machine.
+struct CostAccum {          // normal equations for t ~ c0 + c1 m1 + c2 m2 + c3 m3
+  double n = 0, sy = 0, syy = 0, tmax = 0;
+  double xtx[4][4] = {{0}};
+  double xty[4] = {0};
+  void add(const double* x, double y) {
+    n += 1; sy += y; syy += y * y;
+    if (y > tmax) tmax = y;
+    for (int i = 0; i < 4; i++) {
+      xty[i] += x[i] * y;
+      for (int j = 0; j < 4; j++) xtx[i][j] += x[i] * x[j];
+    }
+  }
+  void merge(const CostAccum& o) {
+    n += o.n; sy += o.sy; syy += o.syy;
+    if (o.tmax > tmax) tmax = o.tmax;
+    for (int i = 0; i < 4; i++) {
+      xty[i] += o.xty[i];
+      for (int j = 0; j < 4; j++) xtx[i][j] += o.xtx[i][j];
+    }
+  }
+};
+struct CostRec { float t_us, m1, m2, m3; int kind; };
+
 template <typename Data>
 class FoFPhase1Node : public CBase_FoFPhase1Node<Data> {
 public:
@@ -329,6 +355,13 @@ public:
   };
 
   std::mutex lock;
+
+  // Cost-model probe (throwaway branch): the process's normal equations,
+  // folded in by each processor at the end of relabel.
+  CostAccum cost_node_[3];
+  std::vector<CostRec> cost_recs_node_;   // process 0 only
+  std::mutex cost_lock;
+  std::atomic<int> cost_done{0};
   // PE -> subtrees resident on that PE (this process's PEs only).
   std::map<int, std::vector<SubtreeRef>> pe_subtrees;
   std::vector<std::pair<long, long>> edges; // cross-PE (tip, tip) edges
@@ -731,6 +764,7 @@ public:
                 gridSelfUnion(sa))
               continue;
           }
+          const double cp_t0 = costProbe() ? CkWallTimer() : 0.0;
           walk(sa.root, sb.root,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); },
                [&](Node<Data>* a, Node<Data>* b) {
@@ -752,6 +786,9 @@ public:
                  if (find(ra) == find(rb)) { p1_conn_suppressed++; return true; }
                  return false;
                });
+          if (costProbe())
+            costRecord(pass, sa.root, sb.root,
+                       (CkWallTimer() - cp_t0) * 1e6);
         }
       }
     }
@@ -826,6 +863,65 @@ public:
   double t_tip_annotate = 0.0;
   // Empty nodes keep the identity range, so uniform() stays false for
   // them, exactly as FragData's own constructor intends.
+
+  // ---- Cost-model probe (FOF_COST_PROBE=1; throwaway branch) ------------
+  // Predicting what a subtree pair will cost is the missing piece for
+  // placing phaseB work before the stage instead of repairing it during.
+  // Two candidate predictors are already in the tree and neither has ever
+  // been checked against measured time: the pool's LPT key (box overlap
+  // volume) and unitCost (the particle-count product).
+  //
+  // Rather than write every record out, each process fits its own model
+  // in place: the normal equations for a linear fit are a 4x4 matrix and
+  // a 4-vector, so a pair costs four multiply-adds to record and nothing
+  // to store. Only process 0 keeps raw records, for offline work.
+  //
+  // Features, per pair (a, b):
+  //   m1 = n_a * n_b                  the naive particle-pair count
+  //   m2 = rho_a * rho_b * V_int * Vb the expected number of pairs within
+  //                                   the linking length: densities times
+  //                                   the overlap of a's box grown by b
+  //                                   with b's box, times the b-ball
+  //   m3 = n_a + n_b                  descent size, a tree-walk proxy
+  static bool costProbe() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_COST_PROBE");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  CostAccum cost_acc_[3];               // 0 A-self, 1 A-cross, 2 B
+  std::vector<CostRec> cost_recs_;      // process 0 only
+
+  // Volume of the intersection of a grown by the linking length with b.
+  static double overlapVolume(const OrientedBox<Real>& ba,
+                              const OrientedBox<Real>& bb, double b) {
+    double v = 1.0;
+    for (int d = 0; d < 3; d++) {
+      double lo_a = (d == 0 ? ba.lesser_corner.x : d == 1 ? ba.lesser_corner.y : ba.lesser_corner.z) - b;
+      double hi_a = (d == 0 ? ba.greater_corner.x : d == 1 ? ba.greater_corner.y : ba.greater_corner.z) + b;
+      double lo_b = (d == 0 ? bb.lesser_corner.x : d == 1 ? bb.lesser_corner.y : bb.lesser_corner.z);
+      double hi_b = (d == 0 ? bb.greater_corner.x : d == 1 ? bb.greater_corner.y : bb.greater_corner.z);
+      double w = std::min(hi_a, hi_b) - std::max(lo_a, lo_b);
+      if (w <= 0) return 0.0;
+      v *= w;
+    }
+    return v;
+  }
+  void costRecord(int kind, Node<Data>* a, Node<Data>* b, double t_us) {
+    const double na = (double)a->data.n_below, nb = (double)b->data.n_below;
+    const double va = (double)a->data.box.volume(), vb = (double)b->data.box.volume();
+    const double blen = std::sqrt(b2_);
+    const double vint = overlapVolume(a->data.box, b->data.box, blen);
+    const double vball = 4.0 / 3.0 * 3.14159265358979 * blen * blen * blen;
+    const double m1 = na * nb;
+    const double m2 = (va > 0 && vb > 0) ? (na / va) * (nb / vb) * vint * vball : 0.0;
+    const double m3 = na + nb;
+    const double x[4] = {1.0, m1, m2, m3};
+    cost_acc_[kind].add(x, t_us);
+    if (CkMyNode() == 0 && cost_recs_.size() < 50000)
+      cost_recs_.push_back({(float)t_us, (float)m1, (float)m2, (float)m3, kind});
+  }
   // Freeze and annotate in one walk. Returns how many particles it
   // covered so the caller can confirm the leaves account for the whole
   // block. Writes each particle's final tip, feeds root_counts for the
@@ -940,6 +1036,8 @@ public:
           // leveling is complete (design/phase1-scaling.md).
           double tp = CkWallTimer() - tp0;
           if (tp > t_phaseB_maxpair) t_phaseB_maxpair = tp;
+          if (costProbe())
+            costRecord(2, nb->phaseb_pool[k].a, nb->phaseb_pool[k].b, tp * 1e6);
       }
     }
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
@@ -950,6 +1048,81 @@ public:
 
   // (d) Rewrite this PE's particles' group_number through the merge map
   // (identity if absent).
+
+  // Fold this processor's normal equations into the process's, and let the
+  // last one solve and report. Gaussian elimination on a 4x4 is exact
+  // enough here and needs no library.
+  void foldCost() {
+    auto* nb = node_proxy.ckLocalBranch();
+    {
+      std::lock_guard<std::mutex> g(nb->cost_lock);
+      for (int k = 0; k < 3; k++) nb->cost_node_[k].merge(cost_acc_[k]);
+      // Same address space, so each processor hands its records over here
+      // rather than the last one reaching across for them.
+      if (CkMyNode() == 0 && !cost_recs_.empty()) {
+        nb->cost_recs_node_.insert(nb->cost_recs_node_.end(),
+                                   cost_recs_.begin(), cost_recs_.end());
+        cost_recs_.clear();
+      }
+    }
+    if (nb->cost_done.fetch_add(1) + 1 != CkNodeSize(CkMyNode())) return;
+    static const char* kname[3] = {"A_self", "A_cross", "B"};
+    for (int k = 0; k < 3; k++) {
+      const CostAccum& A = nb->cost_node_[k];
+      if (A.n < 8) continue;
+      double M[4][5];
+      for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) M[i][j] = A.xtx[i][j];
+        M[i][4] = A.xty[i];
+      }
+      // Ridge term: m1 and m2 can be nearly collinear in uniform regions.
+      for (int i = 0; i < 4; i++) M[i][i] *= 1.0 + 1e-9;
+      bool ok = true;
+      for (int c = 0; c < 4 && ok; c++) {
+        int piv = c;
+        for (int r = c + 1; r < 4; r++)
+          if (std::fabs(M[r][c]) > std::fabs(M[piv][c])) piv = r;
+        if (std::fabs(M[piv][c]) < 1e-30) { ok = false; break; }
+        if (piv != c) for (int j = 0; j <= 4; j++) std::swap(M[c][j], M[piv][j]);
+        for (int r = 0; r < 4; r++) {
+          if (r == c) continue;
+          double f = M[r][c] / M[c][c];
+          for (int j = c; j <= 4; j++) M[r][j] -= f * M[c][j];
+        }
+      }
+      double coef[4] = {0, 0, 0, 0};
+      if (ok) for (int i = 0; i < 4; i++) coef[i] = M[i][4] / M[i][i];
+      // R^2 against the mean.
+      double mean = A.sy / A.n;
+      double ss_tot = A.syy - A.n * mean * mean;
+      double ss_res = A.syy;
+      for (int i = 0; i < 4; i++) ss_res -= coef[i] * A.xty[i];
+      double r2 = (ss_tot > 0) ? 1.0 - ss_res / ss_tot : 0.0;
+      CkPrintf("FOF3COST process %d phase %-7s pairs %.0f total_ms %.1f "
+               "mean_us %.2f max_us %.1f | c0 %.4g c1 %.4g c2 %.4g c3 %.4g "
+               "R2 %.4f %s\n",
+               CkMyNode(), kname[k], A.n, A.sy / 1000.0, mean, A.tmax,
+               coef[0], coef[1], coef[2], coef[3], r2, ok ? "" : "SINGULAR");
+    }
+    if (CkMyNode() == 0) dumpCostRecords();
+  }
+
+  // One process writes its raw records, so the fit can be redone offline
+  // with other model forms without another run.
+  void dumpCostRecords() {
+    auto* nb = node_proxy.ckLocalBranch();
+    auto& all = nb->cost_recs_node_;
+    if (all.empty()) return;
+    const char* path = std::getenv("FOF_COST_FILE");
+    FILE* f = std::fopen(path ? path : "fof-cost-records.csv", "w");
+    if (!f) { CkPrintf("FOF3COST could not open the record file\n"); return; }
+    std::fprintf(f, "kind,t_us,m1_npairs,m2_expected,m3_nsum\n");
+    for (auto& r : all)
+      std::fprintf(f, "%d,%.3f,%.6g,%.6g,%.6g\n", r.kind, r.t_us, r.m1, r.m2, r.m3);
+    std::fclose(f);
+    CkPrintf("FOF3COST wrote %zu records from process 0\n", all.size());
+  }
+
   void relabelBody() {
     auto& tip_map = node_proxy.ckLocalBranch()->tip_map;
     for (auto& s : subtrees) {
@@ -1185,6 +1358,7 @@ public:
   void relabelChained(double tA, double tB, double tM) {
     double t0 = CkWallTimer();
     relabelBody();
+    if (costProbe()) foldCost();
     // Stage walls to the driver: process-local values, max-reduced over
     // all PEs (every PE of a process contributes its process's identical
     // tA/tB/tM plus its own relabel time).
