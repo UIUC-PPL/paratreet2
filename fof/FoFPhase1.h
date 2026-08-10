@@ -766,12 +766,29 @@ public:
     // applyUF2Labels), so depositLabelCounts can deposit this map
     // directly.
     std::vector<long> root_counts(uf_parent.size(), 0);
-    for (auto& s : subtrees)
-      for (int i = 0; i < s.n; i++) {
-        int r = find(s.offset + i);
-        s.parts[i].group_number = flat_order[r];
-        root_counts[r]++;
+    if (tipAnnotate()) {
+      // Fused: the freeze and the node annotation both touch every
+      // particle, and the annotation reads back the group_number the
+      // freeze has just written, so they are one walk. Iterating leaves
+      // rather than the flat block is the only difference - a leaf's
+      // particles are a contiguous slice of the block, so the flat index
+      // the union-find needs is offset + (slice base) + j.
+      for (auto& s : subtrees) {
+        long covered = freezeAndAnnotate(s.root, s, root_counts);
+        // Every particle of the block must belong to exactly one leaf,
+        // or the tips and the component counts that ride this loop would
+        // both be short. Cheap to check, and it protects Kale's
+        // freeze-pass component counting.
+        CkEnforce(covered == (long)s.n);
       }
+    } else {
+      for (auto& s : subtrees)
+        for (int i = 0; i < s.n; i++) {
+          int r = find(s.offset + i);
+          s.parts[i].group_number = flat_order[r];
+          root_counts[r]++;
+        }
+    }
     tip_counts.clear();
     for (size_t r = 0; r < root_counts.size(); r++)
       if (root_counts[r] > 0) tip_counts[flat_order[r]] = root_counts[r];
@@ -793,11 +810,9 @@ public:
     // Superseded by Subtree::upwardPass after relabel, which is what
     // phase 3 reads. Uniformity is monotone across the merge, so a node
     // uniform here is still uniform there.
-    if (tipAnnotate()) {
-      double ta0 = CkWallTimer();
-      for (auto& s : subtrees) annotateFrozenTips(s.root);
-      t_tip_annotate = CkWallTimer() - ta0;
-    }
+    // (The annotation is written by the fused freeze walk above; it used
+    // to be a second pass over every particle, which cost about 0.10 s
+    // at 8M and made the change a net loss at small scale.)
     t_phaseA = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
   }
 
@@ -811,6 +826,44 @@ public:
   double t_tip_annotate = 0.0;
   // Empty nodes keep the identity range, so uniform() stays false for
   // them, exactly as FragData's own constructor intends.
+  // Freeze and annotate in one walk. Returns how many particles it
+  // covered so the caller can confirm the leaves account for the whole
+  // block. Writes each particle's final tip, feeds root_counts for the
+  // component counting that rides this pass, and leaves every node
+  // carrying the min and max tip beneath it.
+  long freezeAndAnnotate(Node<Data>* n, const SubtreeRef& s,
+                         std::vector<long>& root_counts) {
+    const long kMin = std::numeric_limits<long>::max();
+    const long kMax = std::numeric_limits<long>::min();
+    if (n == nullptr) return 0;
+    long mn = kMin, mx = kMax, covered = 0;
+    if (n->isLeaf()) {
+      const int base = (int)(n->particles() - s.parts);
+      for (int j = 0; j < n->n_particles; j++) {
+        int r = find(s.offset + base + j);
+        long g = flat_order[r];
+        s.parts[base + j].group_number = g;
+        root_counts[r]++;
+        if (g < mn) mn = g;
+        if (g > mx) mx = g;
+      }
+      covered = n->n_particles;
+    } else {
+      for (int i = 0; i < n->n_children; i++) {
+        Node<Data>* c = n->getChild(i);
+        if (c == nullptr) continue;
+        covered += freezeAndAnnotate(c, s, root_counts);
+        if (c->data.min_frag < mn) mn = c->data.min_frag;
+        if (c->data.max_frag > mx) mx = c->data.max_frag;
+      }
+    }
+    n->data.min_frag = mn;
+    n->data.max_frag = mx;
+    return covered;
+  }
+
+  // Kept for reference and for any caller that needs the annotation
+  // without the freeze; the production path uses the fused walk above.
   std::pair<long, long> annotateFrozenTips(Node<Data>* n) {
     const long kMin = std::numeric_limits<long>::max();
     const long kMax = std::numeric_limits<long>::min();
