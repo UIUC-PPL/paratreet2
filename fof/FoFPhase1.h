@@ -776,7 +776,63 @@ public:
     for (size_t r = 0; r < root_counts.size(); r++)
       if (root_counts[r] > 0) tip_counts[flat_order[r]] = root_counts[r];
 
+    // Write the frozen tips into the node annotation, bottom up.
+    //
+    // phaseA cannot use min_frag/max_frag itself: its tips are LIVE, the
+    // union-find merges fragments as the walk proceeds, so a value stored
+    // in a node is stale at the next union. That is why phaseA answers
+    // "is this node internally connected" through cert_rep, a memo over
+    // union-find roots whose entries stay valid across merges.
+    //
+    // phaseB has no such constraint. The freeze pass above wrote a final
+    // group_number into every particle and nothing changes it until the
+    // merge, so from here the annotation is simply data: constant time to
+    // test, hereditary, and carried in the node rather than in a
+    // per-processor map keyed by node address.
+    //
+    // Superseded by Subtree::upwardPass after relabel, which is what
+    // phase 3 reads. Uniformity is monotone across the merge, so a node
+    // uniform here is still uniform there.
+    if (tipAnnotate()) {
+      double ta0 = CkWallTimer();
+      for (auto& s : subtrees) annotateFrozenTips(s.root);
+      t_tip_annotate = CkWallTimer() - ta0;
+    }
     t_phaseA = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
+  }
+
+  static bool tipAnnotate() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_TIP_ANNOTATE");
+      return !e || std::atoi(e) != 0;   // FOF_TIP_ANNOTATE=0 for the A/B
+    }();
+    return on;
+  }
+  double t_tip_annotate = 0.0;
+  // Empty nodes keep the identity range, so uniform() stays false for
+  // them, exactly as FragData's own constructor intends.
+  std::pair<long, long> annotateFrozenTips(Node<Data>* n) {
+    const long kMin = std::numeric_limits<long>::max();
+    const long kMax = std::numeric_limits<long>::min();
+    if (n == nullptr) return {kMin, kMax};
+    long mn = kMin, mx = kMax;
+    if (n->isLeaf()) {
+      const Particle* p = n->particles();
+      for (int i = 0; i < n->n_particles; i++) {
+        long g = p[i].group_number;
+        if (g < mn) mn = g;
+        if (g > mx) mx = g;
+      }
+    } else {
+      for (int i = 0; i < n->n_children; i++) {
+        auto r = annotateFrozenTips(n->getChild(i));
+        if (r.first < mn) mn = r.first;
+        if (r.second > mx) mx = r.second;
+      }
+    }
+    n->data.min_frag = mn;
+    n->data.max_frag = mx;
+    return {mn, mx};
   }
 
   // (b) Cross-PE edge emission. For each subtree pair spanning this PE and a
@@ -1989,6 +2045,10 @@ private:
   // Cleared at the start of each phaseB.
   std::unordered_map<Node<Data>*, long> cert_tip;
   long certTipRep(Node<Data>* n) {
+    // One fragment under this node: the star through the representative
+    // has no edges to add, so neither the subtree walk nor a memo entry
+    // is needed. This is the case the memo was paying for.
+    if (tipAnnotate() && n->data.uniform()) return n->data.min_frag;
     auto it = cert_tip.find(n);
     if (it != cert_tip.end()) return it->second;
     long rep = firstTip(n);
@@ -2067,6 +2127,16 @@ private:
 
   // phaseB leaf action: pairwise distance checks -> deduplicated tip edges.
   void leafLeafEmit(Node<Data>* a, Node<Data>* b) {
+    // When each leaf holds a single fragment, every particle pair in this
+    // visit can only ever produce the SAME edge: if the two fragments are
+    // already one, there is no edge to find at all; otherwise the first
+    // pair within range is the only one worth finding. Without this the
+    // loop emits that one edge once per particle pair and the seen-set
+    // throws all but the first away - measured at 2B, 7.8 billion
+    // emissions to keep 1.1 million edges.
+    const bool both_uniform =
+        tipAnnotate() && a->data.uniform() && b->data.uniform();
+    if (both_uniform && a->data.min_frag == b->data.min_frag) return;
     const Particle* pa = a->particles();
     const Particle* pb = b->particles();
     for (int i = 0; i < a->n_particles; i++) {
@@ -2080,6 +2150,7 @@ private:
         // 4.29e9 particles, silently suppressing real edges.
         if (seen.insert(paratreet::packTipPair(lo, hi)).second)
           edge_buf.emplace_back(lo, hi);
+        if (both_uniform) return;   // one edge is all this pair can yield
       }
     }
   }
