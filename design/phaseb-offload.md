@@ -751,3 +751,74 @@ process, so fewer processes means less of it, while decomposition and
 phase 3 behave differently — has not been measured, and the whole
 iteration, not phaseB alone, has to be the judge before the standing
 configuration changes.
+
+## 18. The node uniformity annotation: phaseB halved (2026-08-09, Kale's question)
+
+Kale asked why the FragData tip annotation has to be recomputed by
+upwardPass when phaseA already computed that information. The answer is
+that it never did: phase 1 does not write node->data at all. What phaseA
+learns about a node lives in cert_rep, a per-processor map keyed by node
+ADDRESS, filled only for nodes its pair walk happened to touch, cleared
+at the end of the phase, and impossible to ship. min_frag/max_frag live
+IN the node, so upwardPass was computing them for the first time, not
+recomputing them — and it runs after relabel, far too late for phaseB.
+
+So: write the frozen tips into the annotation at the end of phaseA, while
+the tips are stable, and phaseB gains a constant-time "is this whole
+subtree one fragment" test that travels with the node, including into a
+steal shipment. The values are superseded by upwardPass for phase 3;
+uniformity is monotone across the merge, so a node uniform here is still
+uniform there.
+
+Three uses:
+  - a certificate on a uniform subtree returns the tip immediately.
+    Previously this walked the subtree to emit a star that, for a uniform
+    node, contains no edges at all.
+  - a leaf pair whose leaves are one fragment is skipped outright.
+  - a leaf pair of two fragments stops at the first edge in range, rather
+    than re-emitting that same edge for every particle pair.
+
+2B, 16 nodes, three repetitions each. Component count exact everywhere.
+
+| arm | phaseB mean |
+|---|---|
+| annotation off | 3.36 (3.063, 3.091, 3.936) |
+| annotation on | 1.58 (1.715, 1.531, 1.483) |
+| annotation off, movement on | 2.32 (2.256, 2.287, 2.424) |
+| annotation on, movement on | 1.72 (2.425, 1.457, 1.272) |
+
+The mechanism, summed over 128 processes:
+
+| | annotation off | annotation on |
+|---|---|---|
+| walk, own work | 269 core-s | 144 core-s |
+| emissions | 7.79e9 | 1.13e9 |
+| particles walked by star emits | 254,237,928 | 646 |
+| certificates answered by the node | 0 | 775,672,539 |
+| leaf pairs stopped at the first edge | 0 | 727,141,542 |
+
+phaseB is 2.1 times faster and the work behind it is 1.9 times smaller.
+The star emission is gone: 254 million particles walked, down to 646.
+No phaseA cost is measurable at 2B against that stage's own variance
+(2.26 to 3.67 s across these runs), though 8M isolated it at 0.13 s.
+
+Two further readings matter.
+
+**It helps borrowed work exactly as much as local work, and no more.**
+Per borrowed unit the walk went 102 us to 47 us, own work 36 us to 19 us
+— the same factor. This confirms what section 16 measured: shipped units
+were never handled worse, so an annotation that travels with the node
+does not close a gap, it makes both sides cheaper.
+
+**It removes most of the case for moving work at all.** With the
+annotation on, movement no longer helps: 1.58 s without it against 1.72 s
+with it. Halving the work halved what there was to move, and the steal
+machinery now costs more than it returns. Together with the layout result
+in section 17 — two processes of 63 threads beating eight of 15 with
+movement — the honest summary is that phaseB's remaining wall is not
+addressed by shipping work between processes.
+
+samefrag never fired (0 of 727 million). phaseB pairs are cross-thread
+subtree pairs, so the two sides always belong to different threads'
+fragments; the same-fragment case exists in phase 3, not here. The check
+is two comparisons and costs nothing, but it is dead code in this phase.

@@ -537,6 +537,9 @@ public:
                                                    // certificate star emit
   std::atomic<long> ex_shortcut[2] = {{0}, {0}};   // repeats caught without
                                                    // touching the hash map
+  std::atomic<long> ex_uniform_cert[2] = {{0}, {0}};
+  std::atomic<long> ex_same_frag[2] = {{0}, {0}};
+  std::atomic<long> ex_leaf_early[2] = {{0}, {0}};
   std::atomic<long> seen_resets{0};                // dedup sets thrown away
   std::atomic<long> flat_memo_hits{0};
   std::atomic<long> flat_memo_misses{0};
@@ -703,6 +706,7 @@ public:
       ex_units[i] = 0; ex_walk_us[i] = 0; ex_edges[i] = 0; ex_dupes[i] = 0;
       ex_cert_hit[i] = 0; ex_cert_miss[i] = 0; ex_star_parts[i] = 0;
       ex_shortcut[i] = 0;
+      ex_uniform_cert[i] = 0; ex_same_frag[i] = 0; ex_leaf_early[i] = 0;
     }
     seen_resets = 0;
     steal_flatten_us = 0;
@@ -975,7 +979,56 @@ public:
     for (size_t r = 0; r < root_counts.size(); r++)
       if (root_counts[r] > 0) tip_counts[flat_order[r]] = root_counts[r];
 
+    // Write the frozen tips into the node annotation, bottom up. Phase 1
+    // otherwise never touches node->data at all: what phaseA learns about
+    // a node lives in cert_rep, a per-processor map keyed by node address,
+    // which is discarded at the end of the phase and cannot be shipped.
+    // min_frag/max_frag live IN the node, so phaseB can ask whether a
+    // whole subtree is one fragment in constant time, and a subtree handed
+    // to another process carries the answer with it.
+    // These values are superseded by Subtree::upwardPass after relabel,
+    // which is what phase 3 reads; the merge only ever merges tips, so a
+    // node uniform here is still uniform there.
+    if (tipAnnotate()) {
+      double ta0 = CkWallTimer();
+      for (auto& s : subtrees) annotateFrozenTips(s.root);
+      t_tip_annotate = CkWallTimer() - ta0;
+    }
     t_phaseA = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
+  }
+
+  static bool tipAnnotate() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_TIP_ANNOTATE");
+      return !e || std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  double t_tip_annotate = 0.0;
+  // Empty nodes keep the identity range, so uniform() stays false for them,
+  // exactly as the build-time constructor intends.
+  std::pair<long, long> annotateFrozenTips(Node<Data>* n) {
+    const long kNone = std::numeric_limits<long>::max();
+    const long kNoneMax = std::numeric_limits<long>::min();
+    if (n == nullptr) return {kNone, kNoneMax};
+    long mn = kNone, mx = kNoneMax;
+    if (n->isLeaf()) {
+      const Particle* p = n->particles();
+      for (int i = 0; i < n->n_particles; i++) {
+        long g = p[i].group_number;
+        if (g < mn) mn = g;
+        if (g > mx) mx = g;
+      }
+    } else {
+      for (int i = 0; i < n->n_children; i++) {
+        auto r = annotateFrozenTips(n->getChild(i));
+        if (r.first < mn) mn = r.first;
+        if (r.second > mx) mx = r.second;
+      }
+    }
+    n->data.min_frag = mn;
+    n->data.max_frag = mx;
+    return {mn, mx};
   }
 
   // (b) Cross-PE edge emission. For each subtree pair spanning this PE and a
@@ -1397,6 +1450,19 @@ public:
       };
       walk(u.a, u.b,
            [&](Node<Data>* x, Node<Data>* y) {
+             // When each leaf holds a single fragment, every particle pair
+             // in this visit can only ever produce the SAME edge. If the
+             // two fragments are already the same one, there is no edge to
+             // find and the whole double loop can be skipped; otherwise the
+             // first pair within range is the only one worth finding. This
+             // is where the emissions are: 8.5 billion of them in a 2B run
+             // to keep 1.09 million distinct edges.
+             const bool both_uniform =
+                 tipAnnotate() && x->data.uniform() && y->data.uniform();
+             if (both_uniform && x->data.min_frag == y->data.min_frag) {
+               pe_same_frag_[w]++;
+               return;
+             }
              const Particle* px = x->particles();
              const Particle* py = y->particles();
              for (int i = 0; i < x->n_particles; i++)
@@ -1404,6 +1470,7 @@ public:
                  if (paratreet::periodicDistSq(px[i].position, py[j].position,
                                                period_) > b2_) continue;
                  emit(px[i].group_number, py[j].group_number);
+                 if (both_uniform) { pe_leaf_early_[w]++; return; }
                }
            },
            [&](Node<Data>* x, Node<Data>* y) {
@@ -1486,6 +1553,9 @@ public:
       nb->ex_cert_miss[i] += pe_cert_miss_[i];
       nb->ex_star_parts[i] += pe_star_parts_[i];
       nb->ex_shortcut[i] += pe_shortcut_[i];
+      nb->ex_uniform_cert[i] += pe_uniform_cert_[i];
+      nb->ex_same_frag[i] += pe_same_frag_[i];
+      nb->ex_leaf_early[i] += pe_leaf_early_[i];
     }
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
@@ -1736,7 +1806,8 @@ public:
       for (int i = 0; i < 2; i++) {
         pe_units_[i] = pe_walk_us_[i] = pe_edges_[i] = pe_dupes_[i] = 0;
         pe_cert_hit_[i] = pe_cert_miss_[i] = pe_star_parts_[i] = 0;
-        pe_shortcut_[i] = 0;
+        pe_shortcut_[i] = pe_uniform_cert_[i] = 0;
+        pe_same_frag_[i] = pe_leaf_early_[i] = 0;
         pe_last_lo_[i] = pe_last_hi_[i] = -1;
       }
       pb_done_ = false;
@@ -2271,6 +2342,9 @@ public:
         rec.ex_cert_miss[i] = nb->ex_cert_miss[i].load();
         rec.ex_star_parts[i] = nb->ex_star_parts[i].load();
         rec.ex_shortcut[i] = nb->ex_shortcut[i].load();
+        rec.ex_uniform_cert[i] = nb->ex_uniform_cert[i].load();
+        rec.ex_same_frag[i] = nb->ex_same_frag[i].load();
+        rec.ex_leaf_early[i] = nb->ex_leaf_early[i].load();
       }
       rec.seen_resets = nb->seen_resets.load();
       n = 1;
@@ -3258,6 +3332,14 @@ private:
   // process's particles, and this process's union-find cannot use them.
   template <typename Seen, typename Buf>
   long certTipRep(Node<Data>* n, Seen& out_seen, Buf& out_buf, int w = 0) {
+    // One fragment under this node: the star through the representative
+    // has no edges to add, so neither the walk nor a memo entry is needed.
+    // This is the case the memo was paying for - 281 million particles
+    // walked on misses in a 2B run, to emit nothing.
+    if (tipAnnotate() && n->data.uniform()) {
+      pe_uniform_cert_[w]++;
+      return n->data.min_frag;
+    }
     auto it = cert_tip.find(n);
     if (it != cert_tip.end()) {
       pe_cert_hit_[w]++;
@@ -3402,6 +3484,9 @@ private:
   long pe_cert_miss_[2] = {0, 0};
   long pe_star_parts_[2] = {0, 0};
   long pe_shortcut_[2] = {0, 0};
+  long pe_uniform_cert_[2] = {0, 0};  // certificates answered by the node
+  long pe_same_frag_[2] = {0, 0};     // leaf pairs skipped, one fragment
+  long pe_leaf_early_[2] = {0, 0};    // leaf pairs stopped at the first edge
   long pe_last_lo_[2] = {-1, -1};
   long pe_last_hi_[2] = {-1, -1};
   bool pb_done_ = false;      // this processor has deposited its phaseB
@@ -3610,12 +3695,14 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
         if (r.ex_units[w] == 0) continue;
         CkPrintf("FOF3STAT execacct: process %d %s units %ld walk_ms %.1f "
                  "us_per_unit %.1f edges %ld dupes %ld certhit %ld "
-                 "certmiss %ld starparts %ld shortcut %ld resets %ld\n",
+                 "certmiss %ld starparts %ld shortcut %ld unifcert %ld samefrag %ld leafearly %ld resets %ld\n",
                  r.process, w == 0 ? "own     " : "borrowed",
                  r.ex_units[w], r.ex_walk_us[w] / 1000.0,
                  (double)r.ex_walk_us[w] / r.ex_units[w], r.ex_edges[w],
                  r.ex_dupes[w], r.ex_cert_hit[w], r.ex_cert_miss[w],
-                 r.ex_star_parts[w], r.ex_shortcut[w], r.seen_resets);
+                 r.ex_star_parts[w], r.ex_shortcut[w],
+                 r.ex_uniform_cert[w], r.ex_same_frag[w],
+                 r.ex_leaf_early[w], r.seen_resets);
       }
     }
     delete am;

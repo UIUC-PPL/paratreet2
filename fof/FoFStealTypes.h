@@ -72,6 +72,9 @@ struct StealAcct {
   long ex_cert_miss[2] = {0, 0};
   long ex_star_parts[2] = {0, 0};
   long ex_shortcut[2] = {0, 0};
+  long ex_uniform_cert[2] = {0, 0};
+  long ex_same_frag[2] = {0, 0};
+  long ex_leaf_early[2] = {0, 0};
   long seen_resets = 0;
 };
 
