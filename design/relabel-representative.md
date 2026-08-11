@@ -222,3 +222,25 @@ numbers appended here as they arrive).
    scatter with intra-node redistribution reserved for the
    large-P/small-slice corner (see section 3 for the reconverse
    loopback caveat on that second hop).
+
+## Measured results
+
+### 80M, Anvil 4 nodes/480 PEs (job 19774169, 2026-08-10, 3 reps x 2 arms)
+
+All six runs exact (23,707,197 components) — first at-scale validation
+of the full staged pipeline (owner-encoded serial tips, representative
+application, sliced delivery machinery).
+
+- phase1_stages relabel: **0.009-0.011 s** against 0.039-0.063 s
+  measured pre-change the same evening on the same hardware (cost-probe
+  job 19773099) — the stage-1 per-representative application is ~4-5x
+  here.
+- tip_encode (new in serial mode): 0.010-0.029 s, the folded
+  per-representative encoding + materialization.
+- phaseA 0.21-0.29 / phaseB 0.029-0.035 / merge 0.001 — unchanged.
+- relabel(p3): 0.032-0.110 s, within the historical noise of this
+  bracket at 80M.
+- CAVEAT: the transport A/B did NOT arm — the map is 39,738 entries =
+  636 KB, below the 1 MB gate, so both arms correctly chose broadcast.
+  The stage-3 comparison rests on the 2B job (19774171), whose map
+  should be well above the gate.
