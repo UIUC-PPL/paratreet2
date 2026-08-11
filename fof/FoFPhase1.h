@@ -670,9 +670,20 @@ public:
     double key; // LPT order: ascending = costliest-first (see poolPush)
     Node<Data>* a;
     Node<Data>* b;
+    double m2;  // expected-pairs cost estimate (campaign S2; 0.87 R2 at 2B)
   };
   std::vector<PoolUnit> phaseb_pool;
   std::atomic<size_t> phaseb_next{0};
+  // Campaign S2: KD partitioning of the pool (FOF_PB_PARTS > 0). The
+  // pool is reordered partition-contiguous; each partition has a range,
+  // an m2 cost, a claim flag (a PE claims a whole partition, costliest
+  // unclaimed first — optimistic pick + CAS, same shape as the S1 piece
+  // claims), and a unit cursor (fetch_add within the claimed partition;
+  // exclusive today, shared with helpers under S3).
+  std::vector<std::pair<uint32_t, uint32_t>> pb_part_range;
+  std::vector<double> pb_part_cost;
+  std::unique_ptr<std::atomic<int>[]> pb_part_claimed;
+  std::unique_ptr<std::atomic<uint32_t>[]> pb_part_next;
   // Parallel pool build (2026-08-07): each of the process's threads
   // enumerates a stripe of the TreePiece-pair space into its own slice —
   // no lock, no sharing — and the last one to finish concatenates and
@@ -703,6 +714,10 @@ public:
     steal_pool.clear();
     steal_claimed.reset();
     steal_built = false;
+    pb_part_range.clear();
+    pb_part_cost.clear();
+    pb_part_claimed.reset();
+    pb_part_next.reset();
     a_time_sum = 0.0;
     a_time_max = 0.0;
     clearSeen();
@@ -1283,6 +1298,7 @@ public:
     if (!pb_active_) {   // start of stage (not a slice re-entry)
       pb_active_ = true;
       pb_t_accum_ = 0.0;
+      pb_cur_part_ = -1;
       b2_ = b2;
       t_phaseB_maxpair = 0.0;
       t_phaseB_units = 0;
@@ -1298,11 +1314,47 @@ public:
     // the pool is LPT-sorted, so consecutive units are the costliest —
     // chunked claims would stack them on one PE. Atomic traffic is one
     // fetch_add per unit, a few thousand per PE.
+    // Campaign S2 partitioned claims: a PE holds one PARTITION at a time
+    // (costliest unclaimed first — optimistic pick + CAS, the S1 shape)
+    // and drains its units through the partition cursor; with no
+    // partitions built (FOF_PB_PARTS=0, the default) the flat global
+    // cursor below is today's behavior unchanged. pb_cur_part_ persists
+    // across P1 slice re-entries.
+    const bool parts_on = !nb->pb_part_range.empty();
     const size_t CHUNK = 1;
     for (;;) {
-      size_t start = nb->phaseb_next.fetch_add(CHUNK);
-      if (start >= nb->phaseb_pool.size()) break;
-      size_t end = std::min(start + CHUNK, nb->phaseb_pool.size());
+      size_t start, end;
+      if (parts_on) {
+        if (pb_cur_part_ < 0) {
+          // Claim the costliest unclaimed partition.
+          int pick = -1;
+          double best = 0;
+          for (int pnum = 0; pnum < (int)nb->pb_part_range.size(); pnum++) {
+            if (nb->pb_part_claimed[pnum].load(std::memory_order_relaxed))
+              continue;
+            if (pick < 0 || nb->pb_part_cost[pnum] > best) {
+              pick = pnum;
+              best = nb->pb_part_cost[pnum];
+            }
+          }
+          if (pick < 0) break; // all partitions claimed
+          int expect = 0;
+          if (!nb->pb_part_claimed[pick].compare_exchange_strong(expect, 1))
+            continue; // lost the race; re-scan
+          pb_cur_part_ = pick;
+        }
+        uint32_t u = nb->pb_part_next[pb_cur_part_].fetch_add(1);
+        if (u >= nb->pb_part_range[pb_cur_part_].second) {
+          pb_cur_part_ = -1; // partition drained; claim another
+          continue;
+        }
+        start = u;
+        end = u + 1;
+      } else {
+        start = nb->phaseb_next.fetch_add(CHUNK);
+        if (start >= nb->phaseb_pool.size()) break;
+        end = std::min(start + CHUNK, nb->phaseb_pool.size());
+      }
       for (size_t k = start; k < end; k++) {
           t_phaseB_units++;
           double tp0 = CkWallTimer();
@@ -1481,6 +1533,39 @@ public:
         // overlap volume; separated pairs follow by ascending gap.
         // Ascending sort then claims costliest-first, so the pool's
         // tail is cheap units and the last claim cannot be a giant.
+        // m2 = rho_a * rho_b * V_int(a grown by b, b) * V_ball: the
+        // expected-pairs estimate the cost probe validated (0.87 alone at
+        // 2B against 0.04 for the particle-count product). Computed for
+        // every unit (drives the adaptive tail split and the KD
+        // partition costs); FOF_PB_M2KEY=1 (default) also makes it the
+        // LPT key, -m2 so ascending sort = costliest first.
+        double m2v = 0.0;
+        {
+          double va = (double)a->data.box.volume();
+          double vb = (double)b->data.box.volume();
+          if (va > 0 && vb > 0) {
+            double bb2 = std::sqrt(b2_);
+            double vint = 1.0;
+            for (int ax = 0; ax < 3 && vint > 0; ax++) {
+              double lo = std::max((double)a->data.box.lesser_corner[ax] - bb2,
+                                   (double)b->data.box.lesser_corner[ax]);
+              double hi = std::min((double)a->data.box.greater_corner[ax] + bb2,
+                                   (double)b->data.box.greater_corner[ax]);
+              vint = hi > lo ? vint * (hi - lo) : 0.0;
+            }
+            double vball = 4.18879 * bb2 * bb2 * bb2;
+            m2v = ((double)a->data.n_below / va) *
+                  ((double)b->data.n_below / vb) * vint * vball;
+          }
+        }
+        static const bool m2key = [] {
+          const char* e = std::getenv("FOF_PB_M2KEY");
+          return !e || std::atoi(e) != 0;
+        }();
+        if (m2key && m2v > 0) {
+          out.push_back({-m2v, a, b, m2v});
+          return;
+        }
         double key;
         if (d2 > 0) {
           key = d2;
@@ -1499,7 +1584,7 @@ public:
               (double)std::max(ba.lesser_corner.z, bb.lesser_corner.z));
           key = -ov;
         }
-        out.push_back({key, a, b});
+        out.push_back({key, a, b, m2v});
         return;
       }
       for (int ci = 0; ci < a->n_children; ci++) {
@@ -1557,6 +1642,180 @@ public:
           if (i < sl.size()) nb->phaseb_pool.push_back(sl[i]);
       for (auto& sl : nb->pool_slices)
         std::vector<typename FoFPhase1Node<Data>::PoolUnit>().swap(sl);
+      // Campaign S2a: adaptive m2 tail split (FOF_PB_SPLIT x mean,
+      // default 8; 0 disables). Split only units whose m2 exceeds the
+      // threshold — the measured rule (~1% of units hold 48-63% of
+      // time); children re-estimated by their own geometry, so the
+      // recursion terminates on the estimate itself. The 24x-units
+      // geometric rule this replaces split everything; this splits
+      // exactly the dense-core tail.
+      static const double split_fac = [] {
+        const char* e = std::getenv("FOF_PB_SPLIT");
+        return e ? std::atof(e) : 8.0;
+      }();
+      if (split_fac > 0 && !nb->phaseb_pool.empty()) {
+        double mean = 0;
+        for (auto& u : nb->phaseb_pool) mean += u.m2;
+        mean /= nb->phaseb_pool.size();
+        double thresh = split_fac * mean;
+        if (thresh > 0) {
+          std::vector<typename FoFPhase1Node<Data>::PoolUnit> out;
+          out.reserve(nb->phaseb_pool.size());
+          // Iterative worklist; split the larger side, gate children on
+          // mindist; cap the extra depth so a pathological estimate
+          // cannot run away.
+          std::vector<std::pair<typename FoFPhase1Node<Data>::PoolUnit, int>>
+              work;
+          for (auto& u : nb->phaseb_pool) work.push_back({u, 0});
+          while (!work.empty()) {
+            auto pr = work.back();
+            work.pop_back();
+            auto& u = pr.first;
+            bool splittable = pr.second < 4 && u.m2 > thresh &&
+                              !(u.a->isLeaf() && u.b->isLeaf());
+            if (!splittable) {
+              out.push_back(u);
+              continue;
+            }
+            Node<Data>* open_n = (!u.a->isLeaf() &&
+                                  (u.b->isLeaf() ||
+                                   boxMeasure(u.a) >= boxMeasure(u.b)))
+                                     ? u.a
+                                     : u.b;
+            Node<Data>* other = open_n == u.a ? u.b : u.a;
+            for (int ci = 0; ci < open_n->n_children; ci++) {
+              Node<Data>* c = open_n->getChild(ci);
+              if (c == nullptr || c->n_particles == 0) continue;
+              if (paratreet::mindist2(c->data.box, other->data.box, period_) >
+                  b2_)
+                continue;
+              typename FoFPhase1Node<Data>::PoolUnit cu;
+              cu.a = c;
+              cu.b = other;
+              // Re-estimate the child pair by its own geometry.
+              double m2v = 0.0;
+              double va = (double)c->data.box.volume();
+              double vb = (double)other->data.box.volume();
+              if (va > 0 && vb > 0) {
+                double bb2 = std::sqrt(b2_);
+                double vint = 1.0;
+                for (int ax = 0; ax < 3 && vint > 0; ax++) {
+                  double lo =
+                      std::max((double)c->data.box.lesser_corner[ax] - bb2,
+                               (double)other->data.box.lesser_corner[ax]);
+                  double hi =
+                      std::min((double)c->data.box.greater_corner[ax] + bb2,
+                               (double)other->data.box.greater_corner[ax]);
+                  vint = hi > lo ? vint * (hi - lo) : 0.0;
+                }
+                m2v = ((double)c->data.n_below / va) *
+                      ((double)other->data.n_below / vb) * vint *
+                      (4.18879 * bb2 * bb2 * bb2);
+              }
+              cu.m2 = m2v;
+              cu.key = m2v > 0 ? -m2v : 0.0;
+              work.push_back({cu, pr.second + 1});
+            }
+          }
+          nb->phaseb_pool.swap(out);
+        }
+      }
+      // Campaign S2: KD partitioning (FOF_PB_PARTS, default 0 = off =
+      // today's flat pool). m2-weighted median splits on unit centroids
+      // (spatially coherent AND cost-balanced); the pool is reordered
+      // partition-contiguous, each partition LPT-sorted internally, with
+      // a cost, a claim flag, and a unit cursor.
+      static const int kparts = [] {
+        const char* e = std::getenv("FOF_PB_PARTS");
+        return e ? std::atoi(e) : 0;
+      }();
+      if (kparts > 1 && !nb->phaseb_pool.empty()) {
+        auto& pool = nb->phaseb_pool;
+        size_t n = pool.size();
+        int depth = 0;
+        while ((1 << depth) < kparts) depth++;
+        int nleaf = 1 << depth;
+        std::vector<double> cx(n), cy(n), cz(n);
+        for (size_t i = 0; i < n; i++) {
+          cx[i] = 0.25 * ((double)pool[i].a->data.box.lesser_corner.x +
+                          (double)pool[i].a->data.box.greater_corner.x +
+                          (double)pool[i].b->data.box.lesser_corner.x +
+                          (double)pool[i].b->data.box.greater_corner.x);
+          cy[i] = 0.25 * ((double)pool[i].a->data.box.lesser_corner.y +
+                          (double)pool[i].a->data.box.greater_corner.y +
+                          (double)pool[i].b->data.box.lesser_corner.y +
+                          (double)pool[i].b->data.box.greater_corner.y);
+          cz[i] = 0.25 * ((double)pool[i].a->data.box.lesser_corner.z +
+                          (double)pool[i].a->data.box.greater_corner.z +
+                          (double)pool[i].b->data.box.lesser_corner.z +
+                          (double)pool[i].b->data.box.greater_corner.z);
+        }
+        const double* coords[3] = {cx.data(), cy.data(), cz.data()};
+        std::vector<int> idx(n), leaf_of(n, 0);
+        for (size_t i = 0; i < n; i++) idx[i] = (int)i;
+        // Weighted median KD split, iterative over (lo, hi, depth, base).
+        struct Span { int lo, hi, d, base; };
+        std::vector<Span> stack{{0, (int)n, depth, 0}};
+        while (!stack.empty()) {
+          Span sp = stack.back();
+          stack.pop_back();
+          if (sp.d == 0 || sp.hi - sp.lo <= 1) {
+            for (int i = sp.lo; i < sp.hi; i++) leaf_of[idx[i]] = sp.base;
+            continue;
+          }
+          double mn[3] = {1e300, 1e300, 1e300},
+                 mx[3] = {-1e300, -1e300, -1e300};
+          for (int i = sp.lo; i < sp.hi; i++)
+            for (int ax = 0; ax < 3; ax++) {
+              double c = coords[ax][idx[i]];
+              if (c < mn[ax]) mn[ax] = c;
+              if (c > mx[ax]) mx[ax] = c;
+            }
+          int axis = 0;
+          for (int ax = 1; ax < 3; ax++)
+            if (mx[ax] - mn[ax] > mx[axis] - mn[axis]) axis = ax;
+          std::sort(idx.begin() + sp.lo, idx.begin() + sp.hi,
+                    [&](int x, int y) { return coords[axis][x] < coords[axis][y]; });
+          double total = 0;
+          for (int i = sp.lo; i < sp.hi; i++) total += pool[idx[i]].m2;
+          double acc = 0;
+          int split = sp.lo + 1;
+          for (int i = sp.lo; i < sp.hi - 1; i++) {
+            acc += pool[idx[i]].m2;
+            if (acc >= total / 2) { split = i + 1; break; }
+          }
+          stack.push_back({sp.lo, split, sp.d - 1, sp.base});
+          stack.push_back({split, sp.hi, sp.d - 1,
+                           sp.base + (1 << (sp.d - 1))});
+        }
+        // Reorder partition-contiguous; LPT order within each partition.
+        std::vector<typename FoFPhase1Node<Data>::PoolUnit> reordered;
+        reordered.reserve(n);
+        nb->pb_part_range.assign(nleaf, {0, 0});
+        nb->pb_part_cost.assign(nleaf, 0.0);
+        for (int pnum = 0; pnum < nleaf; pnum++) {
+          uint32_t begin = (uint32_t)reordered.size();
+          for (size_t i = 0; i < n; i++)
+            if (leaf_of[i] == pnum) {
+              reordered.push_back(pool[i]);
+              nb->pb_part_cost[pnum] += pool[i].m2;
+            }
+          uint32_t end = (uint32_t)reordered.size();
+          std::sort(reordered.begin() + begin, reordered.begin() + end,
+                    [](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                       const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                      return x.key < y.key;
+                    });
+          nb->pb_part_range[pnum] = {begin, end};
+        }
+        pool.swap(reordered);
+        nb->pb_part_claimed.reset(new std::atomic<int>[nleaf]);
+        nb->pb_part_next.reset(new std::atomic<uint32_t>[nleaf]);
+        for (int pnum = 0; pnum < nleaf; pnum++) {
+          nb->pb_part_claimed[pnum] = 0;
+          nb->pb_part_next[pnum] = nb->pb_part_range[pnum].first;
+        }
+      }
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].phaseBChained();
@@ -2758,6 +3017,9 @@ private:
   // wall over completed slices.
   bool pb_active_ = false;
   double pb_t_accum_ = 0.0;
+  // Campaign S2: the partition this PE currently holds (-1 = none);
+  // persists across P1 slice re-entries.
+  int pb_cur_part_ = -1;
   // Final-reduction callback of the within-process chain (startPhase1Chain).
   CkCallback done_cb_;
   // Touched-component (negative-label) per-process totals held between
