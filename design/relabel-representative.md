@@ -1,0 +1,196 @@
+# Representative-indirect relabeling and the sliced phase-3 label map
+
+Design for agenda items 12 (representative-indirect relabeling, Kale's
+proposal 2026-08-06) and 7 (slim the serial-mode phase-3 relabel
+broadcast to per-process slices). One document because they compose:
+item 12 builds the per-representative structure, and item 7's best form
+(owner-sharded slices) becomes cheap only once item 12 has made tip
+encoding a per-representative operation. Written 2026-08-10; not yet
+implemented.
+
+## 1. Current state: every pass that touches per-particle labels
+
+After phaseA, a processor's particles never change component membership
+at finer granularity than their frozen phaseA fragment. Every later
+stage only RENAMES fragments. The code nevertheless re-visits every
+particle with a hash probe at each renaming. The passes, in pipeline
+order (all in fof/FoFPhase1.h unless noted):
+
+1. **phaseA freeze** (`phaseABody`/`freezeAndAnnotate`): runs `find(i)`
+   on every particle, writes `group_number = flat_order[root]`, and
+   counts members per root (`root_counts`, the item-10 freeze-pass
+   counting). Because `find` path-compresses and is called on every
+   index, `uf_parent[i]` holds the root index directly for every i when
+   the pass ends. `uf_parent` is `int` (PE-local flat indices),
+   `flat_order` maps flat index -> global particle order. Both persist
+   until `reset()`. This pass stays as is; it produces the asset the
+   rest of the design uses.
+2. **relabelBody** (after the process-level phaseB merge): for every
+   particle, a hash probe into the process merge map `tip_map`
+   (identity if absent). 2B/16 nodes: 0.22-0.3 s; the fof3-2b-scaling
+   table shows 0.048 -> 0.3 s growing from 8 to 128 Frontier nodes.
+3. **applyTipEncoding** (dist mode only): for every particle, an
+   arithmetic rewrite to the owner-encoded id
+   `(process << kUF2IdxBits) | tip`, plus a full rekey of `tip_counts`.
+   2B: ~0.24 s.
+4. **Phase-3 serial** (`runFoFPhase3` in FoFPhase3.h ->
+   `applyGlobalMap`): processor 0 builds `map_vec` (one entry per
+   edge-touched tip, value `-(root+2)`) and broadcasts the whole vector
+   to the per-PE FoFPhase1 GROUP. Every PE then constructs its own
+   `unordered_map` copy of the full global map and probes it once per
+   particle. 2B/16 nodes: **2.84 s** (`relabel(p3)`), the number that
+   motivates item 7. Three costs stack: the broadcast payload is
+   copied per PE (1920 copies at 2B), the hash map is built per PE,
+   and the probe runs per particle.
+5. **applyUF2Labels** (dist mode): per-particle hash probe into the
+   node-shared touched-label map (the map itself is already built once
+   per process — only the probing is per-particle).
+6. **rekeyTipCounts** after passes 2, 3, 4, 5: a hash pass over the
+   per-tip counting map.
+
+The exact 2B map size is printed as `tips_remapped` in serial-mode
+logs; harvest it from the cost-2b job (19772491) log for the design's
+final arithmetic. Order of magnitude: edge-touched tips only, bounded
+by twice the unique cross-process edge count.
+
+## 2. Item 12: apply maps to representatives, materialize by indexed load
+
+Invariant the design rests on: after the freeze, all particles of a
+frozen fragment carry the same label forever after; every subsequent
+map is a function of the current label only. So a label map never needs
+to be applied per particle — only per DISTINCT frozen root, of which a
+PE has thousands (2B: ~12,500 roots/PE against ~1M particles/PE; 80M/4
+nodes: similar ratio).
+
+Structure added per PE (FoFPhase1 members, built during the freeze):
+
+- `roots`: compact vector of the frozen root indices
+  (`root_counts[r] > 0`), size = number of local fragments.
+- `rep_label`: dense `long` array over the flat index space;
+  `rep_label[r]` = the fragment's CURRENT label, initialized to
+  `flat_order[r]` at the freeze. Non-root slots unused. Memory: 8 B per
+  particle per PE (~8 MB/PE at 2B) — accepted for simplicity; a
+  compacted variant (rank the roots, add an `int` rank array) saves
+  most of it if ever needed.
+
+Every label pass then becomes:
+
+- **apply**: `for r in roots: probe map with rep_label[r]; update.`
+  Thousands of probes instead of a million.
+- **materialize** (only where a consumer actually reads particle
+  labels): `parts[i].group_number = rep_label[uf_parent[i]]` — a pure
+  indexed load, no hashing, one pass.
+
+Materialization points — the pipeline needs exactly two:
+
+- **M1**, before `TreePiece::upwardPass`: the upward pass annotates
+  nodes from particle labels, and the phase-3 walk ships and reads
+  them (FragData min/max fragment, SEEN suppression), so labels must
+  be real in the particles by then. M1 replaces BOTH the relabelBody
+  hash pass and the applyTipEncoding arithmetic pass: apply the merge
+  map to `rep_label`, then encode `rep_label` in place (dist mode; see
+  section 3 for serial), then materialize once.
+- **M2**, after the phase-3 label application (either mode): apply the
+  global map (serial) or the touched-label map (dist) to `rep_label`
+  per representative, materialize once. The verification harness, the
+  component counter deposit, and any writer read labels after M2.
+
+Counting side: `root_counts` (dense, already built) replaces the
+`tip_counts` hash map entirely. `depositLabelCounts` emits
+`(rep_label[r], root_counts[r])` per root at deposit time;
+`rekeyTipCounts` is deleted. The sign convention (negative = touched
+by a cross-process edge, needs global summing) is carried by
+`rep_label` values unchanged, so `histogramShard`/
+`collectTouchedCounts` are untouched. `FOF_COUNT_VERIFY=1` keeps the
+recount-and-compare debug path.
+
+Safety: `uf_parent` must never be mutated after the freeze. Add a
+debug-build flag set at freeze time and a `CkEnforce` in `unite()`
+against post-freeze unions.
+
+## 3. Item 7: owner-sharded slices instead of a full-map broadcast
+
+Fragments are process-local, so the set of labels present on a process
+is disjoint from every other process's. Each process therefore needs
+only the map entries whose key is one of ITS labels — a slice about
+1/P of the map. The obstacle today is that serial-mode tips are RAW
+global particle orders, which carry no owner information, so processor
+0 cannot shard the map.
+
+Design: adopt the owner-encoded tip namespace in serial mode too.
+
+- With item 12 in place, encoding is a per-representative arithmetic
+  update folded into M1 — the historical cost objection to encoding on
+  the serial path (a full extra particle pass) is gone.
+- The serial union-find then runs over encoded tips, union by minimum
+  ENCODED tip. This gives up the "global root = minimum particle order
+  of the component" property inside the pipeline. The fof3 harness
+  already tolerates arbitrary labels (it canonicalizes each label
+  group by minimum order when comparing against references — added for
+  dist mode, design/step4.md decision 3), and the component counter
+  uses only the sign convention. Audit before implementing: FragCheck
+  visitors, the stats-mode distributed checks, and any output writer
+  for a leftover assumption that labels equal minimum orders.
+- Processor 0 shards `map_vec` by `tip >> kUF2IdxBits` and sends slice
+  p DIRECTLY to `FoFPhase1Node[p]` (nodegroup, one point-to-point
+  message per process). No group broadcast, no spanning tree — per the
+  large-payload-reduction rule, direct sends of pre-merged per-process
+  payloads are the right shape; P messages of |map|/P each cost
+  microseconds of send overhead against megabytes saved.
+- The node branch stores the slice hash ONCE per process; each PE
+  applies it to its `rep_label` roots (per-representative probes into
+  the shared map — no per-PE map construction at all), then M2 runs.
+- Dist mode gets the same per-representative treatment of
+  `applyUF2Labels` for free (its map is already node-shared; only the
+  per-particle probing changes to per-representative + M2). Its
+  labeling-request batching remains item 11, unaffected.
+
+Expected effect on the 2B/16 numbers: the 2.84 s `relabel(p3)` term
+contains (a) a full-map broadcast materialized 1920 times, (b) 1920
+hash-map constructions, (c) 2e9 hash probes. After: (a) becomes ~|map|
+total wire in 128 direct messages, (b) becomes 128 shared hashes,
+(c) becomes ~1.6M representative probes plus one indexed-load pass
+over the particles. Every term drops by two to three orders of
+magnitude except the indexed-load pass, which is memory-bandwidth
+bound and comparable to one iteration of the freeze loop (~0.1 s
+scale). Predicted post-change relabel(p3): well under 0.5 s, dominated
+by M2's materialization.
+
+## 4. Staged implementation, each stage gated and measured separately
+
+Per the standing requirement (walk->uf2 campaign): document the
+measured benefit of EACH stage separately (laptop + 80M A/B + 2B
+numbers appended here as they arrive).
+
+- **Stage 1 — item 12 alone, no protocol change.** `roots` +
+  `rep_label` + per-representative application in relabelBody,
+  applyTipEncoding, applyGlobalMap (map still broadcast exactly as
+  today), applyUF2Labels; M1/M2 materialization; counts from
+  `root_counts`; delete rekeyTipCounts. Gate: bit-identical counts and
+  histograms (16-run matrix, 1M both b values, serial vs dist, LAMBS
+  1M), FOF_COUNT_VERIFY pass, reconverse set. Measure: phase1_stages
+  relabel + tip_encode + relabel(p3) at 80M/4 nodes.
+- **Stage 2 — encoded tips in serial mode.** Flip the serial pipeline
+  to encoded tips (applyTipEncoding folded into M1 in both modes);
+  audit and fix the label-convention assumptions listed above. Gate:
+  same identity checks (canonicalized comparison), plus one 80M Anvil
+  run serial vs dist cross-check.
+- **Stage 3 — item 7 proper.** Shard at processor 0, direct
+  per-process slice sends to the node branch, per-representative
+  application, drop the group broadcast. Gate: identity as above;
+  measure relabel(p3) at 2B/16 nodes against the 2.84 s baseline.
+
+## 5. Open questions (Kale)
+
+1. Is the minimum-order label convention relied on anywhere outside
+   the harness (e.g., students consuming written output at cluster
+   scale)? If yes, a final canonicalization pass at reporting time can
+   restore it per component at representative granularity — cheap, but
+   it should be a decision, not an accident.
+2. Dense `rep_label` (8 B/particle/PE) versus compacted (extra int
+   rank array, most of the 8 MB back): default is dense for
+   simplicity; flip if 2B memory headroom argues otherwise.
+3. Slice transport: direct sends from processor 0 are proposed; at
+   thousands of processes a two-level scatter could replace them, but
+   the large-payload lesson says not before measurement shows the send
+   loop matters.
