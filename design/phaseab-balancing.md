@@ -400,7 +400,25 @@ Steps (P = instrument, S = scheme):
   unclaimed pieces). RE-KEY CONSTRAINT: pe_treepieces re-bucketed by
   realized assignment before buildPoolSlice (the silent-under-merge
   trap; fof1 phase-1-exact is the guard). Readout: phaseA_skew within
-  factor at 80M + 2B (2B within = 1.84 pre-campaign).
+  factor at 80M + 2B (2B within = 1.84 pre-campaign). The CROSS pass
+  runs over the realized set after the pool drains (preserving global
+  self-before-cross suppression ordering); its cost is NOT counted in
+  claim pacing. Claim-balancing cross pairs too (Kale's question,
+  2026-08-11) is blocked not by atomic cost but by OWNERSHIP: a cross
+  pair unites in the claiming PE's private uf_parent, so a foreign
+  executor races the owner. S1b, IF the measured cross tail warrants:
+  process-wide LOCK-FREE union-find (CAS unite; union-by-min-GLOBAL-
+  ORDER is a total order, so attach-larger-to-smaller is cycle-free by
+  construction — the same union-find the GPU port needs, so S1b
+  doubles as its CPU rehearsal), making self+cross one claimable pool;
+  requires re-basing the cert/connectivity memos on a process-global
+  index space and abandons the frozen-phase no-atomics principle for
+  phaseA (contention = the measurable). The cheaper alternative
+  (edge-emission for stolen cross pairs) costs ~2.5x per pair (13.1 vs
+  5.2 us measured live-vs-frozen) and weakens the suppression
+  ordering. GATE: the milestone job's stealgeo arm — if within-skew at
+  480 PEs stays ~1.0x with the deferred cross pass included (laptop:
+  1.02-1.05), S1b is unnecessary.
 - S2. HIERARCHICAL PHASEB (Kale step 2): KD partition of pool units
   by m2-weighted centroid median splits (k = FOF_PB_PARTS, default 32
   per process); per-partition claim cursors; recursive m2-ranked TAIL
