@@ -663,6 +663,10 @@ public:
     treepieces.clear();
     uf_parent.clear();
     flat_order.clear();
+    roots.clear();
+    rep_label.clear();
+    root_counts.clear();
+    frozen_ = false;
     edge_buf.clear();
     seen.clear();
     edge_buf3.clear();
@@ -690,6 +694,7 @@ public:
   // assignment into Particle::group_number.
   void phaseABody(double b2) {
     double t0 = CkWallTimer();
+    frozen_ = false;
     b2_ = b2;
     // Offset table: flat index space over this PE's particle blocks.
     int n_local = 0;
@@ -760,12 +765,13 @@ public:
     // root particle) into every particle. Component counting rides this
     // pass (Kale's design, 2026-08-06): one dense-array increment per
     // particle beside the find() that already runs, replacing the
-    // component counter's separate full-particle hashing pass. The
-    // per-tip counts then mirror every label rewrite the particles
-    // undergo (relabelBody, applyTipEncoding, applyGlobalMap,
-    // applyUF2Labels), so depositLabelCounts can deposit this map
-    // directly.
-    std::vector<long> root_counts(uf_parent.size(), 0);
+    // component counter's separate full-particle hashing pass. The counts
+    // stay keyed by ROOT INDEX (root_counts); labels live in rep_label and
+    // every later rewrite (relabelBody, applyTipEncoding, applyGlobalMap,
+    // applyUF2Labels) touches only rep_label[roots], so depositLabelCounts
+    // deposits (rep_label[r], root_counts[r]) pairs directly
+    // (design/relabel-representative.md).
+    root_counts.assign(uf_parent.size(), 0);
     if (tipAnnotate()) {
       // Fused: the freeze and the node annotation both touch every
       // particle, and the annotation reads back the group_number the
@@ -789,9 +795,17 @@ public:
           root_counts[r]++;
         }
     }
-    tip_counts.clear();
+    // Freeze the representative structure: from here on, label maps touch
+    // only rep_label[roots] and particles are rewritten by
+    // materializeLabels()'s indexed load.
+    roots.clear();
+    rep_label.assign(uf_parent.size(), -1);
     for (size_t r = 0; r < root_counts.size(); r++)
-      if (root_counts[r] > 0) tip_counts[flat_order[r]] = root_counts[r];
+      if (root_counts[r] > 0) {
+        roots.push_back((int)r);
+        rep_label[r] = flat_order[r];
+      }
+    frozen_ = true;
 
     // Write the frozen tips into the node annotation, bottom up.
     //
@@ -948,31 +962,28 @@ public:
     t_phaseB = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
   }
 
-  // (d) Rewrite this PE's particles' group_number through the merge map
-  // (identity if absent).
+  // (d) Rewrite this PE's labels through the merge map (identity if
+  // absent): representative-indirect (design/relabel-representative.md)
+  // — the map is probed once per frozen root, then one indexed-load pass
+  // writes the result into the particles.
   void relabelBody() {
     auto& tip_map = node_proxy.ckLocalBranch()->tip_map;
-    for (auto& s : treepieces) {
-      for (int i = 0; i < s.n; i++) {
-        auto it = tip_map.find(s.parts[i].group_number);
-        if (it != tip_map.end()) s.parts[i].group_number = it->second;
-      }
+    for (int r : roots) {
+      auto it = tip_map.find(rep_label[r]);
+      if (it != tip_map.end()) rep_label[r] = it->second;
     }
-    rekeyTipCounts(tip_map);
+    materializeLabels();
   }
 
-  // Rewrite the counting map's keys through a label map, merging counts
-  // when several old labels land on one new label — the counting-side
-  // mirror of a particle relabel (identity where absent).
-  void rekeyTipCounts(const std::unordered_map<long, long>& label_map) {
-    if (label_map.empty() || tip_counts.empty()) return;
-    std::unordered_map<long, long> next;
-    next.reserve(tip_counts.size());
-    for (auto& kv : tip_counts) {
-      auto it = label_map.find(kv.first);
-      next[it != label_map.end() ? it->second : kv.first] += kv.second;
-    }
-    tip_counts.swap(next);
+  // One indexed-load pass writing each representative's current label into
+  // every particle. No hashing: uf_parent[i] is the root index directly
+  // (full path compression at the freeze). Morton-sorted particle blocks
+  // mean consecutive particles nearly always share a root, so this touches
+  // about one distinct rep_label cache line per fragment.
+  void materializeLabels() {
+    for (auto& s : treepieces)
+      for (int i = 0; i < s.n; i++)
+        s.parts[i].group_number = rep_label[uf_parent[s.offset + i]];
   }
 
   // --- Within-process chain (design/phase1-scaling.md, 2026-07-25).
@@ -1225,19 +1236,15 @@ public:
   void applyTipEncoding(const CkCallback& cb) {
     tips_encoded_ = true; // arms the debug same-process-edge tripwire
     int my_node = CkMyNode();
-    for (auto& s : treepieces) {
-      for (int i = 0; i < s.n; i++) {
-        long tip = s.parts[i].group_number;
-        CkEnforce(tip >= 0 && (uint64_t)tip <= paratreet::kUF2IdxMask);
-        s.parts[i].group_number = (long)paratreet::uf2EncodeTip(my_node, tip);
-      }
+    // Representative-indirect: encode each root's label once, then
+    // materialize. Duplicate labels across roots (post-merge) encode to
+    // the same value, exactly as the per-particle rewrite did.
+    for (int r : roots) {
+      long tip = rep_label[r];
+      CkEnforce(tip >= 0 && (uint64_t)tip <= paratreet::kUF2IdxMask);
+      rep_label[r] = (long)paratreet::uf2EncodeTip(my_node, tip);
     }
-    // Counting-side mirror of the encoding rewrite.
-    std::unordered_map<long, long> next;
-    next.reserve(tip_counts.size());
-    for (auto& kv : tip_counts)
-      next[(long)paratreet::uf2EncodeTip(my_node, kv.first)] = kv.second;
-    tip_counts.swap(next);
+    materializeLabels();
     this->contribute(cb);
   }
 
@@ -1341,28 +1348,17 @@ public:
   void applyUF2Labels(const CkCallback& cb) {
     auto* nb = node_proxy.ckLocalBranch();
     auto& labels = nb->uf2_labels;
-    for (auto& s : treepieces) {
-      for (int i = 0; i < s.n; i++) {
-        uint64_t local_id =
-            (uint64_t)s.parts[i].group_number & paratreet::kUF2IdxMask;
-        auto it = labels.find(local_id);
-        if (it != labels.end()) {
-          CkEnforce(it->second != -1);
-          s.parts[i].group_number = -(it->second + 2);
-        } // else: untouched fragment keeps its encoded tip
-      }
+    // Representative-indirect: probe the node-shared touched-label map
+    // once per frozen root, then materialize.
+    for (int r : roots) {
+      uint64_t local_id = (uint64_t)rep_label[r] & paratreet::kUF2IdxMask;
+      auto it = labels.find(local_id);
+      if (it != labels.end()) {
+        CkEnforce(it->second != -1);
+        rep_label[r] = -(it->second + 2);
+      } // else: untouched fragment keeps its encoded tip
     }
-    // Counting-side mirror of the label application.
-    {
-      std::unordered_map<long, long> next;
-      next.reserve(tip_counts.size());
-      for (auto& kv : tip_counts) {
-        uint64_t local_id = (uint64_t)kv.first & paratreet::kUF2IdxMask;
-        auto it = labels.find(local_id);
-        next[it != labels.end() ? -(it->second + 2) : kv.first] += kv.second;
-      }
-      tip_counts.swap(next);
-    }
+    materializeLabels();
     this->contribute(cb);
   }
 
@@ -1685,21 +1681,23 @@ public:
       return e && std::atoi(e) != 0;
     }();
     if (count_verify) {
-      std::unordered_map<long, long> check;
+      std::unordered_map<long, long> check, maintained;
       for (auto& s : treepieces)
         for (int i = 0; i < s.n; i++) check[s.parts[i].group_number]++;
-      if (check != tip_counts) {
+      for (int r : roots) maintained[rep_label[r]] += root_counts[r];
+      if (check != maintained) {
         CkPrintf("COUNT VERIFY MISMATCH pe %d: maintained %zu labels, "
-                 "recount %zu labels\n", CkMyPe(), tip_counts.size(),
+                 "recount %zu labels\n", CkMyPe(), maintained.size(),
                  check.size());
         CkAbort("freeze-time component counts diverge from particle labels");
       }
     }
-    std::unordered_map<long, long>& counts = tip_counts;
+    // Per-root pairs, labels current in rep_label; histogramShard sums by
+    // label, so duplicate labels across roots need no pre-merging here.
     std::vector<std::vector<std::pair<long, long>>> buckets(n_shards);
-    for (auto& kv : counts)
-      buckets[labelShardMix(kv.first) % n_shards].emplace_back(kv.first,
-                                                               kv.second);
+    for (int r : roots)
+      buckets[labelShardMix(rep_label[r]) % n_shards].emplace_back(
+          rep_label[r], root_counts[r]);
     for (int r = 0; r < n_shards; r++) {
       if (buckets[r].empty()) continue;
       auto& shard = *nb->label_shards[r];
@@ -1766,14 +1764,16 @@ public:
   // labels too.
   void applyGlobalMap(const std::vector<std::pair<long, long>>& map_vec,
                       const CkCallback& cb) {
+    // Representative-indirect: probe once per frozen root, then
+    // materialize. (Stage 3 of design/relabel-representative.md will
+    // replace the full-map broadcast feeding this with per-process
+    // slices; the application below is already slice-ready.)
     std::unordered_map<long, long> tip_map(map_vec.begin(), map_vec.end());
-    for (auto& s : treepieces) {
-      for (int i = 0; i < s.n; i++) {
-        auto it = tip_map.find(s.parts[i].group_number);
-        if (it != tip_map.end()) s.parts[i].group_number = it->second;
-      }
+    for (int r : roots) {
+      auto it = tip_map.find(rep_label[r]);
+      if (it != tip_map.end()) rep_label[r] = it->second;
     }
-    rekeyTipCounts(tip_map);
+    materializeLabels();
     this->contribute(cb);
   }
 
@@ -2220,6 +2220,10 @@ private:
   }
 
   void unite(int x, int y) {
+    // Post-freeze unions would invalidate the representative structure
+    // (rep_label/roots) and the full path compression materializeLabels
+    // relies on.
+    CkEnforce(!frozen_);
     int rx = find(x), ry = find(y);
     if (rx == ry) return;
     // Union by min: the root with the smaller global particle order wins.
@@ -2235,9 +2239,19 @@ private:
   std::vector<long> flat_order; // flat index -> global particle order
   std::vector<std::pair<long, long>> edge_buf;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen;
-  // Per-PE component sizes keyed by the CURRENT label of each component
-  // (maintained through every label rewrite; see the freeze pass).
-  std::unordered_map<long, long> tip_counts;
+  // Representative-indirect relabeling (design/relabel-representative.md):
+  // after the phaseA freeze a particle never changes fragment, so every
+  // later label map is applied to rep_label at ROOT granularity
+  // (thousands of entries) and materialized into the particles by one
+  // indexed load through uf_parent (root-direct after the freeze — the
+  // freeze runs find() on every index, so full path compression holds).
+  // root_counts rides the freeze (item-10 component counting) and is
+  // deposited as (rep_label[r], root_counts[r]) pairs; the per-label
+  // hash map it used to feed (tip_counts) and the rekey pass are gone.
+  std::vector<int> roots;        // compact list of frozen root indices
+  std::vector<long> rep_label;   // flat index -> current label (root slots)
+  std::vector<long> root_counts; // flat index -> member count (root slots)
+  bool frozen_ = false;          // guards unite() against post-freeze unions
   // Phase-3 cross-process buffers (kept separate from phaseB's, above).
   std::vector<std::pair<long, long>> edge_buf3;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3;

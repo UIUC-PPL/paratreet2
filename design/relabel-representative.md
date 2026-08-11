@@ -209,9 +209,13 @@ numbers appended here as they arrive).
    end to end); fof1 never runs tip encoding; the Writer does not
    output group_number. Encoded labels in serial mode are safe with no
    canonicalization pass needed.
-2. Dense `rep_label` (8 B/particle/PE) versus compacted (extra int
-   rank array, most of the 8 MB back): default is dense for
-   simplicity; flip if 2B memory headroom argues otherwise.
+2. RESOLVED (Kale, 2026-08-10): dense form. On the sparse-use cache
+   question (raised and judged minor by Kale — confirmed by access
+   pattern): the apply step touches only the compact roots vector
+   (~thousands of entries), and the materialization loop reads
+   `rep_label[uf_parent[i]]` for Morton-sorted particles, so
+   consecutive particles nearly always hit the same line — about one
+   distinct cache line per FRAGMENT, not per particle.
 3. RESOLVED (Kale, 2026-08-10): transport is size-dependent — direct
    sends when slices are adequately large (8-64 KB+), the existing
    broadcast when the whole map is small, and a per-physical-node
