@@ -162,3 +162,18 @@ planned LPT — the claim protocol needs no predictor to balance;
 prediction is at most an ordering hint. max_piece_n 20,993 against
 ~167k particles/PE: the piece-granularity floor does not bind at 80M.
 The decisive 2B point (global 2.79 recorded) rides job 19782161.
+
+## 9. Measured: 2B at 128 Frontier nodes (Ritvik, traced run, 2026-08-11)
+
+From Ritvik's projections-traced dist-mode run on current main
+(1792 PEs, 14/process; absolute walls inflated by tracing — ratios
+meaningful): `phaseA_skew: within 1.84 cross 1.40 global 1.57
+size_r -0.031 max_piece_n 138233`. WITHIN-PROCESS SKEW STILL DOMINATES
+at 128 nodes — the half-1 gate holds at the third scale point (80M/480
+PEs: 1.44-1.53 vs 1.14-1.20; 2B/1920 Anvil PEs pending job 19782161).
+size predictor again ~0 per PE: dynamic claiming confirmed. Watch
+item: largest piece 138k vs ~31k average (4.5x) — with cost ~n^1.28
+the single-piece floor may bind at this scale; the sub-piece escape
+hatch (section 2 constraint 6) is the answer if it does. Same run:
+phaseB max/avg 21x (0.004/0.134/2.812) with ONE pair at 0.634 s = 23%
+of the stage wall — direct evidence for half 2's tail splitting.
