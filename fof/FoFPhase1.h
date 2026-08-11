@@ -531,8 +531,27 @@ public:
     encode_map.clear();
     uf2_vertices.clear();
     uf2_labels.clear();
+    global_slice.clear();
     clearSeen();
     this->contribute(cb);
+  }
+
+  // Stage 3 (design/relabel-representative.md): this process's slice of
+  // the phase-3 label map, sharded by owner at processor 0. Stored ONCE
+  // per process; every PE then probes it read-only at representative
+  // granularity (FoFPhase1::applySliceOnPE). The store completes before
+  // the per-PE trigger messages are sent, and message delivery orders the
+  // reads after it — same publication pattern as the phase-1 deposit
+  // chain.
+  std::unordered_map<long, long> global_slice;
+  void applyGlobalMapSlice(const std::vector<std::pair<long, long>>& slice,
+                           const CkGroupID& fof_gid, const CkCallback& cb) {
+    global_slice.clear();
+    global_slice.insert(slice.begin(), slice.end());
+    CProxy_FoFPhase1<Data> fof_proxy(fof_gid);
+    int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      fof_proxy[pe].applySliceOnPE(cb);
   }
 
   // Step 4 (distributed UF_2): build the owner-encoded tip namespace from
@@ -1774,6 +1793,24 @@ public:
       if (it != tip_map.end()) rep_label[r] = it->second;
     }
     materializeLabels();
+    this->contribute(cb);
+  }
+
+  // Stage-3 sliced counterpart of applyGlobalMap: the map arrived as this
+  // process's owner-sharded slice, stored once on the node branch
+  // (FoFPhase1Node::applyGlobalMapSlice); probe it read-only per frozen
+  // root, materialize, and close the global reduction. Every PE of every
+  // process contributes exactly once (processor 0 sends a slice — possibly
+  // empty — to every process).
+  void applySliceOnPE(const CkCallback& cb) {
+    auto& slice = node_proxy.ckLocalBranch()->global_slice;
+    if (!slice.empty()) {
+      for (int r : roots) {
+        auto it = slice.find(rep_label[r]);
+        if (it != slice.end()) rep_label[r] = it->second;
+      }
+      materializeLabels();
+    }
     this->contribute(cb);
   }
 

@@ -441,7 +441,12 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
                                     // (null proxy) or FOF_WALK_QD=1 falls back
                                     // to quiescence detection.
                                     CProxy_CacheManager<FragData> cache =
-                                        CProxy_CacheManager<FragData>()) {
+                                        CProxy_CacheManager<FragData>(),
+                                    // Node proxy for the stage-3 sliced
+                                    // label-map delivery; default (null) or a
+                                    // small map falls back to the broadcast.
+                                    CProxy_FoFPhase1Node<FragData> fof_node =
+                                        CProxy_FoFPhase1Node<FragData>()) {
   auto& config = paratreet::getConfiguration();
   CkEnforce(config.decomp_type == paratreet::treepieceDecompForTree(config.tree_type));
   double t_pre = CkWallTimer();
@@ -619,9 +624,47 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   }
   double t3 = CkWallTimer();
 
-  // Broadcast the map; each PE relabels its own registered particles
-  // (owner-writes, identity if absent).
-  fof.applyGlobalMap(map_vec, CkCallbackResumeThread());
+  // Deliver the map and relabel (stage 3, design/relabel-representative.md;
+  // transport policy Kale 2026-08-10). Small maps: the whole-map group
+  // broadcast — sharding a tiny map buys nothing. Adequately large maps:
+  // shard by owner (tips are owner-encoded; every key decodes to exactly
+  // one process) and send each process ONLY its slice, one direct message
+  // to the node branch, which stores it once and fans the application out
+  // to its PEs. Either way every PE contributes once and the reduction
+  // closes the bracket.
+  // FOF_SLICE_MIN_BYTES overrides for testing (0 forces slicing so small
+  // laptop runs exercise the sliced path; the matrix uses it).
+  static const long kSliceMinTotalBytes = [] {
+    const char* e = std::getenv("FOF_SLICE_MIN_BYTES");
+    return e ? std::atol(e) : (long)(1 << 20); // default 1 MB
+  }();
+  long map_bytes = (long)map_vec.size() * (long)sizeof(map_vec[0]);
+  bool sliced = map_bytes >= kSliceMinTotalBytes &&
+                !fof_node.ckGetGroupID().isZero();
+  if (sliced) {
+    int n_procs = CkNumNodes();
+    std::vector<std::vector<std::pair<long, long>>> slices(n_procs);
+    for (auto& kv : map_vec) {
+      uint64_t owner = (uint64_t)kv.first >> paratreet::kUF2IdxBits;
+      CkEnforce(owner < (uint64_t)n_procs);
+      slices[owner].push_back(kv);
+    }
+    long max_slice = 0;
+    for (auto& s : slices) max_slice = std::max(max_slice, (long)s.size());
+    CkPrintf("FOF3STAT relabel_map: entries %ld bytes %ld mode sliced "
+             "max_slice %ld\n", (long)map_vec.size(), map_bytes, max_slice);
+    CkCallbackResumeThread applied;
+    // Every process gets a message (empty slice included) so all PEs
+    // contribute to the closing reduction.
+    for (int p = 0; p < n_procs; p++)
+      fof_node[p].applyGlobalMapSlice(slices[p], fof.ckGetGroupID(), applied);
+    // applied's destructor blocks until every PE has applied and
+    // contributed.
+  } else {
+    CkPrintf("FOF3STAT relabel_map: entries %ld bytes %ld mode broadcast\n",
+             (long)map_vec.size(), map_bytes);
+    fof.applyGlobalMap(map_vec, CkCallbackResumeThread());
+  }
   double t4 = CkWallTimer();
   r.t_setup = t0 - t_pre;
   r.t_walk = t1 - t0;

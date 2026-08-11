@@ -35,6 +35,14 @@ module fof {
     // UnionFindLib. See fof/FoFPhase1.h "Tip encoding" and design/step4.md.
     // Must run after countFragments, before applyTipEncoding.
     entry void computeTipEncoding(const CkCallback&);
+    // Stage 3 of design/relabel-representative.md: receive this process's
+    // slice of the phase-3 label map (keys owner-sharded by processor 0),
+    // store it once per process, and trigger applySliceOnPE on each of the
+    // process's FoFPhase1 elements. The group is identified by CkGroupID
+    // (a plain type — the templated CProxy_FoFPhase1 is not yet declared
+    // at this point in the module).
+    entry void applyGlobalMapSlice(const std::vector<std::pair<long, long> >&,
+                                   const CkGroupID&, const CkCallback&);
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
@@ -62,6 +70,9 @@ module fof {
     entry void phase3Stats(const CkCallback&);
     entry void depositNodeRedundant(const CkCallback&);
     entry void applyGlobalMap(const std::vector<std::pair<long, long> >&, const CkCallback&);
+    // Stage-3 sliced counterpart: apply the node branch's stored slice at
+    // representative granularity and contribute to the global reduction.
+    entry void applySliceOnPE(const CkCallback&);
     // Cluster-assessment entries (see the "Testing on a cluster" section of
     // the top-level README): distributed tip-sentinel check, per-PE memory
     // reduction, and the distributed component-histogram gather used by the
