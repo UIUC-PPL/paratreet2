@@ -198,11 +198,17 @@ numbers appended here as they arrive).
 
 ## 5. Open questions (Kale)
 
-1. Is the minimum-order label convention relied on anywhere outside
-   the harness (e.g., students consuming written output at cluster
-   scale)? If yes, a final canonicalization pass at reporting time can
-   restore it per component at representative granularity — cheap, but
-   it should be a decision, not an accident.
+1. RESOLVED (2026-08-10). Module consumers: Kale — not a concern.
+   Internal audit (this session): every reader of labels is
+   label-value-agnostic — FragCheckVisitor compares particle labels to
+   node annotations by equality only; the full check re-derives
+   canonical representatives per label group (tip_min_order,
+   design/step4.md decision 3); the FOF3STAT determinism line is
+   counts and size histogram only; the component counter uses only the
+   sign convention (which dist mode's encoded labels already exercise
+   end to end); fof1 never runs tip encoding; the Writer does not
+   output group_number. Encoded labels in serial mode are safe with no
+   canonicalization pass needed.
 2. Dense `rep_label` (8 B/particle/PE) versus compacted (extra int
    rank array, most of the 8 MB back): default is dense for
    simplicity; flip if 2B memory headroom argues otherwise.
