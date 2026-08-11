@@ -328,14 +328,21 @@ so nothing compares across the affinity boundary.
 
 Vetting notes on the proposal as given:
 
-- "Node-level coordinator (nodegroup)": Charm vocabulary trap — an SMP
-  "node" IS a process, so a nodegroup gives one branch per PROCESS,
-  not per physical node. The coordinator is therefore a DESIGNATED
-  PROCESS: procs-per-physical-node from the environment (default 8 on
-  Anvil wholenode; FOF_PROCS_PER_PNODE), domain = the block of
-  processes sharing the physical node, coordinator = lowest process of
-  the block. Status reporting and stealing stay within that domain
-  first, exactly as proposed.
+- Coordinator structure (Kale's clarification, 2026-08-11): the
+  coordinator machinery IS a nodegroup — every process's branch is its
+  own LOCAL coordinator (holds its status: claim-cursor position,
+  remaining partition costs; answers polls; executes ship orders), and
+  the DESIGNATED branch (lowest process of a FOF_PROCS_PER_PNODE
+  block, default 8 — the physical-node domain comes from the
+  environment, since a Charm SMP "node" is a process) plays the domain
+  coordinator. Nodegroup entries are served by ANY free PE of the
+  process — the responsiveness property the whole scheme rests on, and
+  it composes with P1's slicing (slices create the free moments; the
+  P0 probe already exercises this exact pathway). The coordinator's
+  DECISION entries are [exclusive] (serialized per branch, no mutex,
+  no two PEs computing conflicting placements); status deposits stay
+  non-exclusive with the narrow lock. Status and stealing stay within
+  the physical-node domain first, as proposed.
 - Coordinator authority vs the one-authority rule (the steal branch's
   paid-for lesson): the coordinator owns the PLACEMENT decision (who
   sends to whom, from reported status); the donor's compliance is an
