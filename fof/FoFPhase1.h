@@ -779,6 +779,10 @@ public:
                 gridSelfUnion(sa))
               continue;
           }
+          // Per-level grid context: set only for SELF pairs (a == b can
+          // never occur inside a cross-piece walk — the two sides descend
+          // different trees), consumed by walk's self-node gate.
+          grid_ctx_ = (i == j) ? &sa : nullptr;
           walk(sa.root, sb.root,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); },
                [&](Node<Data>* a, Node<Data>* b) {
@@ -803,6 +807,7 @@ public:
         }
       }
     }
+    grid_ctx_ = nullptr;
 
     // Freeze + compress: write tip id (order of the component's min-order
     // root particle) into every particle. Component counting rides this
@@ -1933,6 +1938,28 @@ private:
     // pairs descend only to distinct unordered pairs, so this guard at
     // the self nodes makes the entire self-descent mirror-free.
     if (a == b) {
+      // Per-level grid gate (2026-08-11, design/optimization-inventory.md
+      // bottom section; phaseA only — grid_ctx_ is set only around phaseA
+      // self-pair walks): a dense INTERNAL node's self pair is solved by
+      // the cell grid instead of descending. Computable at every level
+      // only since FragData::n_below exists; the root-level gate in
+      // phaseABody remains the first chance, this catches dense cores
+      // inside mixed pieces whose root-average diluted that gate.
+      // FOF_GRID_ROOT_ONLY=1 restores the old behavior (the A/B arm).
+      if (grid_ctx_ != nullptr && grid_thresh_ > 0 && !gridRootOnly() &&
+          a->data.n_below >= 64) {
+        const double vol = (double)a->data.box.volume();
+        const double bb = std::sqrt(b2_);
+        const double cc = bb / std::sqrt(6.0);
+        if (vol > 0 &&
+            (double)a->data.n_below * cc * cc * cc / vol >= grid_thresh_) {
+          const TreePieceRef& s = *grid_ctx_;
+          int flat = firstFlat(a, s);
+          if (gridSelfUnionRange(a->data.box, s.parts + (flat - s.offset),
+                                 (int)a->data.n_below, flat))
+            return;
+        }
+      }
       for (int i = 0; i < a->n_children; i++)
         for (int j = i; j < a->n_children; j++)
           walk(a->getChild(i), a->getChild(j), leaf_fn, cert_fn, prune_fn);
@@ -1989,10 +2016,20 @@ private:
   // Returns false when the grid would be degenerate (caller falls back to
   // the walk): key-packing overflow, or a PBC chare spanning half the box.
   bool gridSelfUnion(const TreePieceRef& s) {
+    return gridSelfUnionRange(s.root->data.box, s.parts, s.n, s.offset);
+  }
+
+  // Range form: the same cell-grid solver over any CONTIGUOUS particle
+  // range (a subtree of a key-sorted piece is contiguous by
+  // construction). base = the range.s first flat union-find index.
+  // Used at the piece root (above) and, since the per-level gate
+  // (2026-08-11, design/optimization-inventory.md bottom section), at
+  // any internal self node whose occupancy passes -G.
+  bool gridSelfUnionRange(const OrientedBox<Real>& box, const Particle* parts,
+                          int n, int base) {
     const double b = std::sqrt(b2_);
     const double c = b / std::sqrt(6.0);
-    const auto& box = s.root->data.box;
-    const double ox = (double)box.lesser_corner.x;
+        const double ox = (double)box.lesser_corner.x;
     const double oy = (double)box.lesser_corner.y;
     const double oz = (double)box.lesser_corner.z;
     const double exx = (double)box.greater_corner.x - ox;
@@ -2009,11 +2046,11 @@ private:
     auto cellKey = [&](int64_t ix, int64_t iy, int64_t iz) -> uint64_t {
       return ((uint64_t)ix << 40) | ((uint64_t)iy << 20) | (uint64_t)iz;
     };
-    std::vector<std::pair<uint64_t, int>> cells(s.n);
-    for (int i = 0; i < s.n; i++) {
-      int64_t ix = (int64_t)(((double)s.parts[i].position.x - ox) / c);
-      int64_t iy = (int64_t)(((double)s.parts[i].position.y - oy) / c);
-      int64_t iz = (int64_t)(((double)s.parts[i].position.z - oz) / c);
+    std::vector<std::pair<uint64_t, int>> cells(n);
+    for (int i = 0; i < n; i++) {
+      int64_t ix = (int64_t)(((double)parts[i].position.x - ox) / c);
+      int64_t iy = (int64_t)(((double)parts[i].position.y - oy) / c);
+      int64_t iz = (int64_t)(((double)parts[i].position.z - oz) / c);
       if (ix < 0) ix = 0; if (ix >= nx) ix = nx - 1;
       if (iy < 0) iy = 0; if (iy >= ny) iy = ny - 1;
       if (iz < 0) iz = 0; if (iz >= nz) iz = nz - 1;
@@ -2027,9 +2064,9 @@ private:
     std::vector<OccCell> occ;
     for (int k = 0; k < (int)cells.size();) {
       int e = k + 1;
-      int rep = s.offset + cells[k].second;
+      int rep = base + cells[k].second;
       while (e < (int)cells.size() && cells[e].first == cells[k].first) {
-        unite(rep, s.offset + cells[e].second);
+        unite(rep, base + cells[e].second);
         e++;
       }
       occ.push_back({cells[k].first, k, e, rep});
@@ -2064,12 +2101,12 @@ private:
         if (find(oc.rep) == find(nb->rep)) continue; // already connected
         bool merged = false;
         for (int a = oc.begin; a < oc.end && !merged; a++) {
-          const Particle& pa = s.parts[cells[a].second];
+          const Particle& pa = parts[cells[a].second];
           for (int q = nb->begin; q < nb->end; q++) {
-            const Particle& pb = s.parts[cells[q].second];
+            const Particle& pb = parts[cells[q].second];
             if (paratreet::periodicDistSq(pa.position, pb.position, period_) <=
                 b2_) {
-              unite(s.offset + cells[a].second, s.offset + cells[q].second);
+              unite(base + cells[a].second, base + cells[q].second);
               merged = true; // one witness merges the components
               break;
             }
@@ -2368,6 +2405,17 @@ private:
   // laptop A/B showed parity-to-slightly-worse at reachable densities;
   // the deep-overdensity payoff regime needs the Anvil A/B).
   double grid_thresh_ = 0.0;
+  // Per-level grid context (set around phaseA SELF-pair walks only; see
+  // walk's self-node gate). FOF_GRID_ROOT_ONLY=1 restores root-only
+  // gating as the A/B arm.
+  const TreePieceRef* grid_ctx_ = nullptr;
+  static bool gridRootOnly() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_GRID_ROOT_ONLY");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
   // Final-reduction callback of the within-process chain (startPhase1Chain).
   CkCallback done_cb_;
   // Touched-component (negative-label) per-process totals held between

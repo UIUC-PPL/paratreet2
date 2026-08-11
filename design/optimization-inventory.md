@@ -98,9 +98,13 @@ construction (visitors union in place).
 
 1. PAIR TRAVERSAL for the self walk: their start-at-own-leaf + ropes
    guarantees each point pair once, structurally, no dedup table.
-   VERIFY whether our self dual walk (a,a) enumerates unordered child
-   pairs once or relies on suppression to kill the mirror; if the
-   mirror is walked, the i<j guard is a cheap win. [action: check]
+   VERIFIED AND FIXED 2026-08-11 (commit fe7fcfb): our self walk DID
+   enumerate both orderings of every distinct child pair; the i<=j
+   guard at self nodes measured 1M phaseA ~1.7x, 8M b0.8 -13%, and
+   80M/480 PEs 0.21-0.24 -> 0.15-0.17 s (~30%, job 19799110, exact,
+   projections trace in traces/mirror-80m). The per-level grid gate
+   (same day) rides the same self branch: FOF_GRID_ROOT_ONLY=1 is its
+   A/B arm; laptop parity-to--3%, deep-overdensity verdict on Anvil.
 2. STACKLESS (rope) traversal: irrelevant on CPU (we recurse), but
    the right shape for the HIP kernel — feed into walk-unification
    stage 4's device driver (their Apetrei-with-Karras-ordering report
