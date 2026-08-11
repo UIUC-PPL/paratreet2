@@ -37,9 +37,14 @@ points at its design note where one exists. Started 2026-08-05.
 5. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
    1.65 s at 16; design/speedup-campaign-2026-08-05.md follow-up 2):
    profile splitter computation and particle flush at 1920 PEs.
-6. -u serial as the production default; retire the keep-alive ring
-   (the serial bracket is quiescence-free and stall-immune; the ring
-   measurably does not suppress the stall in the dist pattern).
+6. DONE 2026-08-10 (modified scope, Kale): -u serial is now the fof3
+   default (quiescence-free bracket, immune to the LCI idle-stall).
+   The keep-alive ring is KEPT (it costs little and the stall issue is
+   unresolved), and dist mode is KEPT fully supported with explicit
+   -u dist runs in make test: distributed union-find is a research
+   focus of this project and is expected to improve as process counts
+   grow. Validated: 16-run matrix, 1M serial-vs-dist histograms
+   identical (333889).
 7. Slim the serial-mode relabel broadcast to per-process map slices
    (2.84 s at 2B/16 nodes for the full-map broadcast).
 8. DONE 2026-08-10 (branch treepiece-rename, code commit 9ab9f04 +
@@ -53,7 +58,12 @@ points at its design note where one exists. Started 2026-08-05.
 9. LCI items for the handover: packet-pool exhaustion at 2B on 4-8
    nodes (refill_recvs deadlock alerts then poll_comp_impl assert
    during the input flush); the idle-stall itself (dist uf2 3.7 s at
-   80M/16 nodes with the keep-alive ring on).
+   80M/16 nodes with the keep-alive ring on). LCI needs a better
+   example program (Kale, 2026-08-10). Also check +lci_ndevices for
+   future Anvil runs — Kale recalls multiple devices per process in
+   Ritvik's notes or scripts; our own 2026-08-01 Anvil A/B found no
+   significant effect on InfiniBand (charm-notes), so reconcile the
+   two before adopting a setting.
 10. DONE 2026-08-06 (freeze-pass counting commit): eliminated the component counter's particle
    pass (Kale's design, 2026-08-06). Count per union-find root during
    the phaseA freeze pass (dense array increment beside the existing
