@@ -406,7 +406,7 @@ Steps (P = instrument, S = scheme):
   claim pacing. Claim-balancing cross pairs too (Kale's question,
   2026-08-11) is blocked not by atomic cost but by OWNERSHIP: a cross
   pair unites in the claiming PE's private uf_parent, so a foreign
-  executor races the owner. S1b, IF the measured cross tail warrants:
+  executor races the owner. S1c, IF the measured cross tail warrants:
   process-wide LOCK-FREE union-find (CAS unite; union-by-min-GLOBAL-
   ORDER is a total order, so attach-larger-to-smaller is cycle-free by
   construction — the same union-find the GPU port needs, so S1b
@@ -418,7 +418,13 @@ Steps (P = instrument, S = scheme):
   5.2 us measured live-vs-frozen) and weakens the suppression
   ordering. GATE: the milestone job's stealgeo arm — if within-skew at
   480 PEs stays ~1.0x with the deferred cross pass included (laptop:
-  1.02-1.05), S1b is unnecessary.
+  1.02-1.05), S1c is unnecessary. ARM NAMING (Kale, 2026-08-11):
+  S1a = claim ignoring geometry (FOF_STEALA_GEO=0; the milestone job's
+  stealscan arm); S1b = claim nearest-centroid (FOF_STEALA_GEO=1, the
+  default; the stealgeo arm). The nearest-piece SELECTION is optimistic,
+  not atomic: scan unclaimed entries with relaxed loads, pick the
+  nearest, then CAS-claim; a lost race just re-scans for the next
+  nearest. Only the claim is exclusive — the pick is advisory.
 - S2. HIERARCHICAL PHASEB (Kale step 2): KD partition of pool units
   by m2-weighted centroid median splits (k = FOF_PB_PARTS, default 32
   per process); per-partition claim cursors; recursive m2-ranked TAIL
