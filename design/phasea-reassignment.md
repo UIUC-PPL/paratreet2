@@ -149,3 +149,16 @@ first-touch pages.
    FOF_PHASEA_STEAL=0 as the A/B, everything else untouched.
 3. Gates: fof1 4-PE exact (the only true phase-1 test), 1M full
    333889, 8M stats bit-identical, 80M components byte-identical.
+
+## 8. Measured: 80M skew split (job 19782163, 4 nodes/480 PEs, 3 reps)
+
+All reps correct. within 1.44/1.53/1.45, cross 1.16/1.20/1.14, global
+1.46/1.49/1.56 — the phaseA skew at this scale is PREDOMINANTLY
+WITHIN-PROCESS, which is the regime the light-reassignment scheme can
+reach. size_r 0.178-0.200 and density r_phaseA 0.154-0.162: BOTH
+per-PE predictors are weak at 480 PEs (the probe's R2 0.9 is per-pair,
+not per-PE aggregate), which favors the dynamic-claim design over
+planned LPT — the claim protocol needs no predictor to balance;
+prediction is at most an ordering hint. max_piece_n 20,993 against
+~167k particles/PE: the piece-granularity floor does not bind at 80M.
+The decisive 2B point (global 2.79 recorded) rides job 19782161.
