@@ -45,9 +45,15 @@ points at its design note where one exists. Started 2026-08-05.
    focus of this project and is expected to improve as process counts
    grow. Validated: 16-run matrix, 1M serial-vs-dist histograms
    identical (333889).
-7. Slim the serial-mode relabel broadcast to per-process map slices
-   (design/relabel-representative.md, written 2026-08-10, with item 12)
-   (2.84 s at 2B/16 nodes for the full-map broadcast).
+7. IMPLEMENTED 2026-08-10 (with item 12; design/relabel-representative.md,
+   stages 1-3 = commits ec06543/fa0a383/bf9dc12): the phase-3 label map
+   is owner-sharded at processor 0 and delivered as per-process slices
+   to the node branch (size-dependent: maps under 1 MB keep the
+   broadcast; FOF_SLICE_MIN_BYTES=0 forces slicing for tests). All
+   identity gates green on both runtimes, both transport paths.
+   REMAINING: the Anvil measurement — relabel(p3) at 2B/16 nodes
+   against the 2.84 s baseline, plus phase1 relabel/tip_encode at 80M
+   (rides the next measurement round; append to the design note).
 8. DONE 2026-08-10 (branch treepiece-rename, code commit 9ab9f04 +
    companion doc commit): renamed the Subtree chare to TreePiece across
    code, comments, and documentation ("subtree" collides with the
@@ -81,9 +87,9 @@ points at its design note where one exists. Started 2026-08-05.
    important (Kale, 2026-08-05) and has been competitive — this and its
    quiescence-closed labeling phase are its main remaining fine-grained
    patterns.
-12. Representative-indirect relabeling (Kale, 2026-08-06; concrete
-    design in design/relabel-representative.md, written 2026-08-10,
-    staged with item 7): keep the
+12. IMPLEMENTED 2026-08-10 (stage 1 of design/relabel-representative.md,
+    commit ec06543; measurement pending with item 7). Original text
+    (Kale, 2026-08-06): keep the
     compressed per-processor union-find array from the phaseA freeze
     (uf_parent[i] = flat index of i's representative). Apply every
     label map — phase-1 merge, tip encoding, the phase-3 map in either
