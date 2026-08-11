@@ -4,6 +4,10 @@ Standing list of agreed future work, in rough priority order. Each item
 points at its design note where one exists. Started 2026-08-05.
 
 1. **Extend paratreet2 to host FoF phase 1** (design/walk-unification.md;
+   GPU-dimension deep dive 2026-08-11: design/walk-unification-gpu.md —
+   staged order serving both the toolkit and Ritvik's HIP port, with
+   stage 0 (device data contract + gridSelfUnion as kernel one)
+   independent of everything and ready now;
    Kale's principle: the framework supports walks, and local versus
    across-process is a smaller variation than the commonality among
    walks). Expedient ordering while the report needs data: lift the
