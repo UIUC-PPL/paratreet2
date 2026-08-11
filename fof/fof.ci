@@ -1,8 +1,8 @@
 module fof {
   // Friends-of-Friends application module, extracted from the paratreet core
   // module (2026-08; see design/fof-module.md). The core toolkit carries no
-  // FoF code: this module consumes the core's generic hooks (Subtree::
-  // callPerSubtreeFn, upwardPass, the visitor/traverser interface) from the
+  // FoF code: this module consumes the core's generic hooks (TreePiece::
+  // callPerTreePieceFn, upwardPass, the visitor/traverser interface) from the
   // outside. Chares are templated over the app Data type; applications
   // instantiate them via extern entry declarations in their mainmodule
   // (see examples/fof3/Main.ci).
@@ -21,7 +21,7 @@ module fof {
   initproc void fofKeepAliveInit(void);
 
   // FoF phase 1 (see fof/FoFPhase1.h and design/phase1.md).
-  // Per-process side: subtree registry for phaseB pair enumeration, boundary
+  // Per-process side: TreePiece registry for phaseB pair enumeration, boundary
   // edge collection, and the PE-tip -> process-level tip merge map.
   template <typename Data>
   nodegroup FoFPhase1Node {

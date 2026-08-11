@@ -47,7 +47,7 @@ void DistributedPrefixLB::InitLB(const CkLBOptions &opt) {
 void DistributedPrefixLB::Strategy(const DistBaseLB::LDStats* const stats) {
   if (CkMyPe() == 0) {
     start_time = CmiWallTimer();
-    CkPrintf("DistributedPrefixLB>>> In DistributedPrefixLB strategy at %lf, term to balance %s, nearestK = %d\n", start_time, (lb_partition_term? "partitions" : "subtrees"), nearestK);
+    CkPrintf("DistributedPrefixLB>>> In DistributedPrefixLB strategy at %lf, term to balance %s, nearestK = %d\n", start_time, (lb_partition_term? "partitions" : "treepieces"), nearestK);
   }
 
   // Reset member variables for this LB iteration
@@ -65,7 +65,7 @@ void DistributedPrefixLB::Strategy(const DistBaseLB::LDStats* const stats) {
   if (_lb_args.debug() >= 2) CkPrintf("My pe = %d; st_ct = %d; total_st_particle_size = %d; pt_ct = %d total_pt_particle_size = %d \n", my_pe, st_ct, st_particle_size_sum, pt_ct, pt_particle_size_sum);
 
   if(lb_partition_term) prefixInit();
-  else subtreeLBInits();
+  else treepieceLBInits();
 }
 
 void DistributedPrefixLB::reportPrefixInitDone(double sum_load){
@@ -90,13 +90,13 @@ void DistributedPrefixLB::initVariables(){
   total_incoming_prefix_migrations = 0;
 
   total_partition_load = 0.0;
-  total_subtree_load = 0.0;
+  total_treepiece_load = 0.0;
   total_pe_load = 0.0;
   total_particle_size = 0;
   global_load = 0.0;
 
 
-  // LB Subtree variables
+  // LB TreePiece variables
 }
 
 void DistributedPrefixLB::createObjMaps(){
@@ -112,7 +112,7 @@ void DistributedPrefixLB::createObjMaps(){
     double obj_load = oData.wallTime * my_stats->pe_speed;
     total_pe_load += obj_load;
     LBUserData usr_data = *(LBUserData *)oData.getUserData(CkpvAccess(_lb_obj_index));
-    // Collect Subtree chare element data
+    // Collect TreePiece chare element data
     if (usr_data.lb_type == LBCommon::st){
       st_ct ++;
       st_obj_map.push_back(
@@ -123,7 +123,7 @@ void DistributedPrefixLB::createObjMaps(){
           });
 
       //if (my_pe == 0) ckout << usr_data.centroid << endl;
-      total_subtree_load += obj_load;
+      total_treepiece_load += obj_load;
       st_particle_size_sum += usr_data.particle_size;
       if (total_particle_size == 0) total_particle_size = usr_data.particle_sum;
     }
@@ -153,14 +153,14 @@ void DistributedPrefixLB::createObjMaps(){
     pe_avg_partition_centroid = avg_centroid / (Real) pt_ct;
   }
 
-  //if(_lb_args.debug() >= 1) CkPrintf("PE[%d] st_ct = %d; subtree load = %.2f;  pt_ct = %d; partition load = %.2f; total pe load = %.2f; background_load = %.2f\n", my_pe, st_ct, total_subtree_load, pt_ct, total_partition_load, total_pe_load, background_load);
+  //if(_lb_args.debug() >= 1) CkPrintf("PE[%d] st_ct = %d; treepiece load = %.2f;  pt_ct = %d; partition load = %.2f; total pe load = %.2f; background_load = %.2f\n", my_pe, st_ct, total_treepiece_load, pt_ct, total_partition_load, total_pe_load, background_load);
 }
 
 void DistributedPrefixLB::prefixInit(){
   prefix_start_time = CmiWallTimer();
   total_iter = ceil(log2(CkNumPes()));
   if(my_pe == 0) CkPrintf("total_iter = %d\n", total_iter);
-  // When Subtree and Partition are bounded
+  // When TreePiece and Partition are bounded
   my_particle_sum = pt_particle_size_sum;
   my_prefix_load = total_partition_load + background_load;
   obj_map_to_balance = pt_obj_map;
@@ -322,13 +322,13 @@ void DistributedPrefixLB::cleanUp(){
   }
 
   migrate_records.clear();
-  subtreeLBCleanUp();
+  treepieceLBCleanUp();
   double end_time = CmiWallTimer();
   if (my_pe == 0){
     CkPrintf("DistributedPrefixLB>> Strategy elapse time %0.4f ms\n", (end_time - start_time) * 1000);
   }
 }
 
-#include "LBSubtreeHelper.C"
+#include "LBTreePieceHelper.C"
 
 #include "DistributedPrefixLB.def.h"

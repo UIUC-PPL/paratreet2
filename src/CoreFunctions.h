@@ -55,16 +55,16 @@ namespace paratreet {
         virtual void operator()(SpatialNode<T>& node, Partition<T>* partition) = 0;
     };
 
-    // Subtree-level analogue of PerLeafAble, for consumers that need each
-    // Subtree element's local tree root and contiguous particle block rather
-    // than individual leaves (delivered by Subtree::callPerSubtreeFn). The
+    // TreePiece-level analogue of PerLeafAble, for consumers that need each
+    // TreePiece element's local tree root and contiguous particle block rather
+    // than individual leaves (delivered by TreePiece::callPerTreePieceFn). The
     // block pointer is stable from the end of tree build until the next
     // rebuild/reset; consumers that retain it must finish inside that window.
     template<typename T>
-    class PerSubtreeAble: public PUP::able {
+    class PerTreePieceAble: public PUP::able {
       public:
-        PerSubtreeAble(void) = default;
-        PerSubtreeAble(CkMigrateMessage *m): PUP::able(m) {}
+        PerTreePieceAble(void) = default;
+        PerTreePieceAble(CkMigrateMessage *m): PUP::able(m) {}
 
         virtual void pup(PUP::er &p) override { PUP::able::pup(p); }
 

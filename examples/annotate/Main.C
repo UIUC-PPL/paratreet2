@@ -15,7 +15,7 @@ PARATREET_REGISTER_MAIN(ExMain);
   // (framework-registered options: -x -f -v -n -p -l -d -t -i -s ...;
   // see paratreet::Configuration::register_fields).
   void ExMain::setDefaults(void) {
-    conf.min_n_subtrees = CkNumPes() * 8;
+    conf.min_n_treepieces = CkNumPes() * 8;
     conf.min_n_partitions = CkNumPes() * 8;
     conf.max_particles_per_leaf = 12;
     conf.decomp_type = paratreet::DecompType::eBinaryOct;
@@ -38,7 +38,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("Input file: %s\n", conf.input_file.c_str());
     CkPrintf("Decomposition type: %s\n", paratreet::asString(conf.decomp_type).c_str());
     CkPrintf("Tree type: %s\n", paratreet::asString(conf.tree_type).c_str());
-    CkPrintf("Minimum number of subtrees: %d\n", conf.min_n_subtrees);
+    CkPrintf("Minimum number of TreePieces: %d\n", conf.min_n_treepieces);
     CkPrintf("Minimum number of partitions: %d\n", conf.min_n_partitions);
     CkPrintf("Maximum number of particles per leaf: %d\n", conf.max_particles_per_leaf);
 

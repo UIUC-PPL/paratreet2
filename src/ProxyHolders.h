@@ -4,12 +4,12 @@
 #include "paratreet.decl.h"
 
 template <typename Data>
-class CProxy_Subtree;
+class CProxy_TreePiece;
 
 template <typename Data>
 struct TPHolder {
-  CProxy_Subtree<Data> proxy;
-  TPHolder(CProxy_Subtree<Data> proxy_) : proxy(proxy_) {}
+  CProxy_TreePiece<Data> proxy;
+  TPHolder(CProxy_TreePiece<Data> proxy_) : proxy(proxy_) {}
   TPHolder() {}
   void pup(PUP::er& p) {
     p | proxy;
@@ -62,15 +62,15 @@ class CProxy_CacheManager;
 template <typename Data>
 struct ProxyPack {
   CProxy_Driver<Data> driver;
-  CProxy_Subtree<Data> subtree;
+  CProxy_TreePiece<Data> treepiece;
   CProxy_Partition<Data> partition;
   CProxy_CacheManager<Data> cache;
-  ProxyPack(CProxy_Driver<Data> d, CProxy_Subtree<Data> s, CProxy_Partition<Data> p, CProxy_CacheManager<Data> c)
-    : driver(d), subtree(s), partition(p), cache(c) {}
+  ProxyPack(CProxy_Driver<Data> d, CProxy_TreePiece<Data> s, CProxy_Partition<Data> p, CProxy_CacheManager<Data> c)
+    : driver(d), treepiece(s), partition(p), cache(c) {}
   ProxyPack() {}
   void pup(PUP::er& p) {
     p | driver;
-    p | subtree;
+    p | treepiece;
     p | partition;
     p | cache;
   }

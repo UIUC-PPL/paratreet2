@@ -16,7 +16,7 @@
 //     (Node::exchangeChild) plus the atomic per-lane `requested` bitmask.
 //   * Traversals READ node data/particles with NO lock (cached Data is
 //     immutable-after-fill; post-build mutation uses PHASE SEPARATION —
-//     see refreshSubtreeCopy and design/cache-concurrency.md).
+//     see refreshTreePieceCopy and design/cache-concurrency.md).
 //   * maps_lock is the ONLY mutex and is intentionally NARROW: it guards
 //     just the registry-map inserts (local_tps / leaf_lookup), nothing on
 //     the data path. Do not widen it and do not add locks — a writer-side
@@ -182,8 +182,8 @@ public:
   Node<Data>* root = nullptr;
   size_t branch_factor = 0;
   NodeLookup local_tps;
-  NodeLookup leaf_lookup; // all the cached leaves from copied subtrees
-  std::map<Key, std::vector<int>> subtree_copy_started;
+  NodeLookup leaf_lookup; // all the cached leaves from copied TreePieces
+  std::map<Key, std::vector<int>> treepiece_copy_started;
   std::set<Key> prefetch_set;
   std::vector<std::vector<Node<Data>*>> cached_leaves; // cached leaves left over
   std::vector<std::vector<Node<Data>*>> displaced_leaves; // leaves split between >1 Partitions
@@ -300,7 +300,7 @@ public:
     leaf_lookup.clear();
     walk_credits.store(0);
     walk_state.store(0);
-    subtree_copy_started.clear();
+    treepiece_copy_started.clear();
     prefetch_set.clear();
 
     root = nullptr;
@@ -338,7 +338,7 @@ public:
     return node;
   }
 
-  // Register a Subtree's local root (and optionally its leaves) with the
+  // Register a TreePiece's local root (and optionally its leaves) with the
   // registries; the prefetch bookkeeping rides along under the same lock.
   void connectRoot(Node<Data>* node) {
     lockMaps();
@@ -396,7 +396,7 @@ public:
   }
 
   // Install a fetched partial subtree (the reply to a node request, or a
-  // shipped subtree copy). Builds Cached* nodes off the pool, wires
+  // shipped TreePiece copy). Builds Cached* nodes off the pool, wires
   // children/placeholders, and atomically publishes the top node in place
   // of its placeholder (swapIn) — concurrent lookups see the placeholder
   // or the complete subtree, never a partial state. Returns the installed
@@ -459,26 +459,26 @@ public:
     return node;
   }
 
-  // Update a previously copied subtree in place from a refreshed
+  // Update a previously copied TreePiece in place from a refreshed
   // flat_subtree snapshot: overwrite each cached node's Data annotation and
   // each cached leaf's particle copies, matching by key. Structure is
   // unchanged, so cached pointers held elsewhere stay valid. No-op when no
-  // copy of the subtree lives here.
+  // copy of the TreePiece lives here.
   //
   // CONCURRENCY CONTRACT: traversals read node->data/particles WITHOUT a
   // lock; this MUTATES that payload, so it is only safe in a mutation phase
   // quiescence-separated from any traversal reading the affected subtree
-  // (the Subtree::upwardPass contract; see design/cache-concurrency.md).
+  // (the TreePiece::upwardPass contract; see design/cache-concurrency.md).
   // maps_lock below guards only the local_tps lookup. Concurrent refreshes
   // touch disjoint subtrees, so no node is written twice.
-  void refreshSubtreeCopy(const CachedP* particles,
+  void refreshTreePieceCopy(const CachedP* particles,
                           std::pair<Key, SpatialNode<Data>>* nodes, int n_nodes) {
     if (n_nodes == 0) return;
     lockMaps();
     auto it = local_tps.find(nodes[0].first);
     Node<Data>* top = (it != local_tps.end()) ? it->second : nullptr;
     unlockMaps();
-    if (!top) return; // no copy of this subtree lives here
+    if (!top) return; // no copy of this TreePiece lives here
     int p_index = 0;
     for (int j = 0; j < n_nodes; j++) {
       auto&& key = nodes[j].first;
@@ -497,7 +497,7 @@ public:
     }
   }
 
-  // refreshSubtreeCopy particle-refresh dispatch: real update when the
+  // refreshTreePieceCopy particle-refresh dispatch: real update when the
   // cached type is the full Particle; abort otherwise (C++11 overload
   // selection — exact match wins when CachedP == Particle).
   static void refreshCachedParticle(Node<Data>* node, int i, const Particle& p) {
@@ -505,7 +505,7 @@ public:
   }
   template <typename T>
   static void refreshCachedParticle(Node<Data>*, int, const T&) {
-    CkAbort("refreshSubtreeCopy's particle refresh requires full cached "
+    CkAbort("refreshTreePieceCopy's particle refresh requires full cached "
             "particles; this application declares a slim Data::CachedParticle");
   }
 
@@ -583,8 +583,8 @@ public:
     }
   }
 
-  // Wire an installed node's children: adopt registered local subtree
-  // roots (above the subtree keys) and create placeholders elsewhere.
+  // Wire an installed node's children: adopt registered local TreePiece
+  // roots (above the TreePiece keys) and create placeholders elsewhere.
   void insertNode(int lane, Node<Data>* node, bool above_tp, bool should_swap) {
     for (int i = 0; i < node->n_children; i++) {
       Node<Data>* new_child = nullptr;

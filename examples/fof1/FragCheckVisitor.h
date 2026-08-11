@@ -9,11 +9,11 @@
 
 // Visits every node (like the annotate example's CheckVisitor) and, at each
 // source leaf, checks that the FragData annotation — recomputed by
-// Subtree::upwardPass after FoF phase 1 wrote Particle::group_number —
+// TreePiece::upwardPass after FoF phase 1 wrote Particle::group_number —
 // matches the leaf's particles exactly. Remote sources arrive through the
 // CacheManager, so this validates cache-shipped leaves too. Target particles
 // (Partition copies) are deliberately not checked: phase 1 relabels only the
-// Subtree copies.
+// TreePiece copies.
 struct FragCheckVisitor {
 public:
   static constexpr const bool CallSelfLeaf = true;

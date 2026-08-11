@@ -3,13 +3,13 @@
 
 // FoF phase 3 v1: cross-process boundary walk + gather-to-one UF_2
 // (design/phase3.md). After phase 1 froze process-level tips in
-// Particle::group_number and Subtree::upwardPass refreshed the FragData
+// Particle::group_number and TreePiece::upwardPass refreshed the FragData
 // annotations, this phase discovers merge-graph edges between fragments on
 // different processes and applies the resulting global relabeling.
 //
 // Walk mechanism: the standard Partition traversal (startDown ->
 // TransposedDownTraverser), i.e. every Partition's target leaves are walked
-// against the full global tree; remote subtrees are fetched and resumed
+// against the full global tree; remote treepieces are fetched and resumed
 // through the CacheManager/Resumer machinery exactly as in the gravity
 // examples. FoFEdgeVisitor (3a, design/step3.md §3) prunes on three
 // certificates: case 1 (negative, mindist(source box, target box) > b),
@@ -31,8 +31,8 @@
 // deduplicated per PE and again at the gather root.
 //
 // Preconditions (asserted by runFoFPhase3):
-//  - Subtree and Partition decompositions match (the FoF configuration,
-//    -d oct with the oct tree): target leaves then alias the Subtree-owned
+//  - TreePiece and Partition decompositions match (the FoF configuration,
+//    -d oct with the oct tree): target leaves then alias the TreePiece-owned
 //    particle blocks that phase 1 relabeled (Partition::verifySharedLeaves
 //    checks pointer identity). Source leaves fetched through the cache carry
 //    relabeled copies because CacheManager::serviceRequest copies live
@@ -75,7 +75,7 @@
 // the old application's FoFVisitor).
 struct FoFEdgeVisitor {
 public:
-  // Self-leaf pairs live inside one Subtree (one PE), so phase 1 already
+  // Self-leaf pairs live inside one TreePiece (one PE), so phase 1 already
   // unioned them: they can never produce a cross-process edge. Skip them.
   static constexpr const bool CallSelfLeaf = false;
   // Dual-tree walk traits (design/dual-tree.md; consulted only by
@@ -380,7 +380,7 @@ struct FoFPhase3Result {
   // pool sizes of all processes). units_total / t_phaseB sum = mean unit
   // cost; min/max spread shows whether the pool's self-scheduling levels.
   long units_min, units_max, units_total;
-  // Density-work proxy X = sum over a PE's subtrees of n^2/V (min/avg/max
+  // Density-work proxy X = sum over a PE's TreePieces of n^2/V (min/avg/max
   // over PEs), and the Pearson r between X and t_phaseA across PEs: the
   // density-drives-phase1-work quantifier. r near 1 = phaseA cost is
   // geometry-predictable (placement can act on X before running).
@@ -393,14 +393,14 @@ struct FoFPhase3Result {
 //   -> flushPhase3Edges (concat reduction to this thread) -> serial UF_2 on
 //   PE 0 -> applyGlobalMap broadcast -> relabel barrier.
 // Must be called from a [threaded] entry method on PE 0 (the driver), after
-// runFoFPhase1 and Subtree::upwardPass (+ QD) and before the next tree
+// runFoFPhase1 and TreePiece::upwardPass (+ QD) and before the next tree
 // rebuild/reset. The gather-to-one UF_2 is fine to about a million edges
 // (49k edges at 80M particles / 32 processes measured 2026-08-04); the
 // distributed UF_2 (-u dist, below) exists for beyond that, and for
 // future needs that want the union-find state to remain distributed.
 //
 // dual_walk: launch the boundary walk as the symmetric dual-tree
-// traversal from the Subtree array (required under single-distribution
+// traversal from the TreePiece array (required under single-distribution
 // mode, where no Partition array exists). Tips stay RAW (global particle
 // order) on this path in either walk: the serial union-find needs no
 // owner encoding, so the caller must NOT have run applyTipEncoding.
@@ -416,7 +416,7 @@ struct FoFPhase3Result {
 // concurrent bulk rounds pay it at most twice, overlapped.
 // Shared-leaf aliasing precondition: asserted via Partition::
 // verifySharedLeaves under dual distribution; under single-distribution
-// mode it holds BY CONSTRUCTION (traversal targets ARE the Subtree
+// mode it holds BY CONSTRUCTION (traversal targets ARE the TreePiece
 // leaves — there is no Partition array), so the check is skipped.
 inline void verifySharedLeavesUnlessSingle(
     CProxy_Partition<FragData>& partitions) {
@@ -429,8 +429,8 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
                                     double linking_length,
                                     Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
                                     bool dual_walk = false,
-                                    CProxy_Subtree<FragData> subtrees =
-                                        CProxy_Subtree<FragData>(),
+                                    CProxy_TreePiece<FragData> treepieces =
+                                        CProxy_TreePiece<FragData>(),
                                     // Cache proxy for the credit-counter walk
                                     // termination (Kale's scheme, 2026-08-05;
                                     // see TreeCache::walk_credits). Default
@@ -439,7 +439,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
                                     CProxy_CacheManager<FragData> cache =
                                         CProxy_CacheManager<FragData>()) {
   auto& config = paratreet::getConfiguration();
-  CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
+  CkEnforce(config.decomp_type == paratreet::treepieceDecompForTree(config.tree_type));
   double t_pre = CkWallTimer();
   verifySharedLeavesUnlessSingle(partitions);
 
@@ -461,11 +461,11 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
         CkCallbackResumeThread armed;
         cache.armWalkCompletion(walk_done, armed);
       } // every process armed before any walk entry can run
-      subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+      treepieces.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
       // walk_done's destructor blocks here until every process's credit
       // counter has reached zero and the done reduction has fired.
     } else {
-      subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+      treepieces.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
       CkWaitQD();
     }
   } else {
@@ -628,7 +628,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
 // UF_2 above with UnionFindLib driving the union/labeling over the
 // owner-encoded tip namespace. PRECONDITION (unlike runFoFPhase3 above):
 // the caller must already have run, in order, after runFoFPhase1's relabel
-// and BEFORE Subtree::upwardPass/Driver::loadCache:
+// and BEFORE TreePiece::upwardPass/Driver::loadCache:
 //   fof.countFragments(cb) -> fof_node.computeTipEncoding(cb) ->
 //   fof.applyTipEncoding(cb)
 // so every particle copy the phase-3 walk reads (including cache-shipped
@@ -643,20 +643,20 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
 // distributed analog of the old serial-map-build bracket), t_relabel covers
 // applyUF2Labels.
 // dual_walk (design/dual-tree.md): launch the walk as a symmetric dual-tree
-// traversal (Subtree::startDual -> DualTraverser) instead of the transposed
+// traversal (TreePiece::startDual -> DualTraverser) instead of the transposed
 // source-tree-vs-flat-target-leaves walk. Same visitor, same edge set (the
 // SEEN table and all emission live in open()/leaf() either way); targets are
-// the subtrees' live local trees, whose internal nodes upwardPass annotated
+// the TreePieces' live local trees, whose internal nodes upwardPass annotated
 // in place, so internal x internal pruning (the design/step3.md 6f lever)
-// becomes available. `subtrees` is only consulted when dual_walk is true.
+// becomes available. `treepieces` is only consulted when dual_walk is true.
 inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         CProxy_FoFPhase1<FragData> fof,
                                         CProxy_FoFPhase1Node<FragData> fof_node,
                                         double linking_length,
                                         Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
                                         bool dual_walk = false,
-                                        CProxy_Subtree<FragData> subtrees =
-                                            CProxy_Subtree<FragData>(),
+                                        CProxy_TreePiece<FragData> treepieces =
+                                            CProxy_TreePiece<FragData>(),
                                         // Pre-created UFNodeMap group (see
                                         // unionFindInitOnePerNode overload:
                                         // inline map creation races with the
@@ -668,7 +668,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
                                         // design/walk-uf2-overlap.md step 1.
                                         long uf2_stream_batch = 0) {
   auto& config = paratreet::getConfiguration();
-  CkEnforce(config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type));
+  CkEnforce(config.decomp_type == paratreet::treepieceDecompForTree(config.tree_type));
   double t_pre = CkWallTimer();
   verifySharedLeavesUnlessSingle(partitions);
 
@@ -706,7 +706,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // walk's remaining work and fetch stalls.
   double t0 = CkWallTimer();
   if (dual_walk) {
-    subtrees.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+    treepieces.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
   } else {
     if (paratreet::getConfiguration().single_distribution)
       CkAbort("transposed phase-3 walk needs the Partition array; use the dual"

@@ -12,7 +12,7 @@
 // particles under the node.
 //
 // Build-time values are garbage — tree build runs before FoF phase 1 assigns
-// group_number — and are never read; run Subtree::upwardPass after phase 1
+// group_number — and are never read; run TreePiece::upwardPass after phase 1
 // (relabel) to compute the real annotations. uniform() is the hereditary
 // predicate phase 3 prunes on: every particle under the node belongs to the
 // same fragment.

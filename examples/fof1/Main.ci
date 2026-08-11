@@ -6,8 +6,8 @@ mainmodule Main {
 
     initnode void initialize(void);
 
-    extern entry void Subtree<FragData> callPerSubtreeFn(CkReference<paratreet::PerSubtreeAble<FragData>>, const CkCallback&);
-    extern entry void Subtree<FragData> upwardPass(const CkCallback&);
+    extern entry void TreePiece<FragData> callPerTreePieceFn(CkReference<paratreet::PerTreePieceAble<FragData>>, const CkCallback&);
+    extern entry void TreePiece<FragData> upwardPass(const CkCallback&);
     extern entry void Partition<FragData> startDown<FragCheckVisitor> (FragCheckVisitor v);
     extern entry void FoFPhase1<FragData> countFragments(const CkCallback&);
     extern entry void FoFPhase1Node<FragData> fragmentHistogram(const CkCallback&);

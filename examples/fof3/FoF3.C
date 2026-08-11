@@ -75,7 +75,7 @@ using namespace paratreet;
     }
     double t0 = CkWallTimer();
     paratreet::FoFPhase1Stages p1s;
-    paratreet::runFoFPhase1(proxy_pack.subtree, fof, fof_node, fof_b, pbc,
+    paratreet::runFoFPhase1(proxy_pack.treepiece, fof, fof_node, fof_b, pbc,
                             &p1s, fof_grid_threshold);
     double t1 = CkWallTimer();
     // Stage decomposition of the phase1 total. reset/register are
@@ -115,7 +115,7 @@ using namespace paratreet;
 
     // Refresh the FragData annotations from the relabeled particles and let
     // canopy propagation (including the re-sends to Driver::recvTC) settle.
-    proxy_pack.subtree.upwardPass(CkCallbackResumeThread());
+    proxy_pack.treepiece.upwardPass(CkCallbackResumeThread());
     CkWaitQD();
     double t2 = CkWallTimer();
 
@@ -492,11 +492,11 @@ using namespace paratreet;
     FoFPhase3Result pr = uf2_mode == UF2Mode::Dist
         ? paratreet::runFoFPhase3Dist(proxy_pack.partition, fof, fof_node, b, pbc,
                                       walk_mode == WalkMode::Dual,
-                                      proxy_pack.subtree, uf_node_map_gid,
+                                      proxy_pack.treepiece, uf_node_map_gid,
                                       fof_uf2_stream_batch)
         : paratreet::runFoFPhase3(proxy_pack.partition, fof, b, pbc,
                                   walk_mode == WalkMode::Dual,
-                                  proxy_pack.subtree, proxy_pack.cache);
+                                  proxy_pack.treepiece, proxy_pack.cache);
     CkPrintf("FOF3STAT edges: emitted %ld sent %ld unique %ld tips_remapped %ld\n",
              pr.edges_emitted, pr.edges_sent, pr.edges_unique, pr.tips_remapped);
     // 3a counters (design/step3.md §6). Redundancy ratio = both-uniform
@@ -540,7 +540,7 @@ using namespace paratreet;
                    : 0.0,
                CkNumPes());
       // Density-vs-work correlation (Kale, 2026-07-29): X = per-PE
-      // sum(n^2/V) over subtrees, the geometric pair-work predictor.
+      // sum(n^2/V) over TreePieces, the geometric pair-work predictor.
       // r near 1 = phaseA cost is predictable from the tree alone.
       CkPrintf("FOF3STAT density: r_phaseA %.3f proxy_x %.3g/%.3g/%.3g "
                "(min/avg/max over %d PEs)\n",

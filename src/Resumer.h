@@ -14,16 +14,16 @@
 // cache placeholders themselves (TreeCache park/install), and this group
 // only decides what to do with the opaques an install hands back — queue
 // the resumed node per (traversal, element) and dispatch one goDown to
-// the walking chare (Subtree or Partition, per use_subtree). The old
+// the walking chare (TreePiece or Partition, per use_treepiece). The old
 // waiting[key] side table is gone.
 template <typename Data>
 class Resumer : public CBase_Resumer<Data> {
 public: // these need to be seen by other local chares
   CProxy_Partition<Data> part_proxy;
-  CProxy_Subtree<Data> subtree_proxy;
+  CProxy_TreePiece<Data> treepiece_proxy;
   CacheManager<Data>* cm_local;
   std::map<std::pair<int, int>, std::queue<Node<Data>*>> all_resume_nodes;
-  bool use_subtree = false;
+  bool use_treepiece = false;
 
   void reset() {
 #if DEBUG
@@ -56,7 +56,7 @@ public: // these need to be seen by other local chares
         // whole queue, so entries pushed onto a non-empty queue ride the
         // credit that goDown already holds).
         cm_local->walkCreditInc(1);
-        if (use_subtree) subtree_proxy[pair.second].goDown(pair.first);
+        if (use_treepiece) treepiece_proxy[pair.second].goDown(pair.first);
         else part_proxy[pair.second].goDown(pair.first);
       }
     }

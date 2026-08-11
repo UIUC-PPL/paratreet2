@@ -11,10 +11,10 @@
 //
 // Structure (all barriers are reduction callbacks driven by the caller):
 //   (a) FoFPhase1 (group, per PE): serial union-find over the particles of
-//       the subtrees resident on this PE. Neighbor discovery is a dual tree
-//       walk over all pairs of this PE's subtrees (including self-pairs),
+//       the TreePieces resident on this PE. Neighbor discovery is a dual tree
+//       walk over all pairs of this PE's TreePieces (including self-pairs),
 //       pruned when the box gap distance squared exceeds b^2.
-//   (b) FoFPhase1 phaseB: for each subtree pair spanning two PEs of the same
+//   (b) FoFPhase1 phaseB: for each TreePiece pair spanning two PEs of the same
 //       process, the lower-PE side walks the pair over frozen data and emits
 //       deduplicated (tip_i, tip_j) edges into its own buffer, then hands the
 //       buffer to the process-wide FoFPhase1Node.
@@ -28,13 +28,13 @@
 // reads only data frozen by the preceding barrier.
 //
 // Driving sequence (from a [threaded] context; see paratreet::runFoFPhase1):
-//   fof_node.reset -> fof.reset -> subtrees.callPerSubtreeFn(SubtreeRegisterFn)
+//   fof_node.reset -> fof.reset -> treepieces.callPerTreePieceFn(TreePieceRegisterFn)
 //   -> fof.phaseA -> fof.phaseB -> fof_node.merge -> fof.relabel
 // Optionally after relabel (see paratreet::runFoFFragmentHistogram):
 //   fof.countFragments -> fof_node.fragmentHistogram
 //
 // Lifetime contract: the Particle blocks registered through the generic
-// Subtree::callPerSubtreeFn hook (fof::SubtreeRegisterFn hands each Subtree
+// TreePiece::callPerTreePieceFn hook (fof::TreePieceRegisterFn hands each TreePiece
 // element's block to its PE's FoFPhase1 branch) are stable from the end of
 // tree build until the next rebuild/reset; run the whole sequence inside
 // that window.
@@ -43,7 +43,7 @@
 // Template definitions of this module's generated code (CBase_/closure/proxy
 // templates from fof.def.h) must be visible before any concrete-Data use of
 // the chares (e.g. FoFPhase3.h's FragData visitors) — same idiom as the
-// core's Subtree.h including templates.h.
+// core's TreePiece.h including templates.h.
 #include "fof-templates.h"
 #include "CoreFunctions.h"
 #include "common.h"
@@ -120,11 +120,11 @@ inline std::pair<int, uint64_t> uf2LocationFromID(uint64_t vid) {
 }
 
 // Fair phaseB work division (design/phase1-scaling.md, 2026-07-25): each
-// unordered subtree pair spanning two PEs of a process is walked by
+// unordered TreePiece pair spanning two PEs of a process is walked by
 // exactly one of the two, chosen by one bit of a symmetric mix of the two
-// subtree ROOT KEYS (stable Morton keys — identical on both sides, so
+// TreePiece ROOT KEYS (stable Morton keys — identical on both sides, so
 // both PEs agree without communication; pointers would vary under ASLR).
-// Subtree granularity splits every PE pair's ~64 subtree pairs about in
+// TreePiece granularity splits every PE pair's ~64 TreePiece pairs about in
 // half with density mixing — the lower-PE-walks-everything rule gave PE i
 // of an N-PE process N-1-i partner PEs (triangular; ~11x phaseB skew in
 // the 80M logs). The emitted edge SET is unchanged (merge unions are
@@ -316,21 +316,21 @@ struct FoFMemoryStats {
 
 } // namespace paratreet
 
-// Per-process side of phase 1: collects the per-PE subtree registry (for
+// Per-process side of phase 1: collects the per-PE TreePiece registry (for
 // phaseB pair enumeration), the cross-PE boundary edges, and — after
 // merge() — the PE-tip -> process-level tip map read by the group branches.
 template <typename Data>
 class FoFPhase1Node : public CBase_FoFPhase1Node<Data> {
 public:
-  struct SubtreeRef {
+  struct TreePieceRef {
     Node<Data>* root;
     Particle* parts;
     int n;
   };
 
   std::mutex lock;
-  // PE -> subtrees resident on that PE (this process's PEs only).
-  std::map<int, std::vector<SubtreeRef>> pe_subtrees;
+  // PE -> TreePieces resident on that PE (this process's PEs only).
+  std::map<int, std::vector<TreePieceRef>> pe_treepieces;
   std::vector<std::pair<long, long>> edges; // cross-PE (tip, tip) edges
   std::unordered_map<long, long> tip_map;   // PE-tip -> process-level tip
   std::unordered_map<long, long> frag_counts; // process-level tip -> exact size
@@ -462,9 +462,9 @@ public:
 
   // Called synchronously (ckLocalBranch) by same-process group branches
   // during registration; hence the lock.
-  void registerSubtree(int pe, Node<Data>* root, Particle* parts, int n) {
+  void registerTreePiece(int pe, Node<Data>* root, Particle* parts, int n) {
     std::lock_guard<std::mutex> g(lock);
-    pe_subtrees[pe].push_back(SubtreeRef{root, parts, n});
+    pe_treepieces[pe].push_back(TreePieceRef{root, parts, n});
   }
 
   // Called synchronously by group branches at the end of phaseB.
@@ -489,7 +489,7 @@ public:
   std::atomic<int> a_done{0};
   std::atomic<int> b_done{0};
   double chain_t0 = 0, stage_tA = 0, stage_tB = 0, stage_tM = 0;
-  // PhaseB dynamic pool (branch phaseb-pool): every cross-PE subtree pair
+  // PhaseB dynamic pool (branch phaseb-pool): every cross-PE TreePiece pair
   // of this process, enumerated once by the last phaseA finisher and
   // CLAIMED IN CHUNKS by whichever PEs are free — replacing the static
   // per-pair hash assignment. Safe because a phaseB pair only reads
@@ -506,7 +506,7 @@ public:
   std::vector<PoolUnit> phaseb_pool;
   std::atomic<size_t> phaseb_next{0};
   // Parallel pool build (2026-08-07): each of the process's threads
-  // enumerates a stripe of the subtree-pair space into its own slice —
+  // enumerates a stripe of the TreePiece-pair space into its own slice —
   // no lock, no sharing — and the last one to finish concatenates and
   // sorts. The build used to run entirely on the thread that finished
   // phaseA last while the other fourteen waited, which is what made
@@ -524,7 +524,7 @@ public:
     a_done = 0;
     b_done = 0;
     chain_t0 = stage_tA = stage_tB = stage_tM = 0;
-    pe_subtrees.clear();
+    pe_treepieces.clear();
     edges.clear();
     tip_map.clear();
     frag_counts.clear();
@@ -633,20 +633,20 @@ private:
 template <typename Data>
 class FoFPhase1 : public CBase_FoFPhase1<Data> {
 public:
-  struct SubtreeRef {
+  struct TreePieceRef {
     Node<Data>* root;
-    Particle* parts; // the Subtree's own particle block (stable until rebuild)
+    Particle* parts; // the TreePiece's own particle block (stable until rebuild)
     int n;
     int offset;      // base of this block in the PE-flat index space
   };
 
   FoFPhase1(CProxy_FoFPhase1Node<Data> node_proxy_) : node_proxy(node_proxy_) {}
 
-  // Synchronous, called on this PE by fof::SubtreeRegisterFn (delivered per
-  // Subtree element through the generic Subtree::callPerSubtreeFn hook).
-  void registerSubtree(Node<Data>* root, Particle* parts, int n) {
-    subtrees.push_back(SubtreeRef{root, parts, n, 0});
-    node_proxy.ckLocalBranch()->registerSubtree(CkMyPe(), root, parts, n);
+  // Synchronous, called on this PE by fof::TreePieceRegisterFn (delivered per
+  // TreePiece element through the generic TreePiece::callPerTreePieceFn hook).
+  void registerTreePiece(Node<Data>* root, Particle* parts, int n) {
+    treepieces.push_back(TreePieceRef{root, parts, n, 0});
+    node_proxy.ckLocalBranch()->registerTreePiece(CkMyPe(), root, parts, n);
   }
 
   // Periodic boundary conditions (design/pbc.md): the box period, broadcast
@@ -660,7 +660,7 @@ public:
   }
 
   void reset(const CkCallback& cb) {
-    subtrees.clear();
+    treepieces.clear();
     uf_parent.clear();
     flat_order.clear();
     edge_buf.clear();
@@ -686,7 +686,7 @@ public:
   }
 
   // (a) Per-PE union-find via dual walks over all pairs of this PE's
-  // subtrees (self-pairs included), then full path compression and tip
+  // TreePieces (self-pairs included), then full path compression and tip
   // assignment into Particle::group_number.
   void phaseABody(double b2) {
     double t0 = CkWallTimer();
@@ -694,7 +694,7 @@ public:
     // Offset table: flat index space over this PE's particle blocks.
     int n_local = 0;
     density_x = 0.0;
-    for (auto& s : subtrees) {
+    for (auto& s : treepieces) {
       s.offset = n_local;
       n_local += s.n;
       double vol = (double)s.root->data.box.volume();
@@ -704,7 +704,7 @@ public:
     std::iota(uf_parent.begin(), uf_parent.end(), 0);
     cert_rep.clear();
     flat_order.resize(n_local);
-    for (auto& s : subtrees)
+    for (auto& s : treepieces)
       for (int i = 0; i < s.n; i++) flat_order[s.offset + i] = s.parts[i].order;
 
     // Self pairs FIRST, cross pairs after (merge-early ordering): local
@@ -712,11 +712,11 @@ public:
     // maximal suppression (design/phase1-scaling.md, connectivity layer).
     p1_conn_suppressed = 0;
     for (int pass = 0; pass < 2; pass++) {
-      for (size_t i = 0; i < subtrees.size(); i++) {
-        for (size_t j = i; j < subtrees.size(); j++) {
+      for (size_t i = 0; i < treepieces.size(); i++) {
+        for (size_t j = i; j < treepieces.size(); j++) {
           if ((pass == 0) != (i == j)) continue; // pass 0: self; pass 1: cross
-          const SubtreeRef& sa = subtrees[i];
-          const SubtreeRef& sb = subtrees[j];
+          const TreePieceRef& sa = treepieces[i];
+          const TreePieceRef& sb = treepieces[j];
           // Per-chare grid (design/phase1-scaling.md "grid phaseA",
           // 2026-07-25): a dense chare's SELF pair is solved by a cell
           // grid in ~O(n) instead of the tree walk. Gated on occupancy
@@ -773,7 +773,7 @@ public:
       // rather than the flat block is the only difference - a leaf's
       // particles are a contiguous slice of the block, so the flat index
       // the union-find needs is offset + (slice base) + j.
-      for (auto& s : subtrees) {
+      for (auto& s : treepieces) {
         long covered = freezeAndAnnotate(s.root, s, root_counts);
         // Every particle of the block must belong to exactly one leaf,
         // or the tips and the component counts that ride this loop would
@@ -782,7 +782,7 @@ public:
         CkEnforce(covered == (long)s.n);
       }
     } else {
-      for (auto& s : subtrees)
+      for (auto& s : treepieces)
         for (int i = 0; i < s.n; i++) {
           int r = find(s.offset + i);
           s.parts[i].group_number = flat_order[r];
@@ -807,7 +807,7 @@ public:
     // test, hereditary, and carried in the node rather than in a
     // per-processor map keyed by node address.
     //
-    // Superseded by Subtree::upwardPass after relabel, which is what
+    // Superseded by TreePiece::upwardPass after relabel, which is what
     // phase 3 reads. Uniformity is monotone across the merge, so a node
     // uniform here is still uniform there.
     // (The annotation is written by the fused freeze walk above; it used
@@ -831,7 +831,7 @@ public:
   // block. Writes each particle's final tip, feeds root_counts for the
   // component counting that rides this pass, and leaves every node
   // carrying the min and max tip beneath it.
-  long freezeAndAnnotate(Node<Data>* n, const SubtreeRef& s,
+  long freezeAndAnnotate(Node<Data>* n, const TreePieceRef& s,
                          std::vector<long>& root_counts) {
     const long kMin = std::numeric_limits<long>::max();
     const long kMax = std::numeric_limits<long>::min();
@@ -888,7 +888,7 @@ public:
     return {mn, mx};
   }
 
-  // (b) Cross-PE edge emission. For each subtree pair spanning this PE and a
+  // (b) Cross-PE edge emission. For each TreePiece pair spanning this PE and a
   // higher PE of the same process, walk the pair over frozen data and emit
   // deduplicated (tip, tip) edges into this PE's buffer; hand the buffer to
   // the nodegroup. No-op when this process has a single PE (non-SMP or
@@ -952,7 +952,7 @@ public:
   // (identity if absent).
   void relabelBody() {
     auto& tip_map = node_proxy.ckLocalBranch()->tip_map;
-    for (auto& s : subtrees) {
+    for (auto& s : treepieces) {
       for (int i = 0; i < s.n; i++) {
         auto it = tip_map.find(s.parts[i].group_number);
         if (it != tip_map.end()) s.parts[i].group_number = it->second;
@@ -998,7 +998,7 @@ public:
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
       // Enumerate the process's phaseB pool before releasing the PEs
-      // (single-threaded; pe_subtrees frozen since registration;
+      // (single-threaded; pe_treepieces frozen since registration;
       // visibility: built before the trigger messages are sent).
       // Geometry-gated build (design/phase1-scaling.md): a pair enters
       // the pool only if it can interact — the walk's own mindist test,
@@ -1116,8 +1116,8 @@ public:
         }
       }
   }
-  // One thread's stripe of the pool enumeration. Subtree pairs are taken
-  // from the flattened (thread-pair, subtree-pair) space by stride, so
+  // One thread's stripe of the pool enumeration. TreePiece pairs are taken
+  // from the flattened (thread-pair, TreePiece-pair) space by stride, so
   // every thread walks a comparable share of the geometry without any
   // coordination. Writes only its own slice.
   void buildPoolSlice() {
@@ -1125,10 +1125,10 @@ public:
     int rank = CkMyRank(), nranks = CkNodeSize(CkMyNode());
     auto& slice = nb->pool_slices[rank];
     long idx = 0;
-    for (auto ita = nb->pe_subtrees.begin(); ita != nb->pe_subtrees.end();
+    for (auto ita = nb->pe_treepieces.begin(); ita != nb->pe_treepieces.end();
          ++ita) {
       auto itb = ita;
-      for (++itb; itb != nb->pe_subtrees.end(); ++itb)
+      for (++itb; itb != nb->pe_treepieces.end(); ++itb)
         for (auto& sa : ita->second)
           for (auto& sb : itb->second)
             if ((idx++ % nranks) == rank) poolPushInto(slice, sa.root, sb.root);
@@ -1199,7 +1199,7 @@ public:
   // submitEdges, so the counts are complete when the barrier fires).
   void countFragments(const CkCallback& cb) {
     std::unordered_map<long, long> counts;
-    for (auto& s : subtrees)
+    for (auto& s : treepieces)
       for (int i = 0; i < s.n; i++) counts[s.parts[i].group_number]++;
     node_proxy.ckLocalBranch()->submitFragCounts(counts);
     this->contribute(cb);
@@ -1225,7 +1225,7 @@ public:
   void applyTipEncoding(const CkCallback& cb) {
     tips_encoded_ = true; // arms the debug same-process-edge tripwire
     int my_node = CkMyNode();
-    for (auto& s : subtrees) {
+    for (auto& s : treepieces) {
       for (int i = 0; i < s.n; i++) {
         long tip = s.parts[i].group_number;
         CkEnforce(tip >= 0 && (uint64_t)tip <= paratreet::kUF2IdxMask);
@@ -1295,7 +1295,7 @@ public:
   // stale/foreign state (ordering bug), not a UF_2 library bug.
   void verifyEncodedTips(const CkCallback& cb) {
     int my_node = CkMyNode();
-    for (auto& s : subtrees) {
+    for (auto& s : treepieces) {
       for (int i = 0; i < s.n; i++) {
         long enc = s.parts[i].group_number;
         CkEnforce(enc >= 0); // sign bit clear (43/20 split)
@@ -1341,7 +1341,7 @@ public:
   void applyUF2Labels(const CkCallback& cb) {
     auto* nb = node_proxy.ckLocalBranch();
     auto& labels = nb->uf2_labels;
-    for (auto& s : subtrees) {
+    for (auto& s : treepieces) {
       for (int i = 0; i < s.n; i++) {
         uint64_t local_id =
             (uint64_t)s.parts[i].group_number & paratreet::kUF2IdxMask;
@@ -1464,7 +1464,7 @@ public:
   double t_phaseB_maxpair = 0.0; // longest single pool-unit walk this PE ran
   long t_phaseB_units = 0;       // pool units this PE claimed (pool balance)
   // Predicted phaseA pair work from geometry alone: sum over this PE's
-  // subtrees of n^2/V (pair count within a chare ~ n * local density).
+  // TreePieces of n^2/V (pair count within a chare ~ n * local density).
   // Correlated against t_phaseA across PEs by the stats reduction — the
   // density-drives-phase1-work quantifier (Kale, 2026-07-29).
   double density_x = 0.0;
@@ -1578,14 +1578,14 @@ public:
     this->contribute(cb);
   }
 
-  // Distributed tip-sentinel check: every registered (Subtree-owned)
+  // Distributed tip-sentinel check: every registered (TreePiece-owned)
   // particle must hold a valid tip, i.e. a global particle order in
   // [0, n_total). Phase 1 writes every registered particle, so an
   // out-of-range value means some copy was never touched. Runs on each PE
   // over its own particles (no gather), so it stays affordable at any N —
   // the fof3 harness runs it in both check modes.
   void verifyTips(long n_total, const CkCallback& cb) {
-    for (auto& s : subtrees) {
+    for (auto& s : treepieces) {
       for (int i = 0; i < s.n; i++) {
         long tip = s.parts[i].group_number;
         CkEnforce(tip >= 0 && tip < n_total);
@@ -1686,7 +1686,7 @@ public:
     }();
     if (count_verify) {
       std::unordered_map<long, long> check;
-      for (auto& s : subtrees)
+      for (auto& s : treepieces)
         for (int i = 0; i < s.n; i++) check[s.parts[i].group_number]++;
       if (check != tip_counts) {
         CkPrintf("COUNT VERIFY MISMATCH pe %d: maintained %zu labels, "
@@ -1761,13 +1761,13 @@ public:
 
   // Owner-writes relabel through the global tip -> root map computed by the
   // serial UF_2 (identity if absent), same pattern as relabel(). Rewrites the
-  // registered Subtree-owned particle blocks; with matching decompositions
+  // registered TreePiece-owned particle blocks; with matching decompositions
   // the Partition target leaves alias these blocks, so they see the global
   // labels too.
   void applyGlobalMap(const std::vector<std::pair<long, long>>& map_vec,
                       const CkCallback& cb) {
     std::unordered_map<long, long> tip_map(map_vec.begin(), map_vec.end());
-    for (auto& s : subtrees) {
+    for (auto& s : treepieces) {
       for (int i = 0; i < s.n; i++) {
         auto it = tip_map.find(s.parts[i].group_number);
         if (it != tip_map.end()) s.parts[i].group_number = it->second;
@@ -1781,7 +1781,7 @@ public:
   // every particle registered on this PE.
   void collect(const CkCallback& cb) {
     std::vector<paratreet::FoFParticleRecord> recs;
-    for (auto& s : subtrees) {
+    for (auto& s : treepieces) {
       for (int i = 0; i < s.n; i++) {
         paratreet::FoFParticleRecord r;
         r.x = s.parts[i].position.x;
@@ -1885,7 +1885,7 @@ private:
   // unions stay valid with a period; residual tests use periodicDistSq.
   // Returns false when the grid would be degenerate (caller falls back to
   // the walk): key-packing overflow, or a PBC chare spanning half the box.
-  bool gridSelfUnion(const SubtreeRef& s) {
+  bool gridSelfUnion(const TreePieceRef& s) {
     const double b = std::sqrt(b2_);
     const double c = b / std::sqrt(6.0);
     const auto& box = s.root->data.box;
@@ -1986,7 +1986,7 @@ private:
   // in LAMBS halos) never advances and this loop spins (the 2026-07-23
   // LAMBS hang). Safe because the build never creates an all-empty
   // Internal: empty regions are EmptyLeaf(0) children.
-  int firstFlat(Node<Data>* n, const SubtreeRef& s) {
+  int firstFlat(Node<Data>* n, const TreePieceRef& s) {
     while (!n->isLeaf()) {
       Node<Data>* next = nullptr;
       for (int i = 0; i < n->n_children; i++) {
@@ -2016,7 +2016,7 @@ private:
   // Positive-certificate action for phaseA: unite every particle under n
   // into rep. Repeat certificates over an already-merged subtree degrade to
   // path-compressed finds (~O(1) each).
-  void uniteSubtree(Node<Data>* n, const SubtreeRef& s, int rep) {
+  void uniteSubtree(Node<Data>* n, const TreePieceRef& s, int rep) {
     if (n == nullptr || n->n_particles == 0) return;
     if (n->isLeaf()) {
       int f = s.offset + int(n->particles() - s.parts);
@@ -2043,7 +2043,7 @@ private:
   // representative" — monotone, so it never invalidates; find(rep) always
   // yields the CURRENT root even after later merges.
   std::unordered_map<Node<Data>*, int> cert_rep;
-  int certRep(Node<Data>* n, const SubtreeRef& s) {
+  int certRep(Node<Data>* n, const TreePieceRef& s) {
     auto it = cert_rep.find(n);
     if (it != cert_rep.end()) return it->second;
     int rep = firstFlat(n, s);
@@ -2060,7 +2060,7 @@ private:
   // percolates upward across successive queries as the walk revisits nodes
   // against new partners ("frequent path compression" at node granularity).
   long p1_conn_suppressed = 0; // pairs pruned by connectivity suppression
-  int connectedRep(Node<Data>* n, const SubtreeRef& s) {
+  int connectedRep(Node<Data>* n, const TreePieceRef& s) {
     auto it = cert_rep.find(n);
     if (it != cert_rep.end()) return it->second;
     // No negative memo: a FAILED check is cheap by construction — the leaf
@@ -2156,7 +2156,7 @@ private:
   // ruled out same-component pairs), a single witness merges everything —
   // return after the first hit (phase 3's uniform-leaf-pair shortcut).
   void leafLeafUnion(Node<Data>* a, Node<Data>* b,
-                     const SubtreeRef& sa, const SubtreeRef& sb) {
+                     const TreePieceRef& sa, const TreePieceRef& sb) {
     const Particle* pa = a->particles();
     const Particle* pb = b->particles();
     int fa = sa.offset + int(pa - sa.parts);
@@ -2228,7 +2228,7 @@ private:
   }
 
   CProxy_FoFPhase1Node<Data> node_proxy;
-  std::vector<SubtreeRef> subtrees;
+  std::vector<TreePieceRef> treepieces;
   // uf_parent stays int: PE-LOCAL flat indices (a single PE never holds
   // 2^31 particles). flat_order holds GLOBAL orders: 64-bit.
   std::vector<int> uf_parent;  // per-PE UF over the flat index space
@@ -2262,30 +2262,30 @@ private:
 
 namespace fof {
 
-// Subtree-registration functor, delivered to every Subtree element through
-// the core's generic Subtree::callPerSubtreeFn hook: hands the element's
+// TreePiece-registration functor, delivered to every TreePiece element through
+// the core's generic TreePiece::callPerTreePieceFn hook: hands the element's
 // local tree root and contiguous particle block to the FoFPhase1 branch on
 // the element's PE. This is the inversion that keeps the core FoF-free —
-// the core exposes subtree views to any PerSubtreeAble, and this module
+// the core exposes TreePiece views to any PerTreePieceAble, and this module
 // consumes them; the core never names an FoF type.
 template <typename Data>
-class SubtreeRegisterFn : public paratreet::PerSubtreeAble<Data> {
+class TreePieceRegisterFn : public paratreet::PerTreePieceAble<Data> {
   CProxy_FoFPhase1<Data> fof_;
 
  public:
-  SubtreeRegisterFn(void) = default;
-  explicit SubtreeRegisterFn(CProxy_FoFPhase1<Data> fof) : fof_(fof) {}
-  SubtreeRegisterFn(CkMigrateMessage* m)
-      : paratreet::PerSubtreeAble<Data>(m) {}
+  TreePieceRegisterFn(void) = default;
+  explicit TreePieceRegisterFn(CProxy_FoFPhase1<Data> fof) : fof_(fof) {}
+  TreePieceRegisterFn(CkMigrateMessage* m)
+      : paratreet::PerTreePieceAble<Data>(m) {}
 
   // Hand-expanded PUPable_decl_template: the macro's register_PUP_ID body
   // calls register_constructor unqualified, which fails here because the
   // PUP::able base is reached through a DEPENDENT base class
-  // (PerSubtreeAble<Data>) — unqualified lookup does not search dependent
+  // (PerTreePieceAble<Data>) — unqualified lookup does not search dependent
   // bases. Same contents, with the call qualified.
  private:
   static PUP::able* call_PUP_constructor(void) {
-    return new SubtreeRegisterFn<Data>((CkMigrateMessage*)0);
+    return new TreePieceRegisterFn<Data>((CkMigrateMessage*)0);
   }
   static PUP::able::PUP_ID my_PUP_ID;
 
@@ -2298,18 +2298,18 @@ class SubtreeRegisterFn : public paratreet::PerSubtreeAble<Data> {
   }
 
   virtual void pup(PUP::er& p) override {
-    paratreet::PerSubtreeAble<Data>::pup(p);
+    paratreet::PerTreePieceAble<Data>::pup(p);
     p | fof_;
   }
 
   virtual void operator()(Node<Data>* local_root, Particle* particles,
                           int n_particles) override {
-    fof_.ckLocalBranch()->registerSubtree(local_root, particles, n_particles);
+    fof_.ckLocalBranch()->registerTreePiece(local_root, particles, n_particles);
   }
 };
 
 template <typename Data>
-PUP::able::PUP_ID SubtreeRegisterFn<Data>::my_PUP_ID = 0;
+PUP::able::PUP_ID TreePieceRegisterFn<Data>::my_PUP_ID = 0;
 
 // Per-Data registration of this module's templated chares and PUPables.
 // Applications call this from an overridden __register() in their Main
@@ -2328,7 +2328,7 @@ void registerChares(void) {
                                       sizeof(FoFPhase1<Data>));
   CkIndex_FoFPhase1Node<Data>::__register(makeName("FoFPhase1Node"),
                                           sizeof(FoFPhase1Node<Data>));
-  PUPable_reg2(SubtreeRegisterFn<Data>, makeName("fof::SubtreeRegisterFn"));
+  PUPable_reg2(TreePieceRegisterFn<Data>, makeName("fof::TreePieceRegisterFn"));
 }
 
 }  // namespace fof
@@ -2353,7 +2353,7 @@ struct FoFPhase1Stages {
 // the next rebuild/reset (registered particle blocks must stay alive).
 // `stages`, if non-null, receives the per-stage wall times.
 template <typename Data>
-void runFoFPhase1(CProxy_Subtree<Data> subtrees,
+void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
                   CProxy_FoFPhase1<Data> fof,
                   CProxy_FoFPhase1Node<Data> fof_node,
                   double linking_length,
@@ -2375,9 +2375,9 @@ void runFoFPhase1(CProxy_Subtree<Data> subtrees,
   fof.setPeriod(period, CkCallbackResumeThread());
   local.reset = CkWallTimer() - t; t = CkWallTimer();
   {
-    fof::SubtreeRegisterFn<Data> reg_fn(fof);
-    subtrees.callPerSubtreeFn(
-        CkReference<paratreet::PerSubtreeAble<Data>>(reg_fn),
+    fof::TreePieceRegisterFn<Data> reg_fn(fof);
+    treepieces.callPerTreePieceFn(
+        CkReference<paratreet::PerTreePieceAble<Data>>(reg_fn),
         CkCallbackResumeThread());
   }
   local.register_s = CkWallTimer() - t;

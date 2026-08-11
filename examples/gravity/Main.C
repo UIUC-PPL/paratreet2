@@ -38,7 +38,7 @@ void ExMain::setDefaults(void) {
   // removes it from the framework parse table so its argv text reaches
   // getopt below). -o and -T collide with nothing framework-registered.
   conf.release_arg("c");
-  conf.min_n_subtrees = CkNumPes() * 8;
+  conf.min_n_treepieces = CkNumPes() * 8;
   conf.min_n_partitions = CkNumPes() * 8;
   conf.max_particles_per_leaf = 12;
   conf.decomp_type = paratreet::DecompType::eOct;
@@ -117,13 +117,13 @@ void ExMain::preTraversalFn(ProxyPack<GravityData>& proxy_pack) {
 void ExMain::traversalFn(BoundingBox& universe,
                          ProxyPack<GravityData>& proxy_pack, int iter) {
   if (single_distribution) {
-    // The subtree-driven TRANSPOSED walk: identical traverser and
-    // acceptance semantics to the default mode, driven by the Subtrees
+    // The TreePiece-driven TRANSPOSED walk: identical traverser and
+    // acceptance semantics to the default mode, driven by the TreePieces
     // (their leaves ARE the same target buckets). The dual walk is not
     // used here: its cell()/inverted-traversal contract is shaped for
     // FoF-style pure-predicate visitors, not for visitors that write
     // into target particles.
-    proxy_pack.subtree.template startDown<GravityVisitor>(
+    proxy_pack.treepiece.template startDown<GravityVisitor>(
         GravityVisitor(theta));
   } else {
     proxy_pack.partition.template startDown<GravityVisitor>(
@@ -157,7 +157,7 @@ void ExMain::runDirectSumCheck(BoundingBox& universe,
                                ProxyPack<GravityData>& proxy_pack) {
   double t0 = CkWallTimer();
   if (single_distribution)
-    proxy_pack.subtree.callPerLeafFn(
+    proxy_pack.treepiece.callPerLeafFn(
         PARATREET_PER_LEAF_FN(DepositFn, GravityData),
         CkCallbackResumeThread());
   else

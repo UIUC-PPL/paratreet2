@@ -11,7 +11,7 @@ void ThreadStateHolder::collectAndResetStats(CkCallback cb) {
 }
 
 void ThreadStateHolder::collectMetaData (const CkCallback & cb) {
-  long nParticles = (long)n_subtree_particles, nCopies = (long)n_ps_copies,
+  long nParticles = (long)n_treepiece_particles, nCopies = (long)n_ps_copies,
        nShares = (long)n_ps_shares;
   const size_t numTuples = 4;
   CkReduction::tupleElement tupleRedn[] = {

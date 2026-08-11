@@ -45,7 +45,7 @@ int CollocateMap::procNum(int, const CkArrayIndex &idx) {
 
 void Decomposition::pup(PUP::er& p) {
   PUP::able::pup(p);
-  p | is_subtree;
+  p | is_treepiece;
 }
 
 void Decomposition::setArrayOpts(CkArrayOptions& opts, const std::vector<int>& partition_locations, bool collocate) {
@@ -142,7 +142,7 @@ int SfcDecomposition::parallelFindSplitters(BoundingBox &universe, CProxy_Reader
   int n_pending = states.size();
   while (n_pending > 0) {
     CkReductionMsg *msg;
-    readers.countAssignments(states, isSubtree(), CkCallbackResumeThread((void*&)msg), false);
+    readers.countAssignments(states, isTreePiece(), CkCallbackResumeThread((void*&)msg), false);
     long* temp_counts = (long*)msg->getData();
 
     for (int i = 0; i < states.size(); i++) {
@@ -170,7 +170,7 @@ int SfcDecomposition::parallelFindSplitters(BoundingBox &universe, CProxy_Reader
   }
 
   CkReductionMsg *msg;
-  readers.countAssignments(states, isSubtree(), CkCallbackResumeThread((void*&)msg), true);
+  readers.countAssignments(states, isTreePiece(), CkCallbackResumeThread((void*&)msg), true);
   long* temp_counts = (long*)msg->getData();
   partition_idxs = {temp_counts, temp_counts + states.size()};
   delete msg;
@@ -379,7 +379,7 @@ int OctDecomposition::findSplitters(BoundingBox &universe, CProxy_Reader &reader
       states.back().start_key = Utility::removeLeadingZeros(keys.get(i), log_branch_factor);
       states.back().end_key = Utility::removeLeadingZeros(keys.get(i+1), log_branch_factor);
     }
-    readers.countAssignments(states, isSubtree(), CkCallbackResumeThread((void*&)msg), false);
+    readers.countAssignments(states, isTreePiece(), CkCallbackResumeThread((void*&)msg), false);
     long* counts = (long*)msg->getData();
     int n_counts = msg->getSize() / sizeof(long);
     // Check counts and create splitters if necessary
@@ -431,7 +431,7 @@ int OctDecomposition::findSplitters(BoundingBox &universe, CProxy_Reader &reader
       states.back().end_key = sp.to;
     }
     CkReductionMsg *msg;
-    readers.countAssignments(states, isSubtree(), CkCallbackResumeThread((void*&)msg), true);
+    readers.countAssignments(states, isTreePiece(), CkCallbackResumeThread((void*&)msg), true);
     long* counts = (long*)msg->getData();
     int n_counts = msg->getSize() / sizeof(long);
     partition_idxs = {counts, counts + n_counts};
@@ -535,7 +535,7 @@ int BinaryDecomposition::parallelFindSplitters(BoundingBox &universe, CProxy_Rea
   for (; (1 << depth) < min_n_splitters; depth++) {
     auto && level_splitters = this->sortAndGetSplitters(universe, readers);
     CkReductionMsg *msg;
-    readers.doSplit(level_splitters, isSubtree(), CkCallbackResumeThread((void*&)msg));
+    readers.doSplit(level_splitters, isTreePiece(), CkCallbackResumeThread((void*&)msg));
     int* counts = (int*)msg->getData();
     bins_sizes = std::vector<int> (counts, counts + (2 * level_splitters.size()));
     partition_idxs = std::vector<int>(counts + (2 * level_splitters.size()), counts + (4 * level_splitters.size()));
@@ -637,7 +637,7 @@ std::vector<GenericSplitter> KdDecomposition::sortAndGetSplitters(BoundingBox &u
   int n_pending = states.size();
   while (n_pending > 0) {
     CkReductionMsg *msg;
-    readers.countAssignments(states, isSubtree(), CkCallbackResumeThread((void*&)msg), false);
+    readers.countAssignments(states, isTreePiece(), CkCallbackResumeThread((void*&)msg), false);
     int* counts = (int*)msg->getData();
     for (int i = 0; i < states.size(); i++) {
       auto&& count = counts[i];
@@ -709,7 +709,7 @@ std::pair<int, Real> LongestDimDecomposition::sortAndGetSplitter(int depth, Bin&
 std::vector<GenericSplitter> LongestDimDecomposition::sortAndGetSplitters(BoundingBox &universe, CProxy_Reader &readers) {
   CkReductionMsg *msg;
   std::vector<GenericSplitter> empty;
-  readers.countAssignments(empty, isSubtree(), CkCallbackResumeThread((void*&)msg), false);
+  readers.countAssignments(empty, isTreePiece(), CkCallbackResumeThread((void*&)msg), false);
   CkReduction::tupleElement* res = nullptr;
   int numRedn = 0;
   msg->toTuple(&res, &numRedn);

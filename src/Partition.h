@@ -168,12 +168,12 @@ template <typename Visitor>
 void Partition<Data>::startDown(Visitor v)
 {
   initLocalBranches();
-  // A prior subtree-driven walk (Subtree::startDual) leaves the per-PE
-  // Resumer routing cache resumes to the subtree proxy; partition-driven
+  // A prior TreePiece-driven walk (TreePiece::startDual) leaves the per-PE
+  // Resumer routing cache resumes to the TreePiece proxy; partition-driven
   // walks must route back to partitions. Latent until an app mixed both
   // walk types in one run (fof3 -w dual does: dual phase-3 walk, then the
   // partition-driven FragCheckVisitor pass).
-  r_local->use_subtree = false;
+  r_local->use_treepiece = false;
   traversers.emplace_back(new TransposedDownTraverser<Data, Visitor>(v, traversers.size(), leaves, *this));
   startNewTraverser();
 }
@@ -250,10 +250,10 @@ void Partition<Data>::applyOpposingEffects(std::vector<std::pair<Key, Particle::
 }
 
 template <typename Data>
-void Partition<Data>::addLeaves(const std::vector<Node<Data>*>& leaf_ptrs, int subtree_idx) {
+void Partition<Data>::addLeaves(const std::vector<Node<Data>*>& leaf_ptrs, int treepiece_idx) {
   decltype(leaves) new_leaves;
   if (!matching_decomps) {
-    // When Subtree and Partition have the same decomp type
+    // When TreePiece and Partition have the same decomp type
     // the tree structures will be identical
     // reuse leaf without checks and modifications
     new_leaves.reserve(leaf_ptrs.size());
@@ -271,7 +271,7 @@ void Partition<Data>::addLeaves(const std::vector<Node<Data>*>& leaf_ptrs, int s
         auto particles = new Particle [leaf_particles.size()];
         std::copy(leaf_particles.begin(), leaf_particles.end(), particles);
         auto node = cm_local->makeNode(leaf->key, Node<Data>::Type::Leaf, leaf->depth,
-          leaf_particles.size(), particles, nullptr, subtree_idx, cm_local->thisIndex);
+          leaf_particles.size(), particles, nullptr, treepiece_idx, cm_local->thisIndex);
         // note here: cm_index is of the old home, not the new home. not sure about this
         new_leaves.push_back(node);
       }
@@ -287,28 +287,28 @@ void Partition<Data>::addLeaves(const std::vector<Node<Data>*>& leaf_ptrs, int s
 }
 
 template <typename Data>
-void Partition<Data>::receiveLeaves(std::vector<Key> leaf_keys, Key tp_key, int subtree_idx, TPHolder<Data> tp_holder) {
+void Partition<Data>::receiveLeaves(std::vector<Key> leaf_keys, Key tp_key, int treepiece_idx, TPHolder<Data> tp_holder) {
   cm_local->lockMaps();
   auto && local_tps = cm_proxy.ckLocalBranch()->local_tps;
   bool found = local_tps.find(tp_key) != local_tps.end();
   if (found) {
     cm_local->unlockMaps();
-    makeLeaves(leaf_keys, subtree_idx);
+    makeLeaves(leaf_keys, treepiece_idx);
   }
   else {
-    lookup_leaf_keys[subtree_idx] = leaf_keys;
-    auto& out = cm_local->subtree_copy_started[subtree_idx];
+    lookup_leaf_keys[treepiece_idx] = leaf_keys;
+    auto& out = cm_local->treepiece_copy_started[treepiece_idx];
     bool should_request = out.empty();
     out.push_back(this->thisIndex);
     cm_local->unlockMaps();
     if (should_request) {
-      tp_holder.proxy[subtree_idx].requestCopy(cm_local->thisIndex, this->thisProxy);
+      tp_holder.proxy[treepiece_idx].requestCopy(cm_local->thisIndex, this->thisProxy);
     }
   }
 }
 
 template <typename Data>
-void Partition<Data>::makeLeaves(const std::vector<Key>& keys, int subtree_idx) {
+void Partition<Data>::makeLeaves(const std::vector<Key>& keys, int treepiece_idx) {
   cm_local->lockMaps();
   std::vector<Node<Data>*> leaf_ptrs;
   for (auto && k : keys) {
@@ -317,13 +317,13 @@ void Partition<Data>::makeLeaves(const std::vector<Key>& keys, int subtree_idx) 
     leaf_ptrs.push_back(it->second);
   }
   cm_local->unlockMaps();
-  addLeaves(leaf_ptrs, subtree_idx);
+  addLeaves(leaf_ptrs, treepiece_idx);
 }
 
 template <typename Data>
-void Partition<Data>::makeLeaves(int subtree_idx) {
-  auto keys = lookup_leaf_keys[subtree_idx];
-  makeLeaves(keys, subtree_idx);
+void Partition<Data>::makeLeaves(int treepiece_idx) {
+  auto keys = lookup_leaf_keys[treepiece_idx];
+  makeLeaves(keys, treepiece_idx);
 }
 
 template <typename Data>
@@ -377,7 +377,7 @@ template <typename Data>
 void Partition<Data>::kick(Real timestep, CkCallback cb)
 {
   // First leapfrog half-kick, on the LIVE leaf particles (aliased with the
-  // Subtree copies under matching decomps) so the perturb step's
+  // TreePiece copies under matching decomps) so the perturb step's
   // copyParticles snapshot below carries the kicked velocities.
   for (auto && leaf : leaves) {
     leaf->kick(timestep);
@@ -445,7 +445,7 @@ void Partition<Data>::rebuild(BoundingBox universe, TPHolder<Data> tp_holder, bo
       ParticleMsg* msg = new (n_particles) ParticleMsg(particles, n_particles);
       tp_holder.proxy[dest].receive(msg);
     };
-    treespec.ckLocalBranch()->getSubtreeDecomposition()->flush(saved_particles, sendParticles);
+    treespec.ckLocalBranch()->getTreePieceDecomposition()->flush(saved_particles, sendParticles);
   }
   saved_particles.clear();
 }
@@ -528,10 +528,10 @@ void Partition<Data>::doOutput(WriterProxy w, int n_total_particles, CkCallback 
 }
 
 // Shared-leaf aliasing check: traversal target leaves must be the very
-// Subtree-owned nodes, so that target particles are the copies subtree-side
-// post-build mutations (upwardPass, callPerSubtreeFn consumers such as the
+// TreePiece-owned nodes, so that target particles are the copies TreePiece-side
+// post-build mutations (upwardPass, callPerTreePieceFn consumers such as the
 // fof module's phase-1 relabel) wrote. With matching decompositions
-// addLeaves() stores the Subtree's leaf pointers directly (no copies), which
+// addLeaves() stores the TreePiece's leaf pointers directly (no copies), which
 // this asserts by pointer identity. CkEnforce, not CkAssert: the production
 // Charm build is CMK_OPTIMIZE, which compiles CkAssert out.
 template <typename Data>

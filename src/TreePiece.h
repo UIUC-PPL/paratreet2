@@ -23,7 +23,7 @@ extern CProxy_TreeSpec treespec;
 extern CProxy_Reader readers;
 
 template <typename Data>
-class Subtree : public CBase_Subtree<Data> {
+class TreePiece : public CBase_TreePiece<Data> {
 public:
   std::vector<Particle> particles, incoming_particles;
   std::vector<Node<Data>*> leaves;
@@ -31,15 +31,15 @@ public:
   Real load;
 
   long n_total_particles; // global count: 64-bit
-  int n_subtrees;
+  int n_treepieces;
   int n_partitions;
 
   bool matching_decomps;
 
   Key tp_key; // Should be a prefix of all particle keys underneath this node
-  Node<Data>* local_root; // Root node of this Subtree, TreeCanopies sit above this node
+  Node<Data>* local_root; // Root node of this TreePiece, TreeCanopies sit above this node
   MultiData<Data> flat_subtree;
-  std::vector<int> copy_requesters; // CacheManager indices that took a flat_subtree copy
+  std::vector<int> copy_requesters; // CacheManager indices that took a flat_TreePiece copy
 
   CProxy_TreeCanopy<Data> tc_proxy;
   CProxy_CacheManager<Data> cm_proxy;
@@ -51,9 +51,9 @@ public:
 
   std::vector<Particle> flushed_particles; // For debugging
 
-  Subtree(const CkCallback&, long, int, int, TCHolder<Data>,
+  TreePiece(const CkCallback&, long, int, int, TCHolder<Data>,
           CProxy_Resumer<Data>, CProxy_CacheManager<Data>, DPHolder<Data>, bool);
-  Subtree(CkMigrateMessage * msg){
+  TreePiece(CkMigrateMessage * msg){
     delete msg;
   };
   void receive(ParticleMsg*);
@@ -78,13 +78,13 @@ public:
   void pup(PUP::er& p);
   void collectMetaData(const CkCallback & cb);
   void callPerLeafFn(paratreet::PerLeafAble<Data>&, const CkCallback&);
-  void callPerSubtreeFn(paratreet::PerSubtreeAble<Data>&, const CkCallback&);
+  void callPerTreePieceFn(paratreet::PerTreePieceAble<Data>&, const CkCallback&);
   void upwardPass(const CkCallback&);
   // Single-distribution movement (design/single-distribution-mode.md
   // phase B): the Partition-resident kick/perturb/rebuild machinery on
-  // the Subtree's OWN particle storage, used when no Partition array
+  // the TreePiece's OWN particle storage, used when no Partition array
   // exists. (Particle deletion — Partition::deleteParticleOfOrder — has
-  // no subtree-side equivalent yet; the collision-style apps that use it
+  // no TreePiece-side equivalent yet; the collision-style apps that use it
   // stay dual-distribution.)
   void kick(Real, const CkCallback&);
   void perturb(Real, const CkCallback&);
@@ -134,13 +134,13 @@ public:
 };
 
 template <typename Data>
-Subtree<Data>::Subtree(const CkCallback& cb, long n_total_particles_,
-                       int n_subtrees_, int n_partitions_, TCHolder<Data> tc_holder,
+TreePiece<Data>::TreePiece(const CkCallback& cb, long n_total_particles_,
+                       int n_treepieces_, int n_partitions_, TCHolder<Data> tc_holder,
                        CProxy_Resumer<Data> r_proxy_,
                        CProxy_CacheManager<Data> cm_proxy_, DPHolder<Data> dp_holder,
                        bool matching_decomps_){
   n_total_particles = n_total_particles_;
-  n_subtrees = n_subtrees_;
+  n_treepieces = n_treepieces_;
   n_partitions = n_partitions_;
 
   tc_proxy = tc_holder.proxy;
@@ -151,15 +151,15 @@ Subtree<Data>::Subtree(const CkCallback& cb, long n_total_particles_,
   //this->load = 0.0;
   //this->usesAutoMeasure = false;
   // Load-balancing participation: in single-distribution mode the
-  // Subtrees ARE the balanced array (Driver's LB block calls
-  // subtrees.pauseForLB). In dual mode they must NOT register for
+  // TreePieces ARE the balanced array (Driver's LB block calls
+  // treepieces.pauseForLB). In dual mode they must NOT register for
   // AtSync — the Partitions drive it and never-synching registered
-  // subtrees would stall the balancer's barrier.
+  // TreePieces would stall the balancer's barrier.
   this->usesAtSync = paratreet::getConfiguration().single_distribution;
 
   matching_decomps = matching_decomps_;
 
-  tp_key = treespec.ckLocalBranch()->getSubtreeDecomposition()->
+  tp_key = treespec.ckLocalBranch()->getTreePieceDecomposition()->
     getTpKey(this->thisIndex);
 
   // Create TreeCanopies and send proxies
@@ -177,9 +177,9 @@ Subtree<Data>::Subtree(const CkCallback& cb, long n_total_particles_,
 }
 
 template <typename Data>
-void Subtree<Data>::pup(PUP::er& p) {
+void TreePiece<Data>::pup(PUP::er& p) {
   p | n_total_particles;
-  p | n_subtrees;
+  p | n_treepieces;
   p | n_partitions;
   p | tp_key;
   p | tc_proxy;
@@ -194,7 +194,7 @@ void Subtree<Data>::pup(PUP::er& p) {
 }
 
 template <typename Data>
-void Subtree<Data>::receive(ParticleMsg* msg) {
+void TreePiece<Data>::receive(ParticleMsg* msg) {
   // Copy particles to local vector
   // TODO: Remove memcpy by just storing the pointer to msg->particles
   // and using it in tree build
@@ -206,7 +206,7 @@ void Subtree<Data>::receive(ParticleMsg* msg) {
 }
 
 template <typename Data>
-void Subtree<Data>::collectMetaData (const CkCallback & cb) {
+void TreePiece<Data>::collectMetaData (const CkCallback & cb) {
   Real maxVelocity = 0.0;
   for (auto& particle : particles){
     if (particle.velocity.lengthSquared() > maxVelocity)
@@ -225,9 +225,9 @@ void Subtree<Data>::collectMetaData (const CkCallback & cb) {
 };
 
 template <typename Data>
-void Subtree<Data>::sendLeaves(CProxy_Partition<Data> part)
+void TreePiece<Data>::sendLeaves(CProxy_Partition<Data> part)
 {
-  // When Subtree and Partition have the same decomp type
+  // When TreePiece and Partition have the same decomp type
   // there is a consistant 1-on-1 mapping
   // partical.partition_idx is ignored
   if (matching_decomps) {
@@ -236,7 +236,7 @@ void Subtree<Data>::sendLeaves(CProxy_Partition<Data> part)
     return;
   }
 
-  // When Subtree and Partition has different decomp types
+  // When TreePiece and Partition has different decomp types
   std::map<int, std::set<Node<Data>*>> part_idx_to_leaf;
   std::set<Node<Data>*> displaced_leaves, shared_leaves;
   for (auto && leaf : leaves) {
@@ -273,23 +273,23 @@ void Subtree<Data>::sendLeaves(CProxy_Partition<Data> part)
   thread_state_holder.ckLocalBranch()->countCopiesAndShares(num_copies, num_shares);
 }
 
-// Subtree-driven TRANSPOSED walk (single-distribution mode): the same
+// TreePiece-driven TRANSPOSED walk (single-distribution mode): the same
 // TransposedDownTraverser the Partitions run in dual-distribution mode,
-// with this subtree's own leaves as the target buckets — the walk
+// with this TreePiece's own leaves as the target buckets — the walk
 // semantics (and the acceptance decisions an app like gravity makes) are
 // identical, only the driving chare differs.
 template <typename Data>
 template <typename Visitor>
-void Subtree<Data>::startDown(Visitor v) {
+void TreePiece<Data>::startDown(Visitor v) {
   r_local = r_proxy.ckLocalBranch();
-  r_local->subtree_proxy = this->thisProxy;
-  r_local->use_subtree = true;
+  r_local->treepiece_proxy = this->thisProxy;
+  r_local->use_treepiece = true;
   // Same resumer/cache cross-wiring as startDual below (no Partition
   // elements exist to have done it).
   auto* cml = cm_proxy.ckLocalBranch();
   r_local->cm_local = cml;
   cml->r_proxy = r_proxy;
-  traverser.reset(new TransposedDownTraverser<Data, Visitor, Subtree<Data>>(
+  traverser.reset(new TransposedDownTraverser<Data, Visitor, TreePiece<Data>>(
       v, 0, leaves, *this));
   traverser->start();
   // Pause protocol, mirrored from Partition::startNewTraverser: the
@@ -305,15 +305,15 @@ void Subtree<Data>::startDown(Visitor v) {
 
 template <typename Data>
 template <typename Visitor>
-void Subtree<Data>::startDual(Visitor v) {
+void TreePiece<Data>::startDual(Visitor v) {
   r_local = r_proxy.ckLocalBranch();
-  r_local->subtree_proxy = this->thisProxy;
-  r_local->use_subtree = true;
+  r_local->treepiece_proxy = this->thisProxy;
+  r_local->use_treepiece = true;
   // Wire the per-PE resumer <-> cache cross-pointers the fetch/resume path
   // needs (CacheManager::process -> Resumer::process -> goDown). Dual-
   // distribution runs inherit these from Partition::initLocalBranches on
-  // every PE (Subtrees are bound to Partitions); in single-distribution
-  // mode there are no Partition elements, so the subtree-driven walk sets
+  // every PE (TreePieces are bound to Partitions); in single-distribution
+  // mode there are no Partition elements, so the TreePiece-driven walk sets
   // them itself. Idempotent — same values either way. Without cm r_proxy,
   // installs notify a NULL group proxy: no walker ever resumes and the
   // undeliverable sends stall quiescence (2-process hang, 2026-08-04).
@@ -334,7 +334,7 @@ void Subtree<Data>::startDual(Visitor v) {
 }
 
 template <typename Data>
-void Subtree<Data>::goDown(size_t travIdx) {
+void TreePiece<Data>::goDown(size_t travIdx) {
   CkAssert(travIdx == 0); // cannot handle multiple dual tree traversals yet
   traverser->resumeTrav();
   // This goDown message's walk credit (added by Resumer::process before
@@ -344,7 +344,7 @@ void Subtree<Data>::goDown(size_t travIdx) {
 
 // Mirror of Partition::resumeAfterPause (see the note in startDown).
 template <typename Data>
-void Subtree<Data>::resumeAfterPause(size_t travIdx) {
+void TreePiece<Data>::resumeAfterPause(size_t travIdx) {
   traverser->resumeAfterPause();
   if (traverser->wantsPause()) {
     this->thisProxy[this->thisIndex].resumeAfterPause(travIdx);
@@ -352,7 +352,7 @@ void Subtree<Data>::resumeAfterPause(size_t travIdx) {
 }
 
 template <typename Data>
-void Subtree<Data>::addNodeToFlatSubtree(Node<Data>* node) {
+void TreePiece<Data>::addNodeToFlatSubtree(Node<Data>* node) {
   SpatialNode<Data> sn (*node);
   flat_subtree.nodes.emplace_back(node->key, sn);
   for (int i = 0; i < node->n_children; i++) {
@@ -361,17 +361,17 @@ void Subtree<Data>::addNodeToFlatSubtree(Node<Data>* node) {
 }
 
 template <typename Data>
-void Subtree<Data>::requestCopy(int cm_index, PPHolder<Data> pp_holder) {
+void TreePiece<Data>::requestCopy(int cm_index, PPHolder<Data> pp_holder) {
   if (flat_subtree.nodes.empty()) addNodeToFlatSubtree(local_root);
-  // Record which remote CacheManagers hold a copy of this subtree, so a later
-  // post-build mutation (Subtree::callPerLeafFn) can be pushed to them via
+  // Record which remote CacheManagers hold a copy of this TreePiece, so a later
+  // post-build mutation (TreePiece::callPerLeafFn) can be pushed to them via
   // refreshCopies(). flat_subtree is a build-time snapshot shipped here BEFORE
   // any mutation, so without that push the remote copies stay stale.
   copy_requesters.push_back(cm_index);
-  cm_proxy[cm_index].receiveSubtree(flat_subtree, pp_holder);
+  cm_proxy[cm_index].receiveTreePiece(flat_subtree, pp_holder);
 }
 
-// Push this subtree's refreshed state to every remote CacheManager that
+// Push this TreePiece's refreshed state to every remote CacheManager that
 // requested a copy of it. Those copies were shipped as a build-time
 // flat_subtree snapshot (see requestCopy) and are promoted into the remote
 // CacheManager's local_tps/leaf_lookup, so a down-traversal reads them as
@@ -385,40 +385,40 @@ void Subtree<Data>::requestCopy(int cm_index, PPHolder<Data> pp_holder) {
 // where remote source leaves are fetched live via
 // CacheManager::serviceRequest).
 //
-// CONCURRENCY: refreshSubtreeCopy mutates cached node payload that traversals
+// CONCURRENCY: refreshTreePieceCopy mutates cached node payload that traversals
 // read locklessly (see its comment in CacheManager.h). The caller MUST run
 // this in a mutation phase quiescence-separated from the down-traversal, and
 // MUST CkWaitQD after it (this method's callback fires when the push messages
 // are SENT, not processed) so the in-place updates land before any traversal
 // read. See examples/annotate preTraversalFn.
 template <typename Data>
-void Subtree<Data>::refreshCopies(const CkCallback& cb) {
+void TreePiece<Data>::refreshCopies(const CkCallback& cb) {
   if (!copy_requesters.empty()) {
     flat_subtree.setParticles(particles); // mutated particle data (converted to CachedParticle)
     flat_subtree.nodes.clear();
     addNodeToFlatSubtree(local_root);     // post-upwardPass node annotations
     for (int cm_index : copy_requesters) {
-      cm_proxy[cm_index].refreshSubtreeCopy(flat_subtree);
+      cm_proxy[cm_index].refreshTreePieceCopy(flat_subtree);
     }
   }
   this->contribute(cb);
 }
 
 template <typename Data>
-typename Node<Data>::Type Subtree<Data>::getType(size_t num_particles, size_t max_particles_per_leaf) const {
+typename Node<Data>::Type TreePiece<Data>::getType(size_t num_particles, size_t max_particles_per_leaf) const {
   if (num_particles == 0) return Node<Data>::Type::EmptyLeaf;
   else if (num_particles <= max_particles_per_leaf) return Node<Data>::Type::Leaf;
   return Node<Data>::Type::Internal;
 }
 
 template <typename Data>
-void Subtree<Data>::handlePossibleLeaf(Node<Data>* node) {
+void TreePiece<Data>::handlePossibleLeaf(Node<Data>* node) {
   if (node->type == Node<Data>::Type::EmptyLeaf) empty_leaves.push_back(node);
   else if (node->type == Node<Data>::Type::Leaf) leaves.push_back(node);
 }
 
 template <typename Data>
-void Subtree<Data>::buildTree(CProxy_Partition<Data> part, CkCallback cb) {
+void TreePiece<Data>::buildTree(CProxy_Partition<Data> part, CkCallback cb) {
   // Copy over received particles
   std::swap(particles, incoming_particles);
 
@@ -448,17 +448,17 @@ void Subtree<Data>::buildTree(CProxy_Partition<Data> part, CkCallback cb) {
 
   // Populate the tree structure (including TreeCanopy)
   populateTree();
-  thread_state_holder.ckLocalBranch()->countSubtreeParticles(particles.size());
+  thread_state_holder.ckLocalBranch()->countTreePieceParticles(particles.size());
   initCache();
 
   this->contribute(cb);
   // Single-distribution mode has no Partition array to feed (part is a
-  // null proxy); traversal targets are this subtree's own leaves.
+  // null proxy); traversal targets are this TreePiece's own leaves.
   if (!paratreet::getConfiguration().single_distribution) sendLeaves(part);
 }
 
 template <typename Data>
-void Subtree<Data>::recursiveBuild(Node<Data>* node, Particle* node_particles, size_t node_n_particles, size_t log_branch_factor) {
+void TreePiece<Data>::recursiveBuild(Node<Data>* node, Particle* node_particles, size_t node_n_particles, size_t log_branch_factor) {
 #if DEBUG
   CkPrintf("[Level %d] created node 0x%" PRIx64 " with %d particles\n",
       node->depth, node->key, node_n_particles);
@@ -496,7 +496,7 @@ void Subtree<Data>::recursiveBuild(Node<Data>* node, Particle* node_particles, s
 }
 
 template <typename Data>
-void Subtree<Data>::populateTree() {
+void TreePiece<Data>::populateTree() {
   // Populates the global tree structure by going up the tree
   std::queue<Node<Data>*> going_up;
 
@@ -514,7 +514,7 @@ void Subtree<Data>::populateTree() {
     going_up.pop();
     CkAssert(node);
     if (node->key == tp_key) {
-      // We are at the root of the Subtree, send accumulated data to
+      // We are at the root of the TreePiece, send accumulated data to
       // parent TreeCanopy
       Key tc_key = tp_key / branch_factor;
       if (tc_key > 0) tc_proxy[tc_key].recvData(*node, branch_factor);
@@ -531,14 +531,14 @@ void Subtree<Data>::populateTree() {
 }
 
 // Recompute node Data bottom-up over the already-built local tree, then
-// re-propagate the subtree root's Data to the TreeCanopy above. For use
+// re-propagate the TreePiece root's Data to the TreeCanopy above. For use
 // after a phase that modifies per-particle state (e.g. FoF fragment
 // assignment): the tree structure is unchanged, only annotations refresh.
 // Contract: run this before any traversal that reads the new annotations
 // issues remote fetches; cached copies shipped in earlier traversals are
 // not invalidated by this pass.
 template <typename Data>
-void Subtree<Data>::upwardPass(const CkCallback& cb) {
+void TreePiece<Data>::upwardPass(const CkCallback& cb) {
   recomputeData(local_root);
   auto branch_factor = paratreet::getConfiguration().branchFactor();
   Key tc_key = tp_key / branch_factor;
@@ -547,7 +547,7 @@ void Subtree<Data>::upwardPass(const CkCallback& cb) {
 }
 
 template <typename Data>
-void Subtree<Data>::recomputeData(Node<Data>* node) {
+void TreePiece<Data>::recomputeData(Node<Data>* node) {
   if (node->isLeaf()) {
     node->data = Data(node->particles(), node->n_particles, node->depth);
     return;
@@ -560,23 +560,23 @@ void Subtree<Data>::recomputeData(Node<Data>* node) {
   }
 }
 
-// First leapfrog half-kick on this subtree's leaves (the single-
+// First leapfrog half-kick on this TreePiece's leaves (the single-
 // distribution twin of Partition::kick; under matching decompositions the
 // leaves are the same objects either way).
 template <typename Data>
-void Subtree<Data>::kick(Real timestep, const CkCallback& cb) {
+void TreePiece<Data>::kick(Real timestep, const CkCallback& cb) {
   for (auto && leaf : leaves) {
     leaf->kick(timestep);
   }
   this->contribute(cb);
 }
 
-// Second leapfrog half-kick + drift on this subtree's owned particles,
+// Second leapfrog half-kick + drift on this TreePiece's owned particles,
 // contributing the moved bounding box (the single-distribution twin of
 // Partition::perturb, minus the deletion filter and the per-element load
 // user data — see the declaration comment).
 template <typename Data>
-void Subtree<Data>::perturb(Real timestep, const CkCallback& cb) {
+void TreePiece<Data>::perturb(Real timestep, const CkCallback& cb) {
   BoundingBox box;
   for (auto && p : particles) {
     p.perturb(timestep);
@@ -595,13 +595,13 @@ void Subtree<Data>::perturb(Real timestep, const CkCallback& cb) {
 // Partition::rebuild): adjustNewUniverse re-generates each particle's key
 // against the driver's re-made universe, then either every particle goes
 // back to the Readers for a full re-sorting decomposition (if_flush) or
-// straight to the subtree whose key range now contains it, through the
+// straight to the TreePiece whose key range now contains it, through the
 // EXISTING splitters. Receivers append to incoming_particles (receive),
 // which the next buildTree swaps in — and which pup ships if load
 // balancing migrates this element afterwards (same safety argument as the
 // Partition path: the live tree is rebuilt from scratch every iteration).
 template <typename Data>
-void Subtree<Data>::rebucket(BoundingBox universe, bool if_flush) {
+void TreePiece<Data>::rebucket(BoundingBox universe, bool if_flush) {
   thread_state_holder.ckLocalBranch()->countPartitionParticles(particles.size());
   for (auto && p : particles) {
     p.adjustNewUniverse(universe.box);
@@ -616,30 +616,30 @@ void Subtree<Data>::rebucket(BoundingBox universe, bool if_flush) {
       ParticleMsg* msg = new (n_particles) ParticleMsg(parts, n_particles);
       this->thisProxy[dest].receive(msg);
     };
-    treespec.ckLocalBranch()->getSubtreeDecomposition()->flush(particles, sendParticles);
+    treespec.ckLocalBranch()->getTreePieceDecomposition()->flush(particles, sendParticles);
   }
   particles.clear();
 }
 
-// Generic subtree-level hook (see paratreet::PerSubtreeAble): applies fn once
-// per Subtree element, handing it the element's local tree root and its
+// Generic TreePiece-level hook (see paratreet::PerTreePieceAble): applies fn once
+// per TreePiece element, handing it the element's local tree root and its
 // contiguous particle block. The block (particles.data()) is stable from the
 // end of tree build until the next rebuild/reset; a consumer that retains the
 // pointers must finish inside that window. Elements with no local tree or no
 // particles contribute without calling fn.
 template <typename Data>
-void Subtree<Data>::callPerSubtreeFn(paratreet::PerSubtreeAble<Data>& fn, const CkCallback& cb) {
+void TreePiece<Data>::callPerTreePieceFn(paratreet::PerTreePieceAble<Data>& fn, const CkCallback& cb) {
   if (local_root != nullptr && !particles.empty()) {
     fn(local_root, particles.data(), (int)particles.size());
   }
   this->contribute(cb);
 }
 
-// Subtree-side analogue of Partition::callPerLeafFn: applies fn to the
-// subtree's own particle copies (the ones traversals fetch through the
+// TreePiece-side analogue of Partition::callPerLeafFn: applies fn to the
+// TreePiece's own particle copies (the ones traversals fetch through the
 // cache), not the partition copies. The Partition* argument is null.
 template <typename Data>
-void Subtree<Data>::callPerLeafFn(paratreet::PerLeafAble<Data>& fn, const CkCallback& cb) {
+void TreePiece<Data>::callPerLeafFn(paratreet::PerLeafAble<Data>& fn, const CkCallback& cb) {
   for (auto && leaf : leaves) {
     fn(*leaf, nullptr);
   }
@@ -647,12 +647,12 @@ void Subtree<Data>::callPerLeafFn(paratreet::PerLeafAble<Data>& fn, const CkCall
 }
 
 template <typename Data>
-void Subtree<Data>::initCache() {
+void TreePiece<Data>::initCache() {
   cm_proxy.ckLocalBranch()->connect(local_root);
 }
 
 template <typename Data>
-void Subtree<Data>::requestNodes(Key key, int cm_index) {
+void TreePiece<Data>::requestNodes(Key key, int cm_index) {
   if (cm_index == cm_proxy.ckLocalBranch()->thisIndex) return;
   Node<Data>* node = local_root->getDescendant(key);
   if (!node) CkPrintf("null found for key %lu on tp %d\n", key, this->thisIndex);
@@ -660,20 +660,20 @@ void Subtree<Data>::requestNodes(Key key, int cm_index) {
 }
 
 template <typename Data>
-void Subtree<Data>::reset() {
+void TreePiece<Data>::reset() {
   particles.clear();
   flat_subtree.clear();
   copy_requesters.clear();
 }
 
 template <typename Data>
-void Subtree<Data>::destroy() {
+void TreePiece<Data>::destroy() {
   reset();
   this->thisProxy[this->thisIndex].ckDestroy();
 }
 
 template <typename Data>
-void Subtree<Data>::print(Node<Data>* node) {
+void TreePiece<Data>::print(Node<Data>* node) {
   ostringstream oss;
   oss << "tree." << this->thisIndex << ".dot";
   ofstream out(oss.str().c_str());

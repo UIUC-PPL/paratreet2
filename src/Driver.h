@@ -22,7 +22,7 @@
 #include "Modularization.h"
 #include "Node.h"
 #include "Writer.h"
-#include "Subtree.h"
+#include "TreePiece.h"
 
 extern CProxy_Reader readers;
 extern CProxy_TreeSpec treespec;
@@ -37,9 +37,9 @@ public:
   std::vector<std::pair<Key, SpatialNode<Data>>> storage;
   bool storage_sorted;
   BoundingBox universe;
-  CProxy_Subtree<Data> subtrees; // Cannot be a global readonly variable
+  CProxy_TreePiece<Data> treepieces; // Cannot be a global readonly variable
   CProxy_Partition<Data> partitions;
-  int n_subtrees;
+  int n_treepieces;
   int n_partitions;
   double start_time;
   std::vector<int> partition_locations;
@@ -50,7 +50,7 @@ public:
   // Performs initial decomposition
   void init(const CkCallback& cb, const paratreet::Configuration& cfg) {
     // TreeCanopy has no initial elements and relies entirely on demand
-    // creation later during tree traversal, so unlike Subtree/Partition
+    // creation later during tree traversal, so unlike TreePiece/Partition
     // (whose ckNew() below is synchronized via a completion callback), its
     // creation in paratreet::initialize() has nothing to wait on. CkWaitQD()
     // was tried here but hangs on this reconverse runtime even once the
@@ -95,7 +95,7 @@ public:
      partition_locations[partition_idx] = home_pe;
   }
 
-  // Performs decomposition by distributing particles among Subtrees,
+  // Performs decomposition by distributing particles among TreePieces,
   // by either loading particle information from input file or re-computing
   // the universal bounding box
   void decompose(int iter) {
@@ -117,8 +117,8 @@ public:
       universe = *((BoundingBox*)result->getData());
       delete result;
       remakeUniverse();
-      if (config.min_n_subtrees < CkNumPes() || config.min_n_partitions < CkNumPes()) {
-        CkPrintf("WARNING: Consider increasing min_n_subtrees and min_n_partitions to at least #pes\n");
+      if (config.min_n_treepieces < CkNumPes() || config.min_n_partitions < CkNumPes()) {
+        CkPrintf("WARNING: Consider increasing min_n_treepieces and min_n_partitions to at least #pes\n");
       }
       // Assign keys and sort particles locally
       start_time = CkWallTimer();
@@ -127,11 +127,11 @@ public:
         (CkWallTimer() - start_time) * 1000);
     } else CkWaitQD();
 
-    bool matching_decomps = config.decomp_type == paratreet::subtreeDecompForTree(config.tree_type);
+    bool matching_decomps = config.decomp_type == paratreet::treepieceDecompForTree(config.tree_type);
     // Single-distribution mode (design/single-distribution-mode.md): no
     // Partition array at all. One splitter computation (below, shared with
     // the dual-distribution matching path), no partition assignment pass,
-    // Subtrees placed by their own decomposition map instead of bindTo.
+    // TreePieces placed by their own decomposition map instead of bindTo.
     // Restrictions enforced here; the movement machinery (kick/perturb/
     // rebuild) is Partition-resident, so moving apps stay dual for now.
     bool single = config.single_distribution;
@@ -149,37 +149,37 @@ public:
 
     if (single) {
       // No Partition array: reuse the splitters just computed as the
-      // subtree decomposition (the matching-decomps identity), create
-      // Subtrees on their own decomposition map, and flush particles
+      // TreePiece decomposition (the matching-decomps identity), create
+      // TreePieces on their own decomposition map, and flush particles
       // straight to them. partitions stays a null proxy; ProxyPack
       // carries it as such and single-mode apps must not use it.
-      n_subtrees = n_partitions;
+      n_treepieces = n_partitions;
       treespec.receiveDecomposition(CkCallbackResumeThread(),
         CkPointer<Decomposition>(treespec.ckLocalBranch()->getPartitionDecomposition()), true);
 
       start_time = CkWallTimer();
-      CkArrayOptions subtree_opts(n_subtrees);
-      treespec.ckLocalBranch()->getSubtreeDecomposition()->setArrayOpts(subtree_opts, {}, false);
+      CkArrayOptions treepiece_opts(n_treepieces);
+      treespec.ckLocalBranch()->getTreePieceDecomposition()->setArrayOpts(treepiece_opts, {}, false);
       // Same map-creation ordering hazard as the dual-distribution path
       // below (see that comment): declare the fresh map as a user group
       // dependency of the array creation.
       CkEntryOptions sub_dep_opts;
-      if (!subtree_opts.getMap().isZero())
-        sub_dep_opts.setGroupDepID(subtree_opts.getMap());
-      subtrees = CProxy_Subtree<Data>::ckNew(
+      if (!treepiece_opts.getMap().isZero())
+        sub_dep_opts.setGroupDepID(treepiece_opts.getMap());
+      treepieces = CProxy_TreePiece<Data>::ckNew(
         CkCallbackResumeThread(),
-        universe.n_particles, n_subtrees, n_partitions,
+        universe.n_particles, n_treepieces, n_partitions,
         calculator, resumer,
-        cache_manager, this->thisProxy, matching_decomps, subtree_opts,
+        cache_manager, this->thisProxy, matching_decomps, treepiece_opts,
         &sub_dep_opts
         );
-      CkPrintf("Created %d Subtrees (single distribution): %.3lf ms\n",
-          n_subtrees, (CkWallTimer() - start_time) * 1000);
+      CkPrintf("Created %d TreePieces (single distribution): %.3lf ms\n",
+          n_treepieces, (CkWallTimer() - start_time) * 1000);
 
       start_time = CkWallTimer();
-      readers.flush(n_subtrees, subtrees);
+      readers.flush(n_treepieces, treepieces);
       CkStartQD(CkCallbackResumeThread());
-      CkPrintf("Flushing particles to Subtrees: %.3lf ms\n",
+      CkPrintf("Flushing particles to TreePieces: %.3lf ms\n",
           (CkWallTimer() - start_time) * 1000);
       CkPrintf("**Total Decomposition time: %.3lf ms\n",
           (CkWallTimer() - decomp_time) * 1000);
@@ -238,45 +238,45 @@ public:
 
     start_time = CkWallTimer();
     if (matching_decomps) {
-      n_subtrees = n_partitions;
-      CkPrintf("Using same decomposition for subtrees and partitions\n");
+      n_treepieces = n_partitions;
+      CkPrintf("Using same decomposition for TreePieces and Partitions\n");
       treespec.receiveDecomposition(CkCallbackResumeThread(),
         CkPointer<Decomposition>(treespec.ckLocalBranch()->getPartitionDecomposition()), true);
     }
     else {
-      n_subtrees = treespec.ckLocalBranch()->getSubtreeDecomposition()->findSplitters(universe, readers, config.min_n_subtrees);
+      n_treepieces = treespec.ckLocalBranch()->getTreePieceDecomposition()->findSplitters(universe, readers, config.min_n_treepieces);
       treespec.receiveDecomposition(CkCallbackResumeThread(),
-        CkPointer<Decomposition>(treespec.ckLocalBranch()->getSubtreeDecomposition()), true);
-      CkPrintf("Setting up splitters for subtree decompositions: %.3lf ms\n",
+        CkPointer<Decomposition>(treespec.ckLocalBranch()->getTreePieceDecomposition()), true);
+      CkPrintf("Setting up splitters for TreePiece decompositions: %.3lf ms\n",
           (CkWallTimer() - start_time) * 1000);
     }
 
-    // Create Subtrees
+    // Create TreePieces
     start_time = CkWallTimer();
-    CkArrayOptions subtree_opts(n_subtrees);
-    if (matching_decomps) subtree_opts.bindTo(partitions);
-    treespec.ckLocalBranch()->getSubtreeDecomposition()->setArrayOpts(subtree_opts, partition_locations, !matching_decomps);
+    CkArrayOptions treepiece_opts(n_treepieces);
+    if (matching_decomps) treepiece_opts.bindTo(partitions);
+    treespec.ckLocalBranch()->getTreePieceDecomposition()->setArrayOpts(treepiece_opts, partition_locations, !matching_decomps);
     // Same map dependency as for Partitions above — and THIS is the
     // exposed site: bindTo(partitions) + the fresh DecompArrayMap from
     // setArrayOpts is exactly the unprotected combination (see the
     // comment at the Partition creation).
     CkEntryOptions sub_dep_opts;
-    if (!subtree_opts.getMap().isZero())
-      sub_dep_opts.setGroupDepID(subtree_opts.getMap());
-    subtrees = CProxy_Subtree<Data>::ckNew(
+    if (!treepiece_opts.getMap().isZero())
+      sub_dep_opts.setGroupDepID(treepiece_opts.getMap());
+    treepieces = CProxy_TreePiece<Data>::ckNew(
       CkCallbackResumeThread(),
-      universe.n_particles, n_subtrees, n_partitions,
+      universe.n_particles, n_treepieces, n_partitions,
       calculator, resumer,
-      cache_manager, this->thisProxy, matching_decomps, subtree_opts,
+      cache_manager, this->thisProxy, matching_decomps, treepiece_opts,
       &sub_dep_opts
       );
-    CkPrintf("Created %d Subtrees: %.3lf ms\n", n_subtrees,
+    CkPrintf("Created %d TreePieces: %.3lf ms\n", n_treepieces,
         (CkWallTimer() - start_time) * 1000);
 
     start_time = CkWallTimer();
-    readers.flush(n_subtrees, subtrees);
+    readers.flush(n_treepieces, treepieces);
     CkStartQD(CkCallbackResumeThread());
-    CkPrintf("Flushing particles to Subtrees: %.3lf ms\n",
+    CkPrintf("Flushing particles to TreePieces: %.3lf ms\n",
         (CkWallTimer() - start_time) * 1000);
     CkPrintf("**Total Decomposition time: %.3lf ms\n",
         (CkWallTimer() - decomp_time) * 1000);
@@ -290,24 +290,24 @@ public:
     for (int iter = 0; iter < config.num_iterations; iter++) {
       CkPrintf("\n* Iteration %d\n", iter);
       double iter_start_time = CkWallTimer();
-      // Start tree build in Subtrees
+      // Start tree build in TreePieces
       start_time = CkWallTimer();
       CkCallback timeCb (CkReductionTarget(Driver<Data>, reportTime), this->thisProxy);
-      subtrees.buildTree(partitions, timeCb);
+      treepieces.buildTree(partitions, timeCb);
       CkWaitQD();
       CkPrintf("Tree build and sending leaves: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
 
       // Meta data collections, first for max velo
       CkReductionMsg * msg, *msg2;
-      subtrees.collectMetaData(CkCallbackResumeThread((void *&) msg));
-      // Parse Subtree reduction message
+      treepieces.collectMetaData(CkCallbackResumeThread((void *&) msg));
+      // Parse TreePiece reduction message
       int numRedn = 0, numRedn2 = 0;
       CkReduction::tupleElement* res = nullptr, *res2 = nullptr;
       msg->toTuple(&res, &numRedn);
       Real max_velocity = *(Real*)(res[0].data); // avoid max_velocity = 0.0
       Real timestep_size = paratreet::getTimestep(universe, max_velocity);
 
-      ProxyPack<Data> proxy_pack (this->thisProxy, subtrees, partitions, cache_manager);
+      ProxyPack<Data> proxy_pack (this->thisProxy, treepieces, partitions, cache_manager);
 
       // Prefetch into cache
       start_time = CkWallTimer();
@@ -342,7 +342,7 @@ public:
       if (config.perturb_particles) {
         // Move the particles: first leapfrog half-kick, on whichever array
         // owns the traversal targets in this mode.
-        if (single_iter) subtrees.kick(timestep_size, CkCallbackResumeThread());
+        if (single_iter) treepieces.kick(timestep_size, CkCallbackResumeThread());
         else partitions.kick(timestep_size, CkCallbackResumeThread());
 
         // Now track PE imbalance for memory reasons
@@ -361,28 +361,28 @@ public:
             (iter % config.flush_period == config.flush_period - 1);
 
         if (iter + 1 == config.num_iterations) complete_rebuild = false;
-        CkPrintf("[Meta] n_subtree = %d; timestep_size = %f; numPSParticleCopies = %ld; numPSParticleShares = %ld; sumPESize = %ld; maxPESize = %ld, avgPESize = %f; ratio = %f; maxVelocity = %f; rebuild = %s\n", n_subtrees, timestep_size, numParticleCopies, numParticleShares, sumPESize, maxPESize, avgPESize, ratio, max_velocity, (complete_rebuild? "yes" : "no"));
+        CkPrintf("[Meta] n_treepiece = %d; timestep_size = %f; numPSParticleCopies = %ld; numPSParticleShares = %ld; sumPESize = %ld; maxPESize = %ld, avgPESize = %f; ratio = %f; maxVelocity = %f; rebuild = %s\n", n_treepieces, timestep_size, numParticleCopies, numParticleShares, sumPESize, maxPESize, avgPESize, ratio, max_velocity, (complete_rebuild? "yes" : "no"));
       }
-      //End Subtree reduction message parsing
+      //End TreePiece reduction message parsing
 
       paratreet::postIterationFn(universe, proxy_pack, iter);
 
       if (config.perturb_particles) {
         CkReductionMsg* result;
-        if (single_iter) subtrees.perturb(timestep_size, CkCallbackResumeThread((void *&)result));
+        if (single_iter) treepieces.perturb(timestep_size, CkCallbackResumeThread((void *&)result));
         else partitions.perturb(timestep_size, CkCallbackResumeThread((void *&)result));
 
         universe = *((BoundingBox*)result->getData());
         delete result;
         remakeUniverse();
-        if (single_iter) subtrees.rebucket(universe, complete_rebuild);
-        else partitions.rebuild(universe, subtrees, complete_rebuild); // 0.1s for example
+        if (single_iter) treepieces.rebucket(universe, complete_rebuild);
+        else partitions.rebuild(universe, treepieces, complete_rebuild); // 0.1s for example
 
         CkWaitQD();
         CkPrintf("Perturbations: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
       }
-      // Load balancing: Partitions drive it in dual mode, Subtrees in
-      // single mode (phase B — Subtree registers for AtSync only in
+      // Load balancing: Partitions drive it in dual mode, TreePieces in
+      // single mode (phase B — TreePiece registers for AtSync only in
       // single mode, and its pup ships incoming_particles, which the
       // rebucket above just filled: exactly the state the next build
       // needs).
@@ -390,21 +390,21 @@ public:
       if (!complete_rebuild && config.lb_period > 0 && iter % config.lb_period == config.lb_period - 1 && iter != config.num_iterations - 1) {
         start_time = CkWallTimer();
         CkPrintf("Starting load balancing...\n");
-        if (single) subtrees.pauseForLB();
+        if (single) treepieces.pauseForLB();
         else partitions.pauseForLB();
         CkWaitQD();
         CkPrintf("Load balancing: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
       }
-      // Destroy subtrees and perform decomposition from scratch
+      // Destroy TreePieces and perform decomposition from scratch
       resumer.reset();
       if (complete_rebuild) {
         treespec.reset();
-        subtrees.destroy();
+        treepieces.destroy();
         if (!single) partitions.destroy();
         decompose(iter+1);
       } else {
         if (!single) partitions.reset();
-        subtrees.reset();
+        treepieces.reset();
       }
 
       // Clear cache and other storages used in this iteration
@@ -438,7 +438,7 @@ public:
 
   void recvTC(std::pair<Key, SpatialNode<Data>> param) {
     storage.emplace_back(param);
-    // A later annotation round (Subtree::upwardPass) may re-send canopies
+    // A later annotation round (TreePiece::upwardPass) may re-send canopies
     // after a loadCache already sorted; force a re-sort (and keep-newest
     // dedup, see sortStorage) before the next ship.
     storage_sorted = false;
@@ -466,7 +466,7 @@ public:
   void sortStorage() {
     auto comp = [] (const std::pair<Key, SpatialNode<Data>>& a, const std::pair<Key, SpatialNode<Data>>& b) {return a.first < b.first;};
     // stable_sort + keep-newest dedup: TreeCanopy re-sends every canopy on
-    // each accumulation round (initial build, then each Subtree::upwardPass),
+    // each accumulation round (initial build, then each TreePiece::upwardPass),
     // and recvTC appends, so storage can hold several generations per key.
     // Later arrivals supersede earlier ones (e.g. post-FoF-phase-1 FragData
     // vs build-time garbage); an unstable sort would ship an arbitrary

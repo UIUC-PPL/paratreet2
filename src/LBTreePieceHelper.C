@@ -1,15 +1,15 @@
-void DistributedPrefixLB::subtreeLBInits(){
-  subtree_migrate_out_ct = std::vector<int> (CkNumPes(), 0);
-  total_subtree_migrates = 0;
+void DistributedPrefixLB::treepieceLBInits(){
+  treepiece_migrate_out_ct = std::vector<int> (CkNumPes(), 0);
+  total_treepiece_migrates = 0;
   broadcastLocalPartitionCentroids();
 }
 
-void DistributedPrefixLB::subtreeLBCleanUp(){
+void DistributedPrefixLB::treepieceLBCleanUp(){
   global_partition_centroids.clear();
-  subtree_migrate_out_ct.clear();
+  treepiece_migrate_out_ct.clear();
   local_partition_centroids.clear();
-  recv_incoming_subtree_counts = 1;
-  incoming_subtree_migrations = 0;
+  recv_incoming_treepiece_counts = 1;
+  incoming_treepiece_migrations = 0;
   recv_pe_centroids_ct = 0;
 }
 
@@ -21,7 +21,7 @@ void DistributedPrefixLB::sendPEParitionCentroids(int sender_pe, std::vector<Vec
   }
   recv_pe_centroids_ct ++;
   if(recv_pe_centroids_ct == CkNumPes()){
-    makeSubtreeMoves();
+    makeTreePieceMoves();
   }
 }
 
@@ -31,46 +31,46 @@ void DistributedPrefixLB::broadcastLocalPartitionCentroids(){
   }
 }
 
-void DistributedPrefixLB::sendSubtreeMigrationDecisions(int count){
-    incoming_subtree_migrations += count;
-    recv_incoming_subtree_counts += 1;
+void DistributedPrefixLB::sendTreePieceMigrationDecisions(int count){
+    incoming_treepiece_migrations += count;
+    recv_incoming_treepiece_counts += 1;
     if (_lb_args.debug() >= 3)
-      CkPrintf("PE[%d] recived decisions from %d PEs, incoming_subtree_migrations = %d\n", my_pe, recv_incoming_subtree_counts, incoming_subtree_migrations);
-    if (recv_incoming_subtree_counts == CkNumPes()){
-      migrates_expected = incoming_subtree_migrations;
+      CkPrintf("PE[%d] recived decisions from %d PEs, incoming_treepiece_migrations = %d\n", my_pe, recv_incoming_treepiece_counts, incoming_treepiece_migrations);
+    if (recv_incoming_treepiece_counts == CkNumPes()){
+      migrates_expected = incoming_treepiece_migrations;
       if (_lb_args.debug() >= 1)
-        CkPrintf("PE[%d] migrates_expected = %d; migrate_out = %d; total_obj = %d\n", my_pe, migrates_expected, total_subtree_migrates, st_ct);
-      PackAndMakeMigrateMsgs(total_subtree_migrates, st_ct);
+        CkPrintf("PE[%d] migrates_expected = %d; migrate_out = %d; total_obj = %d\n", my_pe, migrates_expected, total_treepiece_migrates, st_ct);
+      PackAndMakeMigrateMsgs(total_treepiece_migrates, st_ct);
     }
 }
 
-void DistributedPrefixLB::makeSubtreeMoves(){
+void DistributedPrefixLB::makeTreePieceMoves(){
   for (LBCompareStats & oStat : st_obj_map){
     int to_pe = calculateTargetPE(oStat.centroid, oStat.partical_size);
     if (my_pe != to_pe){
-      total_subtree_migrates ++;
-      if (total_subtree_migrates == st_ct){
-        subtree_migrate_out_ct[my_pe] ++;
-        total_subtree_migrates --;
+      total_treepiece_migrates ++;
+      if (total_treepiece_migrates == st_ct){
+        treepiece_migrate_out_ct[my_pe] ++;
+        total_treepiece_migrates --;
         continue;
       }
-      subtree_migrate_out_ct[to_pe] ++;
+      treepiece_migrate_out_ct[to_pe] ++;
       MigrateInfo * move = new MigrateInfo;
       move->obj = oStat.data_ptr->handle;
       move->from_pe = my_pe;
       move->to_pe = to_pe;
       migrate_records.push_back(move);
     }else{
-      subtree_migrate_out_ct[my_pe] ++;
+      treepiece_migrate_out_ct[my_pe] ++;
     }
   }
   if (_lb_args.debug() >= 2)
     CkPrintf("PE[%d] start to broadcast decisions\n");
 
-  // broadcast subtree migrate decisions
+  // broadcast TreePiece migrate decisions
   for (int i = 0; i < CkNumPes(); i++){
     if (i == my_pe) continue;
-    thisProxy[i].sendSubtreeMigrationDecisions(subtree_migrate_out_ct[i]);
+    thisProxy[i].sendTreePieceMigrationDecisions(treepiece_migrate_out_ct[i]);
   }
 
 }
@@ -97,7 +97,7 @@ int DistributedPrefixLB::calculateTargetPE(Vector3D<Real> c, int size){
     }
   }
 
-  if (_lb_args.debug() >= 1 && (target_pe != my_pe)) CkPrintf("PE[%d] subtree size = %d; targetPE is:: %d; top %d nearestK are [%d %d %d %d %d], distances are [%.4f %.4f %.4f %.4f %.4f]\n", my_pe, size, target_pe, nearestK,
+  if (_lb_args.debug() >= 1 && (target_pe != my_pe)) CkPrintf("PE[%d] treepiece size = %d; targetPE is:: %d; top %d nearestK are [%d %d %d %d %d], distances are [%.4f %.4f %.4f %.4f %.4f]\n", my_pe, size, target_pe, nearestK,
       tmp_centroid_records[0].from_pe,
       tmp_centroid_records[1].from_pe,
       tmp_centroid_records[2].from_pe,

@@ -18,11 +18,11 @@ extern CProxy_TreeSpec treespec;
 // The Charm++ shim over the passive TreeCache core (phase 1 of
 // design/smp-cache-extraction.md). This nodegroup owns everything the
 // core deliberately excludes: the entry methods and message transport
-// (node requests, replies, starter packs, subtree copies), the Resumer
+// (node requests, replies, starter packs, TreePiece copies), the Resumer
 // wake-up policy (process()), and the Partition registry. All tree/pool/
 // registry state and the install/placeholder discipline live in `core`;
 // the public reference aliases below keep the historical member names
-// (cm_local->root etc.) valid for Subtree/Partition/Resumer/Traverser.
+// (cm_local->root etc.) valid for TreePiece/Partition/Resumer/Traverser.
 //
 // CONCURRENCY: see the design note at the top of TreeCache.h — lock-free
 // hot path, narrow maps_lock, phase-separated mutation. Do not add locks
@@ -38,7 +38,7 @@ public:
   Node<Data>*& root = core.root;
   typename TreeCache<Data>::NodeLookup& local_tps = core.local_tps;
   typename TreeCache<Data>::NodeLookup& leaf_lookup = core.leaf_lookup;
-  std::map<Key, std::vector<int>>& subtree_copy_started = core.subtree_copy_started;
+  std::map<Key, std::vector<int>>& treepiece_copy_started = core.treepiece_copy_started;
 
   std::map<int, Partition<Data>*> partition_lookup; // managed by Partition
   CProxy_Resumer<Data> r_proxy;
@@ -106,8 +106,8 @@ public:
   void serviceRequest(Node<Data>*, int);
   void recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack, int n, CkCallback);
   void addCache(MultiData<Data>);
-  void receiveSubtree(MultiData<Data>, PPHolder<Data>);
-  void refreshSubtreeCopy(MultiData<Data>);
+  void receiveTreePiece(MultiData<Data>, PPHolder<Data>);
+  void refreshTreePieceCopy(MultiData<Data>);
   void restoreData(std::pair<Key, SpatialNode<Data>>);
   void connect(Node<Data>*);
 
@@ -159,7 +159,7 @@ void CacheManager<Data>::startParentPrefetch(DPHolder<Data> dp_holder, CkCallbac
   dp_holder.proxy.request(request_list.data(), request_list.size(), this->thisIndex, cb);
 }
 
-// Store/connect an incoming Subtree's local root (Subtree::initCache).
+// Store/connect an incoming TreePiece's local root (TreePiece::initCache).
 template <typename Data>
 void CacheManager<Data>::connect(Node<Data>* node) {
   core.connectRoot(node);
@@ -186,26 +186,26 @@ void CacheManager<Data>::recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack
 }
 
 template <typename Data>
-void CacheManager<Data>::receiveSubtree(MultiData<Data> multidata, PPHolder<Data> pp_holder) {
+void CacheManager<Data>::receiveTreePiece(MultiData<Data> multidata, PPHolder<Data> pp_holder) {
   std::vector<uint64_t> parked; // add_to_tps path never displaces a placeholder
   core.installSubtree(CkMyRank(), multidata.particles.data(), multidata.particles.size(),
                       multidata.nodes.data(), multidata.nodes.size(),
                       multidata.cm_index, multidata.tp_index, true, parked);
   lockMaps();
-  auto copy_out = subtree_copy_started[multidata.tp_index];
+  auto copy_out = treepiece_copy_started[multidata.tp_index];
   unlockMaps();
   for (auto && partition : copy_out) {
     pp_holder.proxy[partition].makeLeaves(multidata.tp_index);
   }
 }
 
-// In-place refresh of a shipped subtree copy; see TreeCache::
-// refreshSubtreeCopy for the phase-separation contract (callers run this
+// In-place refresh of a shipped TreePiece copy; see TreeCache::
+// refreshTreePieceCopy for the phase-separation contract (callers run this
 // quiescence-separated from traversals, before loadCache/startDown — see
 // examples/annotate preTraversalFn).
 template <typename Data>
-void CacheManager<Data>::refreshSubtreeCopy(MultiData<Data> multidata) {
-  core.refreshSubtreeCopy(multidata.particles.data(),
+void CacheManager<Data>::refreshTreePieceCopy(MultiData<Data> multidata) {
+  core.refreshTreePieceCopy(multidata.particles.data(),
                           multidata.nodes.data(), multidata.nodes.size());
 }
 

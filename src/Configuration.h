@@ -8,7 +8,7 @@
 #include "BoundingBox.h"
 
 template<typename T>
-class CProxy_Subtree;
+class CProxy_TreePiece;
 
 namespace paratreet {
     enum class DecompType {
@@ -82,8 +82,8 @@ namespace paratreet {
     };
 
     struct Configuration : public PUP::able, public Loadable {
-        // how many subtrees do you want, at least
-        int min_n_subtrees;
+        // how many TreePieces do you want, at least
+        int min_n_treepieces;
         // how many partitions do you want, at least
         int min_n_partitions;
         // at most how many particles can fit in one leaf
@@ -144,13 +144,13 @@ namespace paratreet {
         bool perturb_particles = true;
 
         // Single-distribution mode (design/single-distribution-mode.md):
-        // no Partition array is created — traversals run from Subtrees
+        // no Partition array is created — traversals run from TreePieces
         // (startDual), decomposition computes one set of splitters, and
         // the copy/share machinery is unreachable. Requirements enforced
         // by Driver::decompose: matching decompositions, and the app must
         // not touch proxy_pack.partition (it is a null proxy) nor rely on
         // partition-side movement/LB (perturb_particles apps stay dual-
-        // distribution until the movement machinery moves to Subtree —
+        // distribution until the movement machinery moves to TreePiece —
         // phase B of the design).
         bool single_distribution = false;
 
@@ -161,7 +161,7 @@ namespace paratreet {
         Configuration(CkMigrateMessage *m): PUP::able(m) {}
 
         void register_fields(void) {
-          this->register_field("nSubtreesMin", "n", min_n_subtrees);
+          this->register_field("nTreePiecesMin", "n", min_n_treepieces);
           this->register_field("nPartitionsMin", "p", min_n_partitions);
           this->register_field("nParticlesPerLeafMax", "l", max_particles_per_leaf);
           this->register_field("achDecompType", "d", decomp_type);
@@ -198,7 +198,7 @@ namespace paratreet {
               }
             }
 #endif
-            p | min_n_subtrees;
+            p | min_n_treepieces;
             p | min_n_partitions;
             p | max_particles_per_leaf;
             p | decomp_type;
@@ -265,7 +265,7 @@ namespace paratreet {
       }
     }
 
-    static DecompType subtreeDecompForTree(TreeType t) {
+    static DecompType treepieceDecompForTree(TreeType t) {
       switch (t) {
         case TreeType::eOct:
           return DecompType::eOct;

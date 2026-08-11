@@ -112,7 +112,7 @@ constexpr bool dualSkipLocalSource(long) { return false; }
 // tree piece keeps about half of its counterpart set, instead of
 // low-indexed pieces keeping everything. Applied only once the source
 // node is known to belong to a single tree piece (tp_index >= 0: the
-// subtree root and below, where the real work is); undecided regions
+// TreePiece root and below, where the real work is); undecided regions
 // descend as before. Self pairs (source piece == target piece) are
 // never dropped here — they keep their historical handling.
 template <typename V>
@@ -207,8 +207,8 @@ public:
 };
 
 // Owner = the chare driving the walk: Partition (the classic dual-
-// distribution arrangement) or Subtree (single-distribution mode, where
-// the walk's target leaves are the subtree's own — phase B of
+// distribution arrangement) or TreePiece (single-distribution mode, where
+// the walk's target leaves are the TreePiece's own — phase B of
 // design/single-distribution-mode.md). Both provide the same member
 // names (leaves, thisIndex, cm_local, cm_proxy, tc_proxy, r_proxy,
 // r_local).
@@ -698,11 +698,11 @@ class DualTraverser : public Traverser<Data> {
 private:
   Visitor v;
   size_t trav_idx;
-  Subtree<Data>& tp;
+  TreePiece<Data>& tp;
   ThreadStateHolder* stats = nullptr;
   std::unordered_map<Key, std::vector<Node<Data>*>> curr_nodes; // source nodes to target nodes
 public:
-  DualTraverser(Visitor& vi, size_t ti, Subtree<Data>& tpi) : v(vi), trav_idx(ti), tp(tpi)
+  DualTraverser(Visitor& vi, size_t ti, TreePiece<Data>& tpi) : v(vi), trav_idx(ti), tp(tpi)
   {
     stats = thread_state_holder.ckLocalBranch();
   }

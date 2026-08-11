@@ -42,11 +42,11 @@ module paratreet {
     entry void recvStarterPack(std::pair<Key, SpatialNode<Data>> pack [n], int n, CkCallback);
     entry void addCache(MultiData<Data>);
     entry void restoreData(std::pair<Key, SpatialNode<Data>>);
-    entry void receiveSubtree(MultiData<Data>, PPHolder<Data>);
+    entry void receiveTreePiece(MultiData<Data>, PPHolder<Data>);
     entry void armWalkCompletion(const CkCallback&, const CkCallback&);
     entry void releaseOpenCredit();
     entry void fireWalkDone();
-    entry void refreshSubtreeCopy(MultiData<Data>);
+    entry void refreshTreePieceCopy(MultiData<Data>);
     entry void cacheStats(const CkCallback&);
     template <typename Visitor>
     entry void startPrefetch(DPHolder<Data>, CkCallback);
@@ -110,17 +110,17 @@ module paratreet {
     entry void requestParticleUpdates(int cm_index, std::vector<Key> pKeys);
     entry void applyOpposingEffects(std::vector<std::pair<Key, std::pair<Vector3D<Real>, Real>>> effects);
 
-    // Asserts that this chare element reuses the very Subtree-owned leaf
+    // Asserts that this chare element reuses the very TreePiece-owned leaf
     // nodes (pointer identity), i.e. traversal targets read the particle
-    // copies that subtree-side post-build mutations (upwardPass,
-    // callPerSubtreeFn consumers such as the fof module) wrote. Holds when
-    // Subtree and Partition decompositions match.
+    // copies that TreePiece-side post-build mutations (upwardPass,
+    // callPerTreePieceFn consumers such as the fof module) wrote. Holds when
+    // TreePiece and Partition decompositions match.
     entry void verifySharedLeaves(const CkCallback&);
   }
 
   template <typename Data>
-  array [1d] Subtree {
-    entry Subtree(const CkCallback&, long, int, int, TCHolder<Data>, CProxy_Resumer<Data>, CProxy_CacheManager<Data>, DPHolder<Data>, bool);
+  array [1d] TreePiece {
+    entry TreePiece(const CkCallback&, long, int, int, TCHolder<Data>, CProxy_Resumer<Data>, CProxy_CacheManager<Data>, DPHolder<Data>, bool);
     entry void receive(ParticleMsg*);
     entry void buildTree(CProxy_Partition<Data>, CkCallback);
     entry void requestNodes(Key, int);
@@ -136,10 +136,10 @@ module paratreet {
     entry void checkParticlesChanged(const CkCallback&);
     entry void collectMetaData(const CkCallback & cb);
     entry void callPerLeafFn(CkReference<paratreet::PerLeafAble<Data>>, const CkCallback&);
-    entry void callPerSubtreeFn(CkReference<paratreet::PerSubtreeAble<Data>>, const CkCallback&);
+    entry void callPerTreePieceFn(CkReference<paratreet::PerTreePieceAble<Data>>, const CkCallback&);
     entry void upwardPass(const CkCallback&);
     // Single-distribution movement (design/single-distribution-mode.md
-    // phase B): the kick/perturb/re-home cycle on the Subtrees when no
+    // phase B): the kick/perturb/re-home cycle on the TreePieces when no
     // Partition array exists.
     entry void kick(Real, const CkCallback&);
     entry void perturb(Real, const CkCallback&);
@@ -178,7 +178,7 @@ module paratreet {
     entry void computeUniverseBoundingBox(const CkCallback&);
     entry void assignKeys(BoundingBox, const CkCallback&);
     template <typename Data>
-    entry void request(CProxy_Subtree<Data>, int, int);
+    entry void request(CProxy_TreePiece<Data>, int, int);
     entry void countAssignments(const std::vector<GenericSplitter>&, bool, const CkCallback&, bool);
     entry void doSplit(const std::vector<GenericSplitter>&, bool, const CkCallback&);
     entry void getAllSfcKeys(const CkCallback&);
@@ -190,7 +190,7 @@ module paratreet {
     entry void localSort(const CkCallback&);
     entry void checkSort(const Key, const CkCallback&);
     template <typename Data>
-    entry void flush(int, CProxy_Subtree<Data>);
+    entry void flush(int, CProxy_TreePiece<Data>);
     template <typename Data>
     entry void assignPartitions(int, CProxy_Partition<Data>);
   };
@@ -200,7 +200,7 @@ module paratreet {
     entry void reset();
     entry void receiveConfiguration(const CkCallback&, CkReference<paratreet::Configuration>);
     entry void receiveDecomposition(const CkCallback&, CkPointer<Decomposition>, bool);
-    entry [local] Decomposition* getSubtreeDecomposition();
+    entry [local] Decomposition* getTreePieceDecomposition();
     entry [local] Decomposition* getPartitionDecomposition();
   }
 

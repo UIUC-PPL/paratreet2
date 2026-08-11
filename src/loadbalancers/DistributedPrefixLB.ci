@@ -16,7 +16,7 @@ group [migratable] DistributedPrefixLB : DistBaseLB {
   //entry void broadcastGlobalLoad(double);
 
   entry void sendPEParitionCentroids(int, std::vector<Vector3D<Real>>);
-  entry void sendSubtreeMigrationDecisions(int);
+  entry void sendTreePieceMigrationDecisions(int);
 };
 
 };

@@ -13,6 +13,6 @@ mainmodule Main {
 
     extern entry void Partition<GravityData> startDown<GravityVisitor> (GravityVisitor v);
     extern entry void Partition<GravityData> callPerLeafFn(CkReference<paratreet::PerLeafAble<GravityData>>, const CkCallback&);
-    extern entry void Subtree<GravityData> startDown<GravityVisitor> (GravityVisitor v);
-    extern entry void Subtree<GravityData> callPerLeafFn(CkReference<paratreet::PerLeafAble<GravityData>>, const CkCallback&);
+    extern entry void TreePiece<GravityData> startDown<GravityVisitor> (GravityVisitor v);
+    extern entry void TreePiece<GravityData> callPerLeafFn(CkReference<paratreet::PerLeafAble<GravityData>>, const CkCallback&);
 }

@@ -13,7 +13,7 @@ public: // these need to be seen by other local chares
   unsigned long long n_closes    = 0ull;
   // 64-bit: process-summed totals reach N (> 2^31 at 2B+ particles).
   unsigned long n_partition_particles = 0u;
-  unsigned long n_subtree_particles   = 0u;
+  unsigned long n_treepiece_particles   = 0u;
   unsigned long n_ps_copies           = 0u;
   unsigned long n_ps_shares           = 0u;
 
@@ -42,7 +42,7 @@ public:
 
   void reset() {
     n_part_ints = n_node_ints = n_opens = n_closes = 0ull;
-    n_partition_particles = n_subtree_particles = 0u;
+    n_partition_particles = n_treepiece_particles = 0u;
     n_ps_copies = n_ps_shares = 0;
     if (!opposing_effects.empty()) CkAbort("user added opposing effects but did not flush them");
   }
@@ -78,8 +78,8 @@ public:
     n_partition_particles += n_parts;
   }
 
-  void countSubtreeParticles(int n_parts) {
-    n_subtree_particles += n_parts;
+  void countTreePieceParticles(int n_parts) {
+    n_treepiece_particles += n_parts;
   }
 
   void countCopiesAndShares(int n_c, int n_s) {

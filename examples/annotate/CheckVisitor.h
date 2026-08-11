@@ -28,7 +28,7 @@ extern CProxy_MinMaxTracker min_max_tracker;
 
 // Visits every node (like VisitAllVisitor) and, at each source leaf, checks
 // that the MinMaxData annotation matches the (mutated) particle densities.
-// Target particles are deliberately NOT checked: only subtree copies are
+// Target particles are deliberately NOT checked: only TreePiece copies are
 // mutated, partition copies keep their original densities.
 struct CheckVisitor {
 public:

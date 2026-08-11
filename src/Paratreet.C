@@ -3,7 +3,7 @@
 #include "Driver.h"
 #include "Reader.h"
 #include "Splitter.h"
-#include "Subtree.h"
+#include "TreePiece.h"
 #include "Partition.h"
 #include "TreeCanopy.h"
 #include "BoundingBox.h"

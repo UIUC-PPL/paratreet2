@@ -30,7 +30,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     conf.release_arg("b");
     conf.release_arg("c");
     conf.release_arg("u");
-    conf.min_n_subtrees = CkNumPes() * 8;
+    conf.min_n_treepieces = CkNumPes() * 8;
     conf.min_n_partitions = CkNumPes() * 8;
     conf.max_particles_per_leaf = 12;
     // Oct decomposition/tree is the FoF configuration (design/phase1.md);
@@ -178,12 +178,12 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("Input file: %s\n", conf.input_file.c_str());
     CkPrintf("Decomposition type: %s\n", paratreet::asString(conf.decomp_type).c_str());
     CkPrintf("Tree type: %s\n", paratreet::asString(conf.tree_type).c_str());
-    CkPrintf("Minimum number of subtrees: %d\n", conf.min_n_subtrees);
+    CkPrintf("Minimum number of TreePieces: %d\n", conf.min_n_treepieces);
     CkPrintf("Minimum number of partitions: %d\n", conf.min_n_partitions);
     CkPrintf("Maximum number of particles per leaf: %d\n", conf.max_particles_per_leaf);
     CkPrintf("Distribution: %s\n",
              conf.single_distribution ? "single (no Partition array)"
-                                      : "dual (Subtrees + Partitions)");
+                                      : "dual (TreePieces + Partitions)");
     CkPrintf("Linking-length factor: %g\n", fof_b_factor);
     CkPrintf("Correctness check mode: %s\n",
              check_mode == CheckMode::Full ? "full" :

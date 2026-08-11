@@ -11,17 +11,17 @@
 #include <utility>
 
 // Remote-particle slimming (design/cached-particle-slimming.md): the
-// particles of cache-shipped subtree copies are CONVERTED ONCE here, at
+// particles of cache-shipped TreePiece copies are CONVERTED ONCE here, at
 // pack time, into the application's CachedParticle type (see
 // CachedParticleOf in Particle.h) and stay in that type on the wire AND
 // in cached-leaf storage. For a non-opting app CachedParticle is
 // Particle and behavior is byte-identical to the unparameterized
 // framework. CONTRACT for an opting app: cached copies carry ONLY the
 // fields CachedParticle keeps — code paths that need full particles
-// from cached leaves (resetCachedParticles, refreshSubtreeCopy's
+// from cached leaves (resetCachedParticles, refreshTreePieceCopy's
 // particle refresh) abort with a clear message for opting apps; the
 // OWNED-particle exchange (ParticleMsg: decomposition flush,
-// Partition<->Subtree routing) is a different path and always ships
+// Partition<->TreePiece routing) is a different path and always ships
 // full particles. This supersedes the older pupRemoteParticle wire-only
 // mechanism (removed).
 template <typename Data>
@@ -35,7 +35,7 @@ struct MultiData {
   MultiData();
   MultiData(const Particle*, int, Node<Data>**, int, int, int);
   // Assign from full particles, converting once (same conversion point
-  // semantics as the constructor). Used by Subtree's flat_subtree.
+  // semantics as the constructor). Used by TreePiece's flat_subtree.
   void setParticles(const std::vector<Particle>& src) {
     particles.clear();
     particles.reserve(src.size());

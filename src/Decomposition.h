@@ -39,7 +39,7 @@ private:
 struct Decomposition: public PUP::able {
   PUPable_abstract(Decomposition);
 
-  Decomposition(bool is_subtree_) : is_subtree(is_subtree_) { }
+  Decomposition(bool is_treepiece_) : is_treepiece(is_treepiece_) { }
   Decomposition(CkMigrateMessage *m) : PUP::able(m) {}
   virtual ~Decomposition() = default;
   virtual void pup(PUP::er& p) override;
@@ -71,15 +71,15 @@ struct Decomposition: public PUP::able {
   }
 
 protected:
-  bool isSubtree() const {return is_subtree;}
+  bool isTreePiece() const {return is_treepiece;}
 private:
-  bool is_subtree = false; // cant use const cause pup()
+  bool is_treepiece = false; // cant use const cause pup()
 };
 
 struct SfcDecomposition : public Decomposition {
   PUPable_decl(SfcDecomposition);
 
-  SfcDecomposition(bool is_subtree) : Decomposition(is_subtree) {}
+  SfcDecomposition(bool is_treepiece) : Decomposition(is_treepiece) {}
   SfcDecomposition(CkMigrateMessage *m) : Decomposition(m) { }
   virtual ~SfcDecomposition() = default;
 
@@ -106,7 +106,7 @@ protected:
 struct OctDecomposition : public SfcDecomposition {
   PUPable_decl(OctDecomposition);
 
-  OctDecomposition(bool is_subtree) : SfcDecomposition(is_subtree) {}
+  OctDecomposition(bool is_treepiece) : SfcDecomposition(is_treepiece) {}
   OctDecomposition(CkMigrateMessage *m) : SfcDecomposition(m) { }
   virtual ~OctDecomposition() = default;
   virtual int getBranchFactor() const {return 8;}
@@ -120,7 +120,7 @@ struct OctDecomposition : public SfcDecomposition {
 struct BinaryOctDecomposition : public OctDecomposition {
   PUPable_decl(BinaryOctDecomposition);
 
-  BinaryOctDecomposition(bool is_subtree) : OctDecomposition(is_subtree) {}
+  BinaryOctDecomposition(bool is_treepiece) : OctDecomposition(is_treepiece) {}
   BinaryOctDecomposition(CkMigrateMessage *m) : OctDecomposition(m) { }
   virtual ~BinaryOctDecomposition() = default;
   virtual int getBranchFactor() const override {return 2;}
@@ -129,7 +129,7 @@ struct BinaryOctDecomposition : public OctDecomposition {
 
 struct BinaryDecomposition : public Decomposition {
 
-  BinaryDecomposition(bool is_subtree) : Decomposition(is_subtree) {}
+  BinaryDecomposition(bool is_treepiece) : Decomposition(is_treepiece) {}
   BinaryDecomposition(CkMigrateMessage *m) : Decomposition(m) { }
   virtual ~BinaryDecomposition() = default;
 
@@ -165,7 +165,7 @@ protected:
 
 struct KdDecomposition : public BinaryDecomposition {
   PUPable_decl(KdDecomposition);
-  KdDecomposition(bool is_subtree) : BinaryDecomposition(is_subtree) {}
+  KdDecomposition(bool is_treepiece) : BinaryDecomposition(is_treepiece) {}
   KdDecomposition(CkMigrateMessage *m) : BinaryDecomposition(m) { }
 
   virtual BinarySplit sortAndGetSplitter(int depth, Bin& bin) override;
@@ -176,7 +176,7 @@ struct KdDecomposition : public BinaryDecomposition {
 
 struct LongestDimDecomposition : public BinaryDecomposition {
   PUPable_decl(LongestDimDecomposition);
-  LongestDimDecomposition(bool is_subtree) : BinaryDecomposition(is_subtree) {}
+  LongestDimDecomposition(bool is_treepiece) : BinaryDecomposition(is_treepiece) {}
   LongestDimDecomposition(CkMigrateMessage *m) : BinaryDecomposition(m) { }
 
   virtual BinarySplit sortAndGetSplitter(int depth, Bin& bin) override;

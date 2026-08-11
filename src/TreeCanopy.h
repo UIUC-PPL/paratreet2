@@ -7,7 +7,7 @@
 #include "CacheManager.h"
 
 template<typename Data>
-class CProxy_Subtree;
+class CProxy_TreePiece;
 
 template<typename Data>
 class CProxy_CacheManager;
@@ -17,8 +17,8 @@ class TreeCanopy : public CBase_TreeCanopy<Data> {
 private:
   SpatialNode<Data> my_sn;
   int recv_count = 0;
-  int tp_index; // If -1, sits above Subtrees
-  CProxy_Subtree<Data> tp_proxy;
+  int tp_index; // If -1, sits above TreePieces
+  CProxy_TreePiece<Data> tp_proxy;
   CProxy_CacheManager<Data> cm_proxy;
   CProxy_Driver<Data> d_proxy;
 public:
@@ -56,7 +56,7 @@ void TreeCanopy<Data>::recvData(SpatialNode<Data> child, int branch_factor) {
   // previous round (initial build or a later upwardPass), which was
   // never reset and would otherwise double-accumulate
   if (recv_count == 0) my_sn.data = Data();
-  // Accumulate data received from Subtree or children TreeCanopies
+  // Accumulate data received from TreePiece or children TreeCanopies
   my_sn.data += child.data;
   my_sn.depth = child.depth - 1;
 

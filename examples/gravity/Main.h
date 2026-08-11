@@ -53,9 +53,9 @@ class ExMain : public paratreet::Main<GravityData> {
   //               when N <= check_auto_limit, at iteration 0)
   //   -S          single-distribution mode (no Partition array;
   //               design/single-distribution-mode.md): the force walk runs
-  //               as the subtree-driven dual traversal, movement through
-  //               Subtree::kick/perturb/rebucket, load balancing on the
-  //               Subtrees.
+  //               as the TreePiece-driven dual traversal, movement through
+  //               TreePiece::kick/perturb/rebucket, load balancing on the
+  //               TreePieces.
   double theta = 0.7;
   double fixed_dt = 0.01;
   bool single_distribution = false;

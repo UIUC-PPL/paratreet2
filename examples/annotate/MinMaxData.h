@@ -8,7 +8,7 @@
 
 // Node annotation carrying the min/max particle density under the node.
 // Used by the annotate example to prove that post-build particle mutation
-// plus Subtree::upwardPass leaves node annotations consistent with the
+// plus TreePiece::upwardPass leaves node annotations consistent with the
 // particles, all the way through the CacheManager.
 struct MinMaxData {
   Real minv;

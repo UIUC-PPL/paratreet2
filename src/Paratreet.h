@@ -13,7 +13,7 @@
 #include "ParticleMsg.h"
 #include "Reader.h"
 #include "ThreadStateHolder.h"
-#include "Subtree.h"
+#include "TreePiece.h"
 #include "Partition.h"
 #include "Configuration.h"
 
@@ -132,12 +132,12 @@ namespace paratreet {
             CkIndex_CacheManager<T>::__register(__makeName("CacheManager"), sizeof(CacheManager<T>));
             CkIndex_Resumer<T>::__register(__makeName("Resumer"), sizeof(Resumer<T>));
             CkIndex_Partition<T>::__register(__makeName("Partition"), sizeof(Partition<T>));
-            CkIndex_Subtree<T>::__register(__makeName("Subtree"), sizeof(Subtree<T>));
+            CkIndex_TreePiece<T>::__register(__makeName("TreePiece"), sizeof(TreePiece<T>));
             CkIndex_TreeCanopy<T>::__register(__makeName("TreeCanopy"), sizeof(TreeCanopy<T>));
             CkIndex_Driver<T>::__register(__makeName("Driver"), sizeof(Driver<T>));
 
-            CkIndex_Reader::idx_request<T>( static_cast<void (Reader::*)(const CProxy_Subtree<T> &, int, int)>(NULL));
-            CkIndex_Reader::idx_flush<T>( static_cast<void (Reader::*)(int, const CProxy_Subtree<T> &)>(NULL));
+            CkIndex_Reader::idx_request<T>( static_cast<void (Reader::*)(const CProxy_TreePiece<T> &, int, int)>(NULL));
+            CkIndex_Reader::idx_flush<T>( static_cast<void (Reader::*)(int, const CProxy_TreePiece<T> &)>(NULL));
             CkIndex_Reader::idx_assignPartitions<T>( static_cast<void (Reader::*)(int, const CProxy_Partition<T> &)>(NULL));
         }
     };

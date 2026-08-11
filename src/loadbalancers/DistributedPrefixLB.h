@@ -33,7 +33,7 @@ public:
   //void broadcastGlobalLoad(double);
 
   void sendPEParitionCentroids(int, std::vector<Vector3D<Real>>);
-  void sendSubtreeMigrationDecisions(int);
+  void sendTreePieceMigrationDecisions(int);
 
 private:
   int my_pe;
@@ -57,7 +57,7 @@ private:
   int total_incoming_prefix_migrations;
   int recv_prefix_move_pes;
 
-  int st_ct; // Subtree object count
+  int st_ct; // TreePiece object count
   int pt_ct; // Partition object count
 
   int total_iter;
@@ -76,23 +76,23 @@ private:
   int my_particle_sum; // local sum, initial value for prefix_sum
   int total_particle_size = 0; // total particles in universe
   double total_partition_load = 0.0;
-  double total_subtree_load = 0.0;
+  double total_treepiece_load = 0.0;
   double total_pe_load = 0.0;
   double background_load = 0.0;
   double background_load_ratio = 1.0;
 
 
-  // LB subtree related variables
+  // LB TreePiece related variables
   int nearestK = 20;
   int recv_pe_centroids_ct = 0;
-  int recv_incoming_subtree_counts = 1;
-  int total_subtree_migrates;
-  int incoming_subtree_migrations = 0;
+  int recv_incoming_treepiece_counts = 1;
+  int total_treepiece_migrates;
+  int incoming_treepiece_migrations = 0;
   Vector3D<Real> pe_avg_partition_centroid;
   std::vector<Vector3D<Real>> local_partition_centroids;
   std::vector<LBCentroidRecord> global_partition_centroids;
 
-  std::vector<int> subtree_migrate_out_ct;
+  std::vector<int> treepiece_migrate_out_ct;
 
   // LB Average Smoothing related variables
 
@@ -119,10 +119,10 @@ private:
   void sendOutPrefixDecisions();
   void makePrefixMoves();
 
-  void subtreeLBInits();
-  void subtreeLBCleanUp();
+  void treepieceLBInits();
+  void treepieceLBCleanUp();
   void broadcastLocalPartitionCentroids();
-  void makeSubtreeMoves();
+  void makeTreePieceMoves();
   int calculateTargetPE(Vector3D<Real>, int);
 
 

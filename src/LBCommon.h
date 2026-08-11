@@ -7,7 +7,7 @@ namespace LBCommon{
 
   enum LBType {
     pt = 1111, // Partition
-    st = 2222, // Subtree
+    st = 2222, // TreePiece
     cp = 3333  // TreeCanopy
   };
 
@@ -64,7 +64,7 @@ namespace LBCommon{
 
   struct LBCompareStats{
     int index; // index from objData
-    int chare_idx; // index from Subtree or Partition chare arrays
+    int chare_idx; // index from TreePiece or Partition chare arrays
     int partical_size;
     double load;
     const LDObjData* data_ptr;
