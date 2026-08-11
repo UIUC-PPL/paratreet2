@@ -23,17 +23,36 @@ points at its design note where one exists. Started 2026-08-05.
    (design/phaseb-offload.md there). Reconsider against item 4 and
    against simply running fewer, larger processes, which measured
    better than moving work between processes.
-4. Parallelize the phaseB pool build across the process's threads. It
-   is currently a serial per-process enumeration and LPT sort performed
-   by the last phaseA depositor while the other 14 threads wait, and it
-   is what blocks finer unit splitting: at 80M/4 nodes,
-   FOF_POOL_SPLIT_SIZE=6 cuts the largest unit 0.063 -> 0.039 s and the
-   slowest thread 0.063 -> 0.053 s, but the stage still regresses
-   0.067 -> 0.121 s because the build now enumerates 2.34M units instead
-   of 199k. The enumeration is embarrassingly parallel over TreePiece
-   pairs; the sort can be per-thread with a merge. Once it is parallel,
-   size-based splitting should be turned on by default and phaseB should
-   scale from one node instead of waiting until eight.
+4. DONE 2026-08-07 (commit 553d722), premises superseded (analysis
+   2026-08-11). The phaseB pool build is parallel: every thread
+   enumerates a stride of the (thread-pair, TreePiece-pair) space into
+   its own slice and sorts it; the last finisher assembles the pool
+   with a comparison-free round-robin merge. The two follow-ons the
+   item predicted are WITHDRAWN. Size-based splitting stays default
+   off: measured at 2B WITH the parallel build in place it produced
+   24x more units with the largest unit unchanged — a small box in a
+   dense core holds enormous work (design/phaseb-handoff-2026-08-10.md,
+   "Dead ends"); the FOF_POOL_SPLIT_SIZE remnants want deleting. And
+   phaseB no longer has a volume problem to scale away: the uniformity
+   annotation left ~145 core-seconds against a 1.3-1.6 s wall at 2B —
+   the wall is CROSS-PROCESS imbalance, which a per-process pool cannot
+   address at any build speed.
+4b. Rank phaseB units by predicted cost, not box geometry (from the
+   cost-model probe, design/cost-model-probe.md on cost-model-probe:
+   the pool's LPT key is raw overlap volume with no densities; the
+   particle-count product explains 13% of a pair's cost, the
+   expected-pairs term 38% linear / 0.60 log-log, and the top 1% of
+   pairs hold 60% of the time — the geometric split rule and the
+   geometric key failed for the same reason). Steps: (i) land
+   FragData::n_below (de21b74, cost-model-probe branch) on main;
+   (ii) densities into the LPT key, re-measure t_phaseB_maxpair;
+   (iii) split only the predicted tail. This is the within-process
+   ordering half of the fresh phaseA/B balancing design; cross-process
+   placement is the other half and needs the same predictor. Gate on
+   the 2B probe point (job 19772491). TO BE CLUBBED with the phaseA
+   light-reassignment idea (Kale, 2026-08-11: PEs process other PEs'
+   TreePieces for phaseA without touching the location manager;
+   feasibility analysis pending) into one balancing item.
 5. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
    1.65 s at 16; design/speedup-campaign-2026-08-05.md follow-up 2):
    profile splitter computation and particle flush at 1920 PEs.

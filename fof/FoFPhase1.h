@@ -1028,7 +1028,7 @@ public:
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
       // Enumerate the process's phaseB pool before releasing the PEs
-      // (single-threaded; pe_treepieces frozen since registration;
+      // (parallel across the process's threads (buildPoolSlice); pe_treepieces frozen since registration;
       // visibility: built before the trigger messages are sent).
       // Geometry-gated build (design/phase1-scaling.md): a pair enters
       // the pool only if it can interact — the walk's own mindist test,
