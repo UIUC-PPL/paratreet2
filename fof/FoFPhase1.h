@@ -1921,6 +1921,23 @@ private:
       leaf_fn(a, b);
       return;
     }
+    // SELF pair of an internal node: enumerate unordered child pairs
+    // directly (i <= j), once each. The one-side-at-a-time split below
+    // would otherwise produce BOTH orderings of every distinct child
+    // pair ((c_i, R) opens R into all (c_i, c_j), and (c_j, R) into all
+    // (c_j, c_i)), recursively at every level of the self-descent —
+    // verified 2026-08-11 against the ArborX pair-traversal comparison
+    // (design/optimization-inventory.md gap 1). Suppression prunes a
+    // mirror only after its first ordering MERGED the pair; unmerged
+    // pairs redid their whole verification descent. Distinct unordered
+    // pairs descend only to distinct unordered pairs, so this guard at
+    // the self nodes makes the entire self-descent mirror-free.
+    if (a == b) {
+      for (int i = 0; i < a->n_children; i++)
+        for (int j = i; j < a->n_children; j++)
+          walk(a->getChild(i), a->getChild(j), leaf_fn, cert_fn, prune_fn);
+      return;
+    }
     bool open_a;
     if (a->isLeaf()) open_a = false;
     else if (b->isLeaf()) open_a = true;
