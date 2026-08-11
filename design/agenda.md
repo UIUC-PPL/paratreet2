@@ -37,22 +37,34 @@ points at its design note where one exists. Started 2026-08-05.
    annotation left ~145 core-seconds against a 1.3-1.6 s wall at 2B —
    the wall is CROSS-PROCESS imbalance, which a per-process pool cannot
    address at any build speed.
-4b. Rank phaseB units by predicted cost, not box geometry (from the
-   cost-model probe, design/cost-model-probe.md on cost-model-probe:
-   the pool's LPT key is raw overlap volume with no densities; the
-   particle-count product explains 13% of a pair's cost, the
-   expected-pairs term 38% linear / 0.60 log-log, and the top 1% of
-   pairs hold 60% of the time — the geometric split rule and the
-   geometric key failed for the same reason). Steps: (i) land
-   FragData::n_below (de21b74, cost-model-probe branch) on main;
-   (ii) densities into the LPT key, re-measure t_phaseB_maxpair;
-   (iii) split only the predicted tail. This is the within-process
-   ordering half of the fresh phaseA/B balancing design; cross-process
-   placement is the other half and needs the same predictor. Gate on
-   the 2B probe point (job 19772491). TO BE CLUBBED with the phaseA
-   light-reassignment idea (Kale, 2026-08-11: PEs process other PEs'
-   TreePieces for phaseA without touching the location manager;
-   feasibility analysis pending) into one balancing item.
+4b. phaseA/phaseB balancing program (one cost model, two halves;
+   Kale's framing 2026-08-11: before stealing, rebalance phaseA).
+   HALF 1 — phaseA light reassignment: a PE runs phaseA over pieces
+   registered to sibling PEs of its process, no location-manager
+   involvement. Feasibility AUDITED SOUND 2026-08-11
+   (design/phasea-reassignment.md): no entry method targets a
+   TreePiece in the phase-1 window; correctness rests on the grouping
+   theorem (any partition of the process's pieces works, provided
+   exclusive ownership per piece and the pool enumerates cross-GROUP
+   pairs — the pool re-key is the one silent-under-merge trap);
+   geometry-aware claiming is load-bearing; phaseA self pairs are 90%
+   of phase-1 pair time, predictable at R2 0.90 from piece size alone
+   (~600 items/process onto 15 PEs). GATED on a ~15-line measurement
+   that does not exist: split the recorded 2.79 max/avg phaseA skew at
+   2B into within-process x cross-process factors — if within ~1, the
+   item becomes cross-process placement instead.
+   HALF 2 — phaseB predicted-cost ranking (was 4b alone): the pool's
+   LPT key is raw overlap volume, no densities; particle-count product
+   explains 13% of pair cost, expected-pairs 38%/0.60 log-log, top 1%
+   of pairs hold 60% of the time. Steps: (i) land FragData::n_below
+   (de21b74) on main; (ii) densities into the LPT key, re-measure
+   t_phaseB_maxpair; (iii) split only the predicted tail. Gate half 2
+   on the 2B probe point (job 19772491).
+   ORDER: skew-split measurement -> phaseA claim pool (dynamic,
+   own-first, geometry-preferring, cost-ordered; FOF_PHASEA_STEAL=0 as
+   the A/B) -> phaseB key -> tail splitting. Full analysis, prior art
+   (three earlier proposals, the old paratreet parallel-help patch),
+   constraints and gates: design/phasea-reassignment.md.
 5. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
    1.65 s at 16; design/speedup-campaign-2026-08-05.md follow-up 2):
    profile splitter computation and particle flush at 1920 PEs.
