@@ -244,3 +244,28 @@ application, sliced delivery machinery).
   636 KB, below the 1 MB gate, so both arms correctly chose broadcast.
   The stage-3 comparison rests on the 2B job (19774171), whose map
   should be well above the gate.
+
+### 2B, Anvil 16 nodes/1920 PEs (job 19774171, 2026-08-11, 2 reps x 2 arms)
+
+All four runs exact (424,897,832 components) — the full staged pipeline
+validated at 2B. Map: 745,544 entries = 11.9 MB (well above the 1 MB
+gate; sliced max_slice 19,223 against a 5,825 even split, i.e. ~3.3x
+owner skew). relabel(p3), the stage this design targets:
+
+| configuration | relabel(p3) |
+|---|---|
+| baseline (2026-08-05 campaign, pre-change) | 2.84 s |
+| broadcast arm (stages 1-2: per-representative application) | 1.238 / 0.969 s |
+| sliced arm (stage 3: per-process slices) | 0.174 / 0.144 s |
+
+Decomposition: stages 1-2 alone are ~2.6x (the 2e9 per-particle hash
+probes are gone; the full-map broadcast and 1,920 per-PE hash
+constructions of an 11.9 MB map remain and dominate the residual);
+stage 3 removes those for another ~7x. Net: 2.84 s -> ~0.15 s, about
+18x, comfortably under the design's "well under 0.5 s" prediction.
+Secondary: phase-1 merge relabel 0.076-0.136 s (prior record 0.22-0.3
+at this scale); tip_encode 0.130-0.178 s is the new serial-mode
+encoding cost, bought back many times over by the slicing it enables.
+t_uf2 is 0.33-0.35 s (processor 0's serial union-find + exact-key
+dedup at this edge count) — watch it as datasets grow; the exact
+TipPairKey set is costlier per insert than the old lossy packing.

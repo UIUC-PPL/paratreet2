@@ -82,9 +82,10 @@ points at its design note where one exists. Started 2026-08-05.
    to the node branch (size-dependent: maps under 1 MB keep the
    broadcast; FOF_SLICE_MIN_BYTES=0 forces slicing for tests). All
    identity gates green on both runtimes, both transport paths.
-   REMAINING: the Anvil measurement — relabel(p3) at 2B/16 nodes
-   against the 2.84 s baseline, plus phase1 relabel/tip_encode at 80M
-   (rides the next measurement round; append to the design note).
+   MEASURED 2026-08-11 (jobs 19774169/19774171, results in the design
+   note): relabel(p3) at 2B/16 nodes 2.84 s -> ~0.15 s (~18x; stages
+   1-2 = ~2.6x, stage 3 = ~7x more); phase-1 relabel ~4-5x at 80M;
+   all runs exact at both scales.
 8. DONE 2026-08-10 (branch treepiece-rename, code commit 9ab9f04 +
    companion doc commit): renamed the Subtree chare to TreePiece across
    code, comments, and documentation ("subtree" collides with the
