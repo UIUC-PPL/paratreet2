@@ -292,3 +292,26 @@ All runs exact. Process-0 lines (627 pieces, 5,401 units, m2 total
   load-bearing regardless of every other outcome.
 - Control rep phaseA_skew 1.43/1.16 matches the earlier 80M
   measurement (instrument stability).
+
+## 13. m2 tail-ranking quality (offline, from the cost-probe records)
+
+Question (Kale): does m2 support ADAPTIVE unit splitting, and was the
+huge unit predictable? Measured from the probe record CSVs (process 0,
+phaseB pairs):
+
+- At 2B the largest-by-time unit (120.45 ms) is ALSO the largest by
+  m2 — rank 1 of 9,014. Perfectly predictable. At 80M the most
+  expensive unit ranks 47/5,401 by m2 (top 0.9%); the top-m2 unit is
+  the 2nd most expensive.
+- Capture curves (time captured taking units in m2-rank order, oracle
+  in parens): 2B top 1% = 63.7% (79.5%), top 10% = 90.0% (93.6%);
+  80M top 1% = 46.7% (60.2%), top 10% = 76.7% (84.5%). Ranking
+  quality IMPROVES with scale.
+- Adaptive-split rule: m2 > 8x mean flags ~1% of units (68/83 per
+  process at 80M/2B) holding 48%/63% of the time — split only those
+  (children re-estimated recursively from their own boxes and
+  n_below) and the unit count grows by hundreds, not the 24x of the
+  geometric rule, because the geometric rule split everything while
+  m2 selects exactly the dense-core pairs. This is agenda 4b half 2
+  step (iii) made concrete, and the KD dry run's empty-partition
+  symptom (section 12) is what it repairs.
