@@ -3,11 +3,11 @@
 Standing list of agreed future work, in rough priority order. Each item
 points at its design note where one exists. Started 2026-08-05.
 
-1. **Extend paratreet2 to host FoF phase 1** (design/walk-unification.md;
-   GPU-dimension deep dive 2026-08-11: design/walk-unification-gpu.md —
-   staged order serving both the toolkit and Ritvik's HIP port, with
-   stage 0 (device data contract + gridSelfUnion as kernel one)
-   independent of everything and ready now;
+1. **Extend paratreet2 to host FoF phase 1** (design/walk-unification.md
+   — now ONE file merging the original plan with the 2026-08-11 GPU
+   deep dive: staged order serving both the toolkit and Ritvik's HIP
+   port, stage 0 (device data contract + gridSelfUnion as kernel one)
+   ready now;
    Kale's principle: the framework supports walks, and local versus
    across-process is a smaller variation than the commonality among
    walks). Expedient ordering while the report needs data: lift the
@@ -67,11 +67,15 @@ points at its design note where one exists. Started 2026-08-05.
    0.87 of phaseB pair cost (particle-count product 0.04, descent
    size 0.01) and the top 1% of pairs hold 79.5% of the time —
    stronger than 80M on every reading (cost-model-probe.md).
-   ORDER: skew-split measurement -> phaseA claim pool (dynamic,
-   own-first, geometry-preferring, cost-ordered; FOF_PHASEA_STEAL=0 as
-   the A/B) -> phaseB key -> tail splitting. Full analysis, prior art
-   (three earlier proposals, the old paratreet parallel-help patch),
-   constraints and gates: design/phasea-reassignment.md.
+   FULL DESIGN 2026-08-11: design/phaseab-balancing.md — Kale.s
+   hierarchical design (partition-level stealable phaseB tasks with an
+   optional mid-phase path-compression merge, phaseA piece stealing,
+   later pre-phaseA predictive migration) audited against the code and
+   the phaseb-steal post-mortem, with the staged order and gates there
+   (first steps: n_below to main, the KD dry run, and the double-run
+   compression experiment — one 2B allocation, ~150 throwaway lines,
+   before any protocol is written). phaseA analysis remains in
+   design/phasea-reassignment.md.
 5. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
    1.65 s at 16; design/speedup-campaign-2026-08-05.md follow-up 2):
    profile splitter computation and particle flush at 1920 PEs.
