@@ -527,6 +527,15 @@ public:
   // finer unit splitting cost more than it saved.
   std::vector<std::vector<PoolUnit>> pool_slices;
   std::atomic<int> slice_done{0};
+  // Double-run experiment state (balance-probes branch, throwaway;
+  // design/phaseab-balancing.md section 11 stage 0c). FOF_PHASEB_DOUBLE=1:
+  // after phaseB, merge + relabel + re-annotate, then run phaseB AGAIN
+  // over the same pool and compare work — the upper bound on the
+  // hierarchical design's path-compression benefit.
+  std::atomic<int> d2_done{0};
+  int double_pass = 1;
+  size_t edges_pass1 = 0;
+  double double_t0 = 0.0, stage_tB1 = 0.0;
 
   void reset(const CkCallback& cb) {
     label_shards.clear();
@@ -534,6 +543,10 @@ public:
     phaseb_next = 0;
     pool_slices.clear();
     slice_done = 0;
+    d2_done = 0;
+    double_pass = 1;
+    edges_pass1 = 0;
+    double_t0 = stage_tB1 = 0.0;
     chain_started = 0;
     a_done = 0;
     b_done = 0;
@@ -1218,16 +1231,230 @@ public:
           if (i < sl.size()) nb->phaseb_pool.push_back(sl[i]);
       for (auto& sl : nb->pool_slices)
         std::vector<typename FoFPhase1Node<Data>::PoolUnit>().swap(sl);
+      // KD dry run (balance-probes branch, throwaway; FOF_KD_DRYRUN=1;
+      // design/phaseab-balancing.md stage 0b): report, per process and
+      // per k, the balance quality of an m2-weighted KD partitioning of
+      // the pool units, and the internal/cross split of units against a
+      // KD REGIONING of the pieces (the surface-to-volume gate G0). No
+      // execution change.
+      if (std::getenv("FOF_KD_DRYRUN")) kdDryRunReport(nb);
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].phaseBChained();
     }
   }
 
+  // ---- KD dry run helpers (throwaway) ----
+  // m2 = rho_a * rho_b * V_intersect(a grown by b, b) * V_ball(b): the
+  // expected-pairs cost key validated by the cost probe (0.87 alone at 2B).
+  double kdUnitM2(Node<Data>* a, Node<Data>* b) const {
+    double bb = std::sqrt(b2_);
+    double va = (double)a->data.box.volume(), vb = (double)b->data.box.volume();
+    if (va <= 0 || vb <= 0) return 0.0;
+    double vint = 1.0;
+    for (int ax = 0; ax < 3; ax++) {
+      double lo = std::max((double)a->data.box.lesser_corner[ax] - bb,
+                           (double)b->data.box.lesser_corner[ax]);
+      double hi = std::min((double)a->data.box.greater_corner[ax] + bb,
+                           (double)b->data.box.greater_corner[ax]);
+      if (hi <= lo) return 0.0;
+      vint *= (hi - lo);
+    }
+    double vball = 4.18879 * bb * bb * bb; // (4/3) pi b^3
+    return ((double)a->data.n_below / va) * ((double)b->data.n_below / vb) *
+           vint * vball;
+  }
+
+  // Weighted KD split into 2^depth leaves over items with (centroid, weight);
+  // returns leaf id per item and records split planes for point location.
+  struct KdPlane { int axis; double plane; };
+  static void kdSplit(std::vector<int>& idx, int lo, int hi, int depth,
+                      int leaf_base, const std::vector<double>* coord,
+                      const std::vector<double>& w, std::vector<int>& leaf_of,
+                      std::vector<KdPlane>& planes, int plane_node) {
+    if (depth == 0 || hi - lo <= 1) {
+      for (int i = lo; i < hi; i++) leaf_of[idx[i]] = leaf_base;
+      return;
+    }
+    double mn[3] = {1e300, 1e300, 1e300}, mx[3] = {-1e300, -1e300, -1e300};
+    for (int i = lo; i < hi; i++)
+      for (int ax = 0; ax < 3; ax++) {
+        double c = coord[ax][idx[i]];
+        if (c < mn[ax]) mn[ax] = c;
+        if (c > mx[ax]) mx[ax] = c;
+      }
+    int axis = 0;
+    for (int ax = 1; ax < 3; ax++)
+      if (mx[ax] - mn[ax] > mx[axis] - mn[axis]) axis = ax;
+    std::sort(idx.begin() + lo, idx.begin() + hi,
+              [&](int x, int y) { return coord[axis][x] < coord[axis][y]; });
+    double total = 0;
+    for (int i = lo; i < hi; i++) total += w[idx[i]];
+    double acc = 0;
+    int split = lo + 1;
+    for (int i = lo; i < hi - 1; i++) {
+      acc += w[idx[i]];
+      if (acc >= total / 2) { split = i + 1; break; }
+    }
+    planes[plane_node] = {axis, coord[axis][idx[split - 1]]};
+    kdSplit(idx, lo, split, depth - 1, leaf_base, coord, w, leaf_of, planes,
+            2 * plane_node + 1);
+    kdSplit(idx, split, hi, depth - 1, leaf_base + (1 << (depth - 1)), coord,
+            w, leaf_of, planes, 2 * plane_node + 2);
+  }
+
+  static int kdLocate(const std::vector<KdPlane>& planes, int depth,
+                      const double c[3]) {
+    int node = 0, leaf = 0;
+    for (int d = depth; d > 0; d--) {
+      bool right = c[planes[node].axis] > planes[node].plane;
+      if (right) leaf += (1 << (d - 1));
+      node = 2 * node + (right ? 2 : 1);
+    }
+    return leaf;
+  }
+
+  void kdDryRunReport(FoFPhase1Node<Data>* nb) {
+    auto& pool = nb->phaseb_pool;
+    size_t n = pool.size();
+    if (n == 0) {
+      CkPrintf("FOF3STAT kd: node %d pool empty\n", CkMyNode());
+      return;
+    }
+    // Unit centroids + m2 weights.
+    std::vector<double> uc[3];
+    std::vector<double> um2(n);
+    for (int ax = 0; ax < 3; ax++) uc[ax].resize(n);
+    double m2_total = 0, m2_max = 0;
+    size_t m2_max_i = 0;
+    for (size_t i = 0; i < n; i++) {
+      for (int ax = 0; ax < 3; ax++)
+        uc[ax][i] = 0.25 * ((double)pool[i].a->data.box.lesser_corner[ax] +
+                            (double)pool[i].a->data.box.greater_corner[ax] +
+                            (double)pool[i].b->data.box.lesser_corner[ax] +
+                            (double)pool[i].b->data.box.greater_corner[ax]);
+      um2[i] = kdUnitM2(pool[i].a, pool[i].b);
+      m2_total += um2[i];
+      if (um2[i] > m2_max) { m2_max = um2[i]; m2_max_i = i; }
+    }
+    // Piece list (roots + centroids + n_below weights) for the regioning.
+    std::vector<Node<Data>*> proots;
+    for (auto& kv : nb->pe_treepieces)
+      for (auto& s : kv.second) proots.push_back(s.root);
+    size_t np = proots.size();
+    std::vector<double> pc[3], pw(np);
+    for (int ax = 0; ax < 3; ax++) pc[ax].resize(np);
+    for (size_t i = 0; i < np; i++) {
+      for (int ax = 0; ax < 3; ax++)
+        pc[ax][i] = 0.5 * ((double)proots[i]->data.box.lesser_corner[ax] +
+                           (double)proots[i]->data.box.greater_corner[ax]);
+      pw[i] = (double)proots[i]->data.n_below;
+    }
+    for (int k : {8, 32, 64}) {
+      int depth = 0;
+      while ((1 << depth) < k) depth++;
+      // (a) Unit-KD: balance of an m2-weighted partitioning of the units.
+      std::vector<int> uidx(n), uleaf(n, 0);
+      for (size_t i = 0; i < n; i++) uidx[i] = (int)i;
+      std::vector<KdPlane> uplanes(1 << (depth + 1));
+      kdSplit(uidx, 0, (int)n, depth, 0, uc, um2, uleaf, uplanes, 0);
+      std::vector<double> pcost(1 << depth, 0.0);
+      std::vector<long> punits(1 << depth, 0);
+      for (size_t i = 0; i < n; i++) {
+        pcost[uleaf[i]] += um2[i];
+        punits[uleaf[i]]++;
+      }
+      double cmin = 1e300, cmax = 0;
+      for (int p = 0; p < (1 << depth); p++) {
+        cmin = std::min(cmin, pcost[p]);
+        cmax = std::max(cmax, pcost[p]);
+      }
+      CkPrintf("FOF3STAT kd u k=%d: node %d units %zu m2 %.3g part_cost "
+               "min/avg/max %.3g/%.3g/%.3g maxunit_m2 %.3g in_part_cost "
+               "%.3g\n",
+               k, CkMyNode(), n, m2_total, cmin, m2_total / (1 << depth),
+               cmax, m2_max, pcost[uleaf[m2_max_i]]);
+      // (b) Piece-region KD: internal/cross split of the units (gate G0).
+      std::vector<int> pidx(np), pleaf(np, 0);
+      for (size_t i = 0; i < np; i++) pidx[i] = (int)i;
+      std::vector<KdPlane> pplanes(1 << (depth + 1));
+      kdSplit(pidx, 0, (int)np, depth, 0, pc, pw, pleaf, pplanes, 0);
+      long cross_units = 0;
+      double cross_m2 = 0;
+      for (size_t i = 0; i < n; i++) {
+        double ca[3], cb[3];
+        for (int ax = 0; ax < 3; ax++) {
+          ca[ax] = 0.5 * ((double)pool[i].a->data.box.lesser_corner[ax] +
+                          (double)pool[i].a->data.box.greater_corner[ax]);
+          cb[ax] = 0.5 * ((double)pool[i].b->data.box.lesser_corner[ax] +
+                          (double)pool[i].b->data.box.greater_corner[ax]);
+        }
+        if (kdLocate(pplanes, depth, ca) != kdLocate(pplanes, depth, cb)) {
+          cross_units++;
+          cross_m2 += um2[i];
+        }
+      }
+      CkPrintf("FOF3STAT kd r k=%d: node %d pieces %zu cross_units %ld "
+               "(%.1f%%) cross_m2 %.1f%%\n",
+               k, CkMyNode(), np, cross_units, 100.0 * cross_units / n,
+               m2_total > 0 ? 100.0 * cross_m2 / m2_total : 0.0);
+    }
+  }
+
+  static bool doubleRun() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_PHASEB_DOUBLE");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+
   void phaseBChained() {
     auto* nb = node_proxy.ckLocalBranch();
     phaseBBody(b2_); // b2_ set by phaseABody on this PE
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+      // Double-run experiment (throwaway; design/phaseab-balancing.md
+      // stage 0c): pass 1 just finished. Merge ALL of phaseB's edges (the
+      // upper bound on any partition-level L2 merge), relabel + re-annotate
+      // on every PE, then run phaseB a SECOND time over the same pool with
+      // the compressed tips and compare the work. Pass-1 edges stay in
+      // nb->edges (the retention rule), so the final merge over the
+      // combined list keeps every collapsed name consistent; pass-2
+      // duplicates are idempotent. Component counts must be identical.
+      if (doubleRun() && nb->double_pass == 1) {
+        nb->stage_tB1 = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
+        nb->edges_pass1 = nb->edges.size();
+        CkPrintf("FOF3STAT double pass1: node %d tB %.3f edges %zu\n",
+                 CkMyNode(), nb->stage_tB1, nb->edges_pass1);
+        double tm0 = CkWallTimer();
+        nb->mergeBody(); // the L2-analog merge (full = upper bound)
+        double tmerge = CkWallTimer() - tm0;
+        CkPrintf("FOF3STAT double merge1: node %d t %.3f map %zu\n",
+                 CkMyNode(), tmerge, nb->tip_map.size());
+        nb->double_pass = 2;
+        int first = CkNodeFirst(CkMyNode());
+        for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+          this->thisProxy[pe].doublePassRelabel();
+        return;
+      }
+      if (doubleRun() && nb->double_pass == 2) {
+        double tB2 = CkWallTimer() - nb->double_t0;
+        CkPrintf("FOF3STAT double pass2: node %d tB %.3f edges_new %zu "
+                 "(pass1 tB %.3f edges %zu)\n",
+                 CkMyNode(), tB2, nb->edges.size() - nb->edges_pass1,
+                 nb->stage_tB1, nb->edges_pass1);
+        // stage_tB reported to the driver = pass 2's wall, so the
+        // FOF3STAT phase1_stages line shows the compressed-tip cost.
+        nb->stage_tB = tB2;
+        double tm0 = CkWallTimer();
+        nb->mergeBody(); // final merge over pass1+pass2 edges
+        nb->stage_tM = CkWallTimer() - tm0;
+        int first = CkNodeFirst(CkMyNode());
+        for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+          this->thisProxy[pe].relabelChained(nb->stage_tA, nb->stage_tB,
+                                             nb->stage_tM);
+        return;
+      }
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
       double tm0 = CkWallTimer();
       nb->mergeBody();
@@ -1236,6 +1463,26 @@ public:
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].relabelChained(nb->stage_tA, nb->stage_tB,
                                            nb->stage_tM);
+    }
+  }
+
+  // Double-run intermediate stage, one execution per PE: apply the pass-1
+  // merge map at representative granularity, materialize the particles,
+  // and re-annotate the frozen-tip node fields — the three-part atomic
+  // rewrite rule of design/phaseab-balancing.md section 3. The last
+  // depositor resets the claim cursor and the stage counter and launches
+  // pass 2 (phaseBBody clears its own seen/cert_tip at entry).
+  void doublePassRelabel() {
+    relabelBody();
+    for (auto& s : treepieces) annotateFrozenTips(s.root);
+    auto* nb = node_proxy.ckLocalBranch();
+    if (nb->d2_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+      nb->b_done = 0;
+      nb->phaseb_next = 0;
+      nb->double_t0 = CkWallTimer();
+      int first = CkNodeFirst(CkMyNode());
+      for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+        this->thisProxy[pe].phaseBChained();
     }
   }
 

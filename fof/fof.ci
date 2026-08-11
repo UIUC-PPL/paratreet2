@@ -62,6 +62,10 @@ module fof {
     entry void startPhase1Chain(double b2, double grid_thresh, const CkCallback&);
     entry void phaseBChained();
     entry void buildPoolSlice();
+    // Double-run experiment stage (balance-probes branch, throwaway;
+    // FOF_PHASEB_DOUBLE=1): merge-relabel-reannotate between two phaseB
+    // passes over the same pool.
+    entry void doublePassRelabel();
     entry void relabelChained(double tA, double tB, double tM);
     entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);
