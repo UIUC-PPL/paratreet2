@@ -315,3 +315,107 @@ phaseB pairs):
   m2 selects exactly the dense-core pairs. This is agenda 4b half 2
   step (iii) made concrete, and the KD dry run's empty-partition
   symptom (section 12) is what it repairs.
+
+## 14. THE CAMPAIGN (Kale's sequence, vetted 2026-08-11; branch phaseab-campaign)
+
+Kale's proposed sequence, with the vetting refinements folded in. Every
+step: env-gated arms in ONE binary, laptop identity gates (16-run
+matrix + fof1 phase-1-exact + 1M/8M/LAMBS counts under
+FOF_COUNT_VERIFY + reconverse spot runs), then an Anvil A/B against
+the step's predecessor. All Anvil measurement under the NEW pinned
+configuration (machines/anvil.md pemap) — the pemap changed baselines,
+so nothing compares across the affinity boundary.
+
+Vetting notes on the proposal as given:
+
+- "Node-level coordinator (nodegroup)": Charm vocabulary trap — an SMP
+  "node" IS a process, so a nodegroup gives one branch per PROCESS,
+  not per physical node. The coordinator is therefore a DESIGNATED
+  PROCESS: procs-per-physical-node from the environment (default 8 on
+  Anvil wholenode; FOF_PROCS_PER_PNODE), domain = the block of
+  processes sharing the physical node, coordinator = lowest process of
+  the block. Status reporting and stealing stay within that domain
+  first, exactly as proposed.
+- Coordinator authority vs the one-authority rule (the steal branch's
+  paid-for lesson): the coordinator owns the PLACEMENT decision (who
+  sends to whom, from reported status); the donor's compliance is an
+  atomic claim on its own pre-built partition array, so no second copy
+  of the admission decision exists. Status flows by coordinator poll
+  (paced) plus piggyback on other traffic later; never
+  donor-broadcast-on-every-change.
+- Responsiveness probe FIRST (Kale's main suspect, and the vetting
+  agrees): a standing coordinator->process RTT probe measures exactly
+  the thing every later step needs (can a process answer a message
+  while its PEs drain phaseB?). Run it BEFORE the yielding step so the
+  bad baseline is on record, then after. OBSERVER EFFECT to control
+  once: background traffic is itself the measured suppressor of the
+  LCI idle-stall (the 2026-08-04 finding), so take one baseline pair
+  with the probe on vs off before trusting probe-on numbers.
+- Transfer probe: reconverse has NO shared-memory transport between
+  processes (the CMK_USE_SHMEM producer half is missing — charm-notes
+  2026-07-26), so "is IPC being used" has a known answer: no; the
+  probe CONFIRMS by latency signature (~2 us+ = NIC loopback) and
+  prices shipment sizes on the real fabric.
+- The B1/B2 barrier is PER-PROCESS (deposit-chain style), not global:
+  tips are process-scoped, so the L2 merge needs only its own
+  process's B1 edges (plus settled returns of stolen B1 work).
+- The 2b sequential union-find = the L2 merge under the section-3
+  three-part atomicity rule (rep_label + materializeLabels +
+  annotateFrozenTips as one step; L2 edges RETAINED). Its benefit
+  bound and barrier price come from tonight's 2B double-run (0c) —
+  build it behind a flag either way; the flag's default follows 0c.
+- Framework note: all of this lands APP-SIDE on the branch. The
+  walk-unification stage-1 lift later absorbs the pool/claim machinery
+  with the opaque group-id + partition-id interface; the campaign
+  keeps the re-key discipline (pool enumerates cross-ASSIGNMENT
+  pairs) so that lift stays mechanical. Do not lift mid-campaign.
+
+Steps (P = instrument, S = scheme):
+
+- P0. RESPONSIVENESS + TRANSFER PROBE (built first; FOF_PROBE=1).
+  Coordinator pings every process of its physical-node domain every
+  FOF_PROBE_MS (default 25) through phases 1-3; per-target RTT
+  min/med/p99/max printed per iteration. At report time, a one-shot
+  transfer ladder (4 KB / 64 KB / 1 MB / 8 MB) to the next process
+  prices shipments. Gate: zero effect on counts; baseline pair with
+  probe on/off.
+- P1. SCHEDULER YIELDING (FOF_PHASEB_SLICE_MS, default off):
+  phaseBBody becomes a sliced drain — deadline check per claimed unit
+  against the wall clock it already reads, re-entry by SELF-SEND
+  (design section 9; nothing to stash, cursor is shared). Probe
+  numbers before/after = the responsiveness delta. Charm scheduling
+  note: plain self-sends, no priorities (reconverse polls FIFO before
+  the prioritized queue), CcdCallFnAfter only on retry/poll paths.
+- S1. PHASEA STEAL (Kale step 1): per-process claim pool of pieces;
+  own-first claim order. Arms: FOF_STEALA=0 (today's static
+  assignment) / FOF_STEALA_GEO=0 (claim arbitrary sibling pieces —
+  Kale's 1b comparison arm) / FOF_STEALA_GEO=1 (claim nearest-centroid
+  unclaimed pieces). RE-KEY CONSTRAINT: pe_treepieces re-bucketed by
+  realized assignment before buildPoolSlice (the silent-under-merge
+  trap; fof1 phase-1-exact is the guard). Readout: phaseA_skew within
+  factor at 80M + 2B (2B within = 1.84 pre-campaign).
+- S2. HIERARCHICAL PHASEB (Kale step 2): KD partition of pool units
+  by m2-weighted centroid median splits (k = FOF_PB_PARTS, default 32
+  per process); per-partition claim cursors; recursive m2-ranked TAIL
+  splitting replaces the depth rule (split only units with m2 > 8x
+  mean, recurse on children's own m2 — the measured adaptive rule,
+  section 13); per-process barrier, then S2b: the L2 merge behind
+  FOF_PB_MERGE (default per 0c), then cross-partition phase.
+  Readout: t_phaseB_maxpair and phaseB max/avg at 2B vs the 0.634 s
+  floor; partition-cost spread vs the KD dry-run prediction.
+- S3. COORDINATOR STEALING within the physical node (Kale step 3):
+  status poll (paced, coordinator-initiated), placement by
+  coordinator, donor ships a whole partition (slimmed
+  StealShipment-shaped blob: FoFCachedParticle particles, dense node
+  indices when available, dedup by partition-scoped SEEN rebuild),
+  edges return by settle-by-count through the origin's submitEdges
+  door (destination-follows-origin on BOTH emit paths). Off below a
+  size gate (the 8M polling lesson). Readout: phaseB max/avg at
+  2B/128 processes vs S2's; probe RTTs during steal traffic.
+
+Baseline set (step 0 of the campaign, AFTER tonight's queued jobs
+drain): 80M/4-node x3 and 2B/16-node x2 on main + pemap config,
+recording phase1_stages, phaseA_skew, t_phaseB_maxpair, probe RTTs
+(on/off pair). These are the campaign's reference numbers; every S
+step's Anvil A/B runs against its predecessor in the same session
+where possible.
