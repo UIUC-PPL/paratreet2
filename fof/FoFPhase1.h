@@ -1333,13 +1333,14 @@ public:
     // the pool is LPT-sorted, so consecutive units are the costliest —
     // chunked claims would stack them on one PE. Atomic traffic is one
     // fetch_add per unit, a few thousand per PE.
-    // Campaign S2 partitioned claims: a PE holds one PARTITION at a time
-    // (costliest unclaimed first — optimistic pick + CAS, the S1 shape)
-    // and drains its units through the partition cursor; with no
-    // partitions built (FOF_PB_PARTS=0, the default) the flat global
-    // cursor below is today's behavior unchanged. pb_cur_part_ persists
-    // across P1 slice re-entries.
-    const bool parts_on = !nb->pb_part_range.empty();
+    // Claim granularity is the UNIT everywhere (measured 2026-08-11:
+    // exclusive whole-partition claims regressed phaseB 0.031 -> 0.114 at
+    // 80M — one PE drained the giant partition alone, un-doing the flat
+    // pool's LPT balance). Partitions remain the SHIPPING/GPU batch unit
+    // (their ranges/costs/claim flags serve S3, where exclusivity is the
+    // point); intra-process draining uses global cursors over the
+    // partition-ordered pool: [0, pb_b2_begin) in the B1 stage,
+    // [pb_b2_begin, n) in B2, the whole pool otherwise.
     const int stage = nb->pb_stage; // 0 flat/unit-KD, 1 = B1, 2 = B2
     const size_t CHUNK = 1;
     for (;;) {
@@ -1349,36 +1350,11 @@ public:
         if (u >= nb->phaseb_pool.size()) break;
         start = u;
         end = u + 1;
-      } else if (parts_on) {
-        if (pb_cur_part_ < 0) {
-          // Claim the costliest unclaimed partition.
-          int pick = -1;
-          double best = 0;
-          for (int pnum = 0; pnum < (int)nb->pb_part_range.size(); pnum++) {
-            if (nb->pb_part_claimed[pnum].load(std::memory_order_relaxed))
-              continue;
-            if (pick < 0 || nb->pb_part_cost[pnum] > best) {
-              pick = pnum;
-              best = nb->pb_part_cost[pnum];
-            }
-          }
-          if (pick < 0) break; // all partitions claimed
-          int expect = 0;
-          if (!nb->pb_part_claimed[pick].compare_exchange_strong(expect, 1))
-            continue; // lost the race; re-scan
-          pb_cur_part_ = pick;
-        }
-        uint32_t u = nb->pb_part_next[pb_cur_part_].fetch_add(1);
-        if (u >= nb->pb_part_range[pb_cur_part_].second) {
-          pb_cur_part_ = -1; // partition drained; claim another
-          continue;
-        }
-        start = u;
-        end = u + 1;
       } else {
+        size_t limit = stage == 1 ? nb->pb_b2_begin : nb->phaseb_pool.size();
         start = nb->phaseb_next.fetch_add(CHUNK);
-        if (start >= nb->phaseb_pool.size()) break;
-        end = std::min(start + CHUNK, nb->phaseb_pool.size());
+        if (start >= limit) break;
+        end = std::min(start + CHUNK, limit);
       }
       for (size_t k = start; k < end; k++) {
           t_phaseB_units++;
