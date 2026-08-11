@@ -131,12 +131,28 @@ Design: adopt the owner-encoded tip namespace in serial mode too.
   uses only the sign convention. Audit before implementing: FragCheck
   visitors, the stats-mode distributed checks, and any output writer
   for a leftover assumption that labels equal minimum orders.
-- Processor 0 shards `map_vec` by `tip >> kUF2IdxBits` and sends slice
-  p DIRECTLY to `FoFPhase1Node[p]` (nodegroup, one point-to-point
-  message per process). No group broadcast, no spanning tree — per the
-  large-payload-reduction rule, direct sends of pre-merged per-process
-  payloads are the right shape; P messages of |map|/P each cost
-  microseconds of send overhead against megabytes saved.
+- Processor 0 shards `map_vec` by `tip >> kUF2IdxBits`. Delivery is
+  size-dependent (Kale, 2026-08-10):
+  - **Slices adequately large (roughly 8-64 KB or more each): direct
+    sends**, one point-to-point message per process to
+    `FoFPhase1Node[p]`. P messages of |map|/P each cost microseconds
+    of send overhead against megabytes saved. At 2B this is the
+    expected regime: a map of order 1M entries over 128 processes is
+    ~128 KB per slice.
+  - **Slices small: keep the broadcast.** When the whole map is small,
+    the current broadcast is already cheap, and sharding buys nothing;
+    pick a total-size threshold (order 1 MB) below which the existing
+    path is used unchanged.
+  - **Large process count with small slices** (the corner where the
+    root's send loop and per-message overhead both matter): scatter
+    combined slices to ONE process per physical node, which
+    redistributes to its co-located processes. Caveat recorded so the
+    second hop is not overestimated: reconverse currently has NO
+    cross-process shared-memory path (the CMK_USE_SHMEM producer half
+    is missing; charm-notes 2026-07-26), so the intra-node hop rides
+    NIC loopback (~2.2 us small messages), not IPC. The scheme still
+    removes the root bottleneck; build it only when measurement at
+    high process counts shows the direct-send loop matters.
 - The node branch stores the slice hash ONCE per process; each PE
   applies it to its `rep_label` roots (per-representative probes into
   the shared map — no per-PE map construction at all), then M2 runs.
@@ -190,7 +206,9 @@ numbers appended here as they arrive).
 2. Dense `rep_label` (8 B/particle/PE) versus compacted (extra int
    rank array, most of the 8 MB back): default is dense for
    simplicity; flip if 2B memory headroom argues otherwise.
-3. Slice transport: direct sends from processor 0 are proposed; at
-   thousands of processes a two-level scatter could replace them, but
-   the large-payload lesson says not before measurement shows the send
-   loop matters.
+3. RESOLVED (Kale, 2026-08-10): transport is size-dependent — direct
+   sends when slices are adequately large (8-64 KB+), the existing
+   broadcast when the whole map is small, and a per-physical-node
+   scatter with intra-node redistribution reserved for the
+   large-P/small-slice corner (see section 3 for the reconverse
+   loopback caveat on that second hop).
