@@ -59,7 +59,10 @@ points at its design note where one exists. Started 2026-08-05.
    of pairs hold 60% of the time. Steps: (i) land FragData::n_below
    (de21b74) on main; (ii) densities into the LPT key, re-measure
    t_phaseB_maxpair; (iii) split only the predicted tail. Gate half 2
-   on the 2B probe point (job 19772491).
+   PASSED 2026-08-11: at 2B the expected-pairs term ALONE explains
+   0.87 of phaseB pair cost (particle-count product 0.04, descent
+   size 0.01) and the top 1% of pairs hold 79.5% of the time —
+   stronger than 80M on every reading (cost-model-probe.md).
    ORDER: skew-split measurement -> phaseA claim pool (dynamic,
    own-first, geometry-preferring, cost-ordered; FOF_PHASEA_STEAL=0 as
    the A/B) -> phaseB key -> tail splitting. Full analysis, prior art
