@@ -415,6 +415,125 @@ public:
     if (t > a_time_max) a_time_max = t;
   }
 
+  // ---- Responsiveness + transfer probe (campaign P0, FOF_PROBE=1;
+  // design/phaseab-balancing.md section 14). The coordinator process of
+  // each physical-node domain (lowest process of a FOF_PROCS_PER_PNODE
+  // block, default 8) pings every domain sibling every FOF_PROBE_MS
+  // (default 25) while armed; RTTs answer the campaign's central
+  // question -- does a process attend to messages while its PEs are
+  // inside phaseA/B? At report time a one-shot transfer ladder to the
+  // next process prices shipment sizes on the real transport (reconverse
+  // has no cross-process shared memory, so this is NIC loopback by
+  // construction; the latency signature confirms it). Charm "node" =
+  // process; the physical-node domain comes from the env, not the
+  // runtime.
+  static int probeProcsPerPnode() {
+    static const int v = [] {
+      const char* e = std::getenv("FOF_PROCS_PER_PNODE");
+      return e ? std::max(1, std::atoi(e)) : 8;
+    }();
+    return v;
+  }
+  static int probePeriodMs() {
+    static const int v = [] {
+      const char* e = std::getenv("FOF_PROBE_MS");
+      return e ? std::max(1, std::atoi(e)) : 25;
+    }();
+    return v;
+  }
+  bool probe_armed = false;
+  std::map<int, std::vector<double>> probe_rtts; // target proc -> rtt seconds
+  CkCallback probe_report_cb;
+  size_t probe_xfer_idx = 0;
+  std::vector<std::pair<size_t, double>> probe_xfer_rtts;
+
+  static void probeTickThunk(void* branch, double) {
+    ((FoFPhase1Node<Data>*)branch)->probeTick();
+  }
+
+  void probeTick() {
+    if (!probe_armed) return;
+    int ppn = probeProcsPerPnode();
+    int base = (CkMyNode() / ppn) * ppn;
+    int hi = std::min(base + ppn, CkNumNodes());
+    double now = CkWallTimer();
+    for (int p = base; p < hi; p++)
+      if (p != CkMyNode()) this->thisProxy[p].probePing(CkMyNode(), now);
+    CcdCallFnAfter(probeTickThunk, this, probePeriodMs());
+  }
+
+  void probeStart(const CkCallback& cb) {
+    if (std::getenv("FOF_PROBE")) {
+      probe_rtts.clear();
+      int ppn = probeProcsPerPnode();
+      if (CkMyNode() % ppn == 0 && CkNumNodes() > 1) {
+        probe_armed = true;
+        CcdCallFnAfter(probeTickThunk, this, probePeriodMs());
+      }
+    }
+    this->contribute(cb);
+  }
+
+  void probePing(int from, double t0) {
+    this->thisProxy[from].probeAck(CkMyNode(), t0);
+  }
+
+  void probeAck(int target, double t0) {
+    std::lock_guard<std::mutex> g(lock);
+    probe_rtts[target].push_back(CkWallTimer() - t0);
+  }
+
+  // Transfer ladder: one size at a time to the next process; the ack
+  // carries no payload, so RTT ~ one-way transfer + small.
+  void probeXfer(int from, double t0, const std::vector<char>& payload) {
+    this->thisProxy[from].probeXferAck(t0, (long)payload.size());
+  }
+
+  void probeXferAck(double t0, long bytes) {
+    probe_xfer_rtts.emplace_back((size_t)bytes, CkWallTimer() - t0);
+    probeXferNext();
+  }
+
+  void probeXferNext() {
+    static const size_t sizes[] = {4096, 65536, 1048576, 8388608};
+    if (probe_xfer_idx < 4 && CkNumNodes() > 1) {
+      size_t sz = sizes[probe_xfer_idx++];
+      std::vector<char> payload(sz, 1);
+      this->thisProxy[CkMyNode() + 1].probeXfer(CkMyNode(), CkWallTimer(),
+                                                payload);
+      return;
+    }
+    // Ladder done: print everything and close the report reduction.
+    for (auto& kv : probe_rtts) {
+      auto v = kv.second;
+      if (v.empty()) continue;
+      std::sort(v.begin(), v.end());
+      size_t n = v.size();
+      CkPrintf("FOF3STAT probe: proc %d->%d rtt_us min %.0f med %.0f "
+               "p99 %.0f max %.0f n %zu\n",
+               CkMyNode(), kv.first, v[0] * 1e6, v[n / 2] * 1e6,
+               v[std::min(n - 1, n * 99 / 100)] * 1e6, v[n - 1] * 1e6, n);
+    }
+    for (auto& pr : probe_xfer_rtts)
+      CkPrintf("FOF3STAT probe_xfer: proc %d->%d bytes %zu rtt_us %.0f\n",
+               CkMyNode(), CkMyNode() + 1, pr.first, pr.second * 1e6);
+    probe_rtts.clear();
+    probe_xfer_rtts.clear();
+    this->contribute(probe_report_cb);
+  }
+
+  void probeReport(const CkCallback& cb) {
+    probe_report_cb = cb;
+    bool was_armed = probe_armed;
+    probe_armed = false; // stop the tick chain
+    if (std::getenv("FOF_PROBE") && was_armed) {
+      probe_xfer_idx = 0;
+      probeXferNext(); // ladder, then print + contribute
+    } else {
+      this->contribute(cb);
+    }
+  }
+
   // Per-PROCESS redundant-descent total (design/step3.md §6d): each of this
   // process's group branches deposits its per-PE p3_redundant_descents here
   // post-walk (depositNodeRedundant), so every PE can then read the same
@@ -955,14 +1074,35 @@ public:
   // deduplicated (tip, tip) edges into this PE's buffer; hand the buffer to
   // the nodegroup. No-op when this process has a single PE (non-SMP or
   // one-PE-per-process runs).
-  void phaseBBody(double b2) {
+  // Sliced drain (campaign step P1, design/phaseab-balancing.md sections
+  // 9 and 14): with FOF_PHASEB_SLICE_MS > 0 the claim loop returns false
+  // at the deadline and the caller re-enters by SELF-SEND, so the
+  // scheduler runs between slices and this PE stays responsive to
+  // messages (steal protocol, probe pings, network progress). Nothing is
+  // stashed: all intermediates are per-PE members and the claim cursor
+  // is process-shared. Default 0 = drain in one call, byte-identical to
+  // the pre-campaign behavior.
+  static double sliceSeconds() {
+    static const double s = [] {
+      const char* e = std::getenv("FOF_PHASEB_SLICE_MS");
+      return e ? std::atof(e) / 1e3 : 0.0;
+    }();
+    return s;
+  }
+
+  bool phaseBBody(double b2) {
     double t0 = CkWallTimer();
-    b2_ = b2;
-    t_phaseB_maxpair = 0.0;
-    t_phaseB_units = 0;
-    edge_buf.clear();
-    seen.clear();
-    cert_tip.clear();
+    if (!pb_active_) {   // start of stage (not a slice re-entry)
+      pb_active_ = true;
+      pb_t_accum_ = 0.0;
+      b2_ = b2;
+      t_phaseB_maxpair = 0.0;
+      t_phaseB_units = 0;
+      edge_buf.clear();
+      seen.clear();
+      cert_tip.clear();
+    }
+    const double slice = sliceSeconds();
     auto* nb = node_proxy.ckLocalBranch();
     // Claim units from the process-wide pool until it drains (dynamic
     // self-scheduling; supersedes the static symmetric-hash assignment —
@@ -1003,11 +1143,17 @@ public:
           double tp = CkWallTimer() - tp0;
           if (tp > t_phaseB_maxpair) t_phaseB_maxpair = tp;
       }
+      if (slice > 0 && CkWallTimer() - t0 > slice) {
+        pb_t_accum_ += CkWallTimer() - t0;
+        return false;   // deadline: caller re-enters by self-send
+      }
     }
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
     edge_buf.clear();
     seen.clear();
-    t_phaseB = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
+    pb_active_ = false;
+    t_phaseB = pb_t_accum_ + (CkWallTimer() - t0); // summed over slices
+    return true;
   }
 
   // (d) Rewrite this PE's labels through the merge map (identity if
@@ -1231,7 +1377,10 @@ public:
 
   void phaseBChained() {
     auto* nb = node_proxy.ckLocalBranch();
-    phaseBBody(b2_); // b2_ set by phaseABody on this PE
+    if (!phaseBBody(b2_)) { // slice deadline: yield, re-enter by self-send
+      this->thisProxy[CkMyPe()].phaseBChained();
+      return;
+    }
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
       double tm0 = CkWallTimer();
@@ -2416,6 +2565,11 @@ private:
     }();
     return on;
   }
+  // Sliced-drain state (campaign P1): stage-active flag guards the
+  // start-of-stage initialization across slice re-entries; accumulated
+  // wall over completed slices.
+  bool pb_active_ = false;
+  double pb_t_accum_ = 0.0;
   // Final-reduction callback of the within-process chain (startPhase1Chain).
   CkCallback done_cb_;
   // Touched-component (negative-label) per-process totals held between

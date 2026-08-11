@@ -73,6 +73,10 @@ using namespace paratreet;
                (double)pbc_period, (double)maxext, fof_b,
                0.5 * (double)pbc_period);
     }
+    // Responsiveness probe (campaign P0, FOF_PROBE=1): armed through
+    // phases 1-3, reported after the phase-3 relabel. Independent of the
+    // union-find mode.
+    if (std::getenv("FOF_PROBE")) fof_node.probeStart(CkCallbackResumeThread());
     double t0 = CkWallTimer();
     paratreet::FoFPhase1Stages p1s;
     paratreet::runFoFPhase1(proxy_pack.treepiece, fof, fof_node, fof_b, pbc,
@@ -523,6 +527,7 @@ using namespace paratreet;
     CkPrintf("FOF3STAT time_s: uf2_setup %.3f phase3_walk %.3f "
              "edge_gather %.3f uf2 %.3f relabel %.3f\n",
              pr.t_setup, pr.t_walk, pr.t_gather, pr.t_uf2, pr.t_relabel);
+    if (std::getenv("FOF_PROBE")) fof_node.probeReport(CkCallbackResumeThread());
     // Per-PE load-imbalance signals (min/avg/max over PEs), from the
     // phase3Stats tuple reduction: phase-1 entry-body times and the walk's
     // per-PE work distribution. max/avg >> 1 = imbalance.
