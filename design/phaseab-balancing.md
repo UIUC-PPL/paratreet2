@@ -450,3 +450,31 @@ recording phase1_stages, phaseA_skew, t_phaseB_maxpair, probe RTTs
 (on/off pair). These are the campaign's reference numbers; every S
 step's Anvil A/B runs against its predecessor in the same session
 where possible.
+
+## 15. Measured: campaign milestone baseline, 80M/4 nodes (job 19803928, 2026-08-11)
+
+First measurement under the PINNED configuration (the new affinity
+boundary); binary = campaign branch (all features off by default). All
+8 arms exact. THE BASELINE (3 reps): phaseA 0.143-0.148, phaseB
+0.031-0.032, within-skew 1.45-1.49, cross 1.15-1.19, global 1.53-1.57.
+
+- S1 AT SCALE: within-skew 1.45-1.49 -> 1.13 (stealscan/S1a) and 1.14
+  (stealgeo/S1b); phaseA wall 0.148 -> 0.121 (S1a) / 0.138 (S1b).
+  Single reps — S1a vs S1b not separable yet; neither reaches the
+  laptop's 1.02 (residual = the un-paced cross pass + claim-scan
+  cost). phaseB rose 0.031 -> 0.040-0.042 in the steal arms (pairs
+  displaced into the pool, as predicted). Net phase1 (A+B): S1a 0.163
+  vs base 0.179. The 2B point decides whether the residual matters
+  (S1c gate stays open, not triggered at 80M).
+- P0 ON INFINIBAND WITH THE PEMAP: median ping RTT 17-130 us across
+  all 28 coordinator->sibling pairs (the laptop's 12 ms burial does
+  NOT occur at ppn 15 — some PE is almost always free), but p99 tails
+  of 1-28 ms remain (the idle-stall family). Transfer ladder: 4 KB
+  40-80 us, 1 MB 240-470 us, 8 MB 3.2-4.8 ms (~2 GB/s) — a slimmed
+  ~10 MB partition shipment costs ~4-5 ms, confirming the 30-60:1
+  ship-to-work estimates. 64 KB shows odd variance (66 us to 2.7 ms)
+  — eager/rendezvous boundary neighborhood, worth one look later.
+- P1 slice: no measurable cost at 80M (phaseB 0.032 = baseline); the
+  laptop's +40% single-rep worry did not transfer.
+- Probe observer effect: probe-on arm's own metrics match the base
+  reps — no distortion visible at this scale.
