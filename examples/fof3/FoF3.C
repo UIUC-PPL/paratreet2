@@ -551,6 +551,20 @@ using namespace paratreet;
       CkPrintf("FOF3STAT density: r_phaseA %.3f proxy_x %.3g/%.3g/%.3g "
                "(min/avg/max over %d PEs)\n",
                pr.density_r, pr.x_min, pr.x_avg, pr.x_max, CkNumPes());
+      // Skew-split instrument (design/phasea-reassignment.md section 3;
+      // independent of the union-find mode): within = worst process's
+      // internal phaseA max/avg over its PEs (what shared-memory
+      // reassignment can recover); cross = hottest process avg / global
+      // avg (what only cross-process placement can recover); global =
+      // the familiar max/avg over all PEs. size_r = Pearson r of
+      // sum(n^1.28) vs t_phaseA over PEs (the size predictor;
+      // density r_phaseA above is the density predictor).
+      CkPrintf("FOF3STAT phaseA_skew: within %.2f cross %.2f global %.2f "
+               "size_r %.3f max_piece_n %ld\n",
+               pr.a_within,
+               pr.t_phaseA_avg > 0 ? pr.a_proc_avg_max / pr.t_phaseA_avg : 0.0,
+               pr.t_phaseA_avg > 0 ? pr.t_phaseA_max / pr.t_phaseA_avg : 0.0,
+               pr.size_r, pr.max_piece_n);
       CkPrintf("FOF3STAT balance: leaf_visits %ld/%.1f/%ld "
                "edges_emitted %ld/%.1f/%ld (min/avg/max over %d PEs)\n",
                pr.leaf_visits_min, pr.leaf_visits / n_pes, pr.leaf_visits_max,

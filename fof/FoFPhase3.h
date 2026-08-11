@@ -386,6 +386,14 @@ struct FoFPhase3Result {
   // geometry-predictable (placement can act on X before running).
   double x_min, x_avg, x_max;
   double density_r;
+  // Skew-split instrument (design/phasea-reassignment.md section 3;
+  // independent of the union-find mode): a_within = max over processes of
+  // (proc max / proc avg) of phaseA walls; a_proc_avg_max = the hottest
+  // process's average (divide by t_phaseA_avg for the cross-process
+  // factor); size_r = Pearson r of sum(n^1.28) vs t_phaseA over PEs;
+  // max_piece_n = largest TreePiece (floor of piece-level rebalancing).
+  double a_within, a_proc_avg_max, size_r;
+  long max_piece_n;
 };
 
 // Convenience driver for the full phase-3 sequence:
@@ -518,7 +526,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   CkReduction::tupleElement* stats_elems = nullptr;
   int n_stats_elems = 0;
   stats_msg->toTuple(&stats_elems, &n_stats_elems);
-  CkEnforce(n_stats_elems == 8);
+  CkEnforce(n_stats_elems == 10);
   const long* stats = (const long*)stats_elems[0].data;
   FoFPhase3Result r;
   r.edges_emitted = stats[0];
@@ -565,6 +573,18 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
     double den = std::sqrt(std::max(0.0, n_pes * csum[1] - sx * sx)) *
                  std::sqrt(std::max(0.0, n_pes * csum[2] - sy * sy));
     r.density_r = den > 0 ? num / den : 0.0;
+    // Skew-split + size-predictor readout (elements 8/9; layout:
+    // FoFPhase1::phase3Stats). Independent of the union-find mode.
+    const double* pskew = (const double*)stats_elems[8].data;
+    r.a_within = pskew[0];
+    r.a_proc_avg_max = pskew[1];
+    r.max_piece_n = (long)pskew[2];
+    const double* scorr = (const double*)stats_elems[9].data;
+    double ssx = scorr[0];
+    double snum = n_pes * scorr[1] - ssx * sy;
+    double sden = std::sqrt(std::max(0.0, n_pes * scorr[2] - ssx * ssx)) *
+                  std::sqrt(std::max(0.0, n_pes * csum[2] - sy * sy));
+    r.size_r = sden > 0 ? snum / sden : 0.0;
   }
   delete[] stats_elems;
   CkEnforce(r.edges_sent == (long)n_edges);
@@ -777,7 +797,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   CkReduction::tupleElement* stats_elems = nullptr;
   int n_stats_elems = 0;
   stats_msg->toTuple(&stats_elems, &n_stats_elems);
-  CkEnforce(n_stats_elems == 8);
+  CkEnforce(n_stats_elems == 10);
   const long* stats = (const long*)stats_elems[0].data;
   FoFPhase3Result r;
   r.edges_emitted = stats[0];
@@ -820,6 +840,18 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     double den = std::sqrt(std::max(0.0, n_pes * csum[1] - sx * sx)) *
                  std::sqrt(std::max(0.0, n_pes * csum[2] - sy * sy));
     r.density_r = den > 0 ? num / den : 0.0;
+    // Skew-split + size-predictor readout (elements 8/9; layout:
+    // FoFPhase1::phase3Stats). Independent of the union-find mode.
+    const double* pskew = (const double*)stats_elems[8].data;
+    r.a_within = pskew[0];
+    r.a_proc_avg_max = pskew[1];
+    r.max_piece_n = (long)pskew[2];
+    const double* scorr = (const double*)stats_elems[9].data;
+    double ssx = scorr[0];
+    double snum = n_pes * scorr[1] - ssx * sy;
+    double sden = std::sqrt(std::max(0.0, n_pes * scorr[2] - ssx * ssx)) *
+                  std::sqrt(std::max(0.0, n_pes * csum[2] - sy * sy));
+    r.size_r = sden > 0 ? snum / sden : 0.0;
   }
   delete[] stats_elems;
   delete stats_msg;

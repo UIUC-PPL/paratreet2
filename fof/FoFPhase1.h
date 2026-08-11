@@ -401,6 +401,20 @@ public:
     seen3_pairs.clear();
   }
 
+  // Per-process phaseA wall-clock deposit (design/phasea-reassignment.md
+  // section 3, the skew-split instrument; INDEPENDENT of the union-find
+  // mode — phaseA precedes either union-find). Each PE deposits its
+  // t_phaseA once; phase3Stats reads sum and max to report the
+  // within-process skew (proc max / proc avg) separately from the
+  // cross-process skew (proc avg spread). One locked add per PE per
+  // iteration, not hot-path.
+  double a_time_sum = 0.0, a_time_max = 0.0;
+  void depositPhaseATime(double t) {
+    std::lock_guard<std::mutex> g(lock);
+    a_time_sum += t;
+    if (t > a_time_max) a_time_max = t;
+  }
+
   // Per-PROCESS redundant-descent total (design/step3.md §6d): each of this
   // process's group branches deposits its per-PE p3_redundant_descents here
   // post-walk (depositNodeRedundant), so every PE can then read the same
@@ -532,6 +546,8 @@ public:
     uf2_vertices.clear();
     uf2_labels.clear();
     global_slice.clear();
+    a_time_sum = 0.0;
+    a_time_max = 0.0;
     clearSeen();
     this->contribute(cb);
   }
@@ -718,11 +734,19 @@ public:
     // Offset table: flat index space over this PE's particle blocks.
     int n_local = 0;
     density_x = 0.0;
+    size_x = 0.0;
+    max_piece_n = 0;
     for (auto& s : treepieces) {
       s.offset = n_local;
       n_local += s.n;
       double vol = (double)s.root->data.box.volume();
       if (vol > 0) density_x += (double)s.n * (double)s.n / vol;
+      // Size predictor for phaseA SELF-pair cost (cost-model probe: cost
+      // ~ n^1.2-1.3, R2 ~0.9; the density predictor above collapses at
+      // scale because suppression linearizes dense regions). Independent
+      // of the union-find mode.
+      size_x += std::pow((double)s.n, 1.28);
+      if ((long)s.n > max_piece_n) max_piece_n = s.n;
     }
     uf_parent.resize(n_local);
     std::iota(uf_parent.begin(), uf_parent.end(), 0);
@@ -1025,6 +1049,9 @@ public:
     auto* nb = node_proxy.ckLocalBranch();
     if (nb->chain_started.fetch_add(1) == 0) nb->chain_t0 = CkWallTimer();
     phaseABody(b2);
+    // Skew-split instrument (design/phasea-reassignment.md section 3):
+    // per-process sum/max of the phaseA walls, read back by phase3Stats.
+    nb->depositPhaseATime(t_phaseA);
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
       // Enumerate the process's phaseB pool before releasing the PEs
@@ -1481,8 +1508,12 @@ public:
   // Predicted phaseA pair work from geometry alone: sum over this PE's
   // TreePieces of n^2/V (pair count within a chare ~ n * local density).
   // Correlated against t_phaseA across PEs by the stats reduction — the
-  // density-drives-phase1-work quantifier (Kale, 2026-07-29).
+  // density-drives-phase1-work quantifier (Kale, 2026-07-29). size_x and
+  // max_piece_n are the SIZE predictor companions (sum n^1.28 and the
+  // largest piece, design/phasea-reassignment.md section 3).
   double density_x = 0.0;
+  double size_x = 0.0;
+  long max_piece_n = 0;
 
   void resetPhase3(const CkCallback& cb) {
     tips_encoded_ = false;
@@ -1567,6 +1598,20 @@ public:
     double times[4] = {t_phaseA, t_phaseB, t_phaseB_maxpair, density_x};
     double corr[3] = {density_x * t_phaseA, density_x * density_x,
                       t_phaseA * t_phaseA};
+    // Skew-split instrument (design/phasea-reassignment.md section 3;
+    // INDEPENDENT of the union-find mode): every PE of a process reads the
+    // same deposited sum/max, so max over PEs == max over processes (the
+    // memoryStats trick). proc_skew[0] = this process's within skew
+    // (max/avg of its PEs' phaseA walls); [1] = this process's avg (its
+    // spread across processes is the cross-process factor); [2] = largest
+    // piece (the floor of any piece-granularity rebalancing).
+    auto* nbs = node_proxy.ckLocalBranch();
+    double proc_avg = nbs->a_time_sum / (double)CkNodeSize(CkMyNode());
+    double proc_skew[3] = {proc_avg > 0 ? nbs->a_time_max / proc_avg : 0.0,
+                           proc_avg, (double)max_piece_n};
+    // Size-predictor correlation terms (x = size_x, y = t_phaseA; the
+    // sums of y and y^2 already travel in times/corr).
+    double size_corr[3] = {size_x, size_x * t_phaseA, size_x * size_x};
     CkReduction::tupleElement tupleRedn[] = {
       CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
       CkReduction::tupleElement(sizeof(long), &peak, CkReduction::max_long),
@@ -1575,9 +1620,13 @@ public:
       CkReduction::tupleElement(sizeof(times), times, CkReduction::sum_double),
       CkReduction::tupleElement(sizeof(times), times, CkReduction::min_double),
       CkReduction::tupleElement(sizeof(times), times, CkReduction::max_double),
-      CkReduction::tupleElement(sizeof(corr), corr, CkReduction::sum_double)
+      CkReduction::tupleElement(sizeof(corr), corr, CkReduction::sum_double),
+      CkReduction::tupleElement(sizeof(proc_skew), proc_skew,
+                                CkReduction::max_double),
+      CkReduction::tupleElement(sizeof(size_corr), size_corr,
+                                CkReduction::sum_double)
     };
-    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 8);
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 10);
     msg->setCallback(cb);
     this->contribute(msg);
   }
