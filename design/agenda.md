@@ -122,7 +122,8 @@ points at its design note where one exists. Started 2026-08-05.
    map instead of re-counting all particles. Removes the 60 ms band at
    80M (projected ~300 ms per processor at 2B); debug flag keeps the
    old particle loop as a cross-check.
-11. IMPLEMENTED 2026-08-11 (unionfind branch batch-labeling, commit
+11. MERGED UPSTREAM 2026-08-11 (Ritvik, merge 40d7ecc into
+   fof_with_aggregation; originally unionfind branch batch-labeling, commit
    cd8a415, pushed — RITVIK REVIEW pending, he stewards unionfind;
    Anvil-scale measurement pending): batch the component-labeling
    requests per destination chare. Three fixes in one: the per-

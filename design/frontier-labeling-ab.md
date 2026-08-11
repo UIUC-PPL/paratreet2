@@ -26,9 +26,11 @@ Use paratreet2 main at 2cd8ca6 or later. `make clean` everywhere after
 pulling — headers were renamed (Subtree.h -> TreePiece.h) and the
 Makefiles have no dependency tracking.
 
-Baseline binary:
+Baseline binary (NOTE 2026-08-11: Ritvik MERGED batch-labeling into
+fof_with_aggregation, merge 40d7ecc — the baseline arm must therefore
+pin the PRE-MERGE tip):
 
-    cd unionfind && git checkout fof_with_aggregation
+    cd unionfind && git checkout 4ce7dec   # pre-merge fof_with_aggregation
     make clean && make CHARM_DIR=<charm> AGGREGATION= PROFILE=
     cd ../paratreet2/src && make clean && make
     cd ../fof && make clean && make
@@ -37,8 +39,8 @@ Baseline binary:
 
 Batched binary (ONLY the unionfind library differs):
 
-    cd unionfind && git fetch origin batch-labeling
-    git checkout batch-labeling        # one commit, cd8a415
+    cd unionfind && git checkout fof_with_aggregation   # now includes the
+    git pull                                            # merged batching
     make clean && make CHARM_DIR=<charm> AGGREGATION= PROFILE=
     # STALE-LIB TRAP: fof/ and examples/fof3 do NOT depend on the .a —
     # make clean BOTH before rebuilding, or you relink the old library.
