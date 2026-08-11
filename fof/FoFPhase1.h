@@ -415,6 +415,41 @@ public:
     if (t > a_time_max) a_time_max = t;
   }
 
+  // ---- phaseA claim pool (campaign S1, FOF_STEALA=1;
+  // design/phaseab-balancing.md section 14 and
+  // design/phasea-reassignment.md). The frozen registry flattened into a
+  // claimable list: any PE of the process may claim any piece (exclusive
+  // ownership by CAS), own pieces first, then unclaimed siblings' —
+  // nearest-centroid first when FOF_STEALA_GEO=1 (default; =0 is the
+  // scan-order comparison arm, Kale's 1b). Built once per iteration
+  // under the narrow lock by the first arriver (~hundreds of entries).
+  struct StealEntry {
+    Node<Data>* root;
+    Particle* parts;
+    int n;
+    int home_pe;
+    double c[3]; // box center, for the geometry claim priority
+  };
+  std::vector<StealEntry> steal_pool;
+  std::unique_ptr<std::atomic<int>[]> steal_claimed;
+  bool steal_built = false;
+  void ensureStealPool() {
+    std::lock_guard<std::mutex> g(lock);
+    if (steal_built) return;
+    for (auto& kv : pe_treepieces)
+      for (auto& s : kv.second) {
+        StealEntry e;
+        e.root = s.root; e.parts = s.parts; e.n = s.n; e.home_pe = kv.first;
+        for (int ax = 0; ax < 3; ax++)
+          e.c[ax] = 0.5 * ((double)s.root->data.box.lesser_corner[ax] +
+                           (double)s.root->data.box.greater_corner[ax]);
+        steal_pool.push_back(e);
+      }
+    steal_claimed.reset(new std::atomic<int>[steal_pool.size()]);
+    for (size_t i = 0; i < steal_pool.size(); i++) steal_claimed[i] = 0;
+    steal_built = true;
+  }
+
   // ---- Responsiveness + transfer probe (campaign P0, FOF_PROBE=1;
   // design/phaseab-balancing.md section 14). The coordinator process of
   // each physical-node domain (lowest process of a FOF_PROCS_PER_PNODE
@@ -665,6 +700,9 @@ public:
     uf2_vertices.clear();
     uf2_labels.clear();
     global_slice.clear();
+    steal_pool.clear();
+    steal_claimed.reset();
+    steal_built = false;
     a_time_sum = 0.0;
     a_time_max = 0.0;
     clearSeen();
@@ -846,15 +884,161 @@ public:
   // (a) Per-PE union-find via dual walks over all pairs of this PE's
   // TreePieces (self-pairs included), then full path compression and tip
   // assignment into Particle::group_number.
+  // Campaign S1 arms.
+  static bool stealA() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_STEALA");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  static bool stealGeo() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_STEALA_GEO");
+      return !e || std::atoi(e) != 0; // geometry priority is the default arm
+    }();
+    return on;
+  }
+
+  // Accounting + flat-index bookkeeping for one piece entering this PE's
+  // phaseA work set (shared by the static and claim paths).
+  void phaseAAdmit(TreePieceRef& s) {
+    s.offset = (int)uf_parent.size();
+    uf_parent.resize(s.offset + s.n);
+    std::iota(uf_parent.begin() + s.offset, uf_parent.end(), s.offset);
+    flat_order.resize(s.offset + s.n);
+    for (int i = 0; i < s.n; i++) flat_order[s.offset + i] = s.parts[i].order;
+    double vol = (double)s.root->data.box.volume();
+    if (vol > 0) density_x += (double)s.n * (double)s.n / vol;
+    size_x += std::pow((double)s.n, 1.28);
+    if ((long)s.n > max_piece_n) max_piece_n = s.n;
+  }
+
+  // One SELF pair (grid gate + walk), shared by both paths.
+  void phaseASelfPair(const TreePieceRef& sa) {
+    if (grid_thresh_ > 0 && sa.n >= 64) {
+      double vol = (double)sa.root->data.box.volume();
+      double b = std::sqrt(b2_);
+      double c = b / std::sqrt(6.0);
+      if (vol > 0 && (double)sa.n * c * c * c / vol >= grid_thresh_ &&
+          gridSelfUnion(sa))
+        return;
+    }
+    grid_ctx_ = &sa;
+    phaseAWalkPair(sa, sa);
+    grid_ctx_ = nullptr;
+  }
+
+  // One pair walk with the standard phaseA callbacks (self or cross).
+  void phaseAWalkPair(const TreePieceRef& sa, const TreePieceRef& sb) {
+    walk(sa.root, sb.root,
+         [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); },
+         [&](Node<Data>* a, Node<Data>* b) {
+           int ra = certRep(a, sa);
+           if (a != b) unite(ra, certRep(b, sb));
+         },
+         [&](Node<Data>* a, Node<Data>* b) {
+           int ra = connectedRep(a, sa);
+           if (ra < 0) return false;
+           if (a == b) { p1_conn_suppressed++; return true; }
+           int rb = connectedRep(b, sb);
+           if (rb < 0) return false;
+           if (find(ra) == find(rb)) { p1_conn_suppressed++; return true; }
+           return false;
+         });
+  }
+
+  // The claim path (FOF_STEALA=1): rebuild this PE's work set by claiming
+  // pieces from the process-wide pool — own pieces first, then unclaimed
+  // siblings' (nearest-centroid first under FOF_STEALA_GEO=1). Self pair
+  // runs at claim time (self-first ordering preserved piece by piece);
+  // the cross pass runs over the realized set afterwards. Ends by
+  // RE-KEYING this PE's registry bucket to the realized assignment — the
+  // constraint that keeps buildPoolSlice enumerating cross-ASSIGNMENT
+  // pairs (the silent-under-merge trap; fof1 phase-1-exact is the guard).
+  void phaseAClaims() {
+    auto* nb = node_proxy.ckLocalBranch();
+    nb->ensureStealPool();
+    auto& pool = nb->steal_pool;
+    auto* claimed = nb->steal_claimed.get();
+    treepieces.clear();
+    uf_parent.clear();
+    flat_order.clear();
+    // My claim-priority reference point: the centroid of my HOME pieces.
+    double myc[3] = {0, 0, 0};
+    int nown = 0;
+    for (auto& e : pool)
+      if (e.home_pe == CkMyPe()) {
+        for (int ax = 0; ax < 3; ax++) myc[ax] += e.c[ax];
+        nown++;
+      }
+    if (nown > 0)
+      for (int ax = 0; ax < 3; ax++) myc[ax] /= nown;
+    auto claim = [&](size_t i) {
+      int expect = 0;
+      if (!claimed[i].compare_exchange_strong(expect, 1)) return false;
+      TreePieceRef r{pool[i].root, pool[i].parts, pool[i].n, 0};
+      treepieces.push_back(r);
+      phaseAAdmit(treepieces.back());
+      phaseASelfPair(treepieces.back());
+      return true;
+    };
+    // Own pieces first (a faster sibling may already hold some — that IS
+    // the stealing).
+    for (size_t i = 0; i < pool.size(); i++)
+      if (pool[i].home_pe == CkMyPe()) claim(i);
+    // Then unclaimed work, geometry-preferring or scan-order.
+    for (;;) {
+      size_t pick = pool.size();
+      if (stealGeo()) {
+        double best = 0;
+        for (size_t i = 0; i < pool.size(); i++) {
+          if (claimed[i].load(std::memory_order_relaxed) != 0) continue;
+          double d = 0;
+          for (int ax = 0; ax < 3; ax++) {
+            double dx = pool[i].c[ax] - myc[ax];
+            d += dx * dx;
+          }
+          if (pick == pool.size() || d < best) { pick = i; best = d; }
+        }
+      } else {
+        for (size_t i = 0; i < pool.size(); i++)
+          if (claimed[i].load(std::memory_order_relaxed) == 0) { pick = i; break; }
+      }
+      if (pick == pool.size()) break; // pool drained
+      claim(pick); // CAS may lose a race; loop re-scans either way
+    }
+    // Cross pairs over the realized set (self pairs already done).
+    for (size_t i = 0; i < treepieces.size(); i++)
+      for (size_t j = i + 1; j < treepieces.size(); j++)
+        phaseAWalkPair(treepieces[i], treepieces[j]);
+    // RE-KEY: my registry bucket = my realized assignment, before the
+    // a_done deposit publishes it to the pool build.
+    {
+      std::lock_guard<std::mutex> g(nb->lock);
+      auto& bucket = nb->pe_treepieces[CkMyPe()];
+      bucket.clear();
+      for (auto& s : treepieces)
+        bucket.push_back({s.root, s.parts, s.n});
+    }
+  }
+
   void phaseABody(double b2) {
     double t0 = CkWallTimer();
     frozen_ = false;
     b2_ = b2;
-    // Offset table: flat index space over this PE's particle blocks.
-    int n_local = 0;
     density_x = 0.0;
     size_x = 0.0;
     max_piece_n = 0;
+    cert_rep.clear();
+    p1_conn_suppressed = 0;
+    if (stealA()) {
+      phaseAClaims();
+      phaseAFreeze(t0);
+      return;
+    }
+    // Static path (default): offset table over the registered pieces.
+    int n_local = 0;
     for (auto& s : treepieces) {
       s.offset = n_local;
       n_local += s.n;
@@ -869,7 +1053,6 @@ public:
     }
     uf_parent.resize(n_local);
     std::iota(uf_parent.begin(), uf_parent.end(), 0);
-    cert_rep.clear();
     flat_order.resize(n_local);
     for (auto& s : treepieces)
       for (int i = 0; i < s.n; i++) flat_order[s.offset + i] = s.parts[i].order;
@@ -927,7 +1110,12 @@ public:
       }
     }
     grid_ctx_ = nullptr;
+    phaseAFreeze(t0);
+  }
 
+  // Shared phaseA tail (static and claim paths): freeze + compress +
+  // annotate + representative structures + component counts.
+  void phaseAFreeze(double t0) {
     // Freeze + compress: write tip id (order of the component's min-order
     // root particle) into every particle. Component counting rides this
     // pass (Kale's design, 2026-08-06): one dense-array increment per
