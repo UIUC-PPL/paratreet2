@@ -121,3 +121,47 @@ and the design has to be adaptive — which would send the next attempt back
 towards movement, but informed about why the previous one failed
 (design/phaseb-offload.md sections 16-17: the grant rate, not the cost of
 moving a unit).
+
+## 80M results (Anvil, 4 nodes/32 processes, job 19773099, 2026-08-10)
+
+First job (19772653) had an awk bug in the in-log fit (`next` in an END
+action — gawk refuses the whole program); records were intact
+(preserved in results-cost80m-run1/). Resubmitted fixed as 19773099;
+both reps correct (23,707,197 components).
+
+In-log per-process medians (32 processes, joint 3-feature fit), rep1/rep2:
+
+```
+A_self   pairs 18,414   total_s 59.9/60.0  median R2 0.899/0.897 (min 0.85 max 0.94)
+A_cross  pairs 385,371  total_s  2.6/2.8   median R2 0.344/0.271 (min 0.04 max 0.72)
+B        pairs 199,189  total_s  4.1/4.6   median R2 0.578/0.579 (min 0.09 max 0.94)
+```
+
+Offline refit of process 0's records (fit-cost-records.py, rep1):
+
+```
+A_self  622 pairs, mean 2995 us:  m1 alone 0.86, m2 alone 0.14, m3 alone 0.87,
+        joint 0.90; log-log slope on m3 1.28 (superlinear in size)
+        top 10% of pairs hold 52% of the time
+A_cross 13,181 pairs, mean 5.2 us:  m1 0.03, m2 0.38, m3 0.02, joint 0.40
+        top 1% hold 41.5%, top 10% hold 93.8%
+B       5,401 pairs, mean 13.1 us:  m1 0.13, m2 0.38, m3 0.05, joint 0.49
+        log-log on m2: R2 0.60
+        top 1% of pairs hold 60.2% of the time
+```
+
+Against the three 1M readings:
+
+1. CONFIRMED at 80M — the particle-count product (unitCost's quantity)
+   explains 13% of phaseB pair cost alone; the expected-pairs term
+   explains 38% linear / 0.60 log-log, and in the joint fit carries the
+   weight. Same for phaseA cross pairs (m2 0.38 vs m1 0.03).
+2. CONFIRMED — self pairs predictable (0.90), cross pairs not (0.40).
+   A_self is also where the CPU time is (60 s total vs ~3+5 s).
+3. CONFIRMED, stronger — phaseB is extremely tail-concentrated: 1% of
+   pairs hold 60% of the time. A predictor only has to rank the tail.
+
+Await the 2B point (job 19772491, same features) before acting; if it
+holds, the actions listed under "What to do with the answer" apply:
+densities into the LPT key, replace unitCost's threshold, pre-place
+phaseB by predicted cost with the tail ranked first.
