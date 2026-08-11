@@ -172,10 +172,13 @@ banner "128 nodes" is Charm nodes = PROCESSES: 128 processes x 14 PEs
 the untraced sweep.s 16-node row the walls match (phaseA 2.54 vs ~2.6,
 phaseB 2.81 vs 2.88) — tracing overhead is minor here, an earlier
 inflation claim retracted (Kale.s challenge: phaseA has too few
-entries to trace for seconds of overhead — correct). One genuine
-anomaly vs the right row: TreeCanopy cache loading 5.56 s, far above
-the untraced 16-node value — needs an untraced rep before item 13
-absorbs it. The skew point: `phaseA_skew: within 1.84 cross 1.40 global 1.57
+entries to trace for seconds of overhead — correct). The apparent
+TreeCanopy-cache-loading anomaly (5.56 s) DISSOLVED on inspection
+(Kale): the framework print brackets the whole preTraversalFn — all of
+phase 1 + encoding + upwardPass + load (5.172+0.124+0.353+0.028 =
+5.68 ~ 5.56 printed); the true cache load was 0.028 s. The print label
+is fixed on main; any table column harvested from the old label is
+preTraversalFn-inclusive. The skew point: `phaseA_skew: within 1.84 cross 1.40 global 1.57
 size_r -0.031 max_piece_n 138233`. WITHIN-PROCESS SKEW STILL DOMINATES
 at 128 nodes — the half-1 gate holds at the third scale point (80M/480
 PEs: 1.44-1.53 vs 1.14-1.20; 2B/1920 Anvil PEs, ALSO 128 processes —

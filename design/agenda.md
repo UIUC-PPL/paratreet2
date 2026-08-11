@@ -151,10 +151,14 @@ points at its design note where one exists. Started 2026-08-05.
     positive tip) is the "local fragment" marker. Companion to the
     freeze-pass counting; together they remove every per-particle hash
     pass after phaseA.
-13. loadCache anti-scaling (Ritvik's Frontier 2B sweep, design/
+13. loadCache anti-scaling (Ritvik.s Frontier 2B sweep, design/
     fof3-2b-scaling.md): the starter-pack load grows ~49x from 8 to 128
     nodes (0.022 -> 1.073 s) as pack size tracks TreePiece count — batch
-    or coarsen the starter-pack shipment. The Anvil 80M tables show the
+    or coarsen the starter-pack shipment. INSTRUMENT CAVEAT (2026-08-11):
+    the framework print formerly labeled "TreeCanopy cache loading"
+    brackets the ENTIRE app preTraversalFn (all of phase 1 included) —
+    re-derive the 49x from the FOF3STAT loadCache field (the true
+    bracket) before investigating; the print label is fixed on main. The Anvil 80M tables show the
     same shape in miniature (0.002 -> 0.048 s over 1 -> 16 nodes).
 14. Load-balancing benefit study (GreedyRefine path is validated;
    deferred by Kale until "much later").

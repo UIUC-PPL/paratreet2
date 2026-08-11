@@ -314,7 +314,12 @@ public:
       // use exactly one of these three commands to load the software cache
       paratreet::preTraversalFn(proxy_pack);
       CkWaitQD();
-      CkPrintf("TreeCanopy cache loading: %.3lf ms\n",
+      // This bracket spans the WHOLE app preTraversalFn — for fof3 that is
+      // all of phase 1 + tip encoding + upwardPass + the cache load, so the
+      // old label "TreeCanopy cache loading" mis-attributed seconds of
+      // phase-1 work to the cache (caught by Kale, 2026-08-11; the true
+      // cache-load time is the app-side FOF3STAT loadCache field).
+      CkPrintf("Pre-traversal (app preTraversalFn, includes cache load): %.3lf ms\n",
           (CkWallTimer() - start_time) * 1000);
 
 
