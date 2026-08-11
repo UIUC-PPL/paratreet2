@@ -165,3 +165,37 @@ Await the 2B point (job 19772491, same features) before acting; if it
 holds, the actions listed under "What to do with the answer" apply:
 densities into the LPT key, replace unitCost's threshold, pre-place
 phaseB by predicted cost with the tail ranked first.
+
+## 2B results (Anvil, 16 nodes/128 processes, job 19772491, 2026-08-11)
+
+Both reps correct (424,897,832). The spooled job script carried the awk
+bug, so the summary came from the per-process FOF3COST lines in the rep
+logs plus the offline refit of process 0's records.
+
+Per-process joint-fit medians (128 processes, rep1): A_self R2 0.856
+(0.51-0.99), A_cross 0.381, B 0.595. Offline refit, process 0:
+
+```
+A_self  601 pairs, 10.4 s, mean 17.3 ms:  m1 alone 0.77, m2 0.12, m3 0.82,
+        joint 0.85; log-log slope on m3 1.21
+B       9,014 pairs, 0.52 s, mean 58 us:  m1 alone 0.04, m2 alone 0.87,
+        m3 0.01, joint 0.88; log-log on m2 0.68
+        top 1% of pairs hold 79.5% of the time
+A_cross 12,561 pairs: m2 0.58 alone; top 1% hold 43.9%
+```
+
+The 2B point STRENGTHENS every 80M reading:
+
+1. The expected-pairs term is not merely the best phaseB predictor —
+   at 2B it is a genuinely good one (0.87 alone, against 0.04 for the
+   particle-count product unitCost keys on and 0.01 for descent size).
+2. Self pairs stay predictable (0.85) and stay the CPU bulk; the size
+   power-law holds (slope 1.21 at 2B vs 1.28 at 80M).
+3. Tail concentration GROWS with scale: top 1% of phaseB pairs hold
+   60% of the time at 80M, 79.5% at 2B.
+
+STUDY COMPLETE. The gate on agenda item 4b half 2 is PASSED: densities
+into the LPT key, replace unitCost's threshold, split only the
+predicted tail — all now measurement-backed at both scales. Keep this
+branch until 4b step (i) lands FragData::n_below (de21b74) on main;
+then it can be deleted per the header.
