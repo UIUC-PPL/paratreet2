@@ -101,13 +101,18 @@ using namespace paratreet;
     // the optional -g fragments-histogram pass; it must still run BEFORE
     // applyTipEncoding, because it counts by the raw (unencoded) tips that
     // traversalFn's runFoFFragmentHistogramNode reads back.
+    // Stage 2 of design/relabel-representative.md: BOTH modes encode.
+    // Serial mode needs owner-decodable tips so processor 0 can shard the
+    // phase-3 label map into per-process slices (stage 3); the encoding
+    // itself is a per-representative rewrite folded into one
+    // materialization pass, so it no longer costs a per-particle pass.
     double t_encode = 0.0, t_fragcount = 0.0;
-    if (uf2_mode == UF2Mode::Dist) {
-      if (fof_frag_histogram) {
-        double tf0 = CkWallTimer();
-        fof.countFragments(CkCallbackResumeThread());
-        t_fragcount = CkWallTimer() - tf0;
-      }
+    if (fof_frag_histogram) {
+      double tf0 = CkWallTimer();
+      fof.countFragments(CkCallbackResumeThread());
+      t_fragcount = CkWallTimer() - tf0;
+    }
+    {
       double te0 = CkWallTimer();
       fof.applyTipEncoding(CkCallbackResumeThread());
       t_encode = CkWallTimer() - te0;
@@ -456,9 +461,10 @@ using namespace paratreet;
     // compute it unconditionally (v1 behavior, never revisited when
     // sparse-uf2 made it optional for dist).
     if (fof_frag_histogram) {
-      auto h = uf2_mode == UF2Mode::Dist
-                   ? paratreet::runFoFFragmentHistogramNode(fof_node)
-                   : paratreet::runFoFFragmentHistogram(fof, fof_node);
+      // Both modes now encode tips (stage 2), so both count fragments by
+      // raw tip in preTraversalFn (before the encoding) and read the
+      // node-merged result back here.
+      auto h = paratreet::runFoFFragmentHistogramNode(fof_node);
       CkPrintf("FOF3STAT fragments: %ld max_size %ld log2_histogram:",
                h.n_fragments, h.max_size);
       for (int k = 0; k < 64; k++)
@@ -466,18 +472,17 @@ using namespace paratreet;
       CkPrintf("\n");
     }
 
-    // Pre-walk soundness check for the phase-3 edge predicate. Serial mode:
-    // the tip sentinel (every registered particle's tip is a global particle
-    // order in [0, N); phase 1 writes every registered particle, so an
-    // out-of-range value means the walk would read copies phase 1 never
-    // touched). Dist mode: the owner-encoded-tip invariant instead (tips are
-    // no longer in [0, N) after preTraversalFn's encoding step; see
-    // FoFPhase1::verifyEncodedTips). Both distributed (barrier reduction),
-    // so they stay on in BOTH check modes. (Target-side sharing is asserted
-    // separately by Partition::verifySharedLeaves inside runFoFPhase3[Dist].)
+    // Pre-walk soundness check for the phase-3 edge predicate: the
+    // owner-encoded-tip invariant (every registered particle's tip decodes
+    // to its own process, with the index bits holding a valid raw tip; see
+    // FoFPhase1::verifyEncodedTips). Both modes encode since stage 2, so
+    // the old serial-mode [0, N) raw-tip sentinel is retired — an
+    // unencoded or foreign tip here means phase 1 skipped a particle or a
+    // cached copy carries stale tips. Distributed (barrier reduction), on
+    // in BOTH check modes. (Target-side sharing is asserted separately by
+    // Partition::verifySharedLeaves inside runFoFPhase3[Dist].)
     double tg0 = CkWallTimer();
-    if (uf2_mode == UF2Mode::Dist) paratreet::runFoFVerifyEncodedTips(fof);
-    else                           paratreet::runFoFVerifyTips(fof, N);
+    paratreet::runFoFVerifyEncodedTips(fof);
     double tg1 = CkWallTimer();
     CkPrintf("FOF3STAT time_s: fragcheck %.3f tip_sentinel %.3f\n",
              tc1 - tc0, tg1 - tg0);

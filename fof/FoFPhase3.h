@@ -401,9 +401,13 @@ struct FoFPhase3Result {
 //
 // dual_walk: launch the boundary walk as the symmetric dual-tree
 // traversal from the TreePiece array (required under single-distribution
-// mode, where no Partition array exists). Tips stay RAW (global particle
-// order) on this path in either walk: the serial union-find needs no
-// owner encoding, so the caller must NOT have run applyTipEncoding.
+// mode, where no Partition array exists). Tips are OWNER-ENCODED on this
+// path too since stage 2 of design/relabel-representative.md (the caller
+// runs applyTipEncoding in both modes): the serial union-find works on
+// any distinct ids, and the encoding is what lets stage 3 shard the
+// label map by owner. Labels are therefore arbitrary values, not
+// minimum particle orders; every internal consumer is value-agnostic
+// (audit in the design note).
 //
 // Quiescence detection is used ONLY for the traversal (message counts
 // there are unpredictable: cache misses, forwards, resumptions). The
@@ -561,10 +565,15 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   CkEnforce(r.edges_sent == (long)n_edges);
   double t2 = CkWallTimer();
 
-  // Serial UF_2 over the deduplicated edges; union by min tip so the global
-  // root of a component is the smallest tip id = the global particle order
-  // of the component's min-order member (one namespace with phase 1).
-  std::unordered_set<uint64_t> unique;
+  // Serial UF_2 over the deduplicated edges; union by min tip. Tips are
+  // owner-encoded (stage 2), so the winning root is the smallest ENCODED
+  // id — an arbitrary but deterministic canonical member, not the minimum
+  // particle order (all internal consumers are value-agnostic; the
+  // harness canonicalizes by min order when comparing). The dedup key
+  // must store both 64-bit endpoints in full: the old 32-bits-per-half
+  // packing silently truncated encoded tips (same lossy-key hazard the
+  // SEEN dedup hit in step 4, fixed with TipPairKey).
+  std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> unique;
   std::unordered_map<long, long> parent;
   auto find = [&](long x) -> long {
     auto it = parent.find(x);
@@ -577,8 +586,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   long n_unique = 0;
   for (int e = 0; e < n_edges; e++) {
     long lo = edges[e].first, hi = edges[e].second;
-    uint64_t key = (uint64_t(uint32_t(lo)) << 32) | uint64_t(uint32_t(hi));
-    if (!unique.insert(key).second) continue;
+    if (!unique.insert(paratreet::packTipPair(lo, hi)).second) continue;
     n_unique++;
     long ra = find(lo), rb = find(hi);
     if (ra == rb) continue;
@@ -626,11 +634,11 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
 // Step 4: distributed UF_2 (-u dist; see design/step4.md and
 // FoFPhase1.h's "Step 4" comment block). Replaces the gather-to-one serial
 // UF_2 above with UnionFindLib driving the union/labeling over the
-// owner-encoded tip namespace. PRECONDITION (unlike runFoFPhase3 above):
-// the caller must already have run, in order, after runFoFPhase1's relabel
-// and BEFORE TreePiece::upwardPass/Driver::loadCache:
-//   fof.countFragments(cb) -> fof_node.computeTipEncoding(cb) ->
-//   fof.applyTipEncoding(cb)
+// owner-encoded tip namespace. PRECONDITION (shared with runFoFPhase3
+// since stage 2 — both modes encode): the caller must already have run,
+// after runFoFPhase1's relabel and BEFORE
+// TreePiece::upwardPass/Driver::loadCache:
+//   fof.applyTipEncoding(cb)   [countFragments before it only for -g]
 // so every particle copy the phase-3 walk reads (including cache-shipped
 // remote copies) already carries the encoded tip -- FoFEdgeVisitor is used
 // completely unchanged. (examples/fof3/FoF3.C's preTraversalFn does this;
