@@ -110,8 +110,16 @@ points at its design note where one exists. Started 2026-08-05.
    map instead of re-counting all particles. Removes the 60 ms band at
    80M (projected ~300 ms per processor at 2B); debug flag keeps the
    old particle loop as a cross-check.
-11. Distributed union-find mode: batch the component-labeling requests
-   per destination chare. The labeling scatter (boss_count_prefix_done ->
+11. IMPLEMENTED 2026-08-11 (unionfind branch batch-labeling, commit
+   cd8a415, pushed — RITVIK REVIEW pending, he stewards unionfind;
+   Anvil-scale measurement pending): batch the component-labeling
+   requests per destination chare. Three fixes in one: the per-
+   destination batch entry, plus making the parent-cache dedup LIVE
+   (entries were never created — dead code), plus two latent defects
+   that surfaced (uninitialized compNum; set_component never cleared
+   drained requestors, an infinite work-queue loop once entries
+   existed). Validated -u dist both runtimes incl. 32-process.
+   Original text: The labeling scatter (boss_count_prefix_done ->
    insertDataNeedBoss, observed ~1400 sends from one chare at 2B) already
    deduplicates by parent through a cache; flushing per destination would
    collapse it to at most one message per peer chare. Dist mode remains
