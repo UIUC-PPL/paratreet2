@@ -684,6 +684,19 @@ public:
   std::vector<double> pb_part_cost;
   std::unique_ptr<std::atomic<int>[]> pb_part_claimed;
   std::unique_ptr<std::atomic<uint32_t>[]> pb_part_next;
+  // Campaign S2b (FOF_PB_MERGE=1, requires FOF_PB_PARTS): piece-REGION
+  // formulation with a process-level barrier. Units are classified
+  // intra-region (B1, partitioned by region) vs cross-region (B2, flat
+  // tail from pb_b2_begin); after B1 drains, the last depositor runs the
+  // mid-phase union-find over the B1 edges (the L2 path compression),
+  // every PE relabels + re-annotates (three-part rule; B1 edges are
+  // RETAINED for the final merge), then B2 runs over compressed tips.
+  int pb_stage = 0;             // 0 flat/unit-KD; 1 = B1; 2 = B2
+  size_t pb_b2_begin = 0;
+  std::atomic<size_t> pb_b2_next{0};
+  std::atomic<int> b1_done{0};
+  std::atomic<int> mid_done{0};
+  double stage_tM1 = 0.0;       // mid-merge wall (diagnostic)
   // Parallel pool build (2026-08-07): each of the process's threads
   // enumerates a stripe of the TreePiece-pair space into its own slice —
   // no lock, no sharing — and the last one to finish concatenates and
@@ -718,6 +731,12 @@ public:
     pb_part_cost.clear();
     pb_part_claimed.reset();
     pb_part_next.reset();
+    pb_stage = 0;
+    pb_b2_begin = 0;
+    pb_b2_next = 0;
+    b1_done = 0;
+    mid_done = 0;
+    stage_tM1 = 0.0;
     a_time_sum = 0.0;
     a_time_max = 0.0;
     clearSeen();
@@ -1321,10 +1340,16 @@ public:
     // cursor below is today's behavior unchanged. pb_cur_part_ persists
     // across P1 slice re-entries.
     const bool parts_on = !nb->pb_part_range.empty();
+    const int stage = nb->pb_stage; // 0 flat/unit-KD, 1 = B1, 2 = B2
     const size_t CHUNK = 1;
     for (;;) {
       size_t start, end;
-      if (parts_on) {
+      if (stage == 2) {
+        size_t u = nb->pb_b2_next.fetch_add(1);
+        if (u >= nb->phaseb_pool.size()) break;
+        start = u;
+        end = u + 1;
+      } else if (parts_on) {
         if (pb_cur_part_ < 0) {
           // Claim the costliest unclaimed partition.
           int pick = -1;
@@ -1391,6 +1416,13 @@ public:
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
     edge_buf.clear();
     seen.clear();
+    if (stage == 1) {
+      // End of B1 only: edges are in; the mid-phase merge and the B2
+      // round follow (phaseBChained routes on the stage). Stay active so
+      // B2 keeps accumulating into the same t_phaseB.
+      pb_t_accum_ += CkWallTimer() - t0;
+      return true;
+    }
     pb_active_ = false;
     t_phaseB = pb_t_accum_ + (CkWallTimer() - t0); // summed over slices
     return true;
@@ -1729,7 +1761,140 @@ public:
         const char* e = std::getenv("FOF_PB_PARTS");
         return e ? std::atoi(e) : 0;
       }();
-      if (kparts > 1 && !nb->phaseb_pool.empty()) {
+      static const bool pbmerge = [] {
+        const char* e = std::getenv("FOF_PB_MERGE");
+        return e && std::atoi(e) != 0;
+      }();
+      if (kparts > 1 && pbmerge && !nb->phaseb_pool.empty()) {
+        // S2b region mode: KD over the PIECES (realized assignment,
+        // n_below-weighted), then classify units by their two endpoints'
+        // regions. Intra-region units become the region's B1 partition;
+        // cross-region units form the flat B2 tail.
+        auto& pool = nb->phaseb_pool;
+        size_t n = pool.size();
+        int depth = 0;
+        while ((1 << depth) < kparts) depth++;
+        int nleaf = 1 << depth;
+        // Piece list from the realized registry.
+        std::vector<double> px, py, pz, pw;
+        for (auto& kv : nb->pe_treepieces)
+          for (auto& sp : kv.second) {
+            px.push_back(0.5 * ((double)sp.root->data.box.lesser_corner.x +
+                                (double)sp.root->data.box.greater_corner.x));
+            py.push_back(0.5 * ((double)sp.root->data.box.lesser_corner.y +
+                                (double)sp.root->data.box.greater_corner.y));
+            pz.push_back(0.5 * ((double)sp.root->data.box.lesser_corner.z +
+                                (double)sp.root->data.box.greater_corner.z));
+            pw.push_back((double)sp.root->data.n_below);
+          }
+        size_t np = px.size();
+        const double* pc[3] = {px.data(), py.data(), pz.data()};
+        struct Plane { int axis; double at; };
+        std::vector<Plane> planes(2 * nleaf, {0, 0.0});
+        std::vector<int> pidx(np);
+        for (size_t i = 0; i < np; i++) pidx[i] = (int)i;
+        struct Span { int lo, hi, d, node; };
+        std::vector<Span> stack{{0, (int)np, depth, 0}};
+        while (!stack.empty()) {
+          Span sp = stack.back();
+          stack.pop_back();
+          if (sp.d == 0 || sp.hi - sp.lo <= 1) continue;
+          double mn[3] = {1e300, 1e300, 1e300},
+                 mx[3] = {-1e300, -1e300, -1e300};
+          for (int i = sp.lo; i < sp.hi; i++)
+            for (int ax = 0; ax < 3; ax++) {
+              double c = pc[ax][pidx[i]];
+              if (c < mn[ax]) mn[ax] = c;
+              if (c > mx[ax]) mx[ax] = c;
+            }
+          int axis = 0;
+          for (int ax = 1; ax < 3; ax++)
+            if (mx[ax] - mn[ax] > mx[axis] - mn[axis]) axis = ax;
+          std::sort(pidx.begin() + sp.lo, pidx.begin() + sp.hi,
+                    [&](int x, int y) { return pc[axis][x] < pc[axis][y]; });
+          double total = 0;
+          for (int i = sp.lo; i < sp.hi; i++) total += pw[pidx[i]];
+          double acc = 0;
+          int split = sp.lo + 1;
+          for (int i = sp.lo; i < sp.hi - 1; i++) {
+            acc += pw[pidx[i]];
+            if (acc >= total / 2) { split = i + 1; break; }
+          }
+          planes[sp.node] = {axis, pc[axis][pidx[split - 1]]};
+          stack.push_back({sp.lo, split, sp.d - 1, 2 * sp.node + 1});
+          stack.push_back({split, sp.hi, sp.d - 1, 2 * sp.node + 2});
+        }
+        auto locate = [&](Node<Data>* nd) {
+          double c[3];
+          c[0] = 0.5 * ((double)nd->data.box.lesser_corner.x +
+                        (double)nd->data.box.greater_corner.x);
+          c[1] = 0.5 * ((double)nd->data.box.lesser_corner.y +
+                        (double)nd->data.box.greater_corner.y);
+          c[2] = 0.5 * ((double)nd->data.box.lesser_corner.z +
+                        (double)nd->data.box.greater_corner.z);
+          int node = 0, leaf = 0;
+          for (int d = depth; d > 0; d--) {
+            bool right = c[planes[node].axis] > planes[node].at;
+            if (right) leaf += (1 << (d - 1));
+            node = 2 * node + (right ? 2 : 1);
+          }
+          return leaf;
+        };
+        // Classify; reorder [B1 by region | B2 tail].
+        std::vector<int> region_of(n);
+        std::vector<char> is_b1(n);
+        for (size_t i = 0; i < n; i++) {
+          int ra = locate(pool[i].a), rb = locate(pool[i].b);
+          is_b1[i] = (ra == rb);
+          region_of[i] = ra;
+        }
+        std::vector<typename FoFPhase1Node<Data>::PoolUnit> reordered;
+        reordered.reserve(n);
+        nb->pb_part_range.assign(nleaf, {0, 0});
+        nb->pb_part_cost.assign(nleaf, 0.0);
+        for (int pnum = 0; pnum < nleaf; pnum++) {
+          uint32_t begin = (uint32_t)reordered.size();
+          for (size_t i = 0; i < n; i++)
+            if (is_b1[i] && region_of[i] == pnum) {
+              reordered.push_back(pool[i]);
+              nb->pb_part_cost[pnum] += pool[i].m2;
+            }
+          uint32_t end = (uint32_t)reordered.size();
+          std::sort(reordered.begin() + begin, reordered.begin() + end,
+                    [](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                       const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                      return x.key < y.key;
+                    });
+          nb->pb_part_range[pnum] = {begin, end};
+        }
+        nb->pb_b2_begin = reordered.size();
+        double b2cost = 0;
+        for (size_t i = 0; i < n; i++)
+          if (!is_b1[i]) {
+            reordered.push_back(pool[i]);
+            b2cost += pool[i].m2;
+          }
+        std::sort(reordered.begin() + nb->pb_b2_begin, reordered.end(),
+                  [](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                     const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                    return x.key < y.key;
+                  });
+        pool.swap(reordered);
+        nb->pb_part_claimed.reset(new std::atomic<int>[nleaf]);
+        nb->pb_part_next.reset(new std::atomic<uint32_t>[nleaf]);
+        for (int pnum = 0; pnum < nleaf; pnum++) {
+          nb->pb_part_claimed[pnum] = 0;
+          nb->pb_part_next[pnum] = nb->pb_part_range[pnum].first;
+        }
+        nb->pb_b2_next = nb->pb_b2_begin;
+        nb->pb_stage = 1;
+        double m2tot = b2cost;
+        for (int pnum = 0; pnum < nleaf; pnum++) m2tot += nb->pb_part_cost[pnum];
+        CkPrintf("FOF3STAT pb_regions: node %d k %d b1_units %zu b2_units %zu "
+                 "b2_m2 %.1f%%\n",
+                 CkMyNode(), nleaf, nb->pb_b2_begin, n - nb->pb_b2_begin,
+                 m2tot > 0 ? 100.0 * b2cost / m2tot : 0.0);
+      } else if (kparts > 1 && !nb->phaseb_pool.empty()) {
         auto& pool = nb->phaseb_pool;
         size_t n = pool.size();
         int depth = 0;
@@ -1828,6 +1993,24 @@ public:
       this->thisProxy[CkMyPe()].phaseBChained();
       return;
     }
+    // S2b B1 completion: last depositor runs the mid-phase union-find
+    // over the B1 edges (RETAINED afterwards — the final merge needs
+    // them for collapsed-name consistency) and fans out the
+    // relabel+re-annotate stage; B2 starts when that stage's last
+    // depositor flips pb_stage and re-broadcasts phaseBChained.
+    if (nb->pb_stage == 1) {
+      if (nb->b1_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+        double tm0 = CkWallTimer();
+        nb->mergeBody();
+        nb->stage_tM1 = CkWallTimer() - tm0;
+        CkPrintf("FOF3STAT pb_merge: node %d t %.3f map %zu\n", CkMyNode(),
+                 nb->stage_tM1, nb->tip_map.size());
+        int first = CkNodeFirst(CkMyNode());
+        for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+          this->thisProxy[pe].phaseBMidRelabel();
+      }
+      return;
+    }
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
       double tm0 = CkWallTimer();
@@ -1837,6 +2020,26 @@ public:
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].relabelChained(nb->stage_tA, nb->stage_tB,
                                            nb->stage_tM);
+    }
+  }
+
+  // S2b mid-phase stage, once per PE: apply the B1 merge map at
+  // representative granularity, materialize, re-annotate the frozen-tip
+  // node fields (the three-part atomicity rule), clear the tip-keyed
+  // per-PE state that the relabel staled (SEEN keys and cert_tip memos
+  // name old tips; clearing only re-emits idempotent duplicates), and
+  // barrier into B2.
+  void phaseBMidRelabel() {
+    relabelBody();
+    for (auto& sp : treepieces) annotateFrozenTips(sp.root);
+    seen.clear();
+    cert_tip.clear();
+    auto* nb = node_proxy.ckLocalBranch();
+    if (nb->mid_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+      nb->pb_stage = 2;
+      int first = CkNodeFirst(CkMyNode());
+      for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+        this->thisProxy[pe].phaseBChained();
     }
   }
 
