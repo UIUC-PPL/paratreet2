@@ -478,3 +478,21 @@ boundary); binary = campaign branch (all features off by default). All
   laptop's +40% single-rep worry did not transfer.
 - Probe observer effect: probe-on arm's own metrics match the base
   reps — no distortion visible at this scale.
+
+## 16. Measured: S2 at 80M (job 19804540) — two findings, one fix
+
+All arms exact. (1) Exclusive whole-partition claims REGRESSED phaseB
+0.031 -> 0.114 s (32 skew-costed partitions over 15 PEs: one PE drains
+the giant alone). FIXED same day (unit-granularity claims over the
+partition-ordered pool; partitions stay the S3 shipping/GPU unit —
+claim exclusivity belongs to SHIPPED partitions only). (2) The region
+formulation's B2 fraction is BIMODAL: 0-12% of m2 on typical
+processes, 99.3% on the hot one — the n_below-weighted KD cuts the
+dense core on exactly the process that matters, so its heavy pairs
+all straddle regions (the dry run's 14% was a process-0 sampling
+artifact). Consequences for the design: Kale's B1-merge-B2 compression
+works as intended on typical processes; the HOT process needs either
+core-avoiding region boundaries (e.g., split planes snapped away from
+high-density gradients) or B2 stealing — which S3 provides anyway,
+and the hot process is precisely the donor S3 targets. Mid-merge
+cost at 80M: sub-millisecond, map ~600-1100 entries.
