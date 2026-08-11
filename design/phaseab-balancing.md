@@ -269,3 +269,26 @@ sort-uniqued once at the boundary, not a live hash set.
 - 4. The intermediate merge — ONLY if 0c justifies it.
 - (later) Point 3's pre-phaseA migration, gated on the cross factor
   becoming the wall after stage 3.
+
+## 12. Measured: stage-0 probes at 80M (job 19789223, 2026-08-11)
+
+All runs exact. Process-0 lines (627 pieces, 5,401 units, m2 total
+1.5e7):
+
+- GATE G0 PASSES AT 80M, against this note's own section-7 prediction:
+  cross-partition fractions by UNIT COUNT follow the geometry
+  (19/33/39% at k=8/32/64) but by M2 COST collapse to
+  **0.1% / 14.4% / 25.2%** — the expensive units are interior to dense
+  regions, which KD-by-piece keeps together; only cheap units straddle
+  boundaries. Cost concentration works FOR the hierarchy. At k=32, B1
+  holds ~86% of phaseB cost internally. (2B confirmation pending.)
+- DOUBLE-RUN: pass2/pass1 median 0.011/0.016 s (~70%), MAX unchanged
+  (0.041/0.041) — the compression upper bound does not touch the
+  bottleneck process at 80M; merge cost ~1 ms. Stage 4 is not
+  justified by 80M evidence; the 2B point decides.
+- TAIL: maxunit m2 3.55e6 vs avg k=32 partition 4.7e5 — the largest
+  unit is 7.5x an average partition and produces empty partitions
+  around it in the weighted split. m2-ranked tail splitting is
+  load-bearing regardless of every other outcome.
+- Control rep phaseA_skew 1.43/1.16 matches the earlier 80M
+  measurement (instrument stability).
