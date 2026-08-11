@@ -1,0 +1,201 @@
+# Predicting what a subtree pair costs — probe, queued jobs, how to finish
+
+Written 2026-08-10 on the throwaway branch `cost-model-probe`. If you are
+picking this up cold, this file is the whole handover: what is running,
+where its output lands, and how to turn it into an answer. Delete the
+branch once the study is done — the probe is not meant to ship.
+
+## The question
+
+phaseB's wall is imbalance, not volume: after the node uniformity
+annotation it is about 1.3 s at 2B on 16 nodes against roughly 0.07 s of
+perfectly balanced work, and it stays flat from 8 to 128 nodes. Nothing
+tried so far repairs that DURING the stage — work movement is throttled by
+whatever happens to be in the queue when a request arrives. The remaining
+lever is placing work before the stage, and that needs a cost predictor.
+
+Two predictors already exist in the tree and neither has ever been checked
+against measured time:
+
+- the phaseB pool's LPT key: raw box overlap volume, no densities;
+- `unitCost` on the steal branch: `n_a * n_b`, the particle-count product.
+
+## What the probe measures
+
+`FOF_COST_PROBE=1` times every subtree pair in all three populations —
+phaseA self pairs, phaseA cross pairs, phaseB pairs — against three
+features:
+
+```
+m1 = n_a * n_b                    the naive particle-pair count (unitCost)
+m2 = rho_a * rho_b * V_int * Vb   expected pairs within the linking length:
+                                  densities times the overlap of a's box
+                                  grown by b with b's box, times the b-ball
+m3 = n_a + n_b                    descent size, a tree-walk proxy
+```
+
+Each process fits its own linear model in place — the normal equations are
+a 4x4 matrix and a 4-vector, four multiply-adds per pair, nothing stored —
+and prints coefficients with R2 as `FOF3COST` lines. Process 0 additionally
+keeps up to 50k records per processor and writes them to `FOF_COST_FILE`,
+so other model forms can be fitted offline without another run.
+
+Off by default; the probe costs nothing when the variable is unset, which
+was verified (identical 1M result, zero output).
+
+## Jobs queued on Anvil (2026-08-10 evening)
+
+```
+19772653  cost-80m    4 nodes   80M lambb.00500, 2 reps
+          log      $CF/cost-80m-19772653.log
+          records  $CF/results-cost80m/records-rep{1,2}.csv
+19772491  cost-2b    16 nodes   2B cosmo25cmb, 2 reps, est. start 08-11 09:40
+          log      $CF/cost-2b-19772491.log
+          records  $CF/results-cost2b/records-rep{1,2}.csv
+
+$CF = /anvil/projects/x-asc050025/x-lkale/software/clusterfinding
+binary: $CF/campaign-bin/FoF3.cost, built from this branch
+```
+
+The job scripts already summarise: per phase, the median coefficients and
+the R2 spread across processes. So the primary result is readable straight
+out of the job log — `grep FOF3COST` or just read the `===` blocks.
+
+## Finishing the analysis
+
+```
+ssh anvil "cat <the job log>"                    # per-process fits, medians
+scp anvil:<records csv> .                        # only if refitting
+python3 results/fit-cost-records.py records.csv  # other model forms
+```
+
+`fit-cost-records.py` adds what the in-run fit cannot: each feature's
+explanatory power alone, a log-log fit (is the cost a power law in this
+feature), and how concentrated the time is — the "top 1% / 10% of pairs
+hold N% of the time" lines, which say how much of the distribution a
+predictor actually has to get right.
+
+## What 1M on a laptop already showed
+
+Small sample, one machine, but the shape is suggestive:
+
+```
+=== A_self   111 pairs   mean 2283 us
+  m1 alone   R2 0.76      m2 alone R2 0.49      m3 alone R2 0.89
+  all three  R2 0.93      log-log slope on m3: 1.36
+  top 10% of pairs hold 54% of the time
+=== A_cross  3265 pairs  mean 3.9 us
+  m1 alone   R2 0.17      m2 alone R2 0.03      m3 alone R2 0.07
+  all three  R2 0.17
+  top 10% of pairs hold 97% of the time
+=== B        850 pairs   mean 6.3 us
+  m1 alone   R2 0.17      m2 alone R2 0.54      m3 alone R2 0.14
+  all three  R2 0.58
+  top 10% of pairs hold 59% of the time
+```
+
+Three readings to test at scale:
+
+1. **The particle-count product is a poor predictor of phaseB cost.** It
+   explains 17% alone, against 54% for the expected-pairs term, and in the
+   joint fit its coefficient is near zero. `unitCost` uses exactly this
+   quantity as its refinement threshold.
+2. **Self pairs are predictable and cross pairs are not.** 0.93 against
+   0.17. If that holds at scale, placement can be planned for self pairs
+   and must be adaptive for cross pairs.
+3. **The time is in the tail.** For cross pairs, a tenth of them hold 97%
+   of the time. A predictor that only ranks the tail correctly would be
+   enough; average-case accuracy is not what matters.
+
+## What to do with the answer
+
+If the expected-pairs term holds up at 2B, the immediate uses are:
+replace `unitCost`'s threshold, replace the pool's LPT key (which uses
+overlap volume WITHOUT densities — the fix may be as small as multiplying
+by them), and use it to place work across processes before phaseB rather
+than moving it during.
+
+If nothing predicts cross pairs even at scale, that is the more important
+result: it says pre-placement cannot work for the population that matters,
+and the design has to be adaptive — which would send the next attempt back
+towards movement, but informed about why the previous one failed
+(design/phaseb-offload.md sections 16-17: the grant rate, not the cost of
+moving a unit).
+
+## 80M results (Anvil, 4 nodes/32 processes, job 19773099, 2026-08-10)
+
+First job (19772653) had an awk bug in the in-log fit (`next` in an END
+action — gawk refuses the whole program); records were intact
+(preserved in results-cost80m-run1/). Resubmitted fixed as 19773099;
+both reps correct (23,707,197 components).
+
+In-log per-process medians (32 processes, joint 3-feature fit), rep1/rep2:
+
+```
+A_self   pairs 18,414   total_s 59.9/60.0  median R2 0.899/0.897 (min 0.85 max 0.94)
+A_cross  pairs 385,371  total_s  2.6/2.8   median R2 0.344/0.271 (min 0.04 max 0.72)
+B        pairs 199,189  total_s  4.1/4.6   median R2 0.578/0.579 (min 0.09 max 0.94)
+```
+
+Offline refit of process 0's records (fit-cost-records.py, rep1):
+
+```
+A_self  622 pairs, mean 2995 us:  m1 alone 0.86, m2 alone 0.14, m3 alone 0.87,
+        joint 0.90; log-log slope on m3 1.28 (superlinear in size)
+        top 10% of pairs hold 52% of the time
+A_cross 13,181 pairs, mean 5.2 us:  m1 0.03, m2 0.38, m3 0.02, joint 0.40
+        top 1% hold 41.5%, top 10% hold 93.8%
+B       5,401 pairs, mean 13.1 us:  m1 0.13, m2 0.38, m3 0.05, joint 0.49
+        log-log on m2: R2 0.60
+        top 1% of pairs hold 60.2% of the time
+```
+
+Against the three 1M readings:
+
+1. CONFIRMED at 80M — the particle-count product (unitCost's quantity)
+   explains 13% of phaseB pair cost alone; the expected-pairs term
+   explains 38% linear / 0.60 log-log, and in the joint fit carries the
+   weight. Same for phaseA cross pairs (m2 0.38 vs m1 0.03).
+2. CONFIRMED — self pairs predictable (0.90), cross pairs not (0.40).
+   A_self is also where the CPU time is (60 s total vs ~3+5 s).
+3. CONFIRMED, stronger — phaseB is extremely tail-concentrated: 1% of
+   pairs hold 60% of the time. A predictor only has to rank the tail.
+
+Await the 2B point (job 19772491, same features) before acting; if it
+holds, the actions listed under "What to do with the answer" apply:
+densities into the LPT key, replace unitCost's threshold, pre-place
+phaseB by predicted cost with the tail ranked first.
+
+## 2B results (Anvil, 16 nodes/128 processes, job 19772491, 2026-08-11)
+
+Both reps correct (424,897,832). The spooled job script carried the awk
+bug, so the summary came from the per-process FOF3COST lines in the rep
+logs plus the offline refit of process 0's records.
+
+Per-process joint-fit medians (128 processes, rep1): A_self R2 0.856
+(0.51-0.99), A_cross 0.381, B 0.595. Offline refit, process 0:
+
+```
+A_self  601 pairs, 10.4 s, mean 17.3 ms:  m1 alone 0.77, m2 0.12, m3 0.82,
+        joint 0.85; log-log slope on m3 1.21
+B       9,014 pairs, 0.52 s, mean 58 us:  m1 alone 0.04, m2 alone 0.87,
+        m3 0.01, joint 0.88; log-log on m2 0.68
+        top 1% of pairs hold 79.5% of the time
+A_cross 12,561 pairs: m2 0.58 alone; top 1% hold 43.9%
+```
+
+The 2B point STRENGTHENS every 80M reading:
+
+1. The expected-pairs term is not merely the best phaseB predictor —
+   at 2B it is a genuinely good one (0.87 alone, against 0.04 for the
+   particle-count product unitCost keys on and 0.01 for descent size).
+2. Self pairs stay predictable (0.85) and stay the CPU bulk; the size
+   power-law holds (slope 1.21 at 2B vs 1.28 at 80M).
+3. Tail concentration GROWS with scale: top 1% of phaseB pairs hold
+   60% of the time at 80M, 79.5% at 2B.
+
+STUDY COMPLETE. The gate on agenda item 4b half 2 is PASSED: densities
+into the LPT key, replace unitCost's threshold, split only the
+predicted tail — all now measurement-backed at both scales. Keep this
+branch until 4b step (i) lands FragData::n_below (de21b74) on main;
+then it can be deleted per the header.
