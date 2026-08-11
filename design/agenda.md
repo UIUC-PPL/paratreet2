@@ -104,8 +104,12 @@ points at its design note where one exists. Started 2026-08-05.
    example program (Kale, 2026-08-10). Also check +lci_ndevices for
    future Anvil runs — Kale recalls multiple devices per process in
    Ritvik's notes or scripts; our own 2026-08-01 Anvil A/B found no
-   significant effect on InfiniBand (charm-notes), so reconcile the
-   two before adopting a setting.
+   significant effect on InfiniBand (charm-notes). RESOLVED 2026-08-11
+   (Kale): on FRONTIER Ritvik sets +lci_ndevices to about half the
+   worker threads per process, capped at 8 (so 8 for ppn 15) — i.e.
+   min(8, ppn/2). Slingshot, not InfiniBand, so it does not contradict
+   the Anvil null result; adopt his setting for Frontier runs, keep
+   Anvil scripts flag-free.
 10. DONE 2026-08-06 (freeze-pass counting commit): eliminated the component counter's particle
    pass (Kale's design, 2026-08-06). Count per union-find root during
    the phaseA freeze pass (dense array increment beside the existing
