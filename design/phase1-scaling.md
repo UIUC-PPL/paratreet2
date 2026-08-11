@@ -63,7 +63,7 @@ DECISION RULE for the next work item:
 - phaseA max/avg collapses to ~1-1.5 => phase-1 skew is solved by
   suppression; the frontier moves to tip_encode + upwardPass (~3.4s at
   P=16) and structural items (FoF module extraction, htram tuning).
-- max/avg stays >~2-3 => density-weighted subtree->PE placement (design
+- max/avg stays >~2-3 => density-weighted TreePiece->PE placement (design
   note §7 static cost model, fix direction 1 below) is the next build,
   with intra-process work sharing as its complement.
 
@@ -102,7 +102,7 @@ FoFPhase1Stages out-param; fof3 prints
    - Plummer:  phaseA_s 0.256/0.591/0.840 (max/min = 3.3)
    - Uniform:  phaseA_s 0.111/0.122/0.132 (max/min = 1.19)
    Same N, same config — only the density profile differs. Skew grows with
-   PE count (1.05 at 2 PEs -> 1.4 at 4 -> 3.3 at 7). Subtrees are assigned
+   PE count (1.05 at 2 PEs -> 1.4 at 4 -> 3.3 at 7). TreePieces are assigned
    to PEs by particle COUNT (balanced to ~9% here), but phaseA's cost per
    PE is the pair-distance work ~ local density; the PE holding the dense
    core bounds the wall. (Uniform is also ~6x cheaper in absolute phaseA
@@ -116,25 +116,25 @@ FoFPhase1Stages out-param; fof3 prints
 
 phase1 total ~= phaseA max-PE time, and `FOF3STAT balance: phaseA_s`
 max/avg grows with P on LAMBS (clustered >> Plummer). The flattening floor
-is the work of the PE holding the densest subtree(s): per-PE AVERAGE falls
+is the work of the PE holding the densest TreePiece(s): per-PE AVERAGE falls
 like 1/P but the hot PE's work stops falling once the dense region no
 longer splits. The phaseA_s min/avg/max lines in the existing sweep logs
 test this directly.
 
 ## Fix directions (in rough order of leverage)
 
-1. **Density-weighted subtree->PE assignment** — design note §7 already
+1. **Density-weighted TreePiece->PE assignment** — design note §7 already
    prescribes it: phase-1 cost is predictable BEFORE FoF starts from the
    built tree (sum over buckets of local pair estimate, e.g. n_i^2 within
-   b-neighborhoods or 0.034*n_i with bucket volume); map subtrees to PEs by
+   b-neighborhoods or 0.034*n_i with bucket volume); map TreePieces to PEs by
    predicted WORK, not particle count. Static, no runtime machinery.
 2. **Intra-process phaseA work sharing** — the old paratreet FoF had
    exactly this tail-imbalance problem and the shared-memory-parallel-help
-   patch for it; a per-process work queue of subtree-pair walks lets idle
+   patch for it; a per-process work queue of TreePiece-pair walks lets idle
    PEs steal from the hot PE (design note §6.3d). Complements 1 (handles
    what prediction misses).
-3. **Finer subtree granularity** in dense regions (bounded: a single hot
-   subtree caps what redistribution can do; oct depth limits apply).
+3. **Finer TreePiece granularity** in dense regions (bounded: a single hot
+   TreePiece caps what redistribution can do; oct depth limits apply).
 
 Note the same density-skew mechanism will apply to tip_encode/upwardPass
 only weakly (they are per-particle, not per-pair); the balance data will
@@ -245,7 +245,7 @@ branch (Kale, 2026-07-25). Vetting recorded before implementation.
 ### 1. Fair phaseB pair division (separate commit)
 
 Current rule: for each PE pair (p, q) of a process, the LOWER PE walks all
-subtree pairs spanning the two. Load is triangular: PE i of an N-PE
+TreePiece pairs spanning the two. Load is triangular: PE i of an N-PE
 process walks pairs with N-1-i partner PEs; PE 0 carries N-1 partners,
 the last PE none. Ritvik's 80M logs show ~11x phaseB skew inside a
 process.
@@ -259,20 +259,20 @@ Options vetted:
   COUNTS (each PE gets ~(N-1)/2 partners) — but pair COST varies with
   boundary density, which parity cannot see.
 - Symmetric hash per SUBTREE pair (chosen): the work unit is the
-  (sa, sb) subtree pair, not the PE pair. walker = min-or-max PE by one
-  bit of a symmetric mix of the two subtree ROOT KEYS (Morton keys:
+  (sa, sb) TreePiece pair, not the PE pair. walker = min-or-max PE by one
+  bit of a symmetric mix of the two TreePiece ROOT KEYS (Morton keys:
   stable, cheap, identical on both sides; pointers would work but vary
-  run-to-run under ASLR). Each PE pair spans ~64 subtree pairs at the
-  default 8 subtrees/PE, so each side gets ~half IN EXPECTATION with
+  run-to-run under ASLR). Each PE pair spans ~64 TreePiece pairs at the
+  default 8 TreePieces/PE, so each side gets ~half IN EXPECTATION with
   density mixing — finer-grained balance than any PE-level rule, and it
-  is the subtree-level version of Kale's "base it on vertex id"
+  is the TreePiece-level version of Kale's "base it on vertex id"
   suggestion.
 
-Correctness invariants: every unordered subtree pair is examined by both
+Correctness invariants: every unordered TreePiece pair is examined by both
 PEs and walked by exactly one (the hash is symmetric and both sides
 compute it identically); the emitted edge SET is unchanged — only the
 emitting PE changes. Cross-PE duplicate edges (same tip pair found from
-different subtree pairs assigned to different walkers) already occur
+different TreePiece pairs assigned to different walkers) already occur
 under the lower-PE rule and are harmless: FoFPhase1Node::merge unions
 are idempotent. Per-PE seen/cert_tip dedup keeps working per walker.
 
@@ -280,7 +280,7 @@ are idempotent. Per-PE seen/cert_tip dedup keeps working per walker.
 
 runFoFPhase1 currently drives six GLOBAL reductions: reset, register,
 phaseA, phaseB, merge, relabel. Dependency audit: after registration
-(pe_subtrees frozen), every stage reads and writes only process-local
+(pe_treepieces frozen), every stage reads and writes only process-local
 data — phaseB reads phaseA's frozen tips of its own process's PEs;
 merge folds the process's edge buffers; relabel reads the process's
 tip_map. Tips are global particle orders taken from particle data, so
@@ -438,12 +438,12 @@ scale — the whole phaseA lever family is receding, and the frontier
 ## PhaseB dynamic pool (branch phaseb-pool, 2026-07-26/27)
 
 The 480-PE timeline view showed phaseB stragglers trailing the phaseA
-chain against idle sibling PEs. A phaseB subtree pair reads only frozen
+chain against idle sibling PEs. A phaseB TreePiece pair reads only frozen
 data and emits edges into the executing PE's own buffer (merge is
 idempotent to duplicates), so ANY PE of the process may execute any
 pair: the static symmetric-hash assignment is replaced by a
 process-wide pool — the last phaseA finisher enumerates every cross-PE
-subtree pair once; PEs claim chunks of 8 via an atomic index until it
+TreePiece pair once; PEs claim chunks of 8 via an atomic index until it
 drains. Termination unchanged (deposit after last claimed pair).
 
 LAPTOP A/B (8M, reconverse): zero measurable synchronization overhead
@@ -456,7 +456,7 @@ correctness byte-identical in all 6 logs. phaseB wall 0.255 -> 0.151
 leveling did not reproduce: phaseB_s spread is still ~10x (avg 0.014,
 max ~0.148). DIAGNOSIS (from reproducibility): pool max is
 0.148/0.149/0.148 across reps — the signature of ONE INDIVISIBLE PAIR,
-a single ~0.148 s subtree-pair walk (dense-core boundary within one
+a single ~0.148 s TreePiece-pair walk (dense-core boundary within one
 process); main's 0.25 straggler was that giant plus movable work the
 pool stripped away. The pool cannot split its own work unit. Also
 noted: phaseA +7 ms on pool (0.266 -> 0.273, reproducible) — no causal

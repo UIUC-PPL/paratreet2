@@ -178,10 +178,10 @@ memory: -215 MB/process at 8M.
 Two structural changes, validated together at 80M:
 
 - **PhaseB fair division**: the old rule assigned each cross-PE
-  subtree pair to the lower PE — triangular load, ~11x skew inside a
-  process. Now each unordered subtree pair is walked by exactly one
-  side, chosen by one bit of a symmetric hash of the two subtree root
-  keys; every PE pair's ~64 subtree pairs split about in half with
+  TreePiece pair to the lower PE — triangular load, ~11x skew inside a
+  process. Now each unordered TreePiece pair is walked by exactly one
+  side, chosen by one bit of a symmetric hash of the two TreePiece root
+  keys; every PE pair's ~64 TreePiece pairs split about in half with
   density mixing. (Vetting note: the plausible "even/odd of the
   smaller PE" rule is unbalanced — 3,0,2,1 at N=4.) 80M: phaseB wall
   0.34-0.42 -> 0.197 s.
@@ -328,7 +328,7 @@ At 80M P=8, the in-algorithm profile is two structures: phaseA
 can recover) and the walk (~0.72 s, more than half of it a
 remote-fetch/resume tail with a 51x min/max leaf-visit spread across
 PEs). End-to-end, input and decomposition (~9.8 s: Tipsy read + flush
-to subtrees) now dominate the iteration. The open research direction
+to TreePieces) now dominate the iteration. The open research direction
 is the walk's resumption phase: asynchronous control interleaving the
 traversal with union-find (streaming edges into UF_2 during the walk
 rather than walk -> quiesce -> drain), plus partition-level load

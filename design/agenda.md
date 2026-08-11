@@ -30,7 +30,7 @@ points at its design note where one exists. Started 2026-08-05.
    FOF_POOL_SPLIT_SIZE=6 cuts the largest unit 0.063 -> 0.039 s and the
    slowest thread 0.063 -> 0.053 s, but the stage still regresses
    0.067 -> 0.121 s because the build now enumerates 2.34M units instead
-   of 199k. The enumeration is embarrassingly parallel over subtree
+   of 199k. The enumeration is embarrassingly parallel over TreePiece
    pairs; the sort can be per-thread with a merge. Once it is parallel,
    size-based splitting should be turned on by default and phaseB should
    scale from one node instead of waiting until eight.
@@ -42,9 +42,14 @@ points at its design note where one exists. Started 2026-08-05.
    measurably does not suppress the stall in the dist pattern).
 7. Slim the serial-mode relabel broadcast to per-process map slices
    (2.84 s at 2B/16 nodes for the full-map broadcast).
-8. Rename Subtree -> TreePiece (code + documentation dedicated pass,
-   before or during report/paper writing; "subtree" collides with the
-   generic word in prose).
+8. DONE 2026-08-10 (branch treepiece-rename, code commit 9ab9f04 +
+   companion doc commit): renamed the Subtree chare to TreePiece across
+   code, comments, and documentation ("subtree" collides with the
+   generic word in prose). Literal tree-sense uses of "subtree"
+   (flat_subtree, installSubtree/collectSubtree, partial/descent/
+   sibling subtrees) are deliberately kept. User-visible: config key
+   nSubtreesMin -> nTreePiecesMin (-n flag unchanged), [Meta] label
+   n_subtree -> n_treepiece, startup prints now say TreePieces.
 9. LCI items for the handover: packet-pool exhaustion at 2B on 4-8
    nodes (refill_recvs deadlock alerts then poll_comp_impl assert
    during the input flush); the idle-stall itself (dist uf2 3.7 s at
@@ -78,7 +83,7 @@ points at its design note where one exists. Started 2026-08-05.
     pass after phaseA.
 13. loadCache anti-scaling (Ritvik's Frontier 2B sweep, design/
     fof3-2b-scaling.md): the starter-pack load grows ~49x from 8 to 128
-    nodes (0.022 -> 1.073 s) as pack size tracks subtree count — batch
+    nodes (0.022 -> 1.073 s) as pack size tracks TreePiece count — batch
     or coarsen the starter-pack shipment. The Anvil 80M tables show the
     same shape in miniature (0.002 -> 0.048 s over 1 -> 16 nodes).
 14. Load-balancing benefit study (GreedyRefine path is validated;

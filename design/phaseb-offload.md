@@ -10,10 +10,10 @@ boundaries (design/phase1-scaling.md, the 2B milestone entry).**
 
 A phase-B pool unit is a PURE FUNCTION over frozen data:
 
-    (subtree A snapshot, subtree B snapshot, b^2)  ->  set of (PE-tip, PE-tip) edges
+    (TreePiece A snapshot, TreePiece B snapshot, b^2)  ->  set of (PE-tip, PE-tip) edges
 
 - Everything a unit reads is frozen at the phaseA barrier: the two
-  subtrees' node structure (boxes, children) and their leaf particles'
+  TreePieces' node structure (boxes, children) and their leaf particles'
   position + group_number. phaseA's freeze-and-compress writes the
   PE-tips INTO the particles precisely so phase B never consults the
   union-find.
@@ -25,16 +25,16 @@ A phase-B pool unit is a PURE FUNCTION over frozen data:
   translation and keeps no state.
 
 So a unit can execute on any PE of any process on any node, at the cost
-of shipping the two subtree snapshots.
+of shipping the two TreePiece snapshots.
 
 ## 2. Assets that already exist
 
 - **Wire form**: flat_subtree / MultiData is exactly the needed snapshot
-  (nodes + particles); with FoFCachedParticle slimming a shipped subtree
+  (nodes + particles); with FoFCachedParticle slimming a shipped TreePiece
   is ~20 bytes/particle (~580 KB at 2B chare sizes of ~29k particles).
 - **Ship-once, use-many**: pool units are 8x8 (and gap-gated depth-2)
-  fragments of subtree pairs, so many units share a parent subtree. A
-  helper that holds a subtree can execute every unit referencing it.
+  fragments of TreePiece pairs, so many units share a parent TreePiece. A
+  helper that holds a TreePiece can execute every unit referencing it.
 - **Completion machinery**: the phase-1 chain's atomic deposit counter
   extends naturally to "expected returns" bookkeeping; the merge is
   already idempotent.
@@ -60,9 +60,9 @@ Scheme sketch:
    pool drains before anyone asks.
 2. **Idle processes request work** once their own pool is empty (they
    know phase B is still open process-wide from the chain state).
-3. **Affinity re-steals**: the victim records which subtrees each helper
+3. **Affinity re-steals**: the victim records which TreePieces each helper
    has already received. A repeat steal request from that helper is
-   served preferentially with units over subtrees it already holds —
+   served preferentially with units over TreePieces it already holds —
    zero incremental shipping. First steals ship the snapshot; later
    steals ride on it.
 4. **Priority tiers for victim selection**:
@@ -115,4 +115,4 @@ Scheme sketch:
    ~20x-average baseline.
 3. Buddy-node tier with the c-regular random-graph wiring + the
    steal-worthiness bar.
-4. Affinity re-steals (subtree-tracking on the victim).
+4. Affinity re-steals (TreePiece-tracking on the victim).

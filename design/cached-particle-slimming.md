@@ -50,7 +50,7 @@ Data type), extended to storage:
    identical layouts, identical code paths after inlining.
 
 2. **Storage.** CacheManager's particle pool for cached (source-tree)
-   nodes becomes `CachedParticle` storage. Subtree-owned local trees are
+   nodes becomes `CachedParticle` storage. TreePiece-owned local trees are
    untouched — they keep full `Particle` (they own the real data;
    phase 1, relabel, and I/O all operate there).
 
@@ -73,7 +73,7 @@ Data type), extended to storage:
 
 ## What deliberately does NOT change
 
-- Local (Subtree-owned) particle storage, ParticleMsg exchange, Readers,
+- Local (TreePiece-owned) particle storage, ParticleMsg exchange, Readers,
   Writers, decomposition: full `Particle` everywhere. This is a cache
   change only.
 - Non-opting applications: bit-for-bit identical behavior; the only cost
@@ -120,7 +120,7 @@ balance line properly (Kale's question, 2026-07-28): phaseB_maxpair
 rule says depth-3 splitting is NOT justified; the phaseB wall at 2B
 is the CROSS-PROCESS floor (the heavy process carries ~20x the
 average process's phaseB work, leveled across its PEs by the pool).
-The lever is inter-process work movement or subtree->process
+The lever is inter-process work movement or TreePiece->process
 placement, not finer units. phaseA skew 2.8x (particles/chare ~29k —
 the -G predictor's regime; worth the A/B). Not instrumented yet:
 pool unit COUNTS (so no mean per-unit time); a 5-line balance-line

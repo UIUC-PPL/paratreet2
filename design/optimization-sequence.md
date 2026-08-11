@@ -29,7 +29,7 @@ entry.
    design/dual-tree.md). The original walk tested every opened tree node
    against a flat list of all local leaves, which cost node-count times
    leaf-count; walking two trees against each other descends both sides
-   together and prunes whole subtree pairs at once (measured 20x on the
+   together and prunes whole TreePiece pairs at once (measured 20x on the
    walk at one process, and it also removed an artificial superlinear
    speedup that had masked the flat walk's waste).
 5. **Split only the larger side, nearest child first** (2026-07-23, same
@@ -68,13 +68,13 @@ entry.
     the last finishing thread triggers the next stage, so a slow process
     no longer holds every other process at each stage boundary.
 11. **The shared work pool for the cross-thread phase** (2026-07-27,
-    design/status-poolab-2026-07-27.md). Subtree-pair work units are
+    design/status-poolab-2026-07-27.md). TreePiece-pair work units are
     enumerated geometrically, split until no unit can hide a large chunk
     of work, sorted costliest-first, and claimed one at a time by all of
     a process's threads from a shared cursor — replacing a fixed
     assignment of pairs to threads that could not adapt to uneven cost.
-12. **Cell-grid solver for dense subtrees** (2026-07-28; default
-    threshold 4.0 on 2026-08-04 after measurement). A subtree whose
+12. **Cell-grid solver for dense TreePieces** (2026-07-28; default
+    threshold 4.0 on 2026-08-04 after measurement). A TreePiece whose
     expected occupancy per linking-length cell is high is solved by
     binning particles into a grid and joining neighbors, which is linear
     in particles, instead of walking the tree; at 2B this cut the dense
@@ -134,7 +134,7 @@ entry.
     design/phaseb-offload.md stages 1-2). A pool work unit reads only
     frozen data, so an idle process can execute it: after finishing its
     own pool, each thread asks the other processes on its machine for
-    units, receives the two subtrees in flattened form, walks them, and
+    units, receives the two TreePieces in flattened form, walks them, and
     returns the edges; the victim's merge waits until every shipped
     batch is home. Measurement against the 2B imbalance is in progress.
 
@@ -177,7 +177,7 @@ entry.
    communication pattern at all; the underlying network-library bug
    remains reported.
 6. **Prediction-based work placement** (considered 2026-07-23/25 for
-   the dense-phase imbalance). Placing subtrees by a density-based cost
+   the dense-phase imbalance). Placing TreePieces by a density-based cost
    model was rejected because the predictor's correlation with actual
    cost collapsed at scale (0.90 on the laptop, near zero at 1920
    processors — the suppression machinery absorbs exactly the work the
@@ -185,7 +185,7 @@ entry.
    The same reasoning chose stealing over prediction-push for
    cross-process offload.
 7. **Fixed assignment of cross-thread pairs** (superseded 2026-07-27).
-   The predecessor of the shared pool assigned subtree pairs to threads
+   The predecessor of the shared pool assigned TreePiece pairs to threads
    by a symmetric hash; it could not adapt when one pair was much more
    expensive than the others and one thread's largest unit set the
    phase's finish time.

@@ -189,10 +189,10 @@ identify the *kind* of imbalance, and apply the narrowest mechanism
 that addresses it.
 
 **Fair division (static).** PhaseB's original rule — the lower PE of
-each pair walks all their shared subtree pairs — gave PE i of an N-PE
+each pair walks all their shared TreePiece pairs — gave PE i of an N-PE
 process N-1-i partners: triangular load, ~11x skew. Replaced by a
-symmetric hash of the two subtree root keys choosing the walker per
-subtree pair. (An amusing vetting detail: the plausible
+symmetric hash of the two TreePiece root keys choosing the walker per
+TreePiece pair. (An amusing vetting detail: the plausible
 "even/odd of the smaller PE" rule is badly unbalanced — worked out on
 paper, it assigns 3,0,2,1 pairs at N=4.)
 
@@ -211,7 +211,7 @@ processes' phaseA tails.
 
 **The phaseB pool (dynamic).** The same timeline showed phaseB
 stragglers trailing against idle sibling PEs. PhaseB has a property
-that makes dynamic scheduling trivially safe: a subtree pair reads only
+that makes dynamic scheduling trivially safe: a TreePiece pair reads only
 frozen data and *emits edges into the executing PE's own buffer* — the
 later merge is idempotent to duplicates — so any PE of the process may
 execute any pair. The static assignment was replaced by a process-wide

@@ -198,7 +198,7 @@ Readout against your 2026-07-24 P=8 numbers:
 5. memory_MB: should drop by roughly the vertex-array + counting-map
    size (laptop: -215 MB/proc at 8M).
 6. balance phaseB_s min/avg/max: the lower-PE triangular rule is
-   replaced by a fair subtree-pair hash; skew (was ~11x inside a
+   replaced by a fair TreePiece-pair hash; skew (was ~11x inside a
    process) should compress.
 
 Rollback if anything fails: current main (= audit + slimming) is the

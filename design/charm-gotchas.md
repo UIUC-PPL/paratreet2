@@ -1,7 +1,7 @@
 # paratreet2-specific Charm++ gotchas
 
 Charm/Converse lessons tied to THIS codebase's internals (the cache, the
-Subtree/Partition copy split, the FoF certificate walk). General, transferable
+TreePiece/Partition copy split, the FoF certificate walk). General, transferable
 Charm lessons live in the SHARED practitioner repo
 (github.com/UIUC-PPL/charm-notes, `charm_best_practices.md`); this file is
 only for the paratreet2-internal specifics that would be noise there.
@@ -16,22 +16,22 @@ Settled 2026-07-23 after a review question, by reading old paratreet: in the
 inherited visitor convention `open(source, target)` / `leaf(source, target)`,
 **target is the walking chare's OWN data** (the partition's bucket leaves in
 the transposed walk — GravityVisitor writes its results INTO target — or the
-subtree's live local tree in the dual walk), and **source is the DESCENDED
+TreePiece's live local tree in the dual walk), and **source is the DESCENDED
 global tree**, whose nodes may be local or cache-shipped remote. paratreet2
 kept this unchanged. Do NOT gloss source as "remote": the global tree
-includes the walker's own subtrees, so a source node is only *possibly*
+includes the walker's own TreePieces, so a source node is only *possibly*
 remote. If a comment needs the locality distinction, say "cached-remote or
 local" for source and "own/local" for target.
 
 ## Two particle copies, two audiences
 
 The framework keeps separate copies of the same particle data for different
-roles: **Subtree** copies serve cache fetches; **Partition** copies are
+roles: **TreePiece** copies serve cache fetches; **Partition** copies are
 traversal targets. Any post-build mutation (relabel, annotate, per-leaf) must
 target the copy its consumer actually reads. Document which API touches which.
 This is the shape behind the `callPerLeafFn` multi-process staleness bug: a
 post-build mutation on the Partition copy was invisible to remote consumers
-reading the Subtree copy under non-matching decompositions. (General kernel —
+reading the TreePiece copy under non-matching decompositions. (General kernel —
 "a build-time snapshot shipped to a remote cache goes stale on later mutation"
 — is in the general file.)
 
@@ -46,7 +46,7 @@ stale cached annotations. (General kernel is in the general file.)
 
 ## Local-tree internal nodes have n_particles = -1 BY DESIGN
 
-Only LEAF nodes carry particle counts; internal nodes of a Subtree's live
+Only LEAF nodes carry particle counts; internal nodes of a TreePiece's live
 local tree keep the constructor sentinel -1 (Node.h: "non-leaves will have
 this as -1"), and empty regions are EmptyLeaf children with count 0. Any
 code descending a local tree by "child that has particles" must therefore

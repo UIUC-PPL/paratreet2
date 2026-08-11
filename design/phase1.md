@@ -7,11 +7,11 @@ distributed union-find (UF_2) later runs over tips, never particles.
 
 ## Decisions (agreed 2026-07-18)
 
-- **Oct decomposition** (`-d oct`) is the FoF configuration: subtree
-  boundaries on oct-node boundaries make every subtree a cube, which keeps
+- **Oct decomposition** (`-d oct`) is the FoF configuration: TreePiece
+  boundaries on oct-node boundaries make every TreePiece a cube, which keeps
   the Minkowski-inflated box test tight in phase 3. SFC keys still drive
   the sort underneath.
-- **No merged per-process tree.** Phase 1 walks the existing per-subtree
+- **No merged per-process tree.** Phase 1 walks the existing per-TreePiece
   local trees pairwise via real pointers. The CacheManager's `local_tps`
   registry (and the canopy replicas above it) already provide the only
   process-level structure needed. A merged tree is a measured fallback,
@@ -21,8 +21,8 @@ distributed union-find (UF_2) later runs over tips, never particles.
   concurrently):
 
   1. **(a) Per-PE UF.** Each PE runs serial UF (path compression + union
-     by min-root) over the particles of the subtrees resident on that PE.
-     Neighbor discovery: dual walks over all pairs of that PE's subtrees
+     by min-root) over the particles of the TreePieces resident on that PE.
+     Neighbor discovery: dual walks over all pairs of that PE's TreePieces
      (including self-pairs), pruning on `mindist(box_A, box_B) > b`;
      leaf-leaf does pairwise distance checks and unions. Walks that would
      cross to another PE or process prune (deferred to (b) / phase 3).
@@ -31,7 +31,7 @@ distributed union-find (UF_2) later runs over tips, never particles.
      id (`order`) of the component's min-order root — one namespace for
      PE-tips, process-level tips, and later UF_2 vertices.
   3. **Barrier** (reduction), then **(b) cross-PE edge emission.** For
-     each subtree pair spanning two PEs of the same process, the
+     each TreePiece pair spanning two PEs of the same process, the
      lower-PE-id side walks the pair and emits `(tip_i, tip_j)` edges
      into its own PE-local buffer (per-PE SEEN set dedups per tip pair).
      Reads only frozen data; writes only own buffer. No atomics.

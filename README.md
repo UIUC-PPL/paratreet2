@@ -24,16 +24,16 @@ Two constraints of the FoF design that ParaTreeT cannot satisfy without a break:
 - Reader pipeline: Tipsy/NChilada load, SFC key generation, sample sort,
   redistribution (`src/Reader.*`, `utility/` structures)
 - Decomposition hierarchy (Oct / SFC / kd) and `TreeSpec`
-- Tree build: `Subtree` + `Modularization` strategies
+- Tree build: `TreePiece` + `Modularization` strategies
 - Traverser/Visitor framework (`src/Traverser.h`) — with the visitor contract
   widened as above
 
 ## Deliberately restructured
 
 - `Data` gains an explicit "upward pass" API callable between traversals —
-  **implemented**: `Subtree::upwardPass(cb)` recomputes node Data bottom-up
+  **implemented**: `TreePiece::upwardPass(cb)` recomputes node Data bottom-up
   over the built tree and re-propagates to the TreeCanopy;
-  `Subtree::callPerLeafFn(fn, cb)` mutates the subtree-side particle copies
+  `TreePiece::callPerLeafFn(fn, cb)` mutates the TreePiece-side particle copies
   (the ones the cache ships to traversals). Tested by `examples/annotate`.
   Contract: run mutation + upwardPass *before* the traversal's cache
   loading; cached node copies from earlier rounds are not invalidated.

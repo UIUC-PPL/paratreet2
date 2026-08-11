@@ -13,8 +13,8 @@ FoF code was woven into the core module: `FoFData.h`/`FoFPhase1.h`/
 `extern module unionFindLib`, and — the part that motivated doing this now —
 the core had grown real compile-time dependencies on FoF:
 
-1. `Subtree.h` included `FoFPhase1.h` and carried an entry method with an
-   FoF-typed signature: `Subtree::registerFoF(CProxy_FoFPhase1<Data>, ...)`.
+1. `TreePiece.h` included `FoFPhase1.h` and carried an entry method with an
+   FoF-typed signature: `TreePiece::registerFoF(CProxy_FoFPhase1<Data>, ...)`.
 2. `Paratreet.h` included `FoFPhase1.h` and registered the FoF chares in
    `paratreet::Main<T>::__register` — every application (annotate,
    searchAlgos) registered FoF chares it never used.
@@ -38,23 +38,23 @@ the core had grown real compile-time dependencies on FoF:
   `INCLUDES`/`LD_LIBS` no longer mention any of them. `-DFOF` died entirely
   (nothing tested it). `-DUNIONFIND` moved into `FOF_INCLUDES`.
 
-## The inversion: registerFoF -> callPerSubtreeFn
+## The inversion: registerFoF -> callPerTreePieceFn
 
-The one non-mechanical piece. The core now exposes a generic subtree-level
+The one non-mechanical piece. The core now exposes a generic TreePiece-level
 hook mirroring the existing per-leaf one:
 
-- `paratreet::PerSubtreeAble<Data>` (CoreFunctions.h): PUP::able functor
+- `paratreet::PerTreePieceAble<Data>` (CoreFunctions.h): PUP::able functor
   `operator()(Node<Data>* local_root, Particle* particles, int n)`.
-- `Subtree::callPerSubtreeFn(CkReference<PerSubtreeAble<Data>>, cb)`:
-  applies the functor once per Subtree element with the element's local tree
+- `TreePiece::callPerTreePieceFn(CkReference<PerTreePieceAble<Data>>, cb)`:
+  applies the functor once per TreePiece element with the element's local tree
   root and contiguous particle block (stable from end of tree build to the
   next rebuild/reset — the same lifetime contract registerFoF documented);
   skips elements with no tree/particles; contributes to cb.
 
-The fof module consumes it with `fof::SubtreeRegisterFn<Data>`
+The fof module consumes it with `fof::TreePieceRegisterFn<Data>`
 (FoFPhase1.h): carries the `CProxy_FoFPhase1<Data>`, and per element hands
 (root, block) to the FoFPhase1 branch on that PE — exactly what
-`Subtree::registerFoF` did, with the FoF knowledge now on the FoF side.
+`TreePiece::registerFoF` did, with the FoF knowledge now on the FoF side.
 `runFoFPhase1` sends it through the hook. `Partition::verifySharedLeaves`
 stayed in core: its content (leaf-aliasing pointer-identity assertion) is
 app-agnostic.
@@ -64,7 +64,7 @@ app-agnostic.
 Templated chares of a non-main module are not auto-registered. The fof
 module provides `fof::registerChares<Data>()` (FoFPhase1.h) — registers
 `CkIndex_FoFPhase1<Data>`, `CkIndex_FoFPhase1Node<Data>`, and the
-`SubtreeRegisterFn<Data>` PUPable — and the FoF app's Main subclass calls it
+`TreePieceRegisterFn<Data>` PUPable — and the FoF app's Main subclass calls it
 from an overridden `__register()` after the base class's (see
 examples/fof3/Main.h). The core's `Main<T>::__register` no longer knows FoF.
 
@@ -75,13 +75,13 @@ examples/fof3/Main.h). The core's `Main<T>::__register` no longer knows FoF.
   `CK_TEMPLATES_ONLY` section. Any header whose inline code uses a
   concrete-Data chare (FoFPhase3.h's FragData visitors call
   `ckLocalBranch()->member` — completeness required at parse) needs those
-  definitions first. The codebase idiom (Subtree.h/CacheManager.h/
+  definitions first. The codebase idiom (TreePiece.h/CacheManager.h/
   TreeCanopy.h include `templates.h`) transfers: FoFPhase1.h includes
   `fof-templates.h` right after `fof.decl.h`. Diagnosed by preprocessing the
   pre-extraction TU and finding `CBase_FoFPhase1`'s definition arrived early
   through exactly that chain.
 - **PUPable_decl_template fails under a dependent base.**
-  `SubtreeRegisterFn<Data> : PerSubtreeAble<Data>` reaches PUP::able through
+  `TreePieceRegisterFn<Data> : PerTreePieceAble<Data>` reaches PUP::able through
   a dependent base, so the macro's unqualified `register_constructor` call
   does not resolve (unqualified lookup skips dependent bases). Hand-expanded
   the macro with `PUP::able::register_constructor` qualified; the templated

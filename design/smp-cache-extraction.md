@@ -24,7 +24,7 @@ The lock-free SMP cache is paratreet2's (and old ParaTreeT's) most
 broadly valuable piece: atomic child-pointer-exchange insertion,
 per-node request deduplication, lock-free reads with phase-separated
 mutation, pooled node storage. Today it is compiled into the paratreet
-module and entangled with the module's other actors — Subtree answers
+module and entangled with the module's other actors — TreePiece answers
 its requests, TreeCanopy restores boundary data, Resumer owns waiting
 lists. No other application (ChaNGa in particular) can use it without
 adopting the framework.
@@ -165,7 +165,7 @@ without it.
   resolution in section 2: per-slot parked lists on the placeholders,
   install returns the opaques, ALREADY_INSTALLED closes the
   park-vs-install race. Resumer::waiting dissolves; Resumer keeps only
-  scheduling policy (which goDown to send, subtree vs partition
+  scheduling policy (which goDown to send, TreePiece vs partition
   routing). handleRemoteNode rewrites onto lookupChildren/park. The
   fanout-fix semantics (notify exactly the requesting lanes) become
   install's returned-opaque list.

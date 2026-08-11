@@ -69,11 +69,11 @@ long-term plan moves these into their own module).
 - **Input and decomposition.** Readers ingest the Tipsy file;
   decomposition computes splitters (oct decomposition is the FoF
   configuration) and assigns particles to SUBTREE chares (default
-  8 x PEs chares, so ~N/(8 x PEs) particles per chare). Each Subtree
-  builds its local octree; TREE CANOPIES knit the subtree roots into a
+  8 x PEs chares, so ~N/(8 x PEs) particles per chare). Each TreePiece
+  builds its local octree; TREE CANOPIES knit the TreePiece roots into a
   conceptual global tree. A second chare array, PARTITIONS, exists for
   traversal work; in the FoF configuration the two decompositions
-  MATCH, and Partition leaves alias the Subtree leaves by pointer
+  MATCH, and Partition leaves alias the TreePiece leaves by pointer
   identity (verifySharedLeaves enforces it; at 2B the framework
   reports zero particle copies from this duality). Design direction
   (design/single-distribution-mode.md): make Partitions optional.
@@ -86,9 +86,9 @@ long-term plan moves these into their own module).
 ## 4. Phase 1: exact FoF within each process
 
 Implemented by a per-PE group FoFPhase1 and a per-process nodegroup
-FoFPhase1Node (src/FoFPhase1.h). Subtrees register their live tree
+FoFPhase1Node (src/FoFPhase1.h). TreePieces register their live tree
 roots and particle blocks with their PE's branch
-(Subtree::registerFoF -> registerSubtree). The whole phase then runs
+(TreePiece::registerFoF -> registerTreePiece). The whole phase then runs
 as a WITHIN-PROCESS CHAIN: each stage is triggered by the last PE (or
 last depositor) of the process finishing the previous stage, tracked
 by atomic deposit counters on the nodegroup — one deposit per PE, no
@@ -97,11 +97,11 @@ max-reduced stage walls to the driver.
 
 ### 4.1 phaseA: per-PE union-find
 
-Each PE owns the particles of its registered subtrees, indexed by a
+Each PE owns the particles of its registered TreePieces, indexed by a
 flat offset space. It runs a sequential union-find (path-compressed,
-frozen at the end of the stage) over all pairs of its subtrees,
+frozen at the end of the stage) over all pairs of its TreePieces,
 including self-pairs, where each pair is processed by a dual-tree walk
-over the two subtree octrees. OrderING: all self-pairs first, then
+over the two TreePiece octrees. OrderING: all self-pairs first, then
 cross-pairs (merge-early: local assembly populates the connectivity
 memo below, so cross walks see maximal suppression).
 
@@ -149,7 +149,7 @@ work, so a placement scheme keyed on raw n^2/V would over-correct.
 
 ### 4.2 phaseB: cross-PE pairs through a process-wide pool
 
-Pairs of subtrees on DIFFERENT PEs of the same process are walked over
+Pairs of TreePieces on DIFFERENT PEs of the same process are walked over
 the frozen phaseA state; witnesses emit (tip, tip) EDGES (deduplicated
 per PE by an exact two-uint64 pair key) rather than performing unions,
 because phaseA state is frozen — this is the frozen-phase discipline
@@ -208,7 +208,7 @@ carries a CkEnforce tripwire).
 
 ## 6. Annotation and the software cache
 
-**upwardPass** recomputes each Subtree's per-node FragData bottom-up:
+**upwardPass** recomputes each TreePiece's per-node FragData bottom-up:
 min_frag/max_frag = the min/max (encoded) tip over the node's
 particles. A node with min_frag == max_frag is UNIFORM: all its
 particles belong to one fragment — the property phase 3's certificates
@@ -256,7 +256,7 @@ resetPhase3 -> create the UF_2 library and register the locator
 -> statistics -> inject the edge remainder -> quiesce -> components.
 
 **The walk itself** is a symmetric DUAL-TREE traversal
-(Subtree::startDual -> DualTraverser): every Subtree walks its live
+(TreePiece::startDual -> DualTraverser): every TreePiece walks its live
 local tree (the target side, whose internal nodes upwardPass annotated
 in place) against the global tree through the cache (the source side).
 The historical alternative — the TRANSPOSED walk (every Partition's

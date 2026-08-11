@@ -31,11 +31,11 @@ Correctness first, at small scale:
 
 ## Walk structure
 
-Driven from the FoFPhase1 group (it already owns the local subtree
-registry): for each local subtree A and each *remote* subtree root key
+Driven from the FoFPhase1 group (it already owns the local TreePiece
+registry): for each local TreePiece A and each *remote* TreePiece root key
 B in the tree (discovered via the canopy / CacheManager `local_tps`
 complement), start a dual walk (A, B) only if `mindist(box_A, box_B)
-<= b`. Ownership rule: the side with the smaller subtree key walks the
+<= b`. Ownership rule: the side with the smaller TreePiece key walks the
 pair (each cross-process pair walked exactly once, globally).
 
 The walk itself descends the *remote* side through the CacheManager
@@ -43,7 +43,7 @@ The walk itself descends the *remote* side through the CacheManager
 Traverser/Resumer machinery pattern), while the local side descends
 real pointers. Leaf x leaf: for particle pairs within b, emit edge
 (local group_number, remote group_number). Remote leaves carry
-particles with group_number already set (subtree-side copies were
+particles with group_number already set (TreePiece-side copies were
 relabeled in phase 1 before upwardPass; the cache ships those copies).
 
 Keep the walk helpers offset-parameterizable (PBC later; see

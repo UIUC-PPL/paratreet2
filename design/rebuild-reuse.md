@@ -16,20 +16,20 @@ flush period). The two paths:
   `readers[CkMyPe()].receive`), then `decompose(iter+1)` reruns the whole
   pipeline from the readers: findSplitters (distributed sample
   sort/histogramming), a FRESH Partition array + FRESH DecompArrayMap, a
-  key-routed flush into partitions, a FRESH Subtree array + fresh map,
+  key-routed flush into partitions, a FRESH TreePiece array + fresh map,
   another key-routed flush. Keys are recomputed per particle
   (adjustNewUniverse) since the universe box moved. The old arrays are
   destroy()ed. Cost: a dump round-trip, full splitter recomputation, two
   all-to-alls, and array/map/location-manager reconstruction — plus the
   post-init map-creation race this recreation exposes (bindTo + fresh
   setMap; see Driver.h comments and charm notes).
-- **!complete_rebuild**: particles route DIRECTLY Partition -> Subtree via
-  the EXISTING subtree decomposition's flush, same arrays, reset() only.
+- **!complete_rebuild**: particles route DIRECTLY Partition -> TreePiece via
+  the EXISTING TreePiece decomposition's flush, same arrays, reset() only.
   Limitation: it reuses the STALE splitters, so imbalance accumulates until
   the ratio trigger fires the sledgehammer path above.
 
 Why a fresh map each rebuild: mechanically, a new array with a new size
-needs a map, and n_partitions/n_subtrees are data-dependent outputs of
+needs a map, and n_partitions/n_treepieces are data-dependent outputs of
 findSplitters each time. The map content itself (DecompArrayMap:
 pe_intervals — a prefix-sum walk of per-splitter particle counts against a
 per-PE threshold) is a pure function of the current splitters: a SNAPSHOT.
@@ -65,12 +65,12 @@ disposable per-rebuild objects," not a necessity.
    from the Reader group. Histogramming over the particles where they
    already live (Partitions) removes one full all-to-all per rebuild.
 3. **Particles move within the SAME arrays under the NEW splitters**: the
-   !complete_rebuild path already demonstrates direct Partition -> Subtree
+   !complete_rebuild path already demonstrates direct Partition -> TreePiece
    routing in-place; feed it freshly computed splitters instead of stale
    ones and the sledgehammer path disappears.
 4. **The variable-count question**, three options by ambition:
    (a) pad to a fixed maximum count and tolerate empty elements — cheap
-       (empty subtrees already exist in the system as EmptyLeafs do in
+       (empty TreePieces already exist in the system as EmptyLeafs do in
        trees); simplest and probably sufficient;
    (b) dynamic insertion/removal of the delta on the same array;
    (c) keep variable counts but recreate ONLY when the count changes
@@ -93,7 +93,7 @@ interval table.
 
 ## Open questions for the eventual design
 
-- bindTo(partitions) for subtrees under matching decomps: binding is fixed
+- bindTo(partitions) for TreePieces under matching decomps: binding is fixed
   at creation; with reused arrays it simply persists — but verify bound
   co-migration interacts correctly with in-place re-flushing.
 - CollocateMap (non-matching decomps path) has the same snapshot->update

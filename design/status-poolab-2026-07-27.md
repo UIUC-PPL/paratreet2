@@ -37,7 +37,7 @@ pool (0.265/0.266/0.268 -> 0.272/0.273/0.274) — small, reproducible across all
 Why the max/avg spread survives: phaseB_s max ~0.148 against an avg of 0.014
 means one PE still carries ~10x the mean. The pool is **process-local**, so it
 cannot move work across the 32 processes; the residue is either cross-process
-skew or a single indivisible expensive subtree pair (the pool's unit of work is
+skew or a single indivisible expensive TreePiece pair (the pool's unit of work is
 one pair, which it cannot split). Distinguishing the two needs a per-process
 phaseB breakdown or a Projections timeline — not done here.
 
@@ -148,7 +148,7 @@ Per PROCESS (15 PEs each), total phaseB work:
 Actionable reading: split + LPT should take phaseB from ~99 ms toward the
 ~46-50 ms floor, roughly halving it again. Below that the binding constraint
 becomes cross-process imbalance, which needs work moved between processes
-(global pool, or a better subtree->process assignment) — more splitting will
+(global pool, or a better TreePiece->process assignment) — more splitting will
 not help there. Global per-PE average is 14 ms, so process 24's floor is 3.3x
 the ideal; that gap is the whole remaining opportunity.
 

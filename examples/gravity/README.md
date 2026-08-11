@@ -18,16 +18,16 @@ Everything below is a Charm++ chare collection created by the framework
 - **Reader** (one per processor): loads the input file, computes
   space-filling-curve keys, and redistributes particles during
   decomposition.
-- **Subtree** (an array, ~8 elements per processor by default): each
+- **TreePiece** (an array, ~8 elements per processor by default): each
   element OWNS a contiguous block of particles — one spatial region —
   and builds a local tree over them each iteration.
 - **Partition** (an array, same element count here): each element owns
   the *traversal work* for a region — its list of target leaf buckets.
   With matching decompositions (this app), a Partition's buckets are the
-  very same leaf nodes its co-located Subtree built (pointer identity;
+  very same leaf nodes its co-located TreePiece built (pointer identity;
   particles are stored once).
 - **TreeCanopy** (a sparse array keyed by tree-node key): the tree nodes
-  ABOVE the subtree roots. Their payloads are combined from subtree
+  ABOVE the TreePiece roots. Their payloads are combined from TreePiece
   contributions, so every process can hold the top of the global tree.
 - **CacheManager** (one per process): the software cache. Holds the top
   of the global tree plus every remote subtree slice fetched so far this
@@ -50,14 +50,14 @@ parallel and asynchronous.
 1. **Decomposition** (first iteration, and again on later rebuilds).
    Readers load particles, compute their space-filling-curve keys, and
    sort them into spatial regions using globally agreed splitter keys.
-   Each region's particles are sent to its Subtree element.
+   Each region's particles are sent to its TreePiece element.
 
-2. **Tree build** (every Subtree element, independently, no messages).
-   Each Subtree sorts its particles and recursively builds its local
+2. **Tree build** (every TreePiece element, independently, no messages).
+   Each TreePiece sorts its particles and recursively builds its local
    tree. `GravityData` is computed bottom-up DURING this build: the leaf
    constructor accumulates mass, mass-weighted position, bounding box,
    and opening radius over the leaf's particles, and `operator+=` folds
-   children into parents on the way up. At the subtree root, the payload
+   children into parents on the way up. At the TreePiece root, the payload
    is contributed upward into the TreeCanopy layer, where the same
    `operator+=` combines sibling subtrees; canopy results stream to the
    Driver. So by the end of tree build, every tree node — leaf to global
@@ -84,7 +84,7 @@ parallel and asynchronous.
      particle summation with softening.
    - **The remote case is where the parallelism gets interesting.** The
      walked tree is the GLOBAL tree, but a process only holds its own
-     subtrees plus the canopy top. When the walk descends into a node
+     TreePieces plus the canopy top. When the walk descends into a node
      whose children live on another process, the framework (not the
      visitor — the visitor never knows) does the following: the FIRST
      walker on this process to hit that node sends one request to the
@@ -162,7 +162,7 @@ exact mode), 1k particles, 2026-08-04:
 - `-d kd -t kd` and `-d longest -t longest` — k-d trees.
 - `-d sfc -t oct` — space-filling-curve decomposition with an octree:
   the decompositions do NOT match, so this exercises the framework's
-  copy/share path (Subtree copies shipped to Partitions) rather than
+  copy/share path (TreePiece copies shipped to Partitions) rather than
   leaf aliasing.
 
 All pass; the monopole error band shifts a little with tree shape
@@ -179,14 +179,14 @@ against the direct-sum reference at the first AND last iteration):
 
 1. **Migration-based load balancing, no re-sorting** — the Charm++
    balancer moves chare array elements (Partitions, with their bound
-   Subtrees) between processors; particle-to-subtree assignment is
+   TreePieces) between processors; particle-to-TreePiece assignment is
    untouched. Enable with `-b <iterations>` (the balancing period) plus
    the runtime flag `+balancer GreedyRefineLB` — in this Charm++ build
    that name resolves to the TreeLB framework running its GreedyRefine
    strategy. Verified: four balancing rounds, 199 element migrations,
    final-iteration forces identical to the no-balancer control.
 2. **Re-bucketing and re-sorting** — between iterations, moved
-   particles are re-sent to the subtree whose key range now contains
+   particles are re-sent to the TreePiece whose key range now contains
    them, through the EXISTING splitters (cheap, every iteration). A
    full re-sort (back through the Readers, splitters recomputed,
    arrays recreated) runs every `-u <iterations>`, or — the default,
@@ -198,7 +198,7 @@ against the direct-sum reference at the first AND last iteration):
 
 Not yet studied (deliberately deferred): whether the balancer IMPROVES
 anything — these runs verify correctness under migration, not benefit.
-The measurement study (partition- versus subtree-granularity balancing,
+The measurement study (partition- versus TreePiece-granularity balancing,
 imbalanced inputs, timing) is the planned experiment in
 design/single-distribution-mode.md.
 

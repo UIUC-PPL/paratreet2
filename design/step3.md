@@ -68,7 +68,7 @@ two node populations:
    expected — but the implementation must verify with a CkEnforce
    (e.g., a validity flag in FragData: min_frag <= max_frag or
    n_particles == 0) on every node the visitor consults.
-2. **TreeCanopy nodes above subtree roots**: `upwardPass` already
+2. **TreeCanopy nodes above TreePiece roots**: `upwardPass` already
    refreshes these (phase 1 relabel happens before it). Covered, but
    the same CkEnforce applies.
 

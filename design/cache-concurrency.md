@@ -37,12 +37,12 @@ counts:
   request bitmask) — as the fill path already does.
 - **Phase separation** for any post-build *mutation* of cached `Data`. Stock
   ParaTreeT never mutates cached Data; the FoF/annotate work does
-  (`Subtree::upwardPass`, `callPerLeafFn` → `CacheManager::refreshSubtreeCopy`).
+  (`TreePiece::upwardPass`, `callPerLeafFn` → `CacheManager::refreshTreePieceCopy`).
   Such a mutation is safe only when it runs in a phase that is
   **quiescence-separated** from any traversal reading it: do the mutation,
   `CkWaitQD()` (also the cross-PE memory barrier), *then* load the cache and
   traverse. `examples/annotate`'s `preTraversalFn` is the reference pattern;
-  `refreshSubtreeCopy` and `Subtree::refreshCopies` carry the contract in
+  `refreshTreePieceCopy` and `TreePiece::refreshCopies` carry the contract in
   their comments.
 
 ## If you think you need a lock
@@ -55,7 +55,7 @@ the `CONCURRENCY DESIGN` block atop `CacheManager` before changing any of it.
 ## Memory accounting + eviction (added 2026-07-24)
 
 The cache can hold far more than the process owns: the walk fetches remote
-subtree copies (nodes into the per-rank FullNodePools, particle copies on
+TreePiece copies (nodes into the per-rank FullNodePools, particle copies on
 CachedRemoteLeafs) and nothing is ever evicted during a run. Measured with
 the new `CacheManager::cacheStats` (per-process nodegroup reduction,
 printed as `FOF3STAT cache:` by fof3, post-QD = phase-separated read):
@@ -73,7 +73,7 @@ viable options, in cost order: (a) BETWEEN-PHASE teardown (already exists:
 cleanup()/resetCachedParticles at iteration boundaries — frees everything,
 fine for single-walk apps like FoF); (b) between-phase SELECTIVE eviction
 (walk the tree at a quiescence point, demote cold cached subtrees back to
-Remote placeholders — same phase-separation contract as refreshSubtreeCopy,
+Remote placeholders — same phase-separation contract as refreshTreePieceCopy,
 no new concurrency machinery, useful for multi-traversal apps); (c) TRUE
 mid-walk eviction — requires epoch-based reclamation or refcounting on the
 hot path; expensive and against the design; only if a single walk's

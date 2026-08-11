@@ -3,20 +3,20 @@
 Status: prototype on branch `dual-tree`, laptop-validated 2026-07-23.
 Motivation: design/step3.md §6f — the transposed walk is source-driven
 against a FLAT list of local target leaves, so far target regions are pruned
-per-leaf, never per-subtree; and the walk's observed superlinearity in local
+per-leaf, never per-TreePiece; and the walk's observed superlinearity in local
 N (§6b, §6h) made it the dominant low-P cost. Kale's directive: prototype on
 a branch, measure on the laptop, keep the single-tree traversal INTACT for
 other applications (Barnes-Hut etc.) — which this does: `startDown`/
 `TransposedDownTraverser` are untouched; the dual walk reuses the framework's
-existing, previously-unused `DualTraverser` + `Subtree::startDual`, opted
+existing, previously-unused `DualTraverser` + `TreePiece::startDual`, opted
 into by fof3 only.
 
 ## Mechanism
 
 `-w dual` (with `-u dist`; default remains `-w transposed`) launches phase 3
-as `subtrees.startDual<FoFEdgeVisitor>` instead of
+as `treepieces.startDual<FoFEdgeVisitor>` instead of
 `partitions.startDown<FoFEdgeVisitor>`. DualTraverser walks (source node,
-target node) PAIRS: the global source tree against each subtree's live local
+target node) PAIRS: the global source tree against each TreePiece's live local
 tree — whose internal nodes upwardPass annotated in place, so internal x
 internal pruning becomes available. Same visitor, same SEEN table, same edge
 emission; the edge set and final labels are identical by construction and
@@ -48,9 +48,9 @@ Two supporting fixes that also stand alone:
    5.3M at 1M) and erased its win; with it, 1M leaf visits drop to ~0.9M in
    BOTH walks. Gated pairs count as negative prunes, so leaf_visits still
    means "leaf pairs actually processed".
-2. **`use_subtree` reset in Partition::startDown** (framework, one line):
-   Subtree::startDual sets the per-PE Resumer to route cache resumes to the
-   subtree proxy; Partition::startDown never reset it, so any later
+2. **`use_treepiece` reset in Partition::startDown** (framework, one line):
+   TreePiece::startDual sets the per-PE Resumer to route cache resumes to the
+   TreePiece proxy; Partition::startDown never reset it, so any later
    partition-driven walk on that PE (the FragCheckVisitor pass) would
    misroute. Latent until fof3 -w dual became the first app to mix both walk
    types in one run.

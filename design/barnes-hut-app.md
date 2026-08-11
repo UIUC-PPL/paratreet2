@@ -62,7 +62,7 @@ configuration.**
    paths FoF (single-iteration, perturb-skip) never touches, and exactly
    the paths single-distribution mode reshapes next.
 3. The gravity-class vehicle the single-distribution design note requires
-   for the partition-LB-vs-subtree-LB experiment.
+   for the partition-LB-vs-TreePiece-LB experiment.
 
 ## Scope
 
@@ -98,7 +98,7 @@ lists, balls — Collision/SPH only). The monopole app needs:
 
 ```
 struct GravityData {
-  OrientedBox<Real> box;     // framework contract (Subtree LB load reads it)
+  OrientedBox<Real> box;     // framework contract (TreePiece LB load reads it)
   Vector3D<Real> moment;     // running sum of m_i * x_i
   Real totalMass = 0;
   long count = 0;

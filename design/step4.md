@@ -86,7 +86,7 @@ directly, including on cache-shipped remote copies, and emits edges as
 `(remote_tip, local_tip)` pairs. If encoding happened only after the walk,
 a process holding an edge to a remote tip `g` would have no way to learn
 `g`'s dense index (only `g`'s owner knows its own encoding). So encoding
-runs BEFORE `Subtree::upwardPass`/`Driver::loadCache`/the walk — the same
+runs BEFORE `TreePiece::upwardPass`/`Driver::loadCache`/the walk — the same
 class of ordering hazard step 3 already fixed for annotation validity, and
 fixed the same way (do the rewrite before the thing that ships it):
 
