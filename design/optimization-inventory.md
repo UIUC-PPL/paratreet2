@@ -104,7 +104,9 @@ construction (visitors union in place).
    80M/480 PEs 0.21-0.24 -> 0.15-0.17 s (~30%, job 19799110, exact,
    projections trace in traces/mirror-80m). The per-level grid gate
    (same day) rides the same self branch: FOF_GRID_ROOT_ONLY=1 is its
-   A/B arm; laptop parity-to--3%, deep-overdensity verdict on Anvil.
+   A/B arm; laptop parity-to--3%; 80M/480 PEs parity within noise
+   (job 19799263, exact both arms) — 80M b=0.2 lacks sub-root regions
+   dense enough to pass the gate; the 2B occupancy tail decides.
 2. STACKLESS (rope) traversal: irrelevant on CPU (we recurse), but
    the right shape for the HIP kernel — feed into walk-unification
    stage 4's device driver (their Apetrei-with-Karras-ordering report
