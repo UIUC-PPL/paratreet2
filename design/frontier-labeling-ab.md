@@ -12,9 +12,11 @@ For Ritvik, written 2026-08-11. Two measurements in one job, at 2B on
 
 ## Before anything: two behavior changes on main you must know
 
-- **`-u serial` is now the fof3 default** (2026-08-10). Your sweep
-  scripts pass no `-u` flag, which previously meant dist. For this A/B
-  — and for any future dist sweep — add `-u dist` explicitly.
+- The fof3 default flipped to `-u serial` on 2026-08-10 and BACK to
+  `-u dist` on 2026-08-11 (Kale: dist is the research focus and
+  preferred production path). Net effect for you: no-flag runs are dist
+  again, but pass `-u dist` explicitly anyway so the arms are pinned
+  regardless of which commit you build.
 - Output strings changed with the TreePiece rename: the config key is
   `nTreePiecesMin` (short `-n` unchanged), the `[Meta]` label is
   `n_treepiece`, startup prints "Created N TreePieces". Check parsing
@@ -39,8 +41,8 @@ pin the PRE-MERGE tip):
 
 Batched binary (ONLY the unionfind library differs):
 
-    cd unionfind && git checkout fof_with_aggregation   # now includes the
-    git pull                                            # merged batching
+    cd unionfind && git checkout fof_with_aggregation   # tip now includes
+    git pull                # the merged batching (40d7ecc, tip 8933bae+)
     make clean && make CHARM_DIR=<charm> AGGREGATION= PROFILE=
     # STALE-LIB TRAP: fof/ and examples/fof3 do NOT depend on the .a —
     # make clean BOTH before rebuilding, or you relink the old library.
@@ -77,9 +79,13 @@ PMI_MAX_KVS_ENTRIES=4194304).
   phaseA_skew: within W cross C global G size_r R max_piece_n N`.
   within = worst process's internal phaseA max/avg (what shared-memory
   rebalancing can recover); cross = hottest process avg over global avg
-  (what only cross-process placement can recover). At 80M/480 PEs on
-  Anvil we measured within 1.44-1.53 against cross 1.14-1.20; the 2B
-  point at scale is what the phaseA design is gated on.
+  (what only cross-process placement can recover). Measured so far:
+  80M/480 PEs Anvil within 1.44-1.53 x cross 1.14-1.20; 2B/16-node
+  Anvil (2026-08-12, pinned map) within 1.70-1.72 x cross 1.44. The
+  Anvil 2B point already gated the phaseA design GO; what Frontier adds
+  is the cross(P) GROWTH CURVE at your node counts (16 -> 128), which
+  decides whether cross-process stealing must escalate beyond the
+  physical node (design/phaseab-balancing.md section 19, v2).
 
 ## What we expect
 

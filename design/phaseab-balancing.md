@@ -505,3 +505,240 @@ costliest-first concatenation. Merge-arm overhead at 80M: phaseB
 0.055 incl. the full B1/barrier/merge/relabel/re-annotate/B2 cycle —
 the barrier machinery costs ~6 ms here. The bimodal B2 finding
 (max 99.3%) reproduced exactly.
+
+## 17. phaseBMidRelabel anatomy + the optimization it needs (Kale's question, 2026-08-11)
+
+What the mid-relabel does per PE, from the code: (1) relabelBody —
+ONE HASH PROBE PER FROZEN ROOT (not per particle; representative-
+indirect since the relabel work), ~50k roots/PE at 80M against a ~1k
+merge map; (2) materializeLabels — one INDEXED store per particle
+(rewrites group_number, the label, not a parent pointer), no hashing;
+(3) annotateFrozenTips — a FULL recursion over every local node
+READING EVERY PARTICLE's group_number to rebuild min/max_frag. So no
+per-particle hash lookup exists; the ~18 ms/PE cost (traced) is the
+per-particle STREAMING of (2)+(3) — each label read pulls a 120-byte
+Particle record through the cache, and (3) also walks every node.
+IS IT PAYING? At 80M: NO — B2 is 0-12% of m2 on typical processes and
+the wall moved ~nothing; the flag stays default-off pending the 2B
+double-run. THE FIX IF 2B JUSTIFIES IT: touch only AFFECTED pieces —
+the merge map is ~1k entries, so only roots whose label changed need
+materialization and only pieces CONTAINING changed roots need
+re-annotation; most pieces have zero changed roots and skip entirely,
+making the barrier cost proportional to the map, not to N.
+
+Related (secondary, Kale): the serial-mode applyGlobalMap broadcast
+path still builds a per-PE hash of the map (480 copies of ~40k
+entries at 80M = the 0.03-0.06 s relabel(p3) there). The sliced path
+already stores the map ONCE per process on the node branch — lowering
+FOF_SLICE_MIN_BYTES to 0 (always slice) removes the per-PE
+construction at every map size; queued for the next measurement round.
+
+## 18. Measured: the 2B stage-0 verdicts (job 19815941, 2026-08-12)
+
+All runs exact under the pinned configuration (the per-arm retry armor
+prevented the IBV-assert losses of the first two attempts).
+
+- 0c DOUBLE-RUN — THE MERGE DOES NOT PAY AT 2B: pass1 per-process
+  phaseB min/med/max 0.010/0.066/1.304 s; pass2 0.003/0.053/1.304.
+  The BOTTLENECK PROCESS IS IDENTICAL TO THREE DECIMALS — full-merge
+  compression (the upper bound of any partition-level merge) removes
+  nothing from the process that sets the wall; only the median moves
+  (-20%). Same shape as 80M. Per the design's own rule, STAGE 4 IS
+  CANCELLED as a wall lever: FOF_PB_MERGE stays default-off (the
+  machinery remains as validated opt-in — its barrier costs ~2-10 ms
+  and it may serve other datasets). The 1.304 s lives on one process
+  and can only MOVE — S3 stealing is confirmed as THE phaseB lever.
+- G0 KD DRY RUN at 2B (process 0): cross-partition m2 5.4% / 24.3% /
+  25.1% at k=8/32/64 — cost concentration holds (geometric prediction
+  was 60-70%), with the standing bimodal caveat (process 0 is not the
+  hot process; per-process pb_regions data showed up to 99% there).
+  With the merge cancelled, partitions matter only as SHIPPING units,
+  and the numbers say the right thing for that: at k=32 the hot
+  partition holds 4.47e7 of m2 (8.3x the average partition) INCLUDING
+  the giant 3.56e7 unit — one grant ships ~26% of the process's
+  work, exactly the whole-partition-steal shape S3 wants.
+- THE 2B SKEW SPLIT (the half-1 gate, now definitive, pinned config):
+  within 1.70-1.72 x cross 1.44. Within-process still dominates at
+  2B/128 processes — S1's claim pool has ~30% of the phaseA wall to
+  recover at 2B (its 80M A/B already measured 1.45 -> 1.13).
+  size_r -0.035: the per-PE size predictor is dead at 2B too, dynamic
+  claiming confirmed once more.
+
+## 19. S3 detailed scheme (reviewed by Kale 2026-08-12; IMPLEMENTED same
+day on phaseab-campaign, commits through fbc04ed — status in section 20)
+
+Coordinator-mediated whole-partition phaseB stealing within the physical
+node. Everything below is inside the existing FoFPhase1Node NODEGROUP —
+no new chare types. FOF_S3=0 (default) is bit-identical current behavior.
+
+ROLES. Every process's branch is an AGENT: it owns the local partition
+table (built by S2's KD split, FOF_PB_PARTS on — with the merge cancelled,
+partitions exist purely as shipping units), executes ship orders, runs
+foreign work, returns edges. The lowest-rank branch of each
+FOF_PROCS_PER_PNODE block is additionally the COORDINATOR for that block.
+Decision entries on the coordinator are [exclusive]; any free PE serves
+them (Kale's spec). v1 scope: within the physical node only.
+
+PROTOCOL.
+1. PUBLISH: when a process finishes its pool build it sends the
+   coordinator s3Publish {k partition costs, total m2, n_units} (~300 B).
+2. MONITOR: the coordinator polls its block every FOF_S3_POLL_MS
+   (default 10 ms, CcdCallFnAfter — pace-every-retry); agents reply
+   s3Report {remaining_m2, drained, idle_pes}. remaining_m2 is an atomic
+   counter decremented at each unit claim (one atomic add per unit,
+   ~9k/process at 2B — negligible). Agents ALSO push an unsolicited
+   report the moment they drain (event beats next poll tick).
+3. DECIDE ([exclusive] s3Decide, fires on report arrival): helper = a
+   drained process; donor = block max remaining_m2. Ship iff
+   donor_remaining > FOF_S3_IMBALANCE (1.5) x block average AND
+   donor_remaining > an absolute floor (~20 ms of predicted work via the
+   cost-model constant) — below that, shipping costs more than it moves.
+   One outstanding order per (donor, helper) pair; [exclusive]
+   serializes decisions; new decisions only on fresh reports (no retry
+   storms). Order: donor's costliest partition not yet ordered.
+4. SHIP (donor agent, s3ShipOrder): mark the partition SHIPPED (CAS; the
+   local unit-claim loop skips unclaimed units of shipped partitions),
+   then collect its still-unclaimed units using the SAME per-unit CAS the
+   local drain uses — whoever wins the CAS owns the unit, so zero double
+   execution by construction, no new locks. If nothing remains, reply
+   s3Declined (coordinator picks another partition). Serialize one
+   shipment: subtree snapshots deduped by root across the partition's
+   units (preorder-flattened nodes with frag summaries incl. n_below +
+   FoFCachedParticle 20 B leaves) + the unit list as snapshot-index
+   pairs + period/b. Feasibility is the measured probe: 8 MB moves in
+   3.2-4.8 ms; the 2B hot partition (~26% of the hot process's work in
+   one grant, section 18) against a 1.304 s imbalance.
+5. EXECUTE (helper): rebuild ephemeral trees (dense arrays), run the
+   units through the existing sliced drain with shipment-scoped SEEN and
+   cert memos. Edges stay in a shipment-local buffer in GLOBAL
+   particle-order tips — phaseB precedes tip encoding, so tips are valid
+   on any process; the helper NEVER encodes (section 3 rule). Helpers
+   take foreign work only when their own pool is drained (true by
+   construction of the decision rule).
+6. RETURN (s3Return to donor): edge vector deduped WITHIN the shipment
+   + per-unit walltimes. The donor feeds them through the ordinary
+   submitEdges door — which re-checks every edge against the donor's
+   LIVE seen set, grown since the shipment left (the same tip pair can
+   arise from different units) — and decrements ships_outstanding
+   (Kale's review point 2026-08-12: helper-side dedup alone is not
+   enough; donor-side re-dedup at return is required. A slipped
+   duplicate would be a cost bug, not a correctness bug — union() is
+   idempotent — but the re-check is nearly free).
+7. TERMINATION: the donor's process merge fires when b_done == nranks
+   AND ships_outstanding == 0 (the return handler may be the closer) —
+   a one-condition extension of the deposit chain. The helper's OWN
+   merge never waits on foreign work; foreign slices keep being served
+   from the scheduler after its deposit, interleaved with whatever its
+   process does next. The global relabel already waits for every
+   process's merge, so the critical path counts foreign work exactly
+   once, at the donor.
+
+KNOBS: FOF_S3, FOF_S3_POLL_MS (10), FOF_S3_IMBALANCE (1.5),
+FOF_S3_MIN_SHIP (absolute floor), FOF_PROCS_PER_PNODE (block size).
+STATS: FOF3STAT s3 line — ships out/in, declined, shipped m2 and bytes,
+build/rebuild/return-latency ms.
+
+GATES: fof1 exact + FOF_COUNT_VERIFY both runtimes at 8M/80M laptop;
+Anvil 80M A/B (S2 vs S2+S3); then 2B, where the target is the 1.304 s
+hot process — its physical node holds 7 near-idle siblings, so the
+ceiling is ~1.304/8 + overhead; the v1 success bar is a 2-3x cut.
+
+SCOPE (confirmed with Kale 2026-08-12): S3 steals ONLY phaseB pair
+units (cross-TreePiece pairs from the process pool, grouped in
+partitions). Nothing in phaseA is ever stolen across processes —
+phaseA work moves only WITHIN a process via S1's claim pool.
+
+DEFERRED to v2: cross-physical-node escalation (coordinator-to-
+coordinator handoff) if the hot process's whole block turns out hot;
+shipping arbitrary unit sets instead of partitions; phaseA cross-process
+steals.
+
+## 20. S3 v1 implementation status (2026-08-12)
+
+Implemented as designed in section 19 with these v1 simplifications,
+all laptop-gated on BOTH runtimes (classic netlrts and reconverse,
+-u serial per the campaign measurement policy):
+
+- Decisions are DRAIN-EVENT driven, no poll layer yet: the coordinator
+  acts on publish/drained/declined events only. The donor pick is
+  "largest un-ordered partition of any other member" — without polls the
+  coordinator does not know remaining work, so declines prune emptied
+  partitions (one decline each, permanent). Polls refine the donor pick
+  later if 80M/2B show bad picks.
+- The helper executes a whole shipment on the PE that serves the
+  s3Shipment entry, unsliced (helpers are drained by construction).
+  Parallel foreign drain and slicing are v2 items.
+- Helper-side in_ships/in_units print at the helper's OWN merge, which
+  can precede its helping — donor-side numbers are authoritative
+  (cosmetic; move the print to phase3Stats when it matters).
+- FOF_S3_TEST=1 forces the maximal exercise: even processes refuse every
+  local claim, so their entire pool must travel order/ship/execute/
+  return and the counts must still be exact.
+
+The termination invariant sharpened during bring-up: the merge fires
+only when b_done is full AND every pool unit is OWNED (one CAS per unit,
+won by a local PE or a shipment collection — the s3_units_owned ledger)
+AND every shipment returned. Cursor exhaustion alone is NOT ownership;
+the forced test lost 2031 components to exactly that assumption before
+the ledger existed. Second bring-up defect: the decision pass initially
+gave up when the FIRST free helper had no donor, orphaning the second
+helper's work — every free helper now gets a donor search per pass.
+
+Gates (all counts exact; 1M and 10k under the full serial-oracle
+verification): classic 2x4 and 4x2 forced tests (entire pools executed
+remotely, e.g. 8 ships/4030 units off node 0; 4-proc run had two donors
+helping each other), natural mode, S3-off bit-identical base; reconverse
+2x4 forced (with a bidirectional 21-unit remnant exchange), 4x2 forced,
+natural, base. Next: 80M Anvil A/B (S2 vs S2+S3), then 2B where the
+1.304 s hot process is the target (ceiling ~1.304/8 + overhead; v1 bar
+2-3x).
+
+## 21. Measured 2026-08-12 afternoon: daytime2b (19833850) + the S3 80M gate (19833867)
+
+Every arm of both jobs exact on the FIRST try — the --mem=0 steps rode
+a daytime window, so the OOM mitigation is untested-by-adversity but
+nothing failed. Findings:
+
+- FIRST 2B S1 MEASUREMENT (serialsum arm, S1b+m2key): phaseA
+  1.43 -> 1.03 s (-28%; reference = probes2bv2 no-claim serial arms,
+  same config previous night), within-skew 1.70 -> 1.38. Direct steal
+  evidence at 2B: EVERY process stole (foreign claims 30-118 pieces per
+  process, typically ~60-90 of ~550 total; 9-14 of 15 PEs per process
+  took at least one foreign piece).
+- THE S1->PHASEB TRADE AT 2B: phaseB 1.30 -> 1.61 s (+0.3) against
+  phaseA's -0.4. Net phase1 gain is small at 2B; claims scatter pieces
+  and the pool pays. This is the 80M trade (0.031->0.040) at scale, and
+  it sharpens the argument that S3 (move phaseB work, not phaseA
+  pieces) is the lever that matters at 2B.
+- V3 VERIFIED AT 2B: parts mode (k=32, costliest-first concatenation)
+  phaseB 1.554 vs flat 1.609 — the v2 regression (+60% at 80M) is gone;
+  partitions are FREE as the S3 shipping substrate.
+- ITEM 11 ANVIL POINT: labelbase uf2 0.391 vs labelbatch 0.288 s
+  (-26%, single rep each; Frontier measured -13% at the same scale).
+- DIST HEALTH: plain -u dist on current main ran clean in the daytime
+  window — nothing in the stack changed; the overnight failures were
+  the OOM window (agenda item 9 root cause).
+- SUM-DETAIL: first campaign-era 2B image data captured (serial, S1b,
+  1920 PEs; traces/sumd2b-serial-19833850.tar.gz, copied to laptop).
+
+S3 80M GATE (19833867, 4 nodes/32 procs, all counts 23707197):
+- natural arms shipped NOTHING and cost NOTHING (phaseB 0.058 = base
+  0.058): the 80M pool drains in 58 ms, no helper is ever matched —
+  S3 idles for free.
+- forced arm: 16 even processes shipped their ENTIRE pools — 513
+  shipments, 377,167 units executed remotely, 51,286 edges returned —
+  counts exact, and phaseB actually dropped to 0.045 s (16 idle
+  helpers soak half the machine's phaseB).
+- protocol exercised at 4 coordinator blocks (FOF_PROCS_PER_PNODE=8
+  default) with donors that also helped (node 0: 32 ships out, 14 in).
+
+Next: the 2B S3 job (base/S3 x2 interleaved + S3 sum-detail + forced
+last) — the hot process's 1.3-1.6 s phaseB is the campaign's target.
+
+Frontier 4-node 80M shakedown (Kale's relay, 2026-08-12 afternoon):
+all three serial arms exact (23707197); forced arm 511 out_ships /
+382,475 units / 48,950 ret_edges — the same shape as Anvil's 80M gate
+(513 / 377k / 51k) on a different transport. S3 v1 has now moved whole
+pools correctly on classic-netlrts (laptop), reconverse-local (laptop),
+InfiniBand (Anvil), and Slingshot/CXI (Frontier). The 16-node 2B 2x2
+A/B (design/frontier-s3-ab.md) is cleared to run.
