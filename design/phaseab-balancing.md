@@ -496,3 +496,12 @@ core-avoiding region boundaries (e.g., split planes snapped away from
 high-density gradients) or B2 stealing — which S3 provides anyway,
 and the hot process is precisely the donor S3 targets. Mid-merge
 cost at 80M: sub-millisecond, map ~600-1100 entries.
+
+Addendum (v2 run, job 19804970): unit-granular claims recovered
+phaseB 0.114 -> 0.049; the residual over the 0.031 baseline was
+index-order partition concatenation (cheap partitions drained before
+the giant — LPT lost across partitions); fixed same evening with
+costliest-first concatenation. Merge-arm overhead at 80M: phaseB
+0.055 incl. the full B1/barrier/merge/relabel/re-annotate/B2 cycle —
+the barrier machinery costs ~6 ms here. The bimodal B2 finding
+(max 99.3%) reproduced exactly.
