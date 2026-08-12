@@ -564,7 +564,8 @@ prevented the IBV-assert losses of the first two attempts).
   size_r -0.035: the per-PE size predictor is dead at 2B too, dynamic
   claiming confirmed once more.
 
-## 19. S3 detailed scheme (PROPOSED 2026-08-12 — awaiting Kale's review)
+## 19. S3 detailed scheme (reviewed by Kale 2026-08-12; IMPLEMENTED same
+day on phaseab-campaign, commits through fbc04ed — status in section 20)
 
 Coordinator-mediated whole-partition phaseB stealing within the physical
 node. Everything below is inside the existing FoFPhase1Node NODEGROUP —
@@ -651,3 +652,43 @@ DEFERRED to v2: cross-physical-node escalation (coordinator-to-
 coordinator handoff) if the hot process's whole block turns out hot;
 shipping arbitrary unit sets instead of partitions; phaseA cross-process
 steals.
+
+## 20. S3 v1 implementation status (2026-08-12)
+
+Implemented as designed in section 19 with these v1 simplifications,
+all laptop-gated on BOTH runtimes (classic netlrts and reconverse,
+-u serial per the campaign measurement policy):
+
+- Decisions are DRAIN-EVENT driven, no poll layer yet: the coordinator
+  acts on publish/drained/declined events only. The donor pick is
+  "largest un-ordered partition of any other member" — without polls the
+  coordinator does not know remaining work, so declines prune emptied
+  partitions (one decline each, permanent). Polls refine the donor pick
+  later if 80M/2B show bad picks.
+- The helper executes a whole shipment on the PE that serves the
+  s3Shipment entry, unsliced (helpers are drained by construction).
+  Parallel foreign drain and slicing are v2 items.
+- Helper-side in_ships/in_units print at the helper's OWN merge, which
+  can precede its helping — donor-side numbers are authoritative
+  (cosmetic; move the print to phase3Stats when it matters).
+- FOF_S3_TEST=1 forces the maximal exercise: even processes refuse every
+  local claim, so their entire pool must travel order/ship/execute/
+  return and the counts must still be exact.
+
+The termination invariant sharpened during bring-up: the merge fires
+only when b_done is full AND every pool unit is OWNED (one CAS per unit,
+won by a local PE or a shipment collection — the s3_units_owned ledger)
+AND every shipment returned. Cursor exhaustion alone is NOT ownership;
+the forced test lost 2031 components to exactly that assumption before
+the ledger existed. Second bring-up defect: the decision pass initially
+gave up when the FIRST free helper had no donor, orphaning the second
+helper's work — every free helper now gets a donor search per pass.
+
+Gates (all counts exact; 1M and 10k under the full serial-oracle
+verification): classic 2x4 and 4x2 forced tests (entire pools executed
+remotely, e.g. 8 ships/4030 units off node 0; 4-proc run had two donors
+helping each other), natural mode, S3-off bit-identical base; reconverse
+2x4 forced (with a bidirectional 21-unit remnant exchange), 4x2 forced,
+natural, base. Next: 80M Anvil A/B (S2 vs S2+S3), then 2B where the
+1.304 s hot process is the target (ceiling ~1.304/8 + overhead; v1 bar
+2-3x).
