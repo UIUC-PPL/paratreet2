@@ -1,4 +1,5 @@
 module fof {
+  include "FoFStealTypes.h";
   // Friends-of-Friends application module, extracted from the paratreet core
   // module (2026-08; see design/fof-module.md). The core toolkit carries no
   // FoF code: this module consumes the core's generic hooks (TreePiece::
@@ -51,6 +52,16 @@ module fof {
     entry void probeAck(int target, double t0);
     entry void probeXfer(int from, double t0, const std::vector<char>&);
     entry void probeXferAck(double t0, long bytes);
+    // S3 coordinator-mediated phaseB stealing (design/phaseab-balancing.md
+    // section 19). Decision handlers serialize on the branch's s3_lock
+    // (the portable equivalent of [exclusive]); any free PE serves.
+    entry void s3Publish(int fromNode, double total,
+                         const std::vector<double>&);
+    entry void s3Drained(int fromNode);
+    entry void s3Declined(int donorNode, int helperNode, int partIdx);
+    entry void s3ShipOrder(int helperNode, int partIdx);
+    entry void s3Shipment(const paratreet::StealShipment<Data>&);
+    entry void s3Return(int fromNode, const std::vector<long>&);
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission

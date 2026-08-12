@@ -440,6 +440,240 @@ public:
   // claims that landed on the piece's home PE vs a sibling ("foreign" =
   // an actual steal). Printed once per process at a_done completion.
   std::atomic<long> s1_own{0}, s1_foreign{0}, s1_pes_foreign{0};
+
+  // ---- S3: coordinator-mediated whole-partition phaseB stealing within
+  // the physical node (design/phaseab-balancing.md section 19). FOF_S3=1
+  // + FOF_PB_PARTS>0, stage-0 (non-merge) pools only. Every branch is an
+  // AGENT; the block's lowest-rank branch is additionally the
+  // COORDINATOR. Decision entries are serialized by s3_lock — the
+  // semantic equivalent of [exclusive], portable to both runtimes.
+  static bool s3On() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_S3");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  static double s3MinShip() { // m2 floor under which nothing ships
+    static const double v = [] {
+      const char* e = std::getenv("FOF_S3_MIN_SHIP");
+      return e ? std::atof(e) : 0.0;
+    }();
+    return v;
+  }
+  int s3Coord() const {
+    int P = probeProcsPerPnode();
+    return (CkMyNode() / P) * P;
+  }
+  // The group proxy, for node-branch handlers that fan out to this
+  // process's PEs (the shipment-return merge closer) and for reaching
+  // the serving PE's group branch (flatten/rebuild/walk live there).
+  CProxy_FoFPhase1<Data> group_proxy;
+  // Per-unit ownership authority (allocated with the partitions when S3
+  // is armed): 0 free, 1 taken by a local PE, 2 shipped. One CAS decides
+  // each unit exactly once — zero double execution by construction.
+  std::unique_ptr<std::atomic<int>[]> s3_unit_taken;
+  // Owned-units ledger: incremented once per unit at its winning CAS
+  // (local claim or shipment collection). The merge closes only when
+  // every unit is owned AND every shipment returned — cursor exhaustion
+  // alone is not ownership (the forced test proved it: refused units
+  // consumed cursor without an owner and 2031 components went missing).
+  std::atomic<long> s3_units_owned{0};
+  size_t s3_units_total = 0;
+  std::atomic<long> s3_ships_outstanding{0};
+  std::atomic<int> s3_b_full{0};      // all PEs deposited b_done
+  std::atomic<int> s3_merge_fired{0};
+  std::atomic<int> s3_drain_sent{0};  // one drain signal per process
+  std::atomic<long> s3_out_ships{0}, s3_out_units{0}, s3_in_ships{0},
+      s3_in_units{0}, s3_declines{0}, s3_ret_edges{0};
+  double s3_out_m2 = 0; // under s3_lock
+  std::mutex s3_lock;
+  struct S3Member {
+    std::vector<double> part_cost; // initial partition costs (publish)
+    std::vector<char> ordered;     // partition already ordered away
+    double total = 0;
+    bool drained = false; // pool cursor exhausted: can help
+    bool busy = false;    // an order/shipment is in flight for this helper
+  };
+  std::map<int, S3Member> s3_members; // coordinator-side status table
+
+  // Agent -> coordinator, once per process at pool build: partition costs.
+  void s3Publish(int fromNode, double total, const std::vector<double>& costs) {
+    std::lock_guard<std::mutex> g(s3_lock);
+    auto& m = s3_members[fromNode];
+    m.part_cost = costs;
+    m.ordered.assign(costs.size(), 0);
+    m.total = total;
+    s3DecideLocked();
+  }
+  // Agent -> coordinator: my pool cursor is exhausted (or my shipment is
+  // done) — I can take work. Idempotent.
+  void s3Drained(int fromNode) {
+    std::lock_guard<std::mutex> g(s3_lock);
+    auto& m = s3_members[fromNode];
+    m.drained = true;
+    m.busy = false;
+    s3DecideLocked();
+  }
+  // Donor -> coordinator: the ordered partition had nothing left to ship.
+  void s3Declined(int donorNode, int helperNode, int partIdx) {
+    (void)donorNode; (void)partIdx; // stays marked ordered: nothing there
+    std::lock_guard<std::mutex> g(s3_lock);
+    auto h = s3_members.find(helperNode);
+    if (h != s3_members.end()) h->second.busy = false;
+    s3DecideLocked();
+  }
+  // One decision pass (coordinator only, s3_lock held): match each free
+  // drained helper to the largest un-ordered partition above the floor,
+  // from a member that has not itself drained. Decisions only on fresh
+  // events (publish/drain/decline) — no retry storms.
+  void s3DecideLocked() {
+    if (CkMyNode() != s3Coord()) return;
+    // EVERY free drained helper gets a donor search — a helper whose only
+    // eligible donor is itself must not end the pass (first version broke
+    // exactly there: it always examined the first free helper and gave up
+    // when that one had nothing, so the second helper was never asked).
+    for (bool issued = true; issued;) {
+      issued = false;
+      for (auto& hkv : s3_members) {
+        if (!hkv.second.drained || hkv.second.busy) continue;
+        int helper = hkv.first;
+        int donor = -1, part = -1;
+        double best = s3MinShip();
+        for (auto& kv : s3_members) {
+          // Drained members stay eligible as donors: their unclaimed-unit
+          // truth lives in the CAS array, not here — an empty partition
+          // costs one decline and is pruned permanently. (Excluding them
+          // would also break FOF_S3_TEST, where a donor's cursor exhausts
+          // instantly because its locals refuse every claim.)
+          if (kv.first == helper) continue;
+          auto& m = kv.second;
+          for (int p = 0; p < (int)m.part_cost.size(); p++)
+            if (!m.ordered[p] && m.part_cost[p] > best) {
+              donor = kv.first;
+              part = p;
+              best = m.part_cost[p];
+            }
+        }
+        if (donor < 0) continue; // nothing for THIS helper; try the next
+        s3_members[donor].ordered[part] = 1;
+        s3_members[helper].busy = true;
+        issued = true;
+        this->thisProxy[donor].s3ShipOrder(helper, part);
+      }
+    }
+  }
+  // Coordinator -> donor: ship partition partIdx's still-unowned units to
+  // helperNode. Ownership per unit via the same CAS the local drain uses.
+  void s3ShipOrder(int helperNode, int partIdx) {
+    paratreet::StealShipment<Data> ship;
+    ship.origin_node = CkMyNode();
+    ship.part_idx = partIdx;
+    auto range = pb_part_range[partIdx];
+    auto* fof = group_proxy.ckLocalBranch();
+    std::unordered_map<Node<Data>*, int> in_ship;
+    auto place = [&](Node<Data>* n) -> int {
+      auto it = in_ship.find(n);
+      if (it != in_ship.end()) return it->second;
+      int idx = (int)ship.trees.size();
+      ship.trees.emplace_back();
+      fof->flattenStealTree(n, ship.trees.back());
+      in_ship.emplace(n, idx);
+      return idx;
+    };
+    double m2 = 0;
+    for (uint32_t k = range.first; k < range.second; k++) {
+      int expect = 0;
+      if (!s3_unit_taken[k].compare_exchange_strong(expect, 2)) continue;
+      s3_units_owned.fetch_add(1);
+      ship.unit_pairs.emplace_back(place(phaseb_pool[k].a),
+                                   place(phaseb_pool[k].b));
+      m2 += phaseb_pool[k].m2;
+    }
+    if (ship.unit_pairs.empty()) {
+      s3_declines.fetch_add(1);
+      this->thisProxy[s3Coord()].s3Declined(CkMyNode(), helperNode, partIdx);
+      return;
+    }
+    ship.m2 = m2;
+    s3_ships_outstanding.fetch_add(1);
+    s3_out_ships.fetch_add(1);
+    s3_out_units.fetch_add((long)ship.unit_pairs.size());
+    {
+      std::lock_guard<std::mutex> g(s3_lock);
+      s3_out_m2 += m2;
+    }
+    this->thisProxy[helperNode].s3Shipment(ship);
+  }
+  // Helper: rebuild, execute every unit with the identical walk/cert/dedup
+  // semantics (walkUnitEdges), exact-dedup across the shipment, return.
+  // v1 limitation: the whole shipment runs on the serving PE, unsliced —
+  // helpers are drained by construction of the decision rule.
+  void s3Shipment(const paratreet::StealShipment<Data>& ship) {
+    auto* fof = group_proxy.ckLocalBranch();
+    std::vector<std::vector<Particle>> parts(ship.trees.size());
+    std::vector<Node<Data>*> roots(ship.trees.size(), nullptr);
+    for (size_t t = 0; t < ship.trees.size(); t++) {
+      parts[t] = ship.trees[t].particles;
+      roots[t] = fof->buildStealTree(ship.trees[t], parts[t]);
+    }
+    std::vector<std::pair<long, long>> es;
+    for (auto& up : ship.unit_pairs)
+      fof->walkUnitEdges(roots[up.first], roots[up.second], es);
+    for (auto* r : roots) fof->deleteStealTree(r);
+    std::sort(es.begin(), es.end());
+    es.erase(std::unique(es.begin(), es.end()), es.end());
+    std::vector<long> flat;
+    flat.reserve(es.size() * 2);
+    for (auto& e : es) {
+      flat.push_back(e.first);
+      flat.push_back(e.second);
+    }
+    s3_in_ships.fetch_add(1);
+    s3_in_units.fetch_add((long)ship.unit_pairs.size());
+    this->thisProxy[ship.origin_node].s3Return(CkMyNode(), flat);
+    this->thisProxy[s3Coord()].s3Drained(CkMyNode()); // available again
+  }
+  // Helper -> donor: edges (deduped within the shipment) come home
+  // through the ordinary submitEdges door; the final merge's union is
+  // idempotent to any duplicates against locally-found edges — exactly
+  // the guarantee local PE buffers already rely on.
+  void s3Return(int fromNode, const std::vector<long>& flat) {
+    (void)fromNode;
+    std::vector<std::pair<long, long>> es;
+    es.reserve(flat.size() / 2);
+    for (size_t i = 0; i + 1 < flat.size(); i += 2)
+      es.emplace_back(flat[i], flat[i + 1]);
+    s3_ret_edges.fetch_add((long)es.size());
+    if (!es.empty()) submitEdges(std::move(es));
+    s3_ships_outstanding.fetch_sub(1);
+    s3TryFinishB();
+  }
+  // The two closers: the last b_done depositor and the last s3Return both
+  // call this; whichever finds both conditions true runs the merge once.
+  void s3TryFinishB() {
+    if (s3_b_full.load(std::memory_order_acquire) == 0) return;
+    if (s3_ships_outstanding.load(std::memory_order_acquire) != 0) return;
+    if ((size_t)s3_units_owned.load(std::memory_order_acquire) !=
+        s3_units_total)
+      return; // un-owned units remain: a future order must ship them
+    finishPhaseB();
+  }
+  void finishPhaseB() {
+    if (s3_merge_fired.exchange(1)) return;
+    double tm0 = CkWallTimer();
+    mergeBody();
+    stage_tM = CkWallTimer() - tm0;
+    if (s3On())
+      CkPrintf("FOF3STAT s3: node %d out_ships %ld out_units %ld out_m2 "
+               "%.3g in_ships %ld in_units %ld ret_edges %ld declines %ld\n",
+               CkMyNode(), s3_out_ships.load(), s3_out_units.load(),
+               s3_out_m2, s3_in_ships.load(), s3_in_units.load(),
+               s3_ret_edges.load(), s3_declines.load());
+    int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      group_proxy[pe].relabelChained(stage_tA, stage_tB, stage_tM);
+  }
   void ensureStealPool() {
     std::lock_guard<std::mutex> g(lock);
     if (steal_built) return;
@@ -737,6 +971,17 @@ public:
     s1_own = 0;
     s1_foreign = 0;
     s1_pes_foreign = 0;
+    s3_unit_taken.reset();
+    s3_units_owned = 0;
+    s3_units_total = 0;
+    s3_ships_outstanding = 0;
+    s3_b_full = 0;
+    s3_merge_fired = 0;
+    s3_drain_sent = 0;
+    s3_out_ships = s3_out_units = s3_in_ships = s3_in_units = 0;
+    s3_declines = s3_ret_edges = 0;
+    s3_out_m2 = 0;
+    s3_members.clear();
     pb_part_range.clear();
     pb_part_cost.clear();
     pb_part_claimed.reset();
@@ -1372,6 +1617,17 @@ public:
         end = std::min(start + CHUNK, limit);
       }
       for (size_t k = start; k < end; k++) {
+          // S3 ownership: one CAS decides each unit exactly once between
+          // this PE (1) and a shipment (2). A lost CAS means the unit
+          // left in a shipment — skip, its edges come home via s3Return.
+          if (nb->s3_unit_taken) {
+            if (s3Test() && CkMyNode() % 2 == 0)
+              continue; // refuse: leave the unit for a shipment
+            int expect = 0;
+            if (!nb->s3_unit_taken[k].compare_exchange_strong(expect, 1))
+              continue;
+            nb->s3_units_owned.fetch_add(1);
+          }
           t_phaseB_units++;
           // Debug: replay this unit through the full ship path (flatten,
           // pup through memory, rebuild, walk) and abort on any edge-set
@@ -1467,6 +1723,9 @@ public:
     done_cb_ = done;
     grid_thresh_ = grid_thresh;
     auto* nb = node_proxy.ckLocalBranch();
+    // First arriver hands the node branch the group proxy (for the S3
+    // merge closer's relabel fan-out); one writer, no race.
+    if (CkMyPe() == CkNodeFirst(CkMyNode())) nb->group_proxy = this->thisProxy;
     if (nb->chain_started.fetch_add(1) == 0) nb->chain_t0 = CkWallTimer();
     phaseABody(b2);
     // Skew-split instrument (design/phasea-reassignment.md section 3):
@@ -1995,6 +2254,30 @@ public:
           nb->pb_part_next[pnum] = nb->pb_part_range[pnum].first;
         }
       }
+      // Arm S3 (stage-0 partitioned pools only): allocate the per-unit
+      // ownership authority BEFORE the fan-out (message order publishes
+      // it), and publish this process's partition costs to the block
+      // coordinator. Merge-mode pools (pb_stage 1) are out of v1 scope.
+      if (FoFPhase1Node<Data>::s3On()) {
+        if (nb->pb_stage == 0 && !nb->pb_part_cost.empty()) {
+          size_t n = nb->phaseb_pool.size();
+          nb->s3_unit_taken.reset(new std::atomic<int>[n]);
+          for (size_t i = 0; i < n; i++) nb->s3_unit_taken[i] = 0;
+          nb->s3_units_owned = 0;
+          nb->s3_units_total = n;
+          double tot = 0;
+          for (double c : nb->pb_part_cost) tot += c;
+          CkPrintf("FOF3STAT s3_arm: node %d parts %zu units %zu m2 %.3g\n",
+                   CkMyNode(), nb->pb_part_cost.size(), n, tot);
+          node_proxy[nb->s3Coord()].s3Publish(CkMyNode(), tot,
+                                              nb->pb_part_cost);
+        } else {
+          CkPrintf("FOF3STAT s3_arm: node %d SKIPPED stage %d parts %zu "
+                   "units %zu\n",
+                   CkMyNode(), nb->pb_stage, nb->pb_part_cost.size(),
+                   nb->phaseb_pool.size());
+        }
+      }
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].phaseBChained();
@@ -2025,8 +2308,20 @@ public:
       }
       return;
     }
+    // S3 drain signal: the first PE to see the pool cursor exhausted
+    // tells the block coordinator this process can take work (its own
+    // last units may still be executing on sibling PEs; THIS PE is free).
+    if (nb->s3_unit_taken && !nb->s3_drain_sent.exchange(1))
+      node_proxy[nb->s3Coord()].s3Drained(CkMyNode());
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
+      if (nb->s3_unit_taken) {
+        // S3: the merge must also wait for outstanding shipments; the
+        // last returner and this depositor race benignly to close.
+        nb->s3_b_full.store(1, std::memory_order_release);
+        nb->s3TryFinishB();
+        return;
+      }
       double tm0 = CkWallTimer();
       nb->mergeBody();
       nb->stage_tM = CkWallTimer() - tm0;
@@ -3164,11 +3459,23 @@ private:
   // ---- S3 transport layer (design/phaseab-balancing.md section 19),
   // ported from the phaseb-steal branch whose data plane survived its
   // post-mortem intact. Stage 1: flatten/rebuild + the pup-loopback
-  // self-test (FOF_S3_LOOPBACK=1); the coordinator protocol follows.
-
+  // self-test (FOF_S3_LOOPBACK=1). PUBLIC: the node branch's S3 handlers
+  // (ship/execute) call these through the serving PE's group branch.
+ public:
   static bool s3Loopback() {
     static const bool on = [] {
       const char* e = std::getenv("FOF_S3_LOOPBACK");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  // Forced-shipment test (FOF_S3_TEST=1, debug): even processes refuse
+  // every local claim, so their whole pool must travel the
+  // order/ship/execute/return path and the counts must still be exact —
+  // the maximal exercise of the S3 protocol on any input.
+  static bool s3Test() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_S3_TEST");
       return e && std::atoi(e) != 0;
     }();
     return on;
@@ -3328,6 +3635,7 @@ private:
     }
   }
 
+ private:
   int find(int x) {
     int root = x;
     while (uf_parent[root] != root) root = uf_parent[root];
