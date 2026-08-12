@@ -734,3 +734,11 @@ S3 80M GATE (19833867, 4 nodes/32 procs, all counts 23707197):
 
 Next: the 2B S3 job (base/S3 x2 interleaved + S3 sum-detail + forced
 last) — the hot process's 1.3-1.6 s phaseB is the campaign's target.
+
+Frontier 4-node 80M shakedown (Kale's relay, 2026-08-12 afternoon):
+all three serial arms exact (23707197); forced arm 511 out_ships /
+382,475 units / 48,950 ret_edges — the same shape as Anvil's 80M gate
+(513 / 377k / 51k) on a different transport. S3 v1 has now moved whole
+pools correctly on classic-netlrts (laptop), reconverse-local (laptop),
+InfiniBand (Anvil), and Slingshot/CXI (Frontier). The 16-node 2B 2x2
+A/B (design/frontier-s3-ab.md) is cleared to run.
