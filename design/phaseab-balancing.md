@@ -742,3 +742,47 @@ all three serial arms exact (23707197); forced arm 511 out_ships /
 pools correctly on classic-netlrts (laptop), reconverse-local (laptop),
 InfiniBand (Anvil), and Slingshot/CXI (Frontier). The 16-node 2B 2x2
 A/B (design/frontier-s3-ab.md) is cleared to run.
+
+## 22. The Frontier 2B verdict (2026-08-12, design/frontier-s3-ab-results-2026-08-12.md)
+
+9/9 exact at 2B/16 nodes, serial AND dist. The forced arm moved 2,035
+shipments / 1.15M units / 611k returned edges, still exact — S3 v1 is
+CORRECT at full scale on Slingshot. But the natural arms shipped 1-8
+grants against ~1,100 declines, and phaseB is unchanged (3.25 s +-
+noise, both modes).
+
+READ THE DECLINES CAREFULLY — they falsify one hypothesis and sharpen
+another:
+- The order-servicing-starvation suspicion is WRONG: ~1,100 declines
+  per run means donors served every order promptly (a starved donor
+  yields silence, not declines). The coordinator solicited all phase.
+- What the declines actually say: WHENEVER A HELPER WAS FREE, EVERY
+  ORDERED PARTITION WAS ALREADY FULLY CLAIMED. Under the v1
+  drain-event protocol, helpers appear only when a process's cursor
+  exhausts — and by then, apparently, everyone's cursor is exhausted.
+
+Two candidate explanations, and the discriminator between them is the
+PER-PROCESS phaseB wall distribution, which no current print shows:
+(a) S2 already balanced phaseB: m2-LPT + costliest-first partitions
+    flattened the per-process walls, so processes finish nearly
+    together and there is genuinely nothing to steal. Then S3 is
+    insurance, not a lever, and the 3.25 s phaseB is a THROUGHPUT
+    problem (walk speed), not a balance problem.
+(b) The imbalance survives but the protocol misses it: claims (one CAS
+    ahead of each walking PE) do not exhaust a hot pool early, but if
+    the hot process's cursor nevertheless runs out before the fast
+    processes' LAST units complete (helpers announce drain once, at
+    cursor exhaustion, possibly while still executing), the match
+    window is narrow. Needs the distribution to judge.
+The queued Anvil 2B job's S3 SUM-DETAIL arm answers this visually
+(per-PE time profile), and a one-line FOF3STAT pb_wall per-process
+print is the cheap permanent instrument. DECISION DEFERRED until that
+evidence: if (a), the campaign pivots from balance to phaseB
+throughput; if (b), S3 v2 = polls + earlier helper availability.
+
+Also measured: Frontier phaseB 3.25 s vs Anvil 1.55-1.61 s at the same
+2B/16-node scale (different CPUs, 14 vs 15 workers/process) — worth
+keeping in mind when comparing campaigns across machines. Frontier
+cross-skew point: 1.40-1.42 at 128 processes (phaseA), stable across
+all arms. FOF_S3_TEST deadlocks single-process (rank 0 refuses claims,
+no helper exists) — documented limitation, >= 2 processes required.
