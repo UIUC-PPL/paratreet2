@@ -532,3 +532,34 @@ entries at 80M = the 0.03-0.06 s relabel(p3) there). The sliced path
 already stores the map ONCE per process on the node branch — lowering
 FOF_SLICE_MIN_BYTES to 0 (always slice) removes the per-PE
 construction at every map size; queued for the next measurement round.
+
+## 18. Measured: the 2B stage-0 verdicts (job 19815941, 2026-08-12)
+
+All runs exact under the pinned configuration (the per-arm retry armor
+prevented the IBV-assert losses of the first two attempts).
+
+- 0c DOUBLE-RUN — THE MERGE DOES NOT PAY AT 2B: pass1 per-process
+  phaseB min/med/max 0.010/0.066/1.304 s; pass2 0.003/0.053/1.304.
+  The BOTTLENECK PROCESS IS IDENTICAL TO THREE DECIMALS — full-merge
+  compression (the upper bound of any partition-level merge) removes
+  nothing from the process that sets the wall; only the median moves
+  (-20%). Same shape as 80M. Per the design's own rule, STAGE 4 IS
+  CANCELLED as a wall lever: FOF_PB_MERGE stays default-off (the
+  machinery remains as validated opt-in — its barrier costs ~2-10 ms
+  and it may serve other datasets). The 1.304 s lives on one process
+  and can only MOVE — S3 stealing is confirmed as THE phaseB lever.
+- G0 KD DRY RUN at 2B (process 0): cross-partition m2 5.4% / 24.3% /
+  25.1% at k=8/32/64 — cost concentration holds (geometric prediction
+  was 60-70%), with the standing bimodal caveat (process 0 is not the
+  hot process; per-process pb_regions data showed up to 99% there).
+  With the merge cancelled, partitions matter only as SHIPPING units,
+  and the numbers say the right thing for that: at k=32 the hot
+  partition holds 4.47e7 of m2 (8.3x the average partition) INCLUDING
+  the giant 3.56e7 unit — one grant ships ~26% of the process's
+  work, exactly the whole-partition-steal shape S3 wants.
+- THE 2B SKEW SPLIT (the half-1 gate, now definitive, pinned config):
+  within 1.70-1.72 x cross 1.44. Within-process still dominates at
+  2B/128 processes — S1's claim pool has ~30% of the phaseA wall to
+  recover at 2B (its 80M A/B already measured 1.45 -> 1.13).
+  size_r -0.035: the per-PE size predictor is dead at 2B too, dynamic
+  claiming confirmed once more.
