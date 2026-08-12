@@ -1828,13 +1828,21 @@ public:
         reordered.reserve(n);
         nb->pb_part_range.assign(nleaf, {0, 0});
         nb->pb_part_cost.assign(nleaf, 0.0);
-        for (int pnum = 0; pnum < nleaf; pnum++) {
+        for (size_t i = 0; i < n; i++)
+          if (is_b1[i]) nb->pb_part_cost[region_of[i]] += pool[i].m2;
+        // Concatenate partitions COSTLIEST-FIRST so the global unit
+        // cursor preserves the flat pool's LPT property across
+        // partitions (index-order concatenation measured +60% phaseB:
+        // the giant's units were claimed last).
+        std::vector<int> order(nleaf);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int x, int y) {
+          return nb->pb_part_cost[x] > nb->pb_part_cost[y];
+        });
+        for (int pnum : order) {
           uint32_t begin = (uint32_t)reordered.size();
           for (size_t i = 0; i < n; i++)
-            if (is_b1[i] && region_of[i] == pnum) {
-              reordered.push_back(pool[i]);
-              nb->pb_part_cost[pnum] += pool[i].m2;
-            }
+            if (is_b1[i] && region_of[i] == pnum) reordered.push_back(pool[i]);
           uint32_t end = (uint32_t)reordered.size();
           std::sort(reordered.begin() + begin, reordered.begin() + end,
                     [](const typename FoFPhase1Node<Data>::PoolUnit& x,
@@ -1934,13 +1942,17 @@ public:
         reordered.reserve(n);
         nb->pb_part_range.assign(nleaf, {0, 0});
         nb->pb_part_cost.assign(nleaf, 0.0);
-        for (int pnum = 0; pnum < nleaf; pnum++) {
+        for (size_t i = 0; i < n; i++) nb->pb_part_cost[leaf_of[i]] += pool[i].m2;
+        // Costliest-first concatenation (see the region-mode comment).
+        std::vector<int> order(nleaf);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int x, int y) {
+          return nb->pb_part_cost[x] > nb->pb_part_cost[y];
+        });
+        for (int pnum : order) {
           uint32_t begin = (uint32_t)reordered.size();
           for (size_t i = 0; i < n; i++)
-            if (leaf_of[i] == pnum) {
-              reordered.push_back(pool[i]);
-              nb->pb_part_cost[pnum] += pool[i].m2;
-            }
+            if (leaf_of[i] == pnum) reordered.push_back(pool[i]);
           uint32_t end = (uint32_t)reordered.size();
           std::sort(reordered.begin() + begin, reordered.begin() + end,
                     [](const typename FoFPhase1Node<Data>::PoolUnit& x,
