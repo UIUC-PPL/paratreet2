@@ -614,9 +614,15 @@ PROTOCOL.
    on any process; the helper NEVER encodes (section 3 rule). Helpers
    take foreign work only when their own pool is drained (true by
    construction of the decision rule).
-6. RETURN (s3Return to donor): deduped edge vector + per-unit walltimes.
-   The donor feeds them through the ordinary submitEdges door and
-   decrements ships_outstanding.
+6. RETURN (s3Return to donor): edge vector deduped WITHIN the shipment
+   + per-unit walltimes. The donor feeds them through the ordinary
+   submitEdges door — which re-checks every edge against the donor's
+   LIVE seen set, grown since the shipment left (the same tip pair can
+   arise from different units) — and decrements ships_outstanding
+   (Kale's review point 2026-08-12: helper-side dedup alone is not
+   enough; donor-side re-dedup at return is required. A slipped
+   duplicate would be a cost bug, not a correctness bug — union() is
+   idempotent — but the re-check is nearly free).
 7. TERMINATION: the donor's process merge fires when b_done == nranks
    AND ships_outstanding == 0 (the return handler may be the closer) —
    a one-condition extension of the deposit chain. The helper's OWN
@@ -636,7 +642,12 @@ Anvil 80M A/B (S2 vs S2+S3); then 2B, where the target is the 1.304 s
 hot process — its physical node holds 7 near-idle siblings, so the
 ceiling is ~1.304/8 + overhead; the v1 success bar is a 2-3x cut.
 
+SCOPE (confirmed with Kale 2026-08-12): S3 steals ONLY phaseB pair
+units (cross-TreePiece pairs from the process pool, grouped in
+partitions). Nothing in phaseA is ever stolen across processes —
+phaseA work moves only WITHIN a process via S1's claim pool.
+
 DEFERRED to v2: cross-physical-node escalation (coordinator-to-
 coordinator handoff) if the hot process's whole block turns out hot;
 shipping arbitrary unit sets instead of partitions; phaseA cross-process
-steals (S1 already balances within the process).
+steals.
