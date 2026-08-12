@@ -433,6 +433,10 @@ public:
   std::vector<StealEntry> steal_pool;
   std::unique_ptr<std::atomic<int>[]> steal_claimed;
   bool steal_built = false;
+  // Direct steal evidence (Kale, 2026-08-12): per-process counts of
+  // claims that landed on the piece's home PE vs a sibling ("foreign" =
+  // an actual steal). Printed once per process at a_done completion.
+  std::atomic<long> s1_own{0}, s1_foreign{0}, s1_pes_foreign{0};
   void ensureStealPool() {
     std::lock_guard<std::mutex> g(lock);
     if (steal_built) return;
@@ -727,6 +731,9 @@ public:
     steal_pool.clear();
     steal_claimed.reset();
     steal_built = false;
+    s1_own = 0;
+    s1_foreign = 0;
+    s1_pes_foreign = 0;
     pb_part_range.clear();
     pb_part_cost.clear();
     pb_part_claimed.reset();
@@ -1008,9 +1015,11 @@ public:
       }
     if (nown > 0)
       for (int ax = 0; ax < 3; ax++) myc[ax] /= nown;
+    long own_claims = 0, foreign_claims = 0;
     auto claim = [&](size_t i) {
       int expect = 0;
       if (!claimed[i].compare_exchange_strong(expect, 1)) return false;
+      (pool[i].home_pe == CkMyPe()) ? own_claims++ : foreign_claims++;
       TreePieceRef r{pool[i].root, pool[i].parts, pool[i].n, 0};
       treepieces.push_back(r);
       phaseAAdmit(treepieces.back());
@@ -1055,6 +1064,9 @@ public:
       for (auto& s : treepieces)
         bucket.push_back({s.root, s.parts, s.n});
     }
+    nb->s1_own += own_claims;
+    nb->s1_foreign += foreign_claims;
+    if (foreign_claims > 0) nb->s1_pes_foreign++;
   }
 
   void phaseABody(double b2) {
@@ -1453,6 +1465,11 @@ public:
     nb->depositPhaseATime(t_phaseA);
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
+      if (stealA())
+        CkPrintf("FOF3STAT s1_claims: node %d own %ld foreign %ld "
+                 "pes_with_foreign %ld of %d\n",
+                 CkMyNode(), nb->s1_own.load(), nb->s1_foreign.load(),
+                 nb->s1_pes_foreign.load(), CkNodeSize(CkMyNode()));
       // Enumerate the process's phaseB pool before releasing the PEs
       // (parallel across the process's threads (buildPoolSlice); pe_treepieces frozen since registration;
       // visibility: built before the trigger messages are sent).
