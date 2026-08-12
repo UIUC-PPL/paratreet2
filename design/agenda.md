@@ -134,10 +134,10 @@ points at its design note where one exists. Started 2026-08-05.
    map instead of re-counting all particles. Removes the 60 ms band at
    80M (projected ~300 ms per processor at 2B); debug flag keeps the
    old particle loop as a cross-check.
-11. MERGED UPSTREAM 2026-08-11 (Ritvik, merge 40d7ecc into
-   fof_with_aggregation; originally unionfind branch batch-labeling, commit
-   cd8a415, pushed — RITVIK REVIEW pending, he stewards unionfind;
-   Anvil-scale measurement pending): batch the component-labeling
+11. MERGED UPSTREAM 2026-08-11 and MEASURED 2026-08-12 (Ritvik's
+   Frontier 2B/16-node A/B: uf2 bracket 0.598 s -> 0.520 s with batch
+   labeling, ~13%; item CLOSED. Merge 40d7ccc into fof_with_aggregation;
+   originally unionfind branch batch-labeling, commit cd8a415): batch the component-labeling
    requests per destination chare. Three fixes in one: the per-
    destination batch entry, plus making the parent-cache dedup LIVE
    (entries were never created — dead code), plus two latent defects
