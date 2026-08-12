@@ -505,3 +505,30 @@ costliest-first concatenation. Merge-arm overhead at 80M: phaseB
 0.055 incl. the full B1/barrier/merge/relabel/re-annotate/B2 cycle —
 the barrier machinery costs ~6 ms here. The bimodal B2 finding
 (max 99.3%) reproduced exactly.
+
+## 17. phaseBMidRelabel anatomy + the optimization it needs (Kale's question, 2026-08-11)
+
+What the mid-relabel does per PE, from the code: (1) relabelBody —
+ONE HASH PROBE PER FROZEN ROOT (not per particle; representative-
+indirect since the relabel work), ~50k roots/PE at 80M against a ~1k
+merge map; (2) materializeLabels — one INDEXED store per particle
+(rewrites group_number, the label, not a parent pointer), no hashing;
+(3) annotateFrozenTips — a FULL recursion over every local node
+READING EVERY PARTICLE's group_number to rebuild min/max_frag. So no
+per-particle hash lookup exists; the ~18 ms/PE cost (traced) is the
+per-particle STREAMING of (2)+(3) — each label read pulls a 120-byte
+Particle record through the cache, and (3) also walks every node.
+IS IT PAYING? At 80M: NO — B2 is 0-12% of m2 on typical processes and
+the wall moved ~nothing; the flag stays default-off pending the 2B
+double-run. THE FIX IF 2B JUSTIFIES IT: touch only AFFECTED pieces —
+the merge map is ~1k entries, so only roots whose label changed need
+materialization and only pieces CONTAINING changed roots need
+re-annotation; most pieces have zero changed roots and skip entirely,
+making the barrier cost proportional to the map, not to N.
+
+Related (secondary, Kale): the serial-mode applyGlobalMap broadcast
+path still builds a per-PE hash of the map (480 copies of ~40k
+entries at 80M = the 0.03-0.06 s relabel(p3) there). The sliced path
+already stores the map ONCE per process on the node branch — lowering
+FOF_SLICE_MIN_BYTES to 0 (always slice) removes the per-PE
+construction at every map size; queued for the next measurement round.
