@@ -108,15 +108,25 @@ points at its design note where one exists. Started 2026-08-05.
 9. LCI items for the handover: packet-pool exhaustion at 2B on 4-8
    nodes (refill_recvs deadlock alerts then poll_comp_impl assert
    during the input flush); the idle-stall itself (dist uf2 3.7 s at
-   80M/16 nodes with the keep-alive ring on). NEW EVIDENCE for
-   reconverse#193 (2026-08-11 evening/night): the IBV poll_comp assert
-   (wcs[i].status == IBV_WC_SUCCESS) killed SIX consecutive 2B/16-node
-   runs across three jobs (19789224 x2, 19799342 x4, mixed binaries,
-   mid-run not startup), while the IDENTICAL configuration ran cleanly
-   four times at midday the same day (job 19774171) — strongly
-   intermittent, plausibly allocation- or load-correlated. Mitigation
-   adopted: per-arm srun -t limits + retry-until-correct loops in
-   2B job scripts. LCI needs a better
+   80M/16 nodes with the keep-alive ring on). ROOT CAUSE FOUND for the
+   2026-08-11/12 overnight failure cluster (Ritvik's diagnosis
+   2026-08-12, confirmed in sacct + logs): OUT OF MEMORY at the input
+   flush, not a fabric fault. Slurm records oom_kill events on steps
+   19789224.0 and 19818006.4 (state OUT_OF_MEMORY; "srun: error: a845:
+   task 105: Out Of Memory"); the IBV poll_comp assert (wcs[i].status ==
+   IBV_WC_SUCCESS) fires on the SURVIVING processes when the OOM-killed
+   peer's queue pair dies — the assert is a SYMPTOM of a peer's death.
+   Death point: right after the startup config prints = readers.flush
+   under QD, before any tree build — which is why serial and dist arms
+   both died (mode-independent code) and why the same binaries passed at
+   midday: the flush's buffering depth (LCI packet pools + unexpected
+   messages) is congestion-sensitive, so a busy fabric window pushes a
+   borderline memory spike over the cgroup limit. Same failure family as
+   the 4-8-node packet-pool exhaustion above, now at 16 nodes with the
+   OOM smoking gun. RETRACTED: the earlier "marginal fabric window /
+   dist most exposed" reading. Mitigations when it matters: stagger or
+   wave the reader flush, cap LCI packet pools, more per-task memory
+   headroom. Per-arm srun -t limits + retry loops remain in 2B scripts. LCI needs a better
    example program (Kale, 2026-08-10). Also check +lci_ndevices for
    future Anvil runs — Kale recalls multiple devices per process in
    Ritvik's notes or scripts; our own 2026-08-01 Anvil A/B found no
@@ -136,7 +146,7 @@ points at its design note where one exists. Started 2026-08-05.
    old particle loop as a cross-check.
 11. MERGED UPSTREAM 2026-08-11 and MEASURED 2026-08-12 (Ritvik's
    Frontier 2B/16-node A/B: uf2 bracket 0.598 s -> 0.520 s with batch
-   labeling, ~13%; item CLOSED. Merge 40d7ccc into fof_with_aggregation;
+   labeling, ~13%; item CLOSED. Merge 40d7ecc into fof_with_aggregation;
    originally unionfind branch batch-labeling, commit cd8a415): batch the component-labeling
    requests per destination chare. Three fixes in one: the per-
    destination batch entry, plus making the parent-cache dedup LIVE
