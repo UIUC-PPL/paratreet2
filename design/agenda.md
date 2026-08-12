@@ -126,7 +126,12 @@ points at its design note where one exists. Started 2026-08-05.
    OOM smoking gun. RETRACTED: the earlier "marginal fabric window /
    dist most exposed" reading. Mitigations when it matters: stagger or
    wave the reader flush, cap LCI packet pools, more per-task memory
-   headroom. Per-arm srun -t limits + retry loops remain in 2B scripts. LCI needs a better
+   headroom. Per-arm srun -t limits + retry loops remain in 2B scripts.
+   MITIGATION ADOPTED 2026-08-12: srun --mem=0 on every 2B step (no
+   per-task memory cgroup; the node has headroom the hot receiver can
+   borrow). Same-day daytime job 19833850 then ran ALL arms clean on
+   the first try, including plain -u dist on current main — the stack
+   was never broken, the overnight window was. LCI needs a better
    example program (Kale, 2026-08-10). Also check +lci_ndevices for
    future Anvil runs — Kale recalls multiple devices per process in
    Ritvik's notes or scripts; our own 2026-08-01 Anvil A/B found no
@@ -146,7 +151,8 @@ points at its design note where one exists. Started 2026-08-05.
    old particle loop as a cross-check.
 11. MERGED UPSTREAM 2026-08-11 and MEASURED 2026-08-12 (Ritvik's
    Frontier 2B/16-node A/B: uf2 bracket 0.598 s -> 0.520 s with batch
-   labeling, ~13%; item CLOSED. Merge 40d7ecc into fof_with_aggregation;
+   labeling, ~13%; Anvil 2B/16-node point 2026-08-12: 0.391 -> 0.288 s,
+   ~26%, single rep each — item CLOSED. Merge 40d7ecc into fof_with_aggregation;
    originally unionfind branch batch-labeling, commit cd8a415): batch the component-labeling
    requests per destination chare. Three fixes in one: the per-
    destination batch entry, plus making the parent-cache dedup LIVE

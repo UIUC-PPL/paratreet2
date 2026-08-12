@@ -692,3 +692,45 @@ helping each other), natural mode, S3-off bit-identical base; reconverse
 natural, base. Next: 80M Anvil A/B (S2 vs S2+S3), then 2B where the
 1.304 s hot process is the target (ceiling ~1.304/8 + overhead; v1 bar
 2-3x).
+
+## 21. Measured 2026-08-12 afternoon: daytime2b (19833850) + the S3 80M gate (19833867)
+
+Every arm of both jobs exact on the FIRST try — the --mem=0 steps rode
+a daytime window, so the OOM mitigation is untested-by-adversity but
+nothing failed. Findings:
+
+- FIRST 2B S1 MEASUREMENT (serialsum arm, S1b+m2key): phaseA
+  1.43 -> 1.03 s (-28%; reference = probes2bv2 no-claim serial arms,
+  same config previous night), within-skew 1.70 -> 1.38. Direct steal
+  evidence at 2B: EVERY process stole (foreign claims 30-118 pieces per
+  process, typically ~60-90 of ~550 total; 9-14 of 15 PEs per process
+  took at least one foreign piece).
+- THE S1->PHASEB TRADE AT 2B: phaseB 1.30 -> 1.61 s (+0.3) against
+  phaseA's -0.4. Net phase1 gain is small at 2B; claims scatter pieces
+  and the pool pays. This is the 80M trade (0.031->0.040) at scale, and
+  it sharpens the argument that S3 (move phaseB work, not phaseA
+  pieces) is the lever that matters at 2B.
+- V3 VERIFIED AT 2B: parts mode (k=32, costliest-first concatenation)
+  phaseB 1.554 vs flat 1.609 — the v2 regression (+60% at 80M) is gone;
+  partitions are FREE as the S3 shipping substrate.
+- ITEM 11 ANVIL POINT: labelbase uf2 0.391 vs labelbatch 0.288 s
+  (-26%, single rep each; Frontier measured -13% at the same scale).
+- DIST HEALTH: plain -u dist on current main ran clean in the daytime
+  window — nothing in the stack changed; the overnight failures were
+  the OOM window (agenda item 9 root cause).
+- SUM-DETAIL: first campaign-era 2B image data captured (serial, S1b,
+  1920 PEs; traces/sumd2b-serial-19833850.tar.gz, copied to laptop).
+
+S3 80M GATE (19833867, 4 nodes/32 procs, all counts 23707197):
+- natural arms shipped NOTHING and cost NOTHING (phaseB 0.058 = base
+  0.058): the 80M pool drains in 58 ms, no helper is ever matched —
+  S3 idles for free.
+- forced arm: 16 even processes shipped their ENTIRE pools — 513
+  shipments, 377,167 units executed remotely, 51,286 edges returned —
+  counts exact, and phaseB actually dropped to 0.045 s (16 idle
+  helpers soak half the machine's phaseB).
+- protocol exercised at 4 coordinator blocks (FOF_PROCS_PER_PNODE=8
+  default) with donors that also helped (node 0: 32 ships out, 14 in).
+
+Next: the 2B S3 job (base/S3 x2 interleaved + S3 sum-detail + forced
+last) — the hot process's 1.3-1.6 s phaseB is the campaign's target.
