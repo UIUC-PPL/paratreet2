@@ -79,14 +79,14 @@ points at its design note where one exists. Started 2026-08-05.
 5. Decomposition anti-scaling at 16 nodes (80M: 0.78 s at 8 nodes ->
    1.65 s at 16; design/speedup-campaign-2026-08-05.md follow-up 2):
    profile splitter computation and particle flush at 1920 PEs.
-6. DONE 2026-08-10 (modified scope, Kale): -u serial is now the fof3
-   default (quiescence-free bracket, immune to the LCI idle-stall).
-   The keep-alive ring is KEPT (it costs little and the stall issue is
-   unresolved), and dist mode is KEPT fully supported with explicit
-   -u dist runs in make test: distributed union-find is a research
-   focus of this project and is expected to improve as process counts
-   grow. Validated: 16-run matrix, 1M serial-vs-dist histograms
-   identical (333889).
+6. CLOSED with the default REVERTED to -u dist (Kale, 2026-08-11,
+   commit 41b2e45): distributed union-find is the research focus and
+   preferred production path. Serial remains one flag away with its
+   measured-18x relabel pipeline (design/relabel-representative.md)
+   and quiescence-free stall-immune bracket; the matrix keeps two
+   explicit -u serial runs so both modes stay covered. The keep-alive
+   ring is KEPT. (History: serial was briefly the default 2026-08-10
+   to 2026-08-11.)
 7. IMPLEMENTED 2026-08-10 (with item 12; design/relabel-representative.md,
    stages 1-3 = commits ec06543/fa0a383/bf9dc12): the phase-3 label map
    is owner-sharded at processor 0 and delivered as per-process slices
