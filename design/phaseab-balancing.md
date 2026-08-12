@@ -563,3 +563,80 @@ prevented the IBV-assert losses of the first two attempts).
   recover at 2B (its 80M A/B already measured 1.45 -> 1.13).
   size_r -0.035: the per-PE size predictor is dead at 2B too, dynamic
   claiming confirmed once more.
+
+## 19. S3 detailed scheme (PROPOSED 2026-08-12 — awaiting Kale's review)
+
+Coordinator-mediated whole-partition phaseB stealing within the physical
+node. Everything below is inside the existing FoFPhase1Node NODEGROUP —
+no new chare types. FOF_S3=0 (default) is bit-identical current behavior.
+
+ROLES. Every process's branch is an AGENT: it owns the local partition
+table (built by S2's KD split, FOF_PB_PARTS on — with the merge cancelled,
+partitions exist purely as shipping units), executes ship orders, runs
+foreign work, returns edges. The lowest-rank branch of each
+FOF_PROCS_PER_PNODE block is additionally the COORDINATOR for that block.
+Decision entries on the coordinator are [exclusive]; any free PE serves
+them (Kale's spec). v1 scope: within the physical node only.
+
+PROTOCOL.
+1. PUBLISH: when a process finishes its pool build it sends the
+   coordinator s3Publish {k partition costs, total m2, n_units} (~300 B).
+2. MONITOR: the coordinator polls its block every FOF_S3_POLL_MS
+   (default 10 ms, CcdCallFnAfter — pace-every-retry); agents reply
+   s3Report {remaining_m2, drained, idle_pes}. remaining_m2 is an atomic
+   counter decremented at each unit claim (one atomic add per unit,
+   ~9k/process at 2B — negligible). Agents ALSO push an unsolicited
+   report the moment they drain (event beats next poll tick).
+3. DECIDE ([exclusive] s3Decide, fires on report arrival): helper = a
+   drained process; donor = block max remaining_m2. Ship iff
+   donor_remaining > FOF_S3_IMBALANCE (1.5) x block average AND
+   donor_remaining > an absolute floor (~20 ms of predicted work via the
+   cost-model constant) — below that, shipping costs more than it moves.
+   One outstanding order per (donor, helper) pair; [exclusive]
+   serializes decisions; new decisions only on fresh reports (no retry
+   storms). Order: donor's costliest partition not yet ordered.
+4. SHIP (donor agent, s3ShipOrder): mark the partition SHIPPED (CAS; the
+   local unit-claim loop skips unclaimed units of shipped partitions),
+   then collect its still-unclaimed units using the SAME per-unit CAS the
+   local drain uses — whoever wins the CAS owns the unit, so zero double
+   execution by construction, no new locks. If nothing remains, reply
+   s3Declined (coordinator picks another partition). Serialize one
+   shipment: subtree snapshots deduped by root across the partition's
+   units (preorder-flattened nodes with frag summaries incl. n_below +
+   FoFCachedParticle 20 B leaves) + the unit list as snapshot-index
+   pairs + period/b. Feasibility is the measured probe: 8 MB moves in
+   3.2-4.8 ms; the 2B hot partition (~26% of the hot process's work in
+   one grant, section 18) against a 1.304 s imbalance.
+5. EXECUTE (helper): rebuild ephemeral trees (dense arrays), run the
+   units through the existing sliced drain with shipment-scoped SEEN and
+   cert memos. Edges stay in a shipment-local buffer in GLOBAL
+   particle-order tips — phaseB precedes tip encoding, so tips are valid
+   on any process; the helper NEVER encodes (section 3 rule). Helpers
+   take foreign work only when their own pool is drained (true by
+   construction of the decision rule).
+6. RETURN (s3Return to donor): deduped edge vector + per-unit walltimes.
+   The donor feeds them through the ordinary submitEdges door and
+   decrements ships_outstanding.
+7. TERMINATION: the donor's process merge fires when b_done == nranks
+   AND ships_outstanding == 0 (the return handler may be the closer) —
+   a one-condition extension of the deposit chain. The helper's OWN
+   merge never waits on foreign work; foreign slices keep being served
+   from the scheduler after its deposit, interleaved with whatever its
+   process does next. The global relabel already waits for every
+   process's merge, so the critical path counts foreign work exactly
+   once, at the donor.
+
+KNOBS: FOF_S3, FOF_S3_POLL_MS (10), FOF_S3_IMBALANCE (1.5),
+FOF_S3_MIN_SHIP (absolute floor), FOF_PROCS_PER_PNODE (block size).
+STATS: FOF3STAT s3 line — ships out/in, declined, shipped m2 and bytes,
+build/rebuild/return-latency ms.
+
+GATES: fof1 exact + FOF_COUNT_VERIFY both runtimes at 8M/80M laptop;
+Anvil 80M A/B (S2 vs S2+S3); then 2B, where the target is the 1.304 s
+hot process — its physical node holds 7 near-idle siblings, so the
+ceiling is ~1.304/8 + overhead; the v1 success bar is a 2-3x cut.
+
+DEFERRED to v2: cross-physical-node escalation (coordinator-to-
+coordinator handoff) if the hot process's whole block turns out hot;
+shipping arbitrary unit sets instead of partitions; phaseA cross-process
+steals (S1 already balances within the process).
