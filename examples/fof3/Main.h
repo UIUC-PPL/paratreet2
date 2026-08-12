@@ -48,12 +48,12 @@ class ExMain: public paratreet::Main<FragData> {
   enum class CheckMode { Auto, Full, Stats };
   CheckMode check_mode = CheckMode::Auto;
   enum class UF2Mode { Dist, Serial };
-  // Serial is the production default (quiescence-free bracket, immune to
-  // the LCI idle-stall; flat 0.01-0.02 s at every measured scale). Dist
-  // remains a fully supported research mode — distributed union-find is a
-  // research focus of this project and is expected to improve as process
-  // counts grow.
-  UF2Mode uf2_mode = UF2Mode::Serial;
+  // Dist is the default (Kale, 2026-08-11: distributed union-find is a
+  // research focus and the preferred production path). Serial remains one
+  // flag away (-u serial): its quiescence-free bracket is immune to the
+  // LCI idle-stall and its relabel pipeline is the measured-18x path
+  // (design/relabel-representative.md).
+  UF2Mode uf2_mode = UF2Mode::Dist;
   // Phase-3 walk mechanism (-w; design/dual-tree.md): dual (DEFAULT since
   // the Anvil 80M A/B — 20x/15x/7.6x/2.9x/1.6x faster than transposed at
   // P = 1/2/4/8/16, identical outputs; -u dist only) or transposed (the

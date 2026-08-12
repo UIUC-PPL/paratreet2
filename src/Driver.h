@@ -297,15 +297,24 @@ public:
       CkWaitQD();
       CkPrintf("Tree build and sending leaves: %.3lf ms\n", (CkWallTimer() - start_time) * 1000);
 
-      // Meta data collections, first for max velo
-      CkReductionMsg * msg, *msg2;
-      treepieces.collectMetaData(CkCallbackResumeThread((void *&) msg));
-      // Parse TreePiece reduction message
+      // Meta data collection (max velocity -> timestep). Its only
+      // consumers are the kick/perturb path and the [Meta] print, so
+      // non-perturbing apps (fof3: perturb_particles = false) skip the
+      // whole pass — it streams every particle's velocity (the first
+      // touch of that memory after the exchange, ~all cache misses) and
+      // serializes at a reduction on the slowest PE (observed: one PE
+      // busy ~30 ms while every other PE idled; Kale, 2026-08-11).
+      CkReductionMsg * msg = nullptr, *msg2;
+      Real max_velocity = 0.0;
+      Real timestep_size = 0.0;
       int numRedn = 0, numRedn2 = 0;
       CkReduction::tupleElement* res = nullptr, *res2 = nullptr;
-      msg->toTuple(&res, &numRedn);
-      Real max_velocity = *(Real*)(res[0].data); // avoid max_velocity = 0.0
-      Real timestep_size = paratreet::getTimestep(universe, max_velocity);
+      if (config.perturb_particles) {
+        treepieces.collectMetaData(CkCallbackResumeThread((void *&) msg));
+        msg->toTuple(&res, &numRedn);
+        max_velocity = *(Real*)(res[0].data); // avoid max_velocity = 0.0
+        timestep_size = paratreet::getTimestep(universe, max_velocity);
+      }
 
       ProxyPack<Data> proxy_pack (this->thisProxy, treepieces, partitions, cache_manager);
 
