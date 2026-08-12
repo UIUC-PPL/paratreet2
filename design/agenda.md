@@ -108,7 +108,15 @@ points at its design note where one exists. Started 2026-08-05.
 9. LCI items for the handover: packet-pool exhaustion at 2B on 4-8
    nodes (refill_recvs deadlock alerts then poll_comp_impl assert
    during the input flush); the idle-stall itself (dist uf2 3.7 s at
-   80M/16 nodes with the keep-alive ring on). LCI needs a better
+   80M/16 nodes with the keep-alive ring on). NEW EVIDENCE for
+   reconverse#193 (2026-08-11 evening/night): the IBV poll_comp assert
+   (wcs[i].status == IBV_WC_SUCCESS) killed SIX consecutive 2B/16-node
+   runs across three jobs (19789224 x2, 19799342 x4, mixed binaries,
+   mid-run not startup), while the IDENTICAL configuration ran cleanly
+   four times at midday the same day (job 19774171) — strongly
+   intermittent, plausibly allocation- or load-correlated. Mitigation
+   adopted: per-arm srun -t limits + retry-until-correct loops in
+   2B job scripts. LCI needs a better
    example program (Kale, 2026-08-10). Also check +lci_ndevices for
    future Anvil runs — Kale recalls multiple devices per process in
    Ritvik's notes or scripts; our own 2026-08-01 Anvil A/B found no
