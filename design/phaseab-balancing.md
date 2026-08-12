@@ -786,3 +786,39 @@ keeping in mind when comparing campaigns across machines. Frontier
 cross-skew point: 1.40-1.42 at 128 processes (phaseA), stable across
 all arms. FOF_S3_TEST deadlocks single-process (rank 0 refuses claims,
 no helper exists) — documented limitation, >= 2 processes required.
+
+## 23. Frontier follow-up (same day): SMT split verdict, the straggler's
+## anatomy, and the starvation mechanism recovered
+
+From the updated Frontier report (design/frontier-s3-ab-results-2026-08-12.md,
+sections added after the first A/B):
+
+- THE HOT PROCESS IS ALIVE under full campaign flags: per-PE phaseB
+  min/med/max = 0.008/0.190/3.221 s. Median process finishes in ~0.19 s;
+  the wall is one straggler at 3.2 s. Explanation (a) of section 22
+  (S2 balanced it away) is DEAD.
+- THE STRAGGLER IS AN ACCUMULATION, NOT A GIANT: max single unit
+  0.256 s against a 3.2 s PE wall (~13 units deep at minimum). The
+  work is divisible — it just never moved.
+- THE STARVATION MECHANISM, CORRECTLY LOCALIZED: section 22 dismissed
+  order-servicing starvation because declines flowed freely — but the
+  declines come from the IDLE donors, whose PEs serve entries
+  instantly. The HOT donor's 14 PEs sit inside the unsliced drain loop
+  for the full 3.2 s and serve its ship orders only at the end, when
+  everything is claimed. The idle donors' promptness masked the hot
+  donor's silence. Fix: FOF_PHASEB_SLICE_MS on S3 arms (the sliced
+  drain surfaces between units); under test in Anvil job 19842202
+  (arms: base, S3+slice, base+slice, S3-no-slice, sum-detail on the
+  fix, forced). If the fix ships, make slicing the S3 default.
+- SMT SPLIT VERDICT (16-node 2B, same 56 physical cores, ppn 14 vs 7):
+  phaseA +27% from SMT (2.037 vs 2.584) — Kale's pointer-chasing
+  intuition confirmed there; phaseB -31% (3.285 vs 2.504); net phase1
+  4.4% faster WITHOUT SMT. CONFOUND to respect: halving ppn changed
+  the decomposition (max_piece_n doubled, pool units 3.2x fewer), so
+  the phaseB number is not pure SMT — bigger pieces shift work between
+  self-pairs, the grid gate, and the pool. Per-core the machines are
+  ~comparable (the 1.9x aggregate gap is mostly the 15-cores-vs-7
+  accounting).
+- OPERATIONAL: +lci_ndevices must track ppn (min(8, ppn/2)); 7 devices
+  on ppn 7 hangs at cache-manager init. Frontier per-core baselines
+  need 1M-8M inputs (10k/100k sit at timer resolution).

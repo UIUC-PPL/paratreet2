@@ -229,3 +229,123 @@ consistent across both scales, not an artifact of the 2B configuration.
   design/fof3-2b-scaling.md gives the real figures (16-node 2B FoF3 step =
   00:00:52). This whole 9-run campaign took 00:03:24. Size jobs from that,
   not from guesses.
+
+---
+
+# Phase-1 speed gap vs Anvil, and the SMT A/B
+
+Added 2026-08-12, follow-up characterization. Same binary/commits as above
+unless stated.
+
+## Compute node
+
+`AMD EPYC 7A53 64-Core Processor`, cpu MHz 3517.917, 128 logical CPUs,
+4 NUMA nodes. SMT siblings are `c` and `c+64` (verified:
+`/sys/devices/system/cpu/cpu1/topology/thread_siblings_list` = `1,65`).
+
+This makes the campaign pemap decodable: `1-7,65-71` is 7 PHYSICAL cores with
+both SMT threads each = 14 PEs per process; 8 such groups = 56 cores/node,
+skipping cores 0,8,16,...,56 (the reserved leader of each of the 8 CCDs).
+**The campaign therefore runs 2 PEs per physical core.**
+
+## 1. 80M / 4 nodes phase1_stages (job 5248439) vs Anvil
+
+| arm | phaseA | phaseB | merge | relabel |
+|---|---|---|---|---|
+| base-serial | **0.240** | **0.094** | 0.002 | 0.017 |
+| s3-serial | 0.246 | 0.093 | 0.002 | 0.017 |
+| s3forced-serial | 0.248 | 0.123 | 0.002 | 0.014 |
+
+Anvil same-config reference (supplied by Kale): phaseA 0.125, phaseB 0.058.
+=> Frontier is **1.92x slower on phaseA, 1.62x on phaseB** at face value.
+The SMT A/B below shows this is partly, but NOT wholly, an SMT-accounting
+artifact.
+
+## 2. 2B single-kernel numbers (job 5248429, base-serial)
+
+```
+rep1  phaseB_maxpair_s 0.000/0.013/0.256   phaseB_units 1/1304.8/4745  total 2338187  mean_unit_ms 0.145
+rep2  phaseB_maxpair_s 0.000/0.014/0.256   phaseB_units 1/1309.8/4588  total 2347196  mean_unit_ms 0.146
+```
+
+Max single-unit walltime **0.256 s**, identical across reps.
+
+Worth noting: the worst PE spends **3.221 s** in phaseB
+(`phaseB_s 0.008/0.190/3.221`) while the largest single unit is only 0.256 s.
+The straggler is an ACCUMULATION of many units, not one indivisible giant —
+relevant to the indivisible-claim-work floor argument.
+
+## 3. Per-core baseline, single process, 8 PEs (job 5248735)
+
+Pinning matters and the first attempt had none — recorded here so the numbers
+are not misread:
+
+| input | pinning | phaseA | phaseB |
+|---|---|---|---|
+| 10k | unpinned (`--cpu-bind=none`, no pemap) | 0.001 | 0.001 |
+| 10k | 1 PE/core (`+pemap 1-7,9`) | 0.001 | 0.001 |
+| 10k | 2 PE/core SMT (`+pemap 1-4,65-68`) | 0.001 | 0.001 |
+| 100k | unpinned | 0.007 | 0.002 |
+| 100k | **1 PE/core** (`+pemap 1-7,9`) | **0.006** | 0.002 |
+| 100k | 2 PE/core SMT (`+pemap 1-4,65-68`) | 0.009 | 0.002 |
+
+Use the 1-PE/core row for cross-machine comparison. CAVEAT: these are at timer
+resolution (1-9 ms, i.e. 3-9 ticks); the 1-PE/core vs SMT difference rests on
+3 ms. For a per-core baseline with real significance, use a 1M-8M input.
+
+## 4. SMT A/B at 2B, 16 nodes (job 5248892) — the decisive experiment
+
+base-serial config (no S3), both arms exact at 424,897,832. **Both arms use
+the SAME 56 physical cores per node**; arm 1 merely adds the second SMT
+thread of each core. So this isolates SMT on identical silicon.
+
+| | arm 1 `+ppn 14` (SMT, 2/core) | arm 2 `+ppn 7` (1 PE/core) |
+|---|---|---|
+| total PEs | 1792 | 896 |
+| `+lci_ndevices` | 7 | 3 |
+| phaseA | 2.037 | **2.584** |
+| phaseB | 3.285 | **2.504** |
+| **phaseA+phaseB** | 5.322 | **5.088** |
+| phaseB_maxpair_s (max) | 0.246 | 0.197 |
+| phaseB_units total | 2,339,805 | 732,904 |
+| mean_unit_ms | 0.146 | 0.157 |
+| phaseA_skew cross | 1.44 | 1.49 |
+
+Findings:
+
+- **phaseA: SMT buys 27%** (2.584 -> 2.037). Real throughput, not accounting.
+- **phaseB: SMT COSTS 31%** (2.504 -> 3.285). Opposite direction.
+- **Net phase1: the physical-only arm is 4.4% FASTER** (5.088 vs 5.322)
+  despite running half as many workers.
+
+So "7 real cores == 14 SMT threads" is not a single answer: it under-states
+SMT for phaseA and over-states it for phaseB. Per core the two machines are
+much closer than the raw 1.92x implies, but the gap is not purely an
+accounting artifact.
+
+**Caveat on phaseB_maxpair_s as a cross-arm invariant:** it is NOT invariant
+under a ppn change. Between the arms `phaseB_units total` changes 3.2x
+(2.34M -> 733k) and `max_piece_n` doubles (138,233 -> 276,457), so the max is
+taken over a different unit population, not the same work item. The 0.246 vs
+0.197 spread is in the expected direction for a thread owning a full core vs
+sharing one, but should be read as suggestive, not as a clean single-kernel
+ratio. (Anvil's 2B maxpair value was not supplied, so the Anvil ratio is not
+computed here.)
+
+## 5. Operational gotcha found by this A/B: +lci_ndevices must track +ppn
+
+The first SMT A/B attempt (job 5248741) HUNG in arm 2 and was killed by the
+per-step guard at 369 s (`rc=143`, `components=NONE`). Cause: `+ppn` was
+halved to 7 but `+lci_ndevices` was left at 7. charm-notes
+machines/frontier.md records the rule as **min(8, ppn/2)** — so ppn 7 needs
+`+lci_ndevices 3`. With 7 devices for 7 PEs plus `+backend_poll_thread 2` the
+run launched correctly (banner: `896 PEs, 7 PEs per process`, pemap applied)
+but stalled at `* Initializing cache managers.` and never reached phase 1;
+the healthy arm was 17 s into loading Tipsy data by the same point.
+
+Lesson for frontier.md and for any sweep script: **`+lci_ndevices` is a
+function of `+ppn`, not a constant.** Every recorded run line shows the
+literal `7` because every recorded run used `+ppn 14`. Compute it
+(`ndev=min(8, ppn/2)`) rather than copying the literal. Corollary: per-step
+`srun -t` guards turn this class of mistake into a 6-minute loss instead of a
+whole-job loss.
