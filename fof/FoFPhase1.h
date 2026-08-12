@@ -39,6 +39,9 @@
 // tree build until the next rebuild/reset; run the whole sequence inside
 // that window.
 
+// S3 shipment types (design/phaseab-balancing.md section 19); must precede
+// fof.decl.h because generated entry declarations reference them.
+#include "FoFStealTypes.h"
 #include "fof.decl.h"
 // Template definitions of this module's generated code (CBase_/closure/proxy
 // templates from fof.def.h) must be visible before any concrete-Data use of
@@ -1370,6 +1373,12 @@ public:
       }
       for (size_t k = start; k < end; k++) {
           t_phaseB_units++;
+          // Debug: replay this unit through the full ship path (flatten,
+          // pup through memory, rebuild, walk) and abort on any edge-set
+          // difference. Outside the timing bracket's usefulness — the
+          // loopback run is for correctness gates only.
+          if (s3Loopback())
+            selftestShippedUnit(nb->phaseb_pool[k].a, nb->phaseb_pool[k].b);
           double tp0 = CkWallTimer();
           walk(nb->phaseb_pool[k].a, nb->phaseb_pool[k].b,
                [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
@@ -3149,6 +3158,173 @@ private:
           edge_buf.emplace_back(lo, hi);
         if (both_uniform) return;   // one edge is all this pair can yield
       }
+    }
+  }
+
+  // ---- S3 transport layer (design/phaseab-balancing.md section 19),
+  // ported from the phaseb-steal branch whose data plane survived its
+  // post-mortem intact. Stage 1: flatten/rebuild + the pup-loopback
+  // self-test (FOF_S3_LOOPBACK=1); the coordinator protocol follows.
+
+  static bool s3Loopback() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_S3_LOOPBACK");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+
+  // Execute one unit over any node pair (live or rebuilt) into a local,
+  // per-call edge set — the identical walk, certificate, and dedup
+  // semantics as phaseBBody, with no shared state. Used by the helper
+  // executor and the self-test. (No uniform-node shortcuts here: the
+  // rebuilt side must produce the same edges as the live side, and the
+  // self-test compares raw sets.)
+  void walkUnitEdges(Node<Data>* a, Node<Data>* b,
+                     std::vector<std::pair<long, long>>& out) {
+    std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> lseen;
+    std::unordered_map<Node<Data>*, long> lmemo;
+    auto emitLocal = [&](long ti, long tj) {
+      if (ti == tj) return;
+      long lo = std::min(ti, tj), hi = std::max(ti, tj);
+      if (lseen.insert(paratreet::packTipPair(lo, hi)).second)
+        out.emplace_back(lo, hi);
+    };
+    std::function<void(Node<Data>*, long)> starLocal =
+        [&](Node<Data>* n, long rep) {
+      if (n == nullptr || n->n_particles == 0) return;
+      if (n->isLeaf()) {
+        const Particle* p = n->particles();
+        for (int i = 0; i < n->n_particles; i++)
+          emitLocal(rep, p[i].group_number);
+        return;
+      }
+      for (int i = 0; i < n->n_children; i++) starLocal(n->getChild(i), rep);
+    };
+    auto certLocal = [&](Node<Data>* n) -> long {
+      auto it = lmemo.find(n);
+      if (it != lmemo.end()) return it->second;
+      long rep = firstTip(n);
+      starLocal(n, rep);
+      lmemo.emplace(n, rep);
+      return rep;
+    };
+    walk(a, b,
+         [&](Node<Data>* x, Node<Data>* y) {
+           const Particle* px = x->particles();
+           const Particle* py = y->particles();
+           for (int i = 0; i < x->n_particles; i++)
+             for (int j = 0; j < y->n_particles; j++) {
+               if (paratreet::periodicDistSq(px[i].position, py[j].position,
+                                             period_) > b2_) continue;
+               emitLocal(px[i].group_number, py[j].group_number);
+             }
+         },
+         [&](Node<Data>* x, Node<Data>* y) {
+           long tx = certLocal(x);
+           long ty = certLocal(y);
+           emitLocal(tx, ty);
+         },
+         [](Node<Data>*, Node<Data>*) { return false; });
+  }
+
+  // Preorder flatten of a pool-unit node's subtree: (key, spatial node)
+  // per node, leaf particles appended in the same preorder.
+  void flattenStealTree(Node<Data>* n, paratreet::StealTree<Data>& out) {
+    if (n == nullptr) {
+      // Absent child slot: key 0 marks it (real keys start at 1), so the
+      // preorder rebuild stays aligned without any key arithmetic.
+      out.nodes.emplace_back(Key(0), SpatialNode<Data>());
+      return;
+    }
+    out.nodes.emplace_back(n->key, SpatialNode<Data>(*n));
+    if (n->isLeaf()) {
+      const Particle* p = n->particles();
+      for (int i = 0; i < n->n_particles; i++) out.particles.push_back(p[i]);
+      return;
+    }
+    for (int i = 0; i < n->n_children; i++)
+      flattenStealTree(n->getChild(i), out);
+  }
+
+  // Rebuild a shipped tree as private FullNodes over the (caller-owned)
+  // particle vector. FoF is oct-only (enforced at startup), so the branch
+  // factor is 8. Children are reconstructed by preorder position.
+  Node<Data>* buildStealTree(const paratreet::StealTree<Data>& t,
+                             std::vector<Particle>& parts) {
+    size_t ni = 0, pi = 0;
+    return buildStealNode(t, parts, ni, pi, nullptr);
+  }
+  Node<Data>* buildStealNode(const paratreet::StealTree<Data>& t,
+                             std::vector<Particle>& parts, size_t& ni,
+                             size_t& pi, Node<Data>* parent) {
+    if (ni >= t.nodes.size()) return nullptr;
+    const auto& kv = t.nodes[ni++];
+    if (kv.first == Key(0)) return nullptr; // absent child slot marker
+    const SpatialNode<Data>& sn = kv.second;
+    bool leaf = sn.n_particles >= 0;
+    auto type = leaf ? (sn.n_particles == 0 ? Node<Data>::Type::EmptyLeaf
+                                            : Node<Data>::Type::Leaf)
+                     : Node<Data>::Type::Internal;
+    Particle* pp = nullptr;
+    if (leaf && sn.n_particles > 0) {
+      pp = parts.data() + pi;
+      pi += sn.n_particles;
+    }
+    auto* node = new FullNode<Data, 8>(kv.first, type, sn, pp, parent, -1, -1);
+    if (!leaf) {
+      for (int i = 0; i < node->n_children; i++) {
+        Node<Data>* c = buildStealNode(t, parts, ni, pi, node);
+        node->exchangeChild(i, c);
+      }
+    }
+    return node;
+  }
+  void deleteStealTree(Node<Data>* n) {
+    if (n == nullptr) return;
+    for (int i = 0; i < n->n_children; i++) deleteStealTree(n->getChild(i));
+    delete n;
+  }
+
+  // Self-test (FOF_S3_LOOPBACK=1, debug): for every locally claimed pool
+  // unit, run the direct walk AND the full ship-path replica — flatten,
+  // serialize and deserialize through memory (the same pup code
+  // marshalled messages use), rebuild, walk — and abort on the first
+  // difference between the two edge sets. Covers every unit of every
+  // process, orders of magnitude more than real steals exercise.
+  void selftestShippedUnit(Node<Data>* a, Node<Data>* b) {
+    std::vector<std::pair<long, long>> direct;
+    walkUnitEdges(a, b, direct);
+    paratreet::StealShipment<Data> ship;
+    ship.trees.emplace_back();
+    flattenStealTree(a, ship.trees.back());
+    ship.trees.emplace_back();
+    flattenStealTree(b, ship.trees.back());
+    ship.unit_pairs.emplace_back(0, 1);
+    PUP::sizer sz;
+    ship.pup(sz);
+    std::vector<char> buf(sz.size());
+    PUP::toMem tm(buf.data());
+    ship.pup(tm);
+    paratreet::StealShipment<Data> ship2;
+    PUP::fromMem fm(buf.data());
+    ship2.pup(fm);
+    std::vector<Particle> pa = ship2.trees[0].particles;
+    std::vector<Particle> pb = ship2.trees[1].particles;
+    Node<Data>* ra = buildStealTree(ship2.trees[0], pa);
+    Node<Data>* rb = buildStealTree(ship2.trees[1], pb);
+    std::vector<std::pair<long, long>> rebuilt;
+    walkUnitEdges(ra, rb, rebuilt);
+    deleteStealTree(ra);
+    deleteStealTree(rb);
+    std::sort(direct.begin(), direct.end());
+    std::sort(rebuilt.begin(), rebuilt.end());
+    if (direct != rebuilt) {
+      CkPrintf("S3 LOOPBACK MISMATCH pe %d: direct %zu edges, rebuilt "
+               "%zu edges (unit roots %llx %llx)\n",
+               CkMyPe(), direct.size(), rebuilt.size(),
+               (unsigned long long)a->key, (unsigned long long)b->key);
+      CkAbort("s3 loopback self-test mismatch");
     }
   }
 
