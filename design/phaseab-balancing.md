@@ -1191,3 +1191,40 @@ Lever ranking refreshed by this evidence:
     donor's least-loaded PE;
 (d) helper rebuild cost (27.8 s) is real but paid by idle PEs — lowest
     priority.
+
+### 31 addendum — the rebuild is the shipment's makespan (Kale's read, 2026-08-13)
+
+Kale, from the overview: s3Shipment entries are long, and no helper PE
+starts until the entry ends. Confirmed on both axes:
+- Trace: 473 s3Shipment calls, mean 58.8 ms, p90 143 ms, MAX 423 ms —
+  one uninterruptible entry method. Since a shipment's drain work is
+  only ~118 PE-ms (~8 ms wall across 14 PEs), the serial rebuild
+  dominates the entire shipment makespan, not just its start.
+- Code (FoFPhase1.h s3Shipment): buildStealTree for EVERY tree —
+  preorder reconstruction with one new FullNode per node, allocator-
+  bound — completes before the drainForeign wake at the end. The
+  helper also holds ONE active shipment at a time (s3_active_ship),
+  so helper throughput is ~1 grant per (rebuild + drain + return).
+- Scales the wrong way: at the new GRANT=128 defaults shipments are
+  ~4x larger, so the serial head grows toward 0.25-1.7 s per grant.
+
+Fix options (not yet built), in preference order:
+(A) LAZY PER-TREE REBUILD IN THE DRAIN: s3Shipment publishes the raw
+    trees + unit list immediately and wakes PEs; a drainer claiming
+    unit k builds its two trees on demand (per-tree atomic state
+    raw/building/ready; on 'building' by someone else, move to the
+    next unit via the cursor rather than spin). Kills the serial head
+    with no protocol change; rebuild cost spreads over 14 PEs and
+    overlaps execution.
+(C) ARENA-ALLOCATE the rebuilt nodes (one block per tree, placement-
+    new in preorder) — attacks the per-node allocation cost itself;
+    composes with (A); zero protocol change.
+(B) DONOR-SIDE SHARDING into per-PE sub-shipments — parallelizes
+    deserialization too, but 14x messages, a new completion protocol,
+    and MORE donor-side collection work, which section 31 already
+    flags as critical-path. Not preferred.
+Interaction: multiple-outstanding-grants (section 26 lever 3) would
+HIDE rebuild latency behind pipelining but not remove the cost; (A)
+removes the serialization and shortens each grant's turnaround, which
+is the quantity that limits how fast the coordinator can re-order the
+straggler's partitions. (A)+(C) first, then reassess lever 3.
