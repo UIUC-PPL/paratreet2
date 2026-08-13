@@ -62,6 +62,8 @@ module fof {
     entry void s3ShipOrder(int helperNode, int partIdx);
     entry void s3Shipment(const paratreet::StealShipment<Data>&);
     entry void s3Return(int fromNode, const std::vector<long>&);
+    entry void s3Poll();
+    entry void s3Report(int fromNode, double remaining);
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
@@ -84,6 +86,7 @@ module fof {
     // Campaign S2b: mid-phase relabel/re-annotate between the B1 and B2
     // rounds (FOF_PB_MERGE=1).
     entry void phaseBMidRelabel();
+    entry void drainForeign();
     entry void relabelChained(double tA, double tB, double tM);
     entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);

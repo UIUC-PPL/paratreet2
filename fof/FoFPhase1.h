@@ -461,18 +461,20 @@ public:
     }();
     return v;
   }
-  // Per-grant m2 ceiling: v1 helpers execute a shipment on ONE PE, so an
-  // uncapped grant of the giant partition (8.3x average at 2B) is ~12
-  // core-seconds of serial remote work — the Frontier trace's 10+ s
-  // s3Shipment bars. Units beyond the cap stay unclaimed for the local
-  // drain (or a later order for another partition; this one is spent).
-  // Default 5e6 m2 ~ a few hundred ms of walk at 2B rates.
-  static double s3MaxGrant() {
-    static const double v = [] {
-      const char* e = std::getenv("FOF_S3_MAX_GRANT_M2");
-      return e ? std::atof(e) : 5e6;
+  // Per-grant UNIT-COUNT ceiling, denominated per helper worker so it
+  // scales with the machine rather than the dataset (Kale, 2026-08-12:
+  // unit count over m2 — immune to cost-model misprediction; and do
+  // not tune to one dataset). v2 helpers drain a shipment with ALL
+  // their PEs, so a grant is sized as units-per-PE x workers.
+  // (History: the v1 m2 cap at 5e6 collided with the m2-LPT order —
+  // hot partitions hold the m2 giants, grants collapsed to 1-3 units
+  // and S3 went inert; Frontier job 5250048.)
+  static long s3GrantUnits() {
+    static const long per_pe = [] {
+      const char* e = std::getenv("FOF_S3_GRANT_UNITS_PER_PE");
+      return e ? std::atol(e) : 32L;
     }();
-    return v;
+    return per_pe * CkNodeSize(CkMyNode());
   }
   int s3Coord() const {
     int P = probeProcsPerPnode();
@@ -503,37 +505,121 @@ public:
   std::mutex s3_lock;
   struct S3Member {
     std::vector<double> part_cost; // initial partition costs (publish)
-    std::vector<char> ordered;     // partition already ordered away
-    double total = 0;
+    std::vector<char> in_flight;   // an order for this partition is out
+    std::vector<char> retired;     // partition declined EMPTY: done forever
+    double total = 0;              // initial published m2
+    double remaining = -1;         // latest polled remaining m2 (<0: none)
     bool drained = false; // pool cursor exhausted: can help
     bool busy = false;    // an order/shipment is in flight for this helper
+    int assigned_donor = -1, assigned_part = -1; // helper's current grant
   };
   std::map<int, S3Member> s3_members; // coordinator-side status table
+  // Live remaining-work ledger on EVERY branch (agent side): m2 of
+  // still-unowned units, decremented at each claim/collection CAS.
+  // The coordinator polls it (s3Poll/s3Report) to pick real stragglers.
+  std::atomic<long> s3_remaining_m2{0};
+  std::atomic<int> s3_poll_armed{0};
+  // Helper-side foreign work (v2 parallel drain): ONE shipment in
+  // flight per helper (coordinator busy flag), drained by ALL the
+  // process's PEs via FoFPhase1::drainForeign. Records are retired to
+  // the graveyard instead of freed so racing cursor reads stay safe;
+  // everything is released at reset.
+  struct S3ForeignShip {
+    int origin = -1;
+    int part_idx = -1;
+    std::vector<typename FoFPhase1Node<Data>::PoolUnit> units;
+    std::atomic<size_t> next{0};
+    std::atomic<int> remaining{0};
+    std::mutex mtx;                      // edge append
+    std::vector<std::pair<long, long>> edges;
+    std::vector<std::vector<Particle>> particles; // rebuilt-tree storage
+    std::vector<Node<Data>*> roots;
+  };
+  std::atomic<S3ForeignShip*> s3_active_ship{nullptr};
+  std::vector<S3ForeignShip*> s3_ship_graveyard; // under s3_lock
 
   // Agent -> coordinator, once per process at pool build: partition costs.
   void s3Publish(int fromNode, double total, const std::vector<double>& costs) {
     std::lock_guard<std::mutex> g(s3_lock);
     auto& m = s3_members[fromNode];
     m.part_cost = costs;
-    m.ordered.assign(costs.size(), 0);
+    m.in_flight.assign(costs.size(), 0);
+    m.retired.assign(costs.size(), 0);
     m.total = total;
+    // Arm the poll loop on the coordinator at first publish.
+    if (CkMyNode() == s3Coord() && !s3_poll_armed.exchange(1))
+      CcdCallFnAfter(s3PollThunk, this, (double)s3PollMs());
     s3DecideLocked();
   }
-  // Agent -> coordinator: my pool cursor is exhausted (or my shipment is
-  // done) — I can take work. Idempotent.
+  // Agent -> coordinator: I can take work (initial drain, or my current
+  // grant finished executing). Clears my in-flight assignment.
   void s3Drained(int fromNode) {
     std::lock_guard<std::mutex> g(s3_lock);
     auto& m = s3_members[fromNode];
     m.drained = true;
     m.busy = false;
+    if (m.assigned_donor >= 0) {
+      auto d = s3_members.find(m.assigned_donor);
+      if (d != s3_members.end() &&
+          m.assigned_part < (int)d->second.in_flight.size())
+        d->second.in_flight[m.assigned_part] = 0; // re-orderable
+      m.assigned_donor = m.assigned_part = -1;
+    }
     s3DecideLocked();
   }
-  // Donor -> coordinator: the ordered partition had nothing left to ship.
+  // Donor -> coordinator: the ordered partition had NOTHING unclaimed —
+  // retire it permanently (an emptied partition never refills).
   void s3Declined(int donorNode, int helperNode, int partIdx) {
-    (void)donorNode; (void)partIdx; // stays marked ordered: nothing there
     std::lock_guard<std::mutex> g(s3_lock);
+    auto d = s3_members.find(donorNode);
+    if (d != s3_members.end() && partIdx >= 0 &&
+        partIdx < (int)d->second.retired.size()) {
+      d->second.retired[partIdx] = 1;
+      d->second.in_flight[partIdx] = 0;
+    }
     auto h = s3_members.find(helperNode);
-    if (h != s3_members.end()) h->second.busy = false;
+    if (h != s3_members.end()) {
+      h->second.busy = false;
+      h->second.assigned_donor = h->second.assigned_part = -1;
+    }
+    s3DecideLocked();
+  }
+  // Poll layer (Kale's original design element): the coordinator asks
+  // every published member for its live remaining-work ledger on a
+  // fixed cadence; replies land in s3Report and drive decisions by
+  // CURRENT backlog instead of stale initial costs.
+  static int s3PollMs() {
+    static const int v = [] {
+      const char* e = std::getenv("FOF_S3_POLL_MS");
+      return e ? std::max(1, std::atoi(e)) : 10;
+    }();
+    return v;
+  }
+  static void s3PollThunk(void* self, double) {
+    static_cast<FoFPhase1Node<Data>*>(self)->s3PollTick();
+  }
+  void s3PollTick() {
+    bool anything_left = false;
+    {
+      std::lock_guard<std::mutex> g(s3_lock);
+      for (auto& kv : s3_members) {
+        if (kv.second.remaining != 0) anything_left = true;
+        this->thisProxy[kv.first].s3Poll();
+      }
+    }
+    if (anything_left)
+      CcdCallFnAfter(s3PollThunk, this, (double)s3PollMs());
+    else
+      s3_poll_armed.store(0);
+  }
+  void s3Poll() { // any member: report my live ledger to the coordinator
+    this->thisProxy[s3Coord()].s3Report(CkMyNode(),
+                                        (double)s3_remaining_m2.load());
+  }
+  void s3Report(int fromNode, double remaining) {
+    std::lock_guard<std::mutex> g(s3_lock);
+    auto m = s3_members.find(fromNode);
+    if (m != s3_members.end()) m->second.remaining = remaining;
     s3DecideLocked();
   }
   // One decision pass (coordinator only, s3_lock held): match each free
@@ -543,34 +629,43 @@ public:
   void s3DecideLocked() {
     if (CkMyNode() != s3Coord()) return;
     // EVERY free drained helper gets a donor search — a helper whose only
-    // eligible donor is itself must not end the pass (first version broke
-    // exactly there: it always examined the first free helper and gave up
-    // when that one had nothing, so the second helper was never asked).
+    // eligible donor is itself must not end the pass (v1 bug: it examined
+    // only the first free helper). Donor choice: LARGEST CURRENT
+    // remaining backlog (polled ledger; fall back to initial total until
+    // the first report). Partition: costliest neither in-flight nor
+    // retired — re-orderable until an empty decline retires it.
     for (bool issued = true; issued;) {
       issued = false;
       for (auto& hkv : s3_members) {
         if (!hkv.second.drained || hkv.second.busy) continue;
         int helper = hkv.first;
-        int donor = -1, part = -1;
-        double best = s3MinShip();
+        int donor = -1;
+        double best_rem = s3MinShip();
         for (auto& kv : s3_members) {
-          // Drained members stay eligible as donors: their unclaimed-unit
-          // truth lives in the CAS array, not here — an empty partition
-          // costs one decline and is pruned permanently. (Excluding them
-          // would also break FOF_S3_TEST, where a donor's cursor exhausts
-          // instantly because its locals refuse every claim.)
           if (kv.first == helper) continue;
           auto& m = kv.second;
+          double rem = m.remaining >= 0 ? m.remaining : m.total;
+          bool has_part = false;
           for (int p = 0; p < (int)m.part_cost.size(); p++)
-            if (!m.ordered[p] && m.part_cost[p] > best) {
-              donor = kv.first;
-              part = p;
-              best = m.part_cost[p];
-            }
+            if (!m.in_flight[p] && !m.retired[p]) { has_part = true; break; }
+          if (has_part && rem > best_rem) {
+            donor = kv.first;
+            best_rem = rem;
+          }
         }
         if (donor < 0) continue; // nothing for THIS helper; try the next
-        s3_members[donor].ordered[part] = 1;
+        auto& dm = s3_members[donor];
+        int part = -1;
+        double best_cost = -1;
+        for (int p = 0; p < (int)dm.part_cost.size(); p++)
+          if (!dm.in_flight[p] && !dm.retired[p] && dm.part_cost[p] > best_cost) {
+            part = p;
+            best_cost = dm.part_cost[p];
+          }
+        dm.in_flight[part] = 1;
         s3_members[helper].busy = true;
+        s3_members[helper].assigned_donor = donor;
+        s3_members[helper].assigned_part = part;
         issued = true;
         this->thisProxy[donor].s3ShipOrder(helper, part);
       }
@@ -595,11 +690,13 @@ public:
       return idx;
     };
     double m2 = 0;
+    const long cap = s3GrantUnits();
     for (uint32_t k = range.first; k < range.second; k++) {
-      if (m2 >= s3MaxGrant()) break; // cap the grant; locals keep the rest
+      if ((long)ship.unit_pairs.size() >= cap) break; // grant cap (units)
       int expect = 0;
       if (!s3_unit_taken[k].compare_exchange_strong(expect, 2)) continue;
       s3_units_owned.fetch_add(1);
+      s3_remaining_m2.fetch_sub((long)phaseb_pool[k].m2);
       ship.unit_pairs.emplace_back(place(phaseb_pool[k].a),
                                    place(phaseb_pool[k].b));
       m2 += phaseb_pool[k].m2;
@@ -619,34 +716,53 @@ public:
     }
     this->thisProxy[helperNode].s3Shipment(ship);
   }
-  // Helper: rebuild, execute every unit with the identical walk/cert/dedup
-  // semantics (walkUnitEdges), exact-dedup across the shipment, return.
-  // v1 limitation: the whole shipment runs on the serving PE, unsliced —
-  // helpers are drained by construction of the decision rule.
+  // Helper (v2 parallel drain): rebuild the shipment ONCE into a foreign
+  // ship record, then wake every PE of this process — they all drain the
+  // record's units through FoFPhase1::drainForeign (sliced, local
+  // buffers); the last finisher returns the edges and re-announces
+  // availability. One shipment in flight per helper (coordinator busy
+  // flag), so a single active record suffices; finished records go to
+  // the graveyard (freed at reset) so racing cursor reads stay safe.
   void s3Shipment(const paratreet::StealShipment<Data>& ship) {
     auto* fof = group_proxy.ckLocalBranch();
-    std::vector<std::vector<Particle>> parts(ship.trees.size());
-    std::vector<Node<Data>*> roots(ship.trees.size(), nullptr);
+    auto* rec = new S3ForeignShip();
+    rec->origin = ship.origin_node;
+    rec->part_idx = ship.part_idx;
+    rec->particles.resize(ship.trees.size());
+    rec->roots.assign(ship.trees.size(), nullptr);
     for (size_t t = 0; t < ship.trees.size(); t++) {
-      parts[t] = ship.trees[t].particles;
-      roots[t] = fof->buildStealTree(ship.trees[t], parts[t]);
+      rec->particles[t] = ship.trees[t].particles;
+      rec->roots[t] = fof->buildStealTree(ship.trees[t], rec->particles[t]);
     }
-    std::vector<std::pair<long, long>> es;
+    rec->units.reserve(ship.unit_pairs.size());
     for (auto& up : ship.unit_pairs)
-      fof->walkUnitEdges(roots[up.first], roots[up.second], es);
-    for (auto* r : roots) fof->deleteStealTree(r);
-    std::sort(es.begin(), es.end());
-    es.erase(std::unique(es.begin(), es.end()), es.end());
+      rec->units.push_back({0.0, rec->roots[up.first], rec->roots[up.second], 0.0});
+    rec->remaining.store((int)rec->units.size());
+    s3_in_ships.fetch_add(1);
+    s3_in_units.fetch_add((long)ship.unit_pairs.size());
+    auto* prev = s3_active_ship.exchange(rec);
+    if (prev) {
+      std::lock_guard<std::mutex> g(s3_lock);
+      s3_ship_graveyard.push_back(prev);
+    }
+    int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      group_proxy[pe].drainForeign();
+  }
+  // Last foreign drainer calls this: dedup, return edges to the origin,
+  // announce availability for the next grant.
+  void s3FinishForeign(S3ForeignShip* rec) {
+    std::sort(rec->edges.begin(), rec->edges.end());
+    rec->edges.erase(std::unique(rec->edges.begin(), rec->edges.end()),
+                     rec->edges.end());
     std::vector<long> flat;
-    flat.reserve(es.size() * 2);
-    for (auto& e : es) {
+    flat.reserve(rec->edges.size() * 2);
+    for (auto& e : rec->edges) {
       flat.push_back(e.first);
       flat.push_back(e.second);
     }
-    s3_in_ships.fetch_add(1);
-    s3_in_units.fetch_add((long)ship.unit_pairs.size());
-    this->thisProxy[ship.origin_node].s3Return(CkMyNode(), flat);
-    this->thisProxy[s3Coord()].s3Drained(CkMyNode()); // available again
+    this->thisProxy[rec->origin].s3Return(CkMyNode(), flat);
+    this->thisProxy[s3Coord()].s3Drained(CkMyNode()); // next grant, please
   }
   // Helper -> donor: edges (deduped within the shipment) come home
   // through the ordinary submitEdges door; the final merge's union is
@@ -996,6 +1112,19 @@ public:
     s3_declines = s3_ret_edges = 0;
     s3_out_m2 = 0;
     s3_members.clear();
+    s3_remaining_m2 = 0;
+    s3_poll_armed = 0;
+    {
+      auto* sh = s3_active_ship.exchange(nullptr);
+      if (sh) s3_ship_graveyard.push_back(sh);
+      for (auto* g : s3_ship_graveyard) {
+        auto* fof = group_proxy.ckLocalBranch();
+        if (fof)
+          for (auto* r : g->roots) fof->deleteStealTree(r);
+        delete g;
+      }
+      s3_ship_graveyard.clear();
+    }
     pb_part_range.clear();
     pb_part_cost.clear();
     pb_part_claimed.reset();
@@ -1641,6 +1770,7 @@ public:
             if (!nb->s3_unit_taken[k].compare_exchange_strong(expect, 1))
               continue;
             nb->s3_units_owned.fetch_add(1);
+            nb->s3_remaining_m2.fetch_sub((long)nb->phaseb_pool[k].m2);
           }
           t_phaseB_units++;
           // Debug: replay this unit through the full ship path (flatten,
@@ -2281,6 +2411,7 @@ public:
           nb->s3_units_total = n;
           double tot = 0;
           for (double c : nb->pb_part_cost) tot += c;
+          nb->s3_remaining_m2.store((long)tot);
           CkPrintf("FOF3STAT s3_arm: node %d parts %zu units %zu m2 %.3g\n",
                    CkMyNode(), nb->pb_part_cost.size(), n, tot);
           node_proxy[nb->s3Coord()].s3Publish(CkMyNode(), tot,
@@ -2344,6 +2475,38 @@ public:
         this->thisProxy[pe].relabelChained(nb->stage_tA, nb->stage_tB,
                                            nb->stage_tM);
     }
+  }
+
+  // v2 helper executor (S3): every PE of a helper process drains the
+  // active foreign shipment's units — sliced, local buffers, identical
+  // walk semantics (walkUnitEdges). The finisher of the last unit
+  // returns the edges to the origin. Safe against shipment swap: a new
+  // grant can only arrive after this one's return (one in flight per
+  // helper), and finished records are graveyarded, not freed.
+  void drainForeign() {
+    auto* nb = node_proxy.ckLocalBranch();
+    auto* rec = nb->s3_active_ship.load();
+    if (rec == nullptr) return;
+    double t0 = CkWallTimer();
+    const double slice = sliceSeconds();
+    std::vector<std::pair<long, long>> es;
+    int done = 0;
+    for (;;) {
+      size_t k = rec->next.fetch_add(1);
+      if (k >= rec->units.size()) break;
+      walkUnitEdges(rec->units[k].a, rec->units[k].b, es);
+      done++;
+      if (slice > 0 && CkWallTimer() - t0 > slice) {
+        this->thisProxy[CkMyPe()].drainForeign(); // yield, re-enter
+        break;
+      }
+    }
+    if (!es.empty()) {
+      std::lock_guard<std::mutex> g(rec->mtx);
+      rec->edges.insert(rec->edges.end(), es.begin(), es.end());
+    }
+    if (done && rec->remaining.fetch_sub(done) == done)
+      nb->s3FinishForeign(rec);
   }
 
   // S2b mid-phase stage, once per PE: apply the B1 merge map at
