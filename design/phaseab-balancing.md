@@ -912,3 +912,41 @@ Next levers, ranked (not yet built):
    tail), trading per-unit m2 for intactness. One-line pick change.
 3. Multiple outstanding grants per helper (removes the
    order->ship->return->drained serialization; moderate change).
+
+## 27. The composition finding, and reservation (PROPOSED — Kale review)
+
+Frontier msg2 (2026-08-12 night, ~30 exact runs): STEALING MOVES THE
+CHEAPEST WORK BY CONSTRUCTION. The pool is costliest-first (deliberate,
+twice: slice claiming and partition concatenation — the +60% regression
+proved LPT matters); the local cursor eats from the front; grants
+collect only what the cursor has not reached — the cheap tail. Donor
+eats giants, helpers get dust. Evidence: m2/shipped-unit FALLS as
+grants grow (19.1 -> 16.4M across GRANT 32->128); straggler = 3x units
+x 3x cost/unit; phaseB_s max floor 1.53 s across every knob of four
+generations; granularity NOT binding (floor would be 0.25 s under
+perfect balance — 6x headroom). Instruments to confirm shipped-dust
+directly (tot_m2 denominator, s3_grant_m2_hist) are in at 0963ded+.
+
+PROPOSED FIX — donor-side reservation, with one refinement over the
+Frontier suggestion: reservation must be DYNAMIC AND CONDITIONAL.
+A static ship-only prefix on every process re-creates the giants-last
+pathology (+60%) on every NON-straggler. So:
+- All processes start normal (LPT drain, no reservation).
+- The coordinator already polls remaining_m2. When a member's remaining
+  exceeds FOF_S3_RESERVE_FACTOR (~2x) x block average, the coordinator
+  sends it RESERVE; the donor then treats its top-m2 unclaimed units
+  (up to a budget) as ship-only: local claims skip them while other
+  units remain, grants collect them FIRST.
+- Starvation valve: a local PE that finds ONLY reserved units left
+  takes them anyway (reservation is advisory; termination ledger
+  unchanged). Coordinator can send UNRESERVE when balance is restored
+  or helpers dry up.
+- Mechanism sketch: reservation = an index threshold into the
+  costliest-first pool order (the top-m2 prefix IS the pool front), so
+  "reserved" is just k < R with R set by the RESERVE message; local
+  drain starts its cursor at R and wraps to [0, R) at the starvation
+  valve; grants scan [0, R) first. One extra cursor, no new locks.
+Expected effect: grants carry giants (s3_grant_m2_hist shifts high),
+straggler max falls toward the 0.25 s granularity floor. Decision
+knobs for review: reserve trigger factor, reserve budget (fraction of
+remaining), and whether UNRESERVE is needed in v1 of this.
