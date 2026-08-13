@@ -64,6 +64,7 @@ module fof {
     entry void s3Return(int fromNode, const std::vector<long>&);
     entry void s3Poll();
     entry void s3Report(int fromNode, double remaining);
+    entry void s3Reserve();
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
