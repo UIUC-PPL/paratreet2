@@ -1254,3 +1254,46 @@ Next measurement: Frontier one-job A/B at the best cell (GRANT=128,
 PARTS=16, defaults otherwise) — old vs new transport; readout =
 s3Shipment EP time (sum-detail or a cheap timer), grant turnaround,
 phaseB_s max.
+
+## 32. Measured: Anvil transport A/B (job 19861888, 2026-08-13 afternoon) — partial harvest under degraded fabric; one open teardown abort
+
+Seven arms at the best cell (PARTS=16, new defaults, no knob
+overrides): base + s3-prewire(d5c24f4) x2 + s3-wire(206b049) x2 +
+traced sumd pair. Binaries staged as FoF3.2b.{prewire,wire}[-sumd],
+transport verified the only code delta. THE AFTERNOON FABRIC WAS
+DEGRADED AGAIN (phaseA 5-33 s across arms vs 1.03 s in the morning
+window; cf. section 29 item 1) — treat all timing as low-confidence.
+
+| arm | rc | exact | phaseB | phaseB_s max | ships | units/ship | out_m2/tot_m2 |
+|---|---|---|---|---|---|---|---|
+| base (wire bin) | 0 | yes | 1.595 | 1.575 | 0 | — | — |
+| s3-prewire-1 | 0 | yes | 1.599 | 1.537 | 563 | 291 | 36% |
+| s3-wire-1 | 0 | yes | 1.708 | **1.263** | 543 | 292 | 35% |
+| s3-prewire-2 | 1 | NO COUNT | — | — | 520 | 314 | 35% |
+| s3-wire-2 | 134 | yes, then abort | 2.575 | 2.233 | 534 | 314 | 35% |
+| sumd pair | 1/1 | no | — | — | — | — | 0 trace files |
+
+1. GRANTS ARE HEALTHY AT THE NEW DEFAULTS ON A SECOND MACHINE:
+   291-314 units/ship, ~35% of pool m2 moved, declines ~1000 (~one
+   retire per partition per process) — Anvil now reproduces Frontier's
+   best-cell shipping behaviour (5253475: 551-566 units/ship, 38%).
+   Composition (grant_m2_hist) is transport-independent, as expected.
+2. The one clean same-window pair is SUGGESTIVE FOR THE WIRE
+   TRANSPORT: per-PE max 1.263 (wire) vs 1.537 (prewire) at equal
+   shipped volume — 18% — but single rep under variable fabric;
+   Frontier's A/B decides.
+3. FAILURES, all consistent with the degraded-fabric family, none
+   implicating the transport: s3-prewire-2 (OLD transport) OOM-killed
+   (task 56) with the IBV_WC assert cascade on peers — the 19842202
+   signature; both traced sumd arms OOM'd (traced RSS + afternoon
+   fabric; the morning window had carried a traced arm fine). The
+   Anvil s3Shipment EP A/B is therefore STILL MISSING — resubmit the
+   sumd pair in a morning window, or rely on Frontier's optional pair.
+4. OPEN ITEM: s3-wire-2 printed the exact count and full stats, then
+   task 0 died with free(): invalid size at teardown (no IBV asserts;
+   same run also had relabel 5.87 s and HEALTHY phaseA 4.97 —
+   internally inconsistent fabric). Unreproduced: laptop 1M loopback
+   under MallocScribble/PreScribble is clean (exact, zero mismatch).
+   Not attributable yet; watch the Frontier A/B — if teardown aborts
+   recur on wire binaries only, suspect the arena path and escalate
+   to Guard Malloc / valgrind on a small case.
