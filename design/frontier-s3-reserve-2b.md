@@ -31,7 +31,12 @@ the mechanism can actually engage.
 ## Build
 
 - `git fetch && git checkout phaseab-campaign && git pull` — must land
-  on 309673c ("S3 section 27: dynamic donor-side reservation").
+  on 4630ef2 (merge of main onto the code branch; contains 309673c
+  "S3 section 27: dynamic donor-side reservation").
+- NOTE: that merge also brings in aba7833 (windowed-flush reader fix,
+  main-side) — your first build with it. Loading/absolute wall rows may
+  shift vs 5250364; judge reservation against THIS job's base-serial
+  and s3-noreserve arms, not against 5250364's absolute numbers.
 - Clean rebuild: `make clean` in src/, fof/, examples/fof3 (stale-lib
   trap, as always). unionfind/htram unchanged.
 
