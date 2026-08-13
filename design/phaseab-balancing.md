@@ -933,8 +933,14 @@ A static ship-only prefix on every process re-creates the giants-last
 pathology (+60%) on every NON-straggler. So:
 - All processes start normal (LPT drain, no reservation).
 - The coordinator already polls remaining_m2. When a member's remaining
-  exceeds FOF_S3_RESERVE_FACTOR (~2x) x block average, the coordinator
-  sends it RESERVE; the donor then treats its top-m2 unclaimed units
+  exceeds FOF_S3_RESERVE_FACTOR (~2x) x the block mean EXCLUDING SELF
+  ((sum - mine)/(P-1)), the coordinator sends it RESERVE. (Frontier
+  review point 2026-08-12: a self-inclusive mean with one 12x straggler
+  among 8 members inflates the average to 2.375x, so a nominal 2x
+  trigger really fires at ~4.75x and misses second-tier ~3x hotspots;
+  self-excluded mean restores the stated intent. Keying on m2 rather
+  than unit count is confirmed by the straggler's decomposition — 3x
+  units AND 3x cost per unit — a count trigger under-detects ~3x.) the donor then treats its top-m2 unclaimed units
   (up to a budget) as ship-only: local claims skip them while other
   units remain, grants collect them FIRST.
 - Starvation valve: a local PE that finds ONLY reserved units left
