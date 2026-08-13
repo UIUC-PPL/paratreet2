@@ -1,13 +1,24 @@
 # Phase 1 on GPU: a Kokkos device port of the intra-process FoF
 
-**STATUS: PLAN, no implementation. Written 2026-08-12; revised the same
-day after review (Ritvik) on three points: one process per GPU is an
-enforced invariant, the tree is KEPT (and made free), and the scope is
-phase 1 only — cross-GPU tree walks for phase 3 are explicitly later
-work. Built from a read of fof/FoFPhase1.h, src/TreePiece.h,
-src/Node.h, the measurement ledgers (design/fof3-2b-scaling.md,
-design/fof3-lambb500-scaling.md, design/phase1-scaling.md), and the
-working Charm++/Kokkos/HIP precedent in ~/jacobi2D.**
+**STATUS: stages 0-3 IMPLEMENTED AND GATED (sections 11-16). The device
+pass reproduces the CPU chain's labels particle-for-particle at 80M and
+runs ~10x faster than phaseA+phaseB+merge on 14 cores (section 16). It
+still runs BESIDE the CPU chain rather than replacing it — that is the
+section-4 contract work, and with staging now double the walk it is the
+next task alongside section 12.1. Sections 1-10 are the original plan and
+are left as written; where measurement has since contradicted them
+(section 5's K3 on the cell grid, section 14.4 on where the walk's time
+goes, and section 14.3's walk shape) the later sections say so
+explicitly rather than editing the prediction away.**
+
+**Written 2026-08-12; revised the same day after review (Ritvik) on
+three points: one process per GPU is an enforced invariant, the tree is
+KEPT (and made free), and the scope is phase 1 only — cross-GPU tree
+walks for phase 3 are explicitly later work. Built from a read of
+fof/FoFPhase1.h, src/TreePiece.h, src/Node.h, the measurement ledgers
+(design/fof3-2b-scaling.md, design/fof3-lambb500-scaling.md,
+design/phase1-scaling.md), and the working Charm++/Kokkos/HIP precedent
+in ~/jacobi2D.**
 
 This is the build-out of design/walk-unification.md's GPU dimension
 (its stages 0 and 4) and of design/optimization-inventory.md's gap
@@ -1069,3 +1080,311 @@ Next: stage 3 (the dense-node cell grid), which section 14.4 identifies
 as the largest remaining lever, and then the section-4 contract work
 (process-wide `rep_label` + deposit barriers) that lets the device
 labeling actually replace the CPU chain rather than run beside it.
+
+---
+
+## 15. Stage 3: connectivity suppression and the cell grid (2026-08-13)
+
+Jobs 5257289 / 5257336 / 5257377 / 5257415 / 5257492, one Frontier node,
+8 processes x 14 PEs, lambb.00500 (80M). Code: the grid pre-pass and the
+suppression block in `fof/gpu/FoFDevice.cpp`, threshold plumbing in
+`fof/FoFPhase1.h`. Gate scripts: `fof/gpu/run_stage3*.sbatch`.
+
+Section 14.4 named two mechanisms as the largest remaining lever. Both
+are now implemented. **One of them is worth 1.8x and the other is worth
+nothing on this dataset**, and the reason the second one loses is not
+the reason section 14.4 predicted it would win.
+
+### 15.1 The gate is unchanged, and that is the point
+
+Neither mechanism is allowed to change the answer, so the stage-2 gate
+applies verbatim: exact per-particle agreement with the CPU chain's
+`group_number` on every process. Both mechanisms only DELETE work that
+provably cannot affect the partition:
+
+- suppression prunes a node pair whose two sides are each internally
+  connected and already in the same component, so every pair between
+  them is a union of two elements that are already equal;
+- the grid solves a dense node's internal pairs exactly, by the two
+  c = b/sqrt(6) guarantees, so the walk can skip that node's self pair.
+
+Every arm of every job reported **0 label mismatches**, including
+`TEST PASSED` at 1k (390 components) and 100k (33,933) under the full
+O(n^2) reference. The 100k `-G 0.25` arm matters more than it looks:
+100k at `-G 4` has NO dense nodes at all, so without that arm the grid
+would have been exercised only at 80M, where a failure is far harder to
+localize. At 0.25 it grids 28-32 nodes covering ~13% of particles, and
+still reproduces the O(n^2) answer exactly.
+
+### 15.2 Suppression: 1.9x, and section 14.4's diagnosis was wrong
+
+Per process (10.0M particles), max over the 8 processes:
+
+| | walk | device pass |
+|---|---|---|
+| stage 2 (job 5256985) | 516 ms | **564 ms** |
+| + connectivity suppression | 254 ms | **302 ms** |
+
+Against the same job's CPU numbers (phaseA 1.184 + phaseB 0.078 +
+merge 0.003 = **1.265 s**) that is **4.2x on the kernel** against 14 CPU
+cores, up from 2.3x at stage 2.
+
+The device memo is `d_node_rep`, the SAME array the positive certificate
+already used — deliberately, exactly as the CPU uses one `cert_rep` map
+for both jobs. An entry means "internally connected, with this
+representative", which is monotone and never needs invalidating, so a
+find through it always yields the current root. Leaves upgrade by
+checking that their particles share a root; internal nodes upgrade
+non-recursively from their children's entries, so connectivity percolates
+up one level per visit as the walk revisits a node against new partners.
+
+**And it corrects section 14.4.** That section observed that certificate
+count tracked walk time across processes almost linearly and concluded
+the positive certificate was the dominant cost. Suppression cut
+certificates from 61.5M to 750k — **82x** — and the walk went 516 to
+254 ms, **2.0x**. The correlation was real and the causation was not:
+certificate count was a proxy for how much dense structure a process
+held, not a measure of where its time went. Two diagnoses from this
+table have now been wrong in the same way (14.3's thundering herd,
+14.4's certificate cost), both from reasoning about a counter instead of
+measuring a phase.
+
+### 15.3 The cell grid works, and loses anyway
+
+Sweeping the occupancy threshold (max over processes, second round):
+
+| `-G` | grid | walk | device pass | dense coverage |
+|---|---|---|---|---|
+| off | 0 | 263 ms | **319 ms** | — |
+| 4 | 111 ms | 217 ms | 373 ms | 13-19% of particles |
+| 1 | 114 ms | 202 ms | 330 ms | 22-33% |
+| 0.25 | 227 ms | 171 ms | 422 ms | 33-49% |
+| 0.1 | — | — | 445 ms | — |
+
+The grid does precisely what it was designed to do: the walk falls
+monotonically as more of the volume is gridded, 263 -> 217 -> 202 ->
+171 ms. It simply costs more than it saves. Lowering the threshold buys
+walk time at a worse exchange rate than it spends, so there is no
+setting at which it wins — the minimum is at "off".
+
+This is worth stating plainly because section 5's K3 called the grid
+"required work, not an optimization". That remains true
+ASYMPTOTICALLY — pair tests per particle scale as 0.216 x overdensity
+while the grid's cost per particle does not, so a denser input or a
+larger b inverts this. It is not true at lambb.00500 with
+b = 0.2 x mean separation. The grid is therefore kept, correct, and
+gated, but **off by default on the device** (`FOF_GPU_GRID` enables it)
+while the CPU walk keeps `-G 4`. "Off" here means "does not pay at this
+density", not "not needed".
+
+### 15.4 Where the grid's time actually goes, after two wrong guesses
+
+The total was useless as a diagnostic: it varied 2.9x across processes
+that had the same cell count to within 20%. Splitting the pass four ways
+settled it immediately (`-G 4`, per process):
+
+| phase | cost |
+|---|---|
+| dense gate + maximal-ancestor fixpoint | 0.8-3.9 ms |
+| layout scans + binning + counting sort | 4.0-18.9 ms |
+| same-cell cliques | 0.1-0.2 ms |
+| **forward-half stencil pass** | **13.4-97.0 ms** |
+
+Two guesses were wrong before that split existed:
+
+1. **Binning imbalance.** The first version ran one team per dense node,
+   and the dense nodes span four orders of magnitude in size, so a
+   500k-particle halo core and a 64-particle clump each got 64 threads.
+   That is a real defect and it is fixed (the flat form needs a particle
+   -> dense-node map, which is one segment-marking scan away, since the
+   blocks are contiguous). It moved the total from 48-110 ms to
+   39-111 ms — i.e. nothing. Kept because it is correct and removes a
+   pathological case; it was not the bottleneck.
+
+2. **The redundant find.** The stencil re-evaluates `ufFind(rep)` inside
+   the 157-offset loop. Hoisting it is provably SAFE — union-find is
+   monotone and `ufFind` only ever returns a current root, so a stale
+   root that matches still proves connectivity and one that has since
+   been attached elsewhere merely stops matching — so staleness can only
+   cost redundant distance tests, never skip a real one. That reasoning
+   is correct, and the change cost **4-7x**: stencil went from 13-97 ms
+   to 138-679 ms, and the whole device pass from 373 ms to 948 ms. Once
+   the face-adjacent unions merge a halo, a stale root stops matching
+   almost every time and the full cell-by-cell product runs for all 157
+   offsets. The early-out is not overhead wrapped around the work; it IS
+   the work. Reverted. (The exactness gate held throughout, which is
+   itself the confirmation that the safety argument was sound and only
+   the cost argument was wrong.)
+
+The stencil's cost is therefore union-find find-depth and atomic
+contention inside dense halos, not probe count — which is also why it
+varies 7x between processes with equal cell counts.
+
+### 15.5 The leaf-pair product
+
+Independent of the grid: the leaf-pair kernel ranged over `L.n_below`,
+so 12 of 64 lanes worked and each walked its 12 partners serially.
+Ranging over the flattened 12x12 fills the wavefront. Worth ~8% of the
+walk (285 -> 263 ms) — real, much smaller than the lane arithmetic
+suggests, and further evidence that the walk is bound by the per-pop
+team-collective protocol rather than by pair arithmetic.
+
+### 15.6 Where this leaves the device pass
+
+Final gate, job 5257492 (the shipped configuration: suppression on,
+grid off), max over the 8 processes:
+
+| | time |
+|---|---|
+| CPU phaseA + phaseB + merge (max PE) | 1.265 s |
+| device walk (max process) | 254 ms |
+| device pass total (prepare 43 + walk 254 + freeze 19 + download 6) | **302 ms** |
+| + staging (pack 110, tree pack 28, upload 10, scatter 39) | ~490 ms |
+
+**4.2x on the kernel, ~2.6x end to end**, from 2.3x / 1.65x at stage 2.
+(The four 80M jobs put the device pass at 302-319 ms; the spread is run
+to run, and the comparisons above each use the CPU number from their own
+job.)
+Still short of section 1's 10-30x projection.
+
+The next lever is a re-test, not a new mechanism. Stage 2 replaced
+thread-per-leaf with team-per-leaf and measured 850 -> 516 ms, on the
+grounds that the serial per-thread pair product dominated. Suppression
+has since cut the work behind each leaf by more than an order of
+magnitude, so each team now does far fewer pops with far less work
+inside each one, while paying the same broadcast-and-barrier protocol on
+every pop. That is exactly the regime in which the stage-2 conclusion
+would invert. Staging is also now 196 ms against a 263 ms walk, so
+section 12.1's "write the device form at tree build" has stopped being
+premature.
+
+### 15.7 One more trap
+
+14. **A counter that correlates with time is not a cost model.** Twice
+    now (14.4's certificates, and the assumption that the grid's total
+    would point at its own hot phase) a plausible per-process counter
+    tracked the wall almost linearly and pointed at the wrong thing. The
+    fix both times was the same: split the phase and time the parts.
+    Sub-timers are cheap; a fenced `Kokkos::Timer` per phase costs
+    nothing at these scales and would have saved both detours.
+
+---
+
+## 16. The walk-shape retest: the stage-2 answer had expired (2026-08-13)
+
+Jobs 5257681 / 5257717 / 5257736 / 5257752, same configuration as
+sections 14-15. Code: the `Wave`/`Solo` adapters and `walkOneLeaf` in
+`fof/gpu/FoFDevice.cpp`. Gate script: `fof/gpu/run_walkshape.sbatch`.
+
+Section 15.6 flagged this as the next lever and it was the largest one
+left: **the device pass went 302 ms to 116 ms**, and the total speedup
+against the CPU chain went 4.2x to **~10x**, which is finally inside the
+10-30x section 1 projected.
+
+### 16.1 Why re-test a settled measurement
+
+Stage 2 replaced thread-per-leaf with team-per-leaf and measured
+850 -> 516 ms. That was a correct measurement of the code as it stood.
+Stage 3's connectivity suppression then removed ~40x of the work behind
+each leaf — and the team shape's cost is a broadcast and a barrier on
+EVERY pop, paid whether or not there is work at that pop. A fixed
+overhead per pop and a 40x cut in work per pop is precisely the setup
+for a reversal, so the choice was re-measured rather than inherited.
+
+**It reversed.** At the default leaf size, one thread per leaf beats one
+wavefront per leaf by 2.1x (walk 255 -> 123 ms, device pass 305 ->
+173 ms).
+
+To keep the A/B honest the traversal was NOT copied. The body lives once
+in `walkOneLeaf`, written against a tiny adapter — `Wave` maps `one`,
+`forRange` and `countRange` onto `Kokkos::single` and `TeamThreadRange`,
+`Solo` degenerates them to straight-line code with a private stack. A
+difference between the arms is therefore a difference in shape and
+nothing else. Both arms reproduce the CPU labels exactly at 1k, 100k and
+80M, which also re-proves the refactor itself.
+
+### 16.2 The shapes cross, and the crossover is the tree
+
+Sweeping leaf size under both shapes (80M, device pass, max process):
+
+| mean leaf occupancy | `-l` | solo | team |
+|---|---|---|---|
+| 3.7 | 12 | **150 ms** | 308 ms |
+| 8.3 | 32 | 247 ms | 175 ms |
+| 16 | 64 | 586 ms | **125 ms** |
+
+The two curves run in opposite directions and cross between 3.7 and 8.3.
+That is exactly what the mechanics predict: solo pays a serial
+leaf_size^2 pair product and wins only while it is small, team pays its
+per-pop collective and wins as soon as there is enough work per leaf to
+amortise it.
+
+**The consequence is that neither shape is the answer.** Shape and leaf
+size are one coupled knob, and every previous conclusion here — stage
+2's, and this section's own first result — came from moving one of them
+with the other pinned. Pushing the team arm to its own optimum:
+
+| `-l` | 64 | 96 | 128 | 192 |
+|---|---|---|---|---|
+| device pass | 126-138 ms | 116 ms | **116 ms** | 121 ms |
+
+A broad basin at 96-128, ~116 ms — better than solo's best (150 ms) by
+1.3x and better than the stage-3 shipped configuration by 2.6x.
+
+So the shape is now **chosen from the measured leaf occupancy** rather
+than fixed: solo below 6 particles/leaf, team above, `FOF_GPU_WALK`
+forcing either. Verified end to end — the default picks solo at 1.6 and
+3.7 particles/leaf and team at 29.5, with 0 mismatches in every arm.
+
+### 16.3 The device wants the opposite tree from the CPU
+
+Large leaves are not free elsewhere, and the direction is the
+interesting part:
+
+| `-l` | CPU phaseA | device pass |
+|---|---|---|
+| 12 | **1.194 s** | 175 ms |
+| 64 | 1.750 s | 138 ms |
+| 96 | 2.362 s | 116 ms |
+| 128 | 2.878 s | 116 ms |
+| 192 | 4.224 s | 121 ms |
+
+The CPU walk degrades 3.5x over the same range that improves the device
+by 1.5x. 12 particles per leaf is a CPU tuning, and section 3.2 already
+suspected as much; this measures it. The two paths want opposite trees,
+which is a real design tension the moment the device path stops being a
+shadow and starts being the only path.
+
+**Comparisons must therefore be best-config against best-config, not two
+arms of one job.** Best CPU (leaf 12): phaseA 1.194 + phaseB 0.079 +
+merge 0.003 = **1.276 s**. Best device (leaf 128, team): **116-124 ms**
+across runs. That is **~10x on the kernel** against 14 CPU cores.
+
+| | time |
+|---|---|
+| CPU phaseA + phaseB + merge, best config | 1.276 s |
+| device pass, best config | ~120 ms |
+| + staging (pack 84, tree pack 2, upload 3, scatter 37) | ~246 ms |
+
+**~10x on the kernel, ~5x end to end**, from 4.2x / 2.6x at stage 3 and
+2.3x / 1.65x at stage 2. Note that staging is now DOUBLE the walk, so
+section 12.1's "emit the device form at tree build" is no longer a
+refinement — it is the next bottleneck, along with the section-4
+contract work.
+
+Two things this does not yet establish, and should not be read as
+claiming: the whole-application cost of a leaf-128 tree (build time and
+phase 3 behaviour) has not been measured, only phase 1's; and the CPU
+arm at leaf 128 is a badly-tuned CPU, which is why it is not the
+comparison used above.
+
+### 16.4 Trap
+
+15. **A tuning decision expires when the code it was measured on
+    changes.** The team-per-leaf choice was correct when made and wrong
+    four days later, because a different optimisation removed the cost it
+    was chosen to amortise. Nothing flagged it — the number in section
+    14.3 simply sat there looking settled. Any recorded "X beat Y"
+    should carry the condition it was measured under, and the ones that
+    gate a hot path are worth re-running after any change that moves the
+    work by an order of magnitude.

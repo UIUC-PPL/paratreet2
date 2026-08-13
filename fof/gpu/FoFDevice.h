@@ -62,12 +62,27 @@ struct WalkStats {
   long n_leaves = 0;
   long n_top_nodes = 0;
   double t_prepare = 0;   // leaf list, top tree, parent init
+  double t_grid = 0;      // stage 3: the dense-node cell-grid pre-pass
+  // ... split four ways, because the total alone said nothing useful:
+  // it varied 2.9x across processes with the same cell count.
+  double t_grid_mark = 0;   // dense gate + maximal-dense-ancestor fixpoint
+  double t_grid_bin = 0;    // layout scans, binning, counting sort
+  double t_grid_union = 0;  // same-cell cliques
+  double t_grid_nbr = 0;    // forward-half stencil pass
   double t_walk = 0;      // the traversal itself
   double t_freeze = 0;    // find-all + label write
   double t_download = 0;
   long stack_overflows = 0;   // must be 0; a nonzero count means LOST WORK
   long certificates = 0;      // positive certificates fired
   long leaf_pairs = 0;        // leaf-leaf pair tests performed
+  // Stage 3 (design/phase1-gpu.md section 15).
+  long suppressed = 0;        // pairs pruned by connectivity suppression
+  long grid_nodes = 0;        // maximal dense nodes solved by the grid
+  long grid_particles = 0;    // particles they cover
+  long grid_cells = 0;        // cells allocated for them
+  long grid_probes = 0;       // residual-stencil cell pairs distance-tested
+  bool walk_solo = false;     // true = one thread per leaf (FOF_GPU_WALK)
+  double leaf_occupancy = 0;  // particles/leaf, which is what picks the shape
 };
 
 struct RoundTripStats {
@@ -163,7 +178,11 @@ class Device {
   // Synchronous, with a fence between kernels so the per-kernel walls are
   // real. The async form (enqueue + hapiAddCallback) is proven in stage 0
   // and is what production will use; measurement comes first.
-  void runPhase1(float b2, WalkStats* out);
+  //
+  // grid_thresh is the CPU's -G occupancy gate (expected particles per
+  // cell of side b/sqrt(6)); <= 0 disables the stage-3 grid pre-pass and
+  // leaves the traversal to solve dense nodes by descent.
+  void runPhase1(float b2, float grid_thresh, WalkStats* out);
 
   void fence();
 

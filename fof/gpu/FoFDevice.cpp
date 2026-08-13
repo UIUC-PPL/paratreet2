@@ -9,6 +9,8 @@
 
 #include <cstring>
 #include <cstdio>
+#include <cmath>
+#include <cstdlib>
 #include <algorithm>
 #include <climits>
 #include <vector>
@@ -81,6 +83,7 @@ struct Device::Impl {
   DView<int> d_leaves;     // node indices of the leaves
   DView<int> d_parent;     // union-find over process-flat particle indices
   DView<int> d_node_rep;   // positive-certificate memo, -1 = unpublished
+  DView<int> d_grid_root;  // stage 3: maximal dense ancestor, -1 = none
   long n_leaves = 0;
   int n_top = 0;
   std::vector<DTopNode> h_top;
@@ -229,6 +232,347 @@ KOKKOS_INLINE_FUNCTION void teamStarUnion(
                  [&]() { Kokkos::atomic_store(&node_rep(m), d.part_begin); });
 }
 
+// Residual stencil for the b/sqrt(6) cell grid, generated exactly as the
+// CPU's gridOffsets() does (fof/FoFPhase1.h): forward half-space, and a
+// pair of cells offset by d can hold a pair within b only if
+// sum(((|d|-1)+)^2) <= 6. Face offsets (a single +-1) are in the list and
+// are recognized by the kernel as test-free unions.
+std::vector<int> gridOffsetTable() {
+  std::vector<int> v;
+  for (int dz = -3; dz <= 3; dz++)
+    for (int dy = -3; dy <= 3; dy++)
+      for (int dx = -3; dx <= 3; dx++) {
+        if (dz < 0 || (dz == 0 && dy < 0) || (dz == 0 && dy == 0 && dx <= 0))
+          continue;
+        auto g = [](int d) { int a = (d < 0 ? -d : d) - 1; return a > 0 ? a : 0; };
+        if (g(dx) * g(dx) + g(dy) * g(dy) + g(dz) * g(dz) <= 6) {
+          v.push_back(dx); v.push_back(dy); v.push_back(dz);
+        }
+      }
+  return v;
+}
+
+// Cell dimensions of a node's grid. Kept in one place because the count
+// (used to size the cell array) and the binning (used to fill it) MUST
+// agree exactly — a mismatch writes outside the node's block and
+// corrupts a neighbour's grid silently.
+KOKKOS_INLINE_FUNCTION void gridDims(const DDNode& d, float c, int dim[3]) {
+  for (int k = 0; k < 3; k++) {
+    const float ext = d.hi[k] - d.lo[k];
+    int n = (int)(ext / c) + 1;
+    if (n < 1) n = 1;
+    dim[k] = n;
+  }
+}
+
+// ---------------------------------------------------------------------
+// The two shapes the traversal can take, behind one interface.
+//
+// Stage 2 measured team-per-leaf at 1.6x thread-per-leaf and the walk has
+// been a team kernel since. Stage 3's suppression then removed ~40x of
+// the work behind each leaf, which is exactly the kind of change that can
+// invert such a result: the team pays a broadcast and a barrier on EVERY
+// pop, and there is now far less work per pop to amortise them against.
+//
+// Rather than keep two copies of a 200-line traversal in sync — the
+// reliable way to make an A/B lie — the body is written once against
+// these two adapters. `Wave` is the real wavefront; `Solo` is a single
+// thread, where every collective degenerates to straight-line code and
+// the shared stack becomes a private array.
+template <typename Member>
+struct Wave {
+  const Member& m;
+  KOKKOS_INLINE_FUNCTION void barrier() const { m.team_barrier(); }
+  template <typename F>
+  KOKKOS_INLINE_FUNCTION void one(const F& f) const {
+    Kokkos::single(Kokkos::PerTeam(m), f);
+  }
+  template <typename F>
+  KOKKOS_INLINE_FUNCTION int oneBcast(const F& f) const {
+    int out = 0;
+    Kokkos::single(Kokkos::PerTeam(m), f, out);
+    return out;
+  }
+  template <typename F>
+  KOKKOS_INLINE_FUNCTION void forRange(int begin, int end, const F& f) const {
+    Kokkos::parallel_for(Kokkos::TeamThreadRange(m, begin, end), f);
+  }
+  template <typename F>
+  KOKKOS_INLINE_FUNCTION int countRange(int begin, int end, const F& f) const {
+    int acc = 0;
+    Kokkos::parallel_reduce(Kokkos::TeamThreadRange(m, begin, end), f, acc);
+    return acc;
+  }
+};
+
+struct Solo {
+  KOKKOS_INLINE_FUNCTION void barrier() const {}
+  template <typename F>
+  KOKKOS_INLINE_FUNCTION void one(const F& f) const { f(); }
+  template <typename F>
+  KOKKOS_INLINE_FUNCTION int oneBcast(const F& f) const {
+    int out = 0;
+    f(out);
+    return out;
+  }
+  template <typename F>
+  KOKKOS_INLINE_FUNCTION void forRange(int begin, int end, const F& f) const {
+    for (int i = begin; i < end; i++) f(i);
+  }
+  template <typename F>
+  KOKKOS_INLINE_FUNCTION int countRange(int begin, int end, const F& f) const {
+    int acc = 0;
+    for (int i = begin; i < end; i++) f(i, acc);
+    return acc;
+  }
+};
+
+// Star-union every particle under node m into its first particle, at most
+// once process-wide, with the work split across whatever the adapter has.
+// The barrier before publishing is required: the memo must not read "done"
+// until every lane's unite has landed.
+template <typename Team>
+KOKKOS_INLINE_FUNCTION void starUnionT(
+    const Team& tm, const Kokkos::View<DDNode*, MemSpace>& nodes,
+    const Kokkos::View<int*, MemSpace>& parent,
+    const Kokkos::View<long*, MemSpace>& order,
+    const Kokkos::View<int*, MemSpace>& node_rep, int m) {
+  const int claimed = tm.oneBcast([&](int& o) {
+    o = (node_rep(m) == -1 &&
+         Kokkos::atomic_compare_exchange(&node_rep(m), -1, -2) == -1)
+            ? 1
+            : 0;
+  });
+  if (!claimed) return;
+  const DDNode d = nodes(m);
+  tm.forRange(1, d.n_below, [&](const int i) {
+    ufUnite(parent, order, d.part_begin, d.part_begin + i);
+  });
+  tm.barrier();
+  tm.one([&]() { Kokkos::atomic_store(&node_rep(m), d.part_begin); });
+}
+
+// One leaf's traversal of the process forest. Written once, run by both
+// kernel shapes. `stack`/`sp` are team scratch under Wave and a private
+// array under Solo; everything else is identical, which is the point.
+template <typename Team>
+KOKKOS_INLINE_FUNCTION void walkOneLeaf(
+    const Team& tm, int li, int* stack, int* sp, int kStack, float b2,
+    const Kokkos::View<DDNode*, MemSpace>& d_nodes,
+    const Kokkos::View<DTopNode*, MemSpace>& d_top,
+    const Kokkos::View<int*, MemSpace>& d_piece_root,
+    const Kokkos::View<int*, MemSpace>& d_parent,
+    const Kokkos::View<long*, MemSpace>& d_order,
+    const Kokkos::View<int*, MemSpace>& d_node_rep,
+    const Kokkos::View<int*, MemSpace>& d_grid_root,
+    const Kokkos::View<float*, MemSpace>& d_pos,
+    const Kokkos::View<long*, MemSpace>& counters) {
+  const DDNode L = d_nodes(li);
+  // The dense ancestor whose grid pass already solved every pair inside
+  // it, or -1. The traversal can only reach that subtree THROUGH this
+  // node, so pruning here prunes all of it.
+  const int l_grid = d_grid_root(li);
+
+  // Connectivity suppression state (design section 15). Once L is known
+  // internally connected, l_rep is a handle to its component and stays
+  // valid forever: union-find is monotone, so a node never becomes
+  // disconnected and find(l_rep) is always current.
+  int l_rep = -1;
+  bool l_dirty = true;
+
+  tm.one([&]() {
+    stack[0] = -1;  // top-tree root
+    sp[0] = 1;
+  });
+  tm.barrier();
+
+  while (true) {
+    // Pop once for the whole team and broadcast; INT_MIN = done.
+    const int e = tm.oneBcast(
+        [&](int& out) { out = (sp[0] > 0) ? stack[--sp[0]] : INT_MIN; });
+    if (e == INT_MIN) break;
+
+    if (e < 0) {  // top tree
+      const DTopNode t = d_top(-e - 1);
+      if (boxMinDist2(L.lo, L.hi, t.lo, t.hi) <= b2) {
+        tm.one([&]() {
+          if (t.piece >= 0) {
+            if (sp[0] < kStack) stack[sp[0]++] = d_piece_root(t.piece);
+            else Kokkos::atomic_fetch_add(&counters(0), 1L);
+          } else if (sp[0] + 2 <= kStack) {
+            stack[sp[0]++] = -(t.left + 1);
+            stack[sp[0]++] = -(t.right + 1);
+          } else {
+            Kokkos::atomic_fetch_add(&counters(0), 1L);
+          }
+        });
+      }
+      tm.barrier();
+      continue;
+    }
+
+    // Every pair inside L's dense ancestor was solved by the grid
+    // pre-pass, and this is the only way in. Same prune the CPU takes
+    // when gridSelfUnionRange returns true.
+    if (e == l_grid) {
+      tm.barrier();
+      continue;
+    }
+
+    const DDNode M = d_nodes(e);
+    if (boxMinDist2(L.lo, L.hi, M.lo, M.hi) > b2) {
+      tm.barrier();
+      continue;
+    }
+
+    // ---- connectivity suppression (the CPU's prune_fn) ----
+    // If L and M are each internally connected AND already in the same
+    // component, no pair between them can add anything, at any level
+    // below either — so the whole subtree is dead. This is what stops a
+    // leaf in a dense core from re-certifying against every node of a
+    // core it has already joined.
+    //
+    // The memo is d_node_rep, exactly as on the CPU, where the
+    // certificate memo and the connectivity memo are deliberately the
+    // SAME map: an entry means "internally connected, with this
+    // representative", which is monotone and never has to be
+    // invalidated. All reads that steer collective code are broadcast
+    // from one lane; a per-lane read of a racing location could
+    // otherwise diverge inside a team barrier.
+    if (l_rep < 0) {
+      const int r0 = tm.oneBcast([&](int& o) { o = d_node_rep(li); });
+      if (r0 >= 0) {
+        l_rep = r0;
+      } else if (l_dirty) {
+        // Lazy upgrade: L is internally connected iff all its particles
+        // currently share a root. Each lane compares against the root it
+        // read itself, which is sound even when they differ: roots only
+        // ever move upward, so a particle matching ANY root that
+        // part_begin held is connected to part_begin.
+        const int root0 = ufFind(d_parent, L.part_begin);
+        const int bad = tm.countRange(1, L.n_below, [&](const int i, int& acc) {
+          if (ufFind(d_parent, L.part_begin + i) != root0) acc += 1;
+        });
+        if (bad == 0) {
+          l_rep = L.part_begin;
+          tm.one([&]() {
+            // CAS from -1 only: never clobber a star-union's in-progress
+            // claim (-2) or another rep.
+            Kokkos::atomic_compare_exchange(&d_node_rep(li), -1, L.part_begin);
+          });
+        }
+        l_dirty = false;
+      }
+    }
+    if (l_rep >= 0) {
+      int mr = tm.oneBcast([&](int& o) { o = d_node_rep(e); });
+      if (mr < 0 && M.child_begin >= 0) {
+        // Bottom-up upgrade from the children's memos, the CPU's
+        // connectedRep for an internal node: non-recursive, so
+        // connectivity percolates up one level per visit as the walk
+        // revisits the node against new partners. M's own first particle
+        // is child 0's first particle, so it is a valid representative.
+        mr = tm.oneBcast([&](int& o) {
+          o = -1;
+          int r = -1;
+          for (int c = 0; c < M.n_children; c++) {
+            const int cr = d_node_rep(M.child_begin + c);
+            if (cr < 0) return;
+            const int fr = ufFind(d_parent, cr);
+            if (r < 0) r = fr;
+            else if (fr != r) return;
+          }
+          if (r < 0) return;
+          Kokkos::atomic_compare_exchange(&d_node_rep(e), -1, M.part_begin);
+          o = M.part_begin;
+        });
+      }
+      // Decided by ONE lane and broadcast. ufFind reads memory that other
+      // teams are actively mutating, so two lanes of the same wavefront
+      // can legitimately return different roots; branching per lane on
+      // that would split the team across a barrier further down.
+      const int same = tm.oneBcast([&](int& o) {
+        o = (mr >= 0 &&
+             ufFind(d_parent, mr) == ufFind(d_parent, l_rep))
+                ? 1
+                : 0;
+        if (o) Kokkos::atomic_fetch_add(&counters(3), 1L);
+      });
+      if (same) {
+        tm.barrier();
+        continue;
+      }
+    }
+
+    // Positive certificate: every cross pair is a friend, so both sides
+    // collapse with no distance test and no descent. The memo is CLAIMED
+    // with a CAS, not merely checked: thousands of teams can reach a hot
+    // node at once, and without the claim they all run the same
+    // O(n_below) star-union.
+    if (boxMaxDist2(L.lo, L.hi, M.lo, M.hi) <= b2) {
+      starUnionT(tm, d_nodes, d_parent, d_order, d_node_rep, li);
+      if (e != li) {
+        starUnionT(tm, d_nodes, d_parent, d_order, d_node_rep, e);
+        tm.one([&]() {
+          // Uniting the two FIRST particles is enough: whoever won each
+          // claim is committed to collapsing that node, and union-find is
+          // order-independent, so it does not matter which finishes first.
+          ufUnite(d_parent, d_order, L.part_begin, M.part_begin);
+          Kokkos::atomic_fetch_add(&counters(1), 1L);
+        });
+      }
+      // L is now internally connected (this team's star-union did it, or
+      // the team that owns the claim is committed to it), so let the next
+      // iteration pick up the published memo.
+      l_dirty = true;
+      tm.barrier();
+      continue;
+    }
+
+    if (M.child_begin < 0) {
+      // Leaf pair, owned by the smaller node index so the mirror visit
+      // from M's own team does nothing (the each-pair-once rule).
+      if (e >= li) {
+        const int ab = L.part_begin, bb = M.part_begin;
+        const int nb_ = (e == li) ? L.n_below : M.n_below;
+        // The WHOLE product over the lanes, not one lane per i. Ranging
+        // over L.n_below put 12 of the 64 lanes to work and made each of
+        // them walk all 12 partners serially; ranging over the flattened
+        // 12x12 fills the wavefront and finishes in ~2 steps instead of
+        // 12. The cost is reloading the i-side position per pair, which
+        // is a broadcast from cache, not a gather.
+        const int self = (e == li) ? 1 : 0;
+        tm.forRange(0, L.n_below * nb_, [&](const int t) {
+          const int i = t / nb_;
+          const int j = t - i * nb_;
+          if (self && j <= i) return;  // unordered pairs once
+          const int q = ab + i;
+          const int p = (self ? ab : bb) + j;
+          const float dx = d_pos(3 * q) - d_pos(3 * p);
+          const float dy = d_pos(3 * q + 1) - d_pos(3 * p + 1);
+          const float dz = d_pos(3 * q + 2) - d_pos(3 * p + 2);
+          if (dx * dx + dy * dy + dz * dz <= b2)
+            ufUnite(d_parent, d_order, q, p);
+        });
+        tm.one([&]() { Kokkos::atomic_fetch_add(&counters(2), 1L); });
+        l_dirty = true;  // L may have just merged; recheck the memo
+      }
+      tm.barrier();
+      continue;
+    }
+
+    tm.one([&]() {
+      if (sp[0] + M.n_children <= kStack) {
+        for (int c = 0; c < M.n_children; c++)
+          stack[sp[0]++] = M.child_begin + c;
+      } else {
+        Kokkos::atomic_fetch_add(&counters(0), 1L);
+      }
+    });
+    tm.barrier();
+  }
+}
+
 }  // namespace
 
 bool Device::available() {
@@ -280,6 +624,7 @@ void Device::finalize() {
   p_->d_leaves = DView<int>();
   p_->d_parent = DView<int>();
   p_->d_node_rep = DView<int>();
+  p_->d_grid_root = DView<int>();
   p_->n_leaves = 0;
   p_->n_top = 0;
   p_->h_top.clear();
@@ -504,8 +849,35 @@ static int buildTopTree(std::vector<DTopNode>& out, const DDNode* nodes,
   return me;
 }
 
-void Device::runPhase1(float b2, WalkStats* out) {
+void Device::runPhase1(float b2, float grid_thresh, WalkStats* out) {
   WalkStats st;
+  // Measurement knob only: which shape the traversal takes. Read here
+  // rather than plumbed through the interface because it selects between
+  // two implementations of the SAME function, not between two behaviours
+  // — both arms must produce identical labels, and the gate checks that.
+  // Walk shape. NOT a fixed choice, because it is not independent of the
+  // tree: the two shapes cross as leaf occupancy changes, and picking one
+  // globally is what made both the stage-2 and the first stage-3 answers
+  // wrong. Measured at 80M (device pass, max process):
+  //
+  //     mean leaf occupancy   solo     team
+  //     3.7  (-l 12)          150 ms   308 ms
+  //     8.3  (-l 32)          247 ms   175 ms
+  //     16   (-l 64)          586 ms   125 ms
+  //
+  // Solo pays a serial leaf_size^2 pair product and wins only while that
+  // is small; team pays a broadcast and a barrier per pop and wins as
+  // soon as there is enough work per leaf to amortise them. The crossover
+  // sits between 3.7 and 8.3, so the gate is 6. FOF_GPU_WALK=solo|team
+  // forces either arm.
+  const char* wenv = std::getenv("FOF_GPU_WALK");
+  bool solo_walk;
+  if (wenv != nullptr) {
+    solo_walk = wenv[0] != 't';
+  } else {
+    solo_walk = true;  // decided below, once the leaf list exists
+  }
+  const bool walk_forced = wenv != nullptr;
   if (!p_->inited || p_->n == 0 || p_->n_nodes == 0) {
     if (out) *out = st;
     return;
@@ -582,156 +954,395 @@ void Device::runPhase1(float b2, WalkStats* out) {
   Kokkos::parallel_for(
       "fof_rep_init", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_nodes),
       KOKKOS_LAMBDA(const long i) { d_node_rep(i) = -1; });
+  p_->d_grid_root = DView<int>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_d_grid_root"),
+      n_nodes);
+  auto d_grid_root = p_->d_grid_root;
+  Kokkos::parallel_for(
+      "fof_grid_root_init", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_nodes),
+      KOKKOS_LAMBDA(const long i) { d_grid_root(i) = -1; });
   exec.fence();
   st.t_prepare = timer.seconds();
   st.n_leaves = n_leaves;
   st.n_top_nodes = p_->n_top;
 
+  if (!walk_forced && n_leaves > 0)
+    solo_walk = ((double)n_part / (double)n_leaves) < 6.0;
+  st.walk_solo = solo_walk;
+  st.leaf_occupancy = n_leaves > 0 ? (double)n_part / (double)n_leaves : 0.0;
+
+  // ---- stage 3: the dense-node cell grid (design section 5, K3) ----
+  //
+  // A node dense enough that its own cell grid is cheaper than descending
+  // it is solved OUTRIGHT, before the walk, and the walk then prunes the
+  // whole node for every leaf inside it. Cell side c = b/sqrt(6) buys two
+  // test-free guarantees: a same-cell pair is within b (diagonal
+  // c*sqrt(3) = b/sqrt(2)) and a FACE-adjacent pair is within b (max
+  // separation c*sqrt(6) = b). Only the residual stencil needs distance
+  // tests, and only between cells not already in the same component.
+  //
+  // This is the same algorithm as the CPU's gridSelfUnionRange, but the
+  // data structure is different in the one place it matters: the CPU
+  // sorts particles by cell key and binary-searches an occupied-cell list
+  // (the divergence its own comment flags), while here every dense node
+  // gets a DENSE cell array, so a neighbour probe is a single load. That
+  // is affordable precisely because the node is dense: the occupancy gate
+  // says cells <= n_below / thresh.
+  if (grid_thresh > 0.f) {
+    timer.reset();
+    Kokkos::Timer gt;
+    // c in DOUBLE, from b2 in double, exactly as the CPU computes it.
+    // The cell side is load-bearing at both ends and cannot be nudged
+    // either way: too large and a face-adjacent pair can exceed b, so a
+    // free union links a non-friend; too small and a pair within b can
+    // land more than 3 cells apart, so the sum(((|d|-1)+)^2) <= 6 stencil
+    // MISSES it. Only c = b/sqrt(6) satisfies both, so the two arms had
+    // better round it the same way.
+    const float cell = (float)(std::sqrt((double)b2) / std::sqrt(6.0));
+    const float thresh = grid_thresh;
+
+    // (1) Maximal dense nodes. `d_grid_root(i)` ends up holding the
+    // topmost dense ancestor-or-self of i, or -1. Seeded at every dense
+    // node and pushed DOWN: children have higher indices than parents, a
+    // node has exactly one parent so no two threads write the same entry,
+    // and an ancestor's value overwrites a descendant's — which is what
+    // makes the fixpoint "maximal", not merely "some".
+    const long cell_cap_slope = 16;   // cells <= 16*n_below + 64, else skip
+    Kokkos::parallel_for(
+        "fof_grid_mark", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_nodes),
+        KOKKOS_LAMBDA(const long i) {
+          const DDNode d = d_nodes(i);
+          if (d.n_below < 64) return;
+          const double vol = (double)(d.hi[0] - d.lo[0]) *
+                             (double)(d.hi[1] - d.lo[1]) *
+                             (double)(d.hi[2] - d.lo[2]);
+          if (!(vol > 0.0)) return;
+          const double cc = (double)cell;
+          if ((double)d.n_below * cc * cc * cc / vol < (double)thresh) return;
+          int dim[3];
+          gridDims(d, cell, dim);
+          const long cells = (long)dim[0] * dim[1] * dim[2];
+          // A needle-shaped box has near-zero volume and passes the
+          // occupancy gate on that alone while needing far more cells
+          // than it has particles. Leave those to the walk.
+          if (cells > cell_cap_slope * (long)d.n_below + 64) return;
+          d_grid_root(i) = (int)i;
+        });
+    long changed = 1;
+    for (int pass = 0; pass < 64 && changed != 0; pass++) {
+      changed = 0;
+      Kokkos::parallel_reduce(
+          "fof_grid_push", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_nodes),
+          KOKKOS_LAMBDA(const long i, long& acc) {
+            const int g = d_grid_root(i);
+            if (g < 0) return;
+            const DDNode d = d_nodes(i);
+            if (d.child_begin < 0) return;
+            for (int c = 0; c < d.n_children; c++)
+              if (d_grid_root(d.child_begin + c) != g) {
+                d_grid_root(d.child_begin + c) = g;
+                acc += 1;
+              }
+          },
+          changed);
+    }
+
+    exec.fence();
+    st.t_grid_mark = gt.seconds();
+    gt.reset();
+
+    // (2) Compact the maximal dense nodes and lay out their particle and
+    // cell blocks with two scans.
+    DView<int> d_gnode(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                          "fof_d_gnode"), n_nodes);
+    long n_grid = 0;
+    Kokkos::parallel_scan(
+        "fof_grid_list", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_nodes),
+        KOKKOS_LAMBDA(const long i, long& acc, const bool final) {
+          const bool mine = d_grid_root(i) == (int)i;
+          if (mine && final) d_gnode(acc) = (int)i;
+          if (mine) acc += 1;
+        },
+        n_grid);
+
+    st.grid_nodes = n_grid;
+    if (n_grid > 0) {
+      DView<long> d_gpoff(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                             "fof_d_gpoff"), n_grid + 1);
+      DView<long> d_gcoff(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                             "fof_d_gcoff"), n_grid + 1);
+      long n_gpart = 0, n_gcell = 0;
+      Kokkos::parallel_scan(
+          "fof_grid_poff", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_grid),
+          KOKKOS_LAMBDA(const long g, long& acc, const bool final) {
+            if (final) d_gpoff(g) = acc;
+            acc += d_nodes(d_gnode(g)).n_below;
+          },
+          n_gpart);
+      Kokkos::parallel_scan(
+          "fof_grid_coff", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_grid),
+          KOKKOS_LAMBDA(const long g, long& acc, const bool final) {
+            if (final) d_gcoff(g) = acc;
+            int dim[3];
+            gridDims(d_nodes(d_gnode(g)), cell, dim);
+            acc += (long)dim[0] * dim[1] * dim[2];
+          },
+          n_gcell);
+      Kokkos::parallel_for(
+          "fof_grid_tail", Kokkos::RangePolicy<ExecSpace>(exec, 0, 1),
+          KOKKOS_LAMBDA(const int) {
+            d_gpoff(n_grid) = n_gpart;
+            d_gcoff(n_grid) = n_gcell;
+          });
+      st.grid_particles = n_gpart;
+      st.grid_cells = n_gcell;
+
+      // (3) Bin. FLAT over grid particles and over cells, not one team per
+      // dense node: the dense nodes span four orders of magnitude in size
+      // (a 64-particle clump and a 500k-particle halo core are both one
+      // node), so a team-per-node kernel gives the halo core 64 threads
+      // and the clump 64 threads. Measured, that imbalance cost 227 ms on
+      // the worst process against 43 ms on the best with the SAME particle
+      // count — it was the whole reason the grid did not pay for itself.
+      //
+      // The flat form needs a particle -> dense-node map, which is one
+      // scan away: the blocks are contiguous, so marking each block's
+      // first slot and running an inclusive sum labels every slot with
+      // its block. Same trick for the cell blocks.
+      DView<int> d_gpart(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                            "fof_d_gpart"), n_gpart);
+      DView<int> d_gcell(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                            "fof_d_gcell"), n_gpart);
+      DView<int> d_qnode("fof_d_qnode", n_gpart);  // zero-filled
+      DView<int> d_cnode("fof_d_cnode", n_gcell);  // zero-filled
+      DView<int> d_ccount("fof_d_ccount", n_gcell + 1);  // zero-filled
+      Kokkos::parallel_for(
+          "fof_grid_seg", Kokkos::RangePolicy<ExecSpace>(exec, 1, n_grid),
+          KOKKOS_LAMBDA(const long g) {
+            d_qnode(d_gpoff(g)) = 1;
+            d_cnode(d_gcoff(g)) = 1;
+          });
+      Kokkos::parallel_scan(
+          "fof_grid_qseg", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_gpart),
+          KOKKOS_LAMBDA(const long q, int& acc, const bool final) {
+            acc += d_qnode(q);
+            if (final) d_qnode(q) = acc;
+          });
+      Kokkos::parallel_scan(
+          "fof_grid_cseg", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_gcell),
+          KOKKOS_LAMBDA(const long c, int& acc, const bool final) {
+            acc += d_cnode(c);
+            if (final) d_cnode(c) = acc;
+          });
+      Kokkos::parallel_for(
+          "fof_grid_bin", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_gpart),
+          KOKKOS_LAMBDA(const long q) {
+            const int g = d_qnode(q);
+            const DDNode d = d_nodes(d_gnode(g));
+            int dim[3];
+            gridDims(d, cell, dim);
+            const int p = d.part_begin + (int)(q - d_gpoff(g));
+            int ix[3];
+            for (int k = 0; k < 3; k++) {
+              int v = (int)((d_pos(3 * p + k) - d.lo[k]) / cell);
+              if (v < 0) v = 0;
+              if (v >= dim[k]) v = dim[k] - 1;
+              ix[k] = v;
+            }
+            const long c = d_gcoff(g) +
+                           (long)(ix[2] * dim[1] + ix[1]) * dim[0] + ix[0];
+            d_gpart(q) = p;
+            d_gcell(q) = (int)c;
+            Kokkos::atomic_fetch_add(&d_ccount(c), 1);
+          });
+
+      // (4) Counting sort into per-cell particle lists.
+      DView<long> d_cbegin(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                              "fof_d_cbegin"), n_gcell + 1);
+      long total = 0;
+      Kokkos::parallel_scan(
+          "fof_grid_cscan", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_gcell),
+          KOKKOS_LAMBDA(const long c, long& acc, const bool final) {
+            if (final) d_cbegin(c) = acc;
+            acc += d_ccount(c);
+          },
+          total);
+      Kokkos::parallel_for(
+          "fof_grid_ctail", Kokkos::RangePolicy<ExecSpace>(exec, 0, 1),
+          KOKKOS_LAMBDA(const int) { d_cbegin(n_gcell) = n_gpart; });
+      DView<int> d_cursor("fof_d_cursor", n_gcell);  // zero-filled
+      DView<int> d_citem(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                            "fof_d_citem"), n_gpart);
+      Kokkos::parallel_for(
+          "fof_grid_scatter", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_gpart),
+          KOKKOS_LAMBDA(const long q) {
+            const long c = d_gcell(q);
+            const int at = Kokkos::atomic_fetch_add(&d_cursor(c), 1);
+            d_citem(d_cbegin(c) + at) = d_gpart(q);
+          });
+
+      exec.fence();
+      st.t_grid_bin = gt.seconds();
+      gt.reset();
+
+      // (5) Same-cell cliques: every particle unites with its cell's
+      // first item. Test-free — the cell diagonal is b/sqrt(2).
+      Kokkos::parallel_for(
+          "fof_grid_clique", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_gpart),
+          KOKKOS_LAMBDA(const long q) {
+            const long c = d_gcell(q);
+            const int rep = d_citem(d_cbegin(c));
+            const int p = d_gpart(q);
+            if (p != rep) ufUnite(d_parent, d_order, rep, p);
+          });
+
+      exec.fence();
+      st.t_grid_union = gt.seconds();
+      gt.reset();
+
+      // (6) Neighbour pass over the forward-half stencil, one thread per
+      // occupied cell. Face-adjacent neighbours are test-free; the rest
+      // are skipped outright when the two cells are already in the same
+      // component, and otherwise stop at the FIRST witness (the cliques
+      // already made each cell one component, so one link merges them).
+      const std::vector<int> offs_h = gridOffsetTable();
+      const int n_off = (int)offs_h.size() / 3;
+      DView<int> d_offs(Kokkos::view_alloc(Kokkos::WithoutInitializing,
+                                           "fof_d_offs"), offs_h.size());
+      {
+        Kokkos::View<const int*, Kokkos::HostSpace,
+                     Kokkos::MemoryTraits<Kokkos::Unmanaged> >
+            h(offs_h.data(), offs_h.size());
+        Kokkos::deep_copy(exec, d_offs, h);
+      }
+      long probes = 0;
+      Kokkos::parallel_reduce(
+          "fof_grid_nbr", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_gcell),
+          KOKKOS_LAMBDA(const long c, long& acc) {
+            const long begin = d_cbegin(c), end = d_cbegin(c + 1);
+            if (begin >= end) return;
+            const long g = d_cnode(c);
+            const DDNode d = d_nodes(d_gnode(g));
+            int dim[3];
+            gridDims(d, cell, dim);
+            const long cbase = d_gcoff(g);
+            long loc = c - cbase;
+            const int ix = (int)(loc % dim[0]);
+            loc /= dim[0];
+            const int iy = (int)(loc % dim[1]);
+            const int iz = (int)(loc / dim[1]);
+            const int rep = d_citem(begin);
+            // NOTE: ufFind(rep) below is deliberately re-evaluated inside
+            // the offset loop. Hoisting it out is SAFE (a stale root that
+            // matches still proves connectivity, since union-find is
+            // monotone and ufFind only returns current roots, so staleness
+            // can only cost redundant tests, never skip a real one) — and
+            // it cost 4-7x, 13-97 ms of stencil going to 138-679 ms. The
+            // early-out is not overhead around the real work; it IS the
+            // work. Once the face-adjacent unions merge a halo, a stale
+            // root stops matching almost every time, and the full
+            // cell-by-cell distance product runs for all ~157 offsets.
+            for (int o = 0; o < n_off; o++) {
+              const int dx = d_offs(3 * o), dy = d_offs(3 * o + 1),
+                        dz = d_offs(3 * o + 2);
+              const int jx = ix + dx, jy = iy + dy, jz = iz + dz;
+              if (jx < 0 || jx >= dim[0] || jy < 0 || jy >= dim[1] ||
+                  jz < 0 || jz >= dim[2])
+                continue;
+              const long nc =
+                  cbase + (long)(jz * dim[1] + jy) * dim[0] + jx;
+              const long nb0 = d_cbegin(nc), nb1 = d_cbegin(nc + 1);
+              if (nb0 >= nb1) continue;
+              const int nrep = d_citem(nb0);
+              const int ad = (dx < 0 ? -dx : dx) + (dy < 0 ? -dy : dy) +
+                             (dz < 0 ? -dz : dz);
+              if (ad == 1) {  // face-adjacent: separation <= c*sqrt(6) = b
+                ufUnite(d_parent, d_order, rep, nrep);
+                continue;
+              }
+              if (ufFind(d_parent, rep) == ufFind(d_parent, nrep)) continue;
+              acc += 1;
+              bool merged = false;
+              for (long a = begin; a < end && !merged; a++) {
+                const int pa = d_citem(a);
+                const float xa = d_pos(3 * pa), ya = d_pos(3 * pa + 1),
+                            za = d_pos(3 * pa + 2);
+                for (long bq = nb0; bq < nb1; bq++) {
+                  const int pb = d_citem(bq);
+                  const float ddx = xa - d_pos(3 * pb);
+                  const float ddy = ya - d_pos(3 * pb + 1);
+                  const float ddz = za - d_pos(3 * pb + 2);
+                  if (ddx * ddx + ddy * ddy + ddz * ddz <= b2) {
+                    ufUnite(d_parent, d_order, pa, pb);
+                    merged = true;  // one witness merges the components
+                    break;
+                  }
+                }
+              }
+            }
+          },
+          probes);
+      st.grid_probes = probes;
+      exec.fence();
+      st.t_grid_nbr = gt.seconds();
+    }
+    exec.fence();
+    st.t_grid = timer.seconds();
+  }
+
   // ---- the walk ----
-  // ONE TEAM (wavefront) PER LEAF, not one thread.
+  // TWO SHAPES, one body (see Wave/Solo and walkOneLeaf above).
   //
-  // The first version ran one thread per leaf and was ~2x the CPU rather
-  // than the ~10x the plan projected. The leaf-size sweep said why: 12 ->
-  // 32 -> 64 particles per leaf made the kernel 2.3x then 4.5x SLOWER,
-  // the opposite of the expected direction, which can only happen if the
-  // per-thread leaf-pair product (leaf_size^2, run serially by one lane)
-  // dominates. Both halves of that are fixed by putting the wavefront on
-  // the work instead of on independent leaves:
-  //
-  //   - every lane runs the SAME traversal on the SAME stack, so the node
-  //     loads are one broadcast per team instead of 64 scattered gathers;
-  //   - the leaf-pair cross product and the certificate star-union are
-  //     split across the 64 lanes and read consecutive particles, so they
-  //     coalesce.
-  //
-  // The stack lives in team scratch (LDS) once per team rather than once
-  // per lane: 64 identical copies in private memory would be 32 KB per
-  // wavefront and would wreck occupancy. Lane 0 owns push/pop and
-  // broadcasts, which is what keeps the shared stack consistent.
+  // Stage 2 replaced thread-per-leaf with team-per-leaf and measured
+  // 850 -> 516 ms, on the evidence that the serial per-thread leaf-pair
+  // product dominated. Stage 3's suppression then deleted ~40x of the
+  // work behind each leaf, so each traversal now does far fewer pops with
+  // far less work in each — while the team still pays a broadcast and a
+  // barrier on every pop. FOF_GPU_WALK=solo runs the same traversal one
+  // thread per leaf so that conclusion can be re-tested rather than
+  // assumed; see design/phase1-gpu.md section 16.
   timer.reset();
-  Kokkos::View<long*, MemSpace> counters("fof_counters", 3);
+  Kokkos::View<long*, MemSpace> counters("fof_counters", 4);
   Kokkos::deep_copy(exec, counters, 0L);
   const int kStack = 128;
-  const int kTeam = 64;  // MI250X wavefront; a warp on NVIDIA is 32
-  using policy_t = Kokkos::TeamPolicy<ExecSpace>;
-  using member_t = policy_t::member_type;
-  const size_t shmem = (size_t)kStack * sizeof(int) + 2 * sizeof(int);
-  policy_t policy(exec, (int)n_leaves, kTeam);
-  policy.set_scratch_size(0, Kokkos::PerTeam((int)shmem));
-  Kokkos::parallel_for(
-      "fof_walk", policy, KOKKOS_LAMBDA(const member_t& team) {
-        const int li = d_leaves(team.league_rank());
-        const DDNode L = d_nodes(li);
-
-        int* stack = (int*)team.team_shmem().get_shmem(kStack * sizeof(int));
-        int* sp = (int*)team.team_shmem().get_shmem(2 * sizeof(int));
-        Kokkos::single(Kokkos::PerTeam(team), [&]() {
-          stack[0] = -1;  // top-tree root
-          sp[0] = 1;
+  auto d_leaves_k = d_leaves;
+  auto d_top_k = p_->d_top;
+  auto d_piece_root_k = d_piece_root;
+  auto d_grid_root_k = d_grid_root;
+  if (solo_walk) {
+    // Private stack, so no scratch and no collectives. 128 ints is 512 B
+    // of scratch per thread, which is exactly the occupancy cost this arm
+    // exists to weigh against the barrier cost of the team arm.
+    Kokkos::parallel_for(
+        "fof_walk_solo", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_leaves),
+        KOKKOS_LAMBDA(const long k) {
+          int stack[128];
+          int sp[2];
+          walkOneLeaf(Solo(), d_leaves_k(k), stack, sp, kStack, b2, d_nodes,
+                      d_top_k, d_piece_root_k, d_parent, d_order, d_node_rep,
+                      d_grid_root_k, d_pos, counters);
         });
-        team.team_barrier();
-
-        while (true) {
-          // Pop once for the whole team and broadcast; INT_MIN = done.
-          int e = 0;
-          Kokkos::single(Kokkos::PerTeam(team),
-                         [&](int& out) {
-                           out = (sp[0] > 0) ? stack[--sp[0]] : INT_MIN;
-                         },
-                         e);
-          if (e == INT_MIN) break;
-
-          if (e < 0) {  // top tree
-            const DTopNode t = d_top(-e - 1);
-            if (boxMinDist2(L.lo, L.hi, t.lo, t.hi) <= b2) {
-              Kokkos::single(Kokkos::PerTeam(team), [&]() {
-                if (t.piece >= 0) {
-                  if (sp[0] < kStack) stack[sp[0]++] = d_piece_root(t.piece);
-                  else Kokkos::atomic_fetch_add(&counters(0), 1L);
-                } else if (sp[0] + 2 <= kStack) {
-                  stack[sp[0]++] = -(t.left + 1);
-                  stack[sp[0]++] = -(t.right + 1);
-                } else {
-                  Kokkos::atomic_fetch_add(&counters(0), 1L);
-                }
-              });
-            }
-            team.team_barrier();
-            continue;
-          }
-
-          const DDNode M = d_nodes(e);
-          if (boxMinDist2(L.lo, L.hi, M.lo, M.hi) > b2) {
-            team.team_barrier();
-            continue;
-          }
-
-          // Positive certificate: every cross pair is a friend, so both
-          // sides collapse with no distance test and no descent. The memo
-          // is CLAIMED with a CAS, not merely checked: thousands of teams
-          // can reach a hot node at once, and without the claim they all
-          // run the same O(n_below) star-union.
-          if (boxMaxDist2(L.lo, L.hi, M.lo, M.hi) <= b2) {
-            teamStarUnion(team, d_nodes, d_parent, d_order, d_node_rep, li);
-            if (e != li) {
-              teamStarUnion(team, d_nodes, d_parent, d_order, d_node_rep, e);
-              Kokkos::single(Kokkos::PerTeam(team), [&]() {
-                // Uniting the two FIRST particles is enough: whoever won
-                // each claim is committed to collapsing that node, and
-                // union-find is order-independent, so it does not matter
-                // which finishes first.
-                ufUnite(d_parent, d_order, L.part_begin, M.part_begin);
-                Kokkos::atomic_fetch_add(&counters(1), 1L);
-              });
-            }
-            team.team_barrier();
-            continue;
-          }
-
-          if (M.child_begin < 0) {
-            // Leaf pair, owned by the smaller node index so the mirror
-            // visit from M's own team does nothing (the structural
-            // each-pair-once rule).
-            if (e >= li) {
-              const int ab = L.part_begin, bb = M.part_begin;
-              const int nb_ = (e == li) ? L.n_below : M.n_below;
-              // Flatten the product over the lanes: consecutive lanes
-              // take consecutive j, so the inner reads of the partner's
-              // positions coalesce.
-              Kokkos::parallel_for(
-                  Kokkos::TeamThreadRange(team, L.n_below), [&](const int i) {
-                    const float xi = d_pos(3 * (ab + i));
-                    const float yi = d_pos(3 * (ab + i) + 1);
-                    const float zi = d_pos(3 * (ab + i) + 2);
-                    const int j0 = (e == li) ? i + 1 : 0;
-                    for (int j = j0; j < nb_; j++) {
-                      const int p = (e == li) ? ab + j : bb + j;
-                      const float dx = xi - d_pos(3 * p);
-                      const float dy = yi - d_pos(3 * p + 1);
-                      const float dz = zi - d_pos(3 * p + 2);
-                      if (dx * dx + dy * dy + dz * dz <= b2)
-                        ufUnite(d_parent, d_order, ab + i, p);
-                    }
-                  });
-              Kokkos::single(Kokkos::PerTeam(team), [&]() {
-                Kokkos::atomic_fetch_add(&counters(2), 1L);
-              });
-            }
-            team.team_barrier();
-            continue;
-          }
-
-          Kokkos::single(Kokkos::PerTeam(team), [&]() {
-            if (sp[0] + M.n_children <= kStack) {
-              for (int c = 0; c < M.n_children; c++)
-                stack[sp[0]++] = M.child_begin + c;
-            } else {
-              Kokkos::atomic_fetch_add(&counters(0), 1L);
-            }
-          });
-          team.team_barrier();
-        }
-      });
+  } else {
+    // The stack lives in team scratch (LDS) once per team rather than once
+    // per lane: 64 identical copies in private memory would be 32 KB per
+    // wavefront and would wreck occupancy. Lane 0 owns push/pop and
+    // broadcasts, which is what keeps the shared stack consistent.
+    const int kTeam = 64;  // MI250X wavefront; a warp on NVIDIA is 32
+    using policy_t = Kokkos::TeamPolicy<ExecSpace>;
+    using member_t = policy_t::member_type;
+    const size_t shmem = (size_t)kStack * sizeof(int) + 2 * sizeof(int);
+    policy_t policy(exec, (int)n_leaves, kTeam);
+    policy.set_scratch_size(0, Kokkos::PerTeam((int)shmem));
+    Kokkos::parallel_for(
+        "fof_walk", policy, KOKKOS_LAMBDA(const member_t& team) {
+          int* stack = (int*)team.team_shmem().get_shmem(kStack * sizeof(int));
+          int* sp = (int*)team.team_shmem().get_shmem(2 * sizeof(int));
+          walkOneLeaf(Wave<member_t>{team}, d_leaves_k(team.league_rank()),
+                      stack, sp, kStack, b2, d_nodes, d_top_k, d_piece_root_k,
+                      d_parent, d_order, d_node_rep, d_grid_root_k, d_pos,
+                      counters);
+        });
+  }
   exec.fence();
   st.t_walk = timer.seconds();
 
@@ -755,6 +1366,7 @@ void Device::runPhase1(float b2, WalkStats* out) {
   st.stack_overflows = h_counters(0);
   st.certificates = h_counters(1);
   st.leaf_pairs = h_counters(2);
+  st.suppressed = h_counters(3);
   if (out) *out = st;
 }
 
