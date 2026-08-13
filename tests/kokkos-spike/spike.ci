@@ -1,0 +1,39 @@
+// Stage-0 integration gate for the phase-1 GPU port
+// (design/phase1-gpu.md section 8). Deliberately mirrors the phase-1
+// chain's SHAPE, not a hello-world: a per-process nodegroup owning the
+// device, a per-PE group filling its own disjoint slice of the pinned
+// staging buffer, an atomic deposit counter whose last arrival launches
+// on the process's home PE, and stream completion delivered as a Charm
+// callback (no fence, no blocked scheduler thread).
+mainmodule spike {
+  readonly CProxy_Main main_proxy;
+  readonly CProxy_DeviceManager dm_proxy;
+  readonly CProxy_Filler filler_proxy;
+  readonly long n_per_process;
+
+  mainchare Main {
+    entry Main(CkArgMsg*);
+    entry [reductiontarget] void reportReady(int n_bad);
+    entry [reductiontarget] void reportDone(int n_fail);
+  };
+
+  // One branch per PROCESS: owns the Kokkos instance and the device.
+  // NOT a group — a group branch exists per PE, which would call
+  // Kokkos::initialize once per PE (14x per process at +ppn 14; this is
+  // the one fix this spike makes to the jacobi2D pattern).
+  nodegroup DeviceManager {
+    entry DeviceManager();
+    entry void start(CkCallback cb);
+    entry void deviceComplete();
+  };
+
+  // One branch per PE: fills and later verifies its own slice, exactly
+  // as the real K0 pack / K5 scatter will.
+  group Filler {
+    entry Filler();
+    entry void fillSlice();
+    entry void beginOnHome();
+    entry void launchOnHome();
+    entry void verifySlice(CkCallback cb);
+  };
+};

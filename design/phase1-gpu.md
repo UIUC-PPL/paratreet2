@@ -1,546 +1,665 @@
-# Phase 1 on GPU: a Kokkos device implementation of the intra-process FoF
+# Phase 1 on GPU: a Kokkos device port of the intra-process FoF
 
-**STATUS: PLAN, no implementation. Written 2026-08-12 after a read of
-fof/FoFPhase1.h (2719 lines, main), src/TreePiece.h, src/Node.h,
-src/MultiData.h and the measurement ledgers
-(design/fof3-2b-scaling.md, design/fof3-lambb500-scaling.md,
-design/phase1-scaling.md). Supersedes nothing; it is the concrete
-build-out of design/walk-unification.md's GPU dimension (stages 0 and 4
-there) and of design/optimization-inventory.md's gap list, with one
-structural change those documents did not commit to: on GPU the unit of
-union-find becomes the PROCESS, not the PE, which deletes phaseB
-instead of porting it.**
+**STATUS: PLAN, no implementation. Written 2026-08-12; revised the same
+day after review (Ritvik) on three points: one process per GPU is an
+enforced invariant, the tree is KEPT (and made free), and the scope is
+phase 1 only — cross-GPU tree walks for phase 3 are explicitly later
+work. Built from a read of fof/FoFPhase1.h, src/TreePiece.h,
+src/Node.h, the measurement ledgers (design/fof3-2b-scaling.md,
+design/fof3-lambb500-scaling.md, design/phase1-scaling.md), and the
+working Charm++/Kokkos/HIP precedent in ~/jacobi2D.**
 
-Target machine: Frontier, MI250X, 8 GCDs/node, already run as 8
-processes/node x 14 PEs — i.e. the process/GCD mapping this plan needs
-is the geometry already in production. Portability layer: **Kokkos**
-(HIP + CUDA + a host backend from one source), which is installed on
-this machine at `/ccs/home/rrao/kokkos` (4.7.00, `build-hip`, HIP +
-Serial backends, `KOKKOS_ARCH_VEGA90A`, hipcc from ROCm 6.2.4,
-rocThrust enabled).
+This is the build-out of design/walk-unification.md's GPU dimension
+(its stages 0 and 4) and of design/optimization-inventory.md's gap
+list, with one structural change those documents did not commit to: on
+the device the unit of union-find becomes the PROCESS, not the PE,
+which DELETES phaseB rather than porting it.
+
+---
+
+## 0. Correction to design/walk-unification.md
+
+That document states: "Charm GPU integration: NONE on this stack —
+charm 8.0.0 HAPI is CUDA-only, reconverse has no GPU support at all."
+**That is no longer true of this tree**, and the difference reshapes
+the integration:
+
+- `charm_reconverse/src/arch/cuda/hybridAPI/hapi_portable.h` maps the
+  whole HAPI surface onto CUDA *or* HIP (`CMK_CUDA` / `CMK_HIP`).
+- `reconverse-linux-x86_64-amd/` is a HIP-enabled build
+  (`include/conv-mach-hip.sh`, `BUILD_HIP=1`, ROCm 6.2.4) and ships
+  `lib/libhybridapi.a`.
+- `hapiAddCallback(hapiStream_t, const CkCallback&, void*)` exists
+  (hapi_impl.cpp:1886) — stream completion delivered as a Charm
+  callback. So device completion is message-driven; nothing has to
+  block a scheduler thread or poll.
+- ~/jacobi2D is a working Charm++ + Kokkos + HIP program on Frontier
+  over this runtime, including device-to-device communication
+  (`+gpushm`, `+gpuipceventpool`, `+gpucommbuffer`).
+
+Everything below assumes that stack. Note for the build matrix: the
+top-level `charm_reconverse/include` symlink points at
+`reconverse-linux-x86_64` (no HIP), so the GPU arm must be built with
+`CHARM_HOME=$HOME/charm_reconverse/reconverse-linux-x86_64-amd`, and
+the sibling stack (unionfind, prefixLib, htram) has to be rebuilt
+against that same build.
 
 ---
 
 ## 1. What is being replaced, and what it costs today
 
-Phase 1 today (FoFPhase1.h, driven by `startPhase1Chain`) is a
-five-stage within-process chain:
-
 | stage | what it does | 2B/16 nodes | 80M/1 node |
 |---|---|---|---|
 | phaseA | per-PE union-find, dual walks over that PE's TreePiece pairs | 2.68 s | 1.56 s |
 | phaseB | cross-PE TreePiece pairs -> (tip, tip) edges through a process pool | 2.88 s | 0.15 s |
-| merge | serial UF over the deposited edges -> tip map | 0.011 s | 0.003 s |
+| merge | serial UF over deposited edges -> tip map | 0.011 s | 0.003 s |
 | relabel | rewrite group_number through the map | 0.31 s | 0.17 s |
 | **phase 1 total (wall)** | | **5.36 s** | **1.76 s** |
 
-(2B = cosmo25cmb 1.98B particles, 128 processes; 80M = lambb.00500.
-Sources: design/fof3-2b-scaling.md, design/fof3-lambb500-scaling.md.)
-
-Two facts from those ledgers set the target:
-
-- **phaseA scales, phaseB does not.** phaseB is flat at 2.4-3.3 s across
-  8->128 nodes at 2B and 0.12-0.21 s across 1->16 nodes at 80M. Past 8
-  nodes it is the largest phase-1 term. Every attempt to move it
-  (stealing, pool split tuning) has been measured and rolled back.
-- **phaseA's cost is concentrated in SELF pairs** — ~60 of ~67 phase-1
-  core-seconds (design/walk-unification.md finding 2).
+**phaseA scales, phaseB does not** — flat at 2.4-3.3 s across 8->128
+nodes at 2B, and past 8 nodes the largest `phase1_stages` term. Every
+attempt to move it (stealing, pool-split tuning) has been measured and
+rolled back.
 
 phaseB exists for exactly one reason: phaseA's union-find is PER PE, so
-pairs spanning two PEs of a process cannot union and must emit edges
-instead. That is a consequence of the no-atomics/frozen-phase
-discipline (design/phase1.md), which in turn exists because CPU threads
-sharing a union-find need locks. **A device union-find does not have
-that problem** — union-by-min-GLOBAL-ORDER is a total order, so a
-lock-free CAS attach is cycle-free by construction
-(design/optimization-inventory.md a.6). So the right GPU target is not
-"phaseA on the device"; it is:
+pairs spanning two PEs cannot union and must emit edges instead. That
+is forced by the no-atomics/frozen-phase discipline
+(design/phase1.md), which exists because CPU threads sharing a
+union-find need locks. A device union-find does not have that problem:
+union-by-min-GLOBAL-ORDER is a total order, so a lock-free CAS attach
+is cycle-free by construction (design/optimization-inventory.md a.6).
+So:
 
-> One device union-find over ALL of the process's particles.
-> phaseA, phaseB and merge collapse into a single device stage.
+> **One device union-find over ALL of the process's particles.
+> phaseA + phaseB + merge collapse into a single device stage.**
 
-That deletes the one term in the profile that has resisted every
-algorithmic fix so far, and it makes the GPU stage strictly simpler
-than the CPU code it replaces (no pool, no LPT ordering, no claim
-cursor, no SEEN set, no edge buffers, no tip map).
-
-Upper bound on the win: ArborX reports 37M particles fully clustered in
-0.15 s on one A100 for the FoF case (design/optimization-inventory.md,
-gap 4). A process holds 15.6M particles at 2B/16 nodes and 10M at
-80M/1 node; an MI250X GCD is roughly half an A100 on this kind of
-kernel. That puts a well-implemented device phase 1 at **0.1-0.2 s
-against today's 5.4 s** — call it 10-30x on the phase-1 core, and
-honestly note that at 2B/16 nodes the remaining iteration terms
-(loadCache 5.9 s, walk 1.5 s, tree build 1.0 s) then dominate: phase 1
-stops being the problem rather than the run getting 5x faster.
+Anchor for the target: ArborX reports 37M particles fully clustered in
+0.15 s on one A100 for the FoF case; a process holds 15.6M particles at
+2B/16 nodes and 10M at 80M/1 node, and an MI250X GCD is roughly half an
+A100 here. That puts a good device phase 1 at **0.1-0.2 s against
+today's 5.4 s**. Honest framing of the payoff: at 2B/16 nodes the other
+iteration terms (loadCache 5.9 s, walk 1.5 s, tree build 1.0 s) then
+dominate — phase 1 stops being the problem rather than the whole run
+getting 5x faster.
 
 ---
 
-## 2. Three findings that shape the design
+## 2. One process, one GPU (invariant, not a preference)
 
-### 2.1 The mean field is SPARSE; the tree is not doing anything silly
+Enforced, not assumed:
 
-With b = 0.2 x mean interparticle separation d, a cube of side b holds
-0.2^3 = **0.008 particles** at mean density. A grid over the whole
-process at cell side b would have ~125 empty cells per particle, and
-the mean number of particles within b of a given particle is
-(4/3)pi b^3 rho = 0.034 x overdensity. This is why the CPU's
-`gridSelfUnion` is GATED on occupancy (`-G 4`) and only fires in dense
-chares: a uniform b/sqrt(6) grid with its ~160-offset stencil would
-cost ~160 hash probes per particle across the sparse bulk, which is
-strictly worse than a tree descent.
+- Frontier has 8 GCDs/node and the production run line is already 8
+  processes/node x `+ppn 14`. So the required geometry is the geometry
+  in use; nothing about the launch changes except the GPU binding.
+- At startup the FoF nodegroup checks `hapiGetDeviceCount()` against
+  the number of processes on the physical node
+  (`CmiNumPesOnPhysicalNode` / `CmiMyNodeSize`, which HAPI itself uses
+  for its device mapping, hapi_impl.cpp:571-577) and **aborts with a
+  clear message** if the mapping is not 1:1. Two processes sharing a
+  GCD is an unsupported configuration, not a slow one.
+- The device id comes from `hapiGetDevice()` — HAPI has already done
+  the PE->GPU mapping — and is handed to Kokkos, exactly as jacobi2D
+  does it.
 
-Consequence for the device: **cell side must be b (13 forward-half
-offsets), not b/sqrt(6), for the base kernel**, with the finer grid
-used only as a dense refinement (section 4.4). At c = b the stencil
-volume is (3b)^3, so the expected pair tests per particle are
-27 x 0.008 x overdensity = 0.216 x overdensity — 0.2 at mean density,
-43 in a Delta=200 halo, and 2x10^5 in a Delta=10^6 cusp. The cusp
-number is why the dense refinement is required work, not an
-optimization: it is the device analog of the positive certificate and
-the connectivity suppression that carry phaseA today.
+Consequence used throughout: the process's GPU is a single resource
+with a single owner, so orchestration is serialized through one host
+thread by design, not by limitation.
 
-### 2.2 No tree is needed for phase 1 — but the tree is free if we want it
+---
 
-Each TreePiece's particles are a key-sorted contiguous `std::vector`
-and every node is a `(begin, n)` range into it
-(TreePiece::recursiveBuild, src/TreePiece.h:461). Flattening the
-existing forest into POD arrays is therefore mechanical
-(walk-unification stage 0). But the cell-list formulation of section 4
-needs no tree at all: it is O(N) with a sort, it handles both the
-sparse bulk and dense cores, and it removes the two things that make
-the CPU walk device-hostile (`Node` is polymorphic with atomic child
-pointers; `cert_rep`/`cert_tip` are hash maps keyed by host node
-pointer).
+## 3. Keeping the tree, and making it free
 
-**Decision: v1 ships no device tree.** Keep the flat-tree work
-(walk-unification stage 0) for the device phase-3 walk later, where a
-tree is genuinely required because the source side is remote.
+Reviewer question: *"can we keep the tree without any cost?"* Yes — and
+on the measurements below the tree should be kept because it is
+**faster than the tree-free alternative in the regime that dominates**,
+not merely because it is available. This reverses the first draft of
+this plan.
 
-### 2.3 Downstream code binds to the REPRESENTATIVE structures, not to particles
+### 3.1 Why the tree wins in the sparse bulk
+
+With b = 0.2 x mean interparticle separation, a cube of side b holds
+0.2^3 = **0.008 particles** at mean density. A tree-free cell list at
+cell side ~b therefore has ~1 particle per occupied cell in the field,
+so occupied cells ~ N and the base cost is 13 neighbor probes per
+particle: ~200M hash probes at N=15.6M, tens of milliseconds and poor
+locality.
+
+The tree, walked LEAF-BATCHED, is cheaper: a 12-particle leaf spans
+~11.5 b in the field, so one traversal amortizes over 12 particles, and
+the descent is ~20-25 node tests of branch-free float arithmetic on
+contiguous arrays. ~1.3-2.6M leaves x ~25 tests ~ 30-60M cheap
+operations against 200M scattered probes. This is also what ArborX does
+to reach its number (BVH traversal + DenseBox for the dense cells), and
+it is why the CPU code gates `gridSelfUnion` on occupancy instead of
+using it everywhere.
+
+The grid is still the right tool where the CPU already says it is: in
+dense nodes, where its free unions collapse work the pair tests cannot.
+So the device algorithm is the CPU algorithm — tree walk with
+certificates, grid inside dense nodes — not a replacement for it.
+That also makes the exactness story far stronger: the same
+certificates, the same suppression semantics, the same tips, so stage-
+by-stage A/B against the CPU arm is meaningful.
+
+### 3.2 Why it costs nothing to have
+
+Three facts make the device tree essentially free:
+
+1. **The tree is built anyway.** upwardPass, the cache and phase 3 all
+   need it; phase 1 is not what pays for it.
+2. **Flattening rides an existing walk.** `TreePiece::recursiveBuild`
+   (src/TreePiece.h:461) already descends pre-order and already fills
+   `flat_subtree`. Emitting a POD `DNode` per node there is one struct
+   store per node inside a walk that already happens — this is
+   walk-unification stage 0, done at tree-build time instead of inside
+   phase 1, so it never appears in the phase-1 wall at all.
+3. **Node particle ranges are contiguous by construction.** A node's
+   particles are `node_particles + start`, a slice of the TreePiece's
+   key-sorted vector. So a `DNode` is just
+   `{box, part_begin, n_below, child_begin, child_mask, depth}` — and,
+   crucially, "union everything under this node" is a flat loop over a
+   contiguous range, not a subtree walk (see the positive certificate
+   in section 5).
+
+```c++
+struct DNode {              // 44 B; dense integer indices, no pointers
+  float  lo[3], hi[3];      // FragData::box (Real is float, src/common.h:28)
+  int    part_begin;        // into the process-flat particle array
+  int    n_below;           // FragData::n_below (exists since 13b1f08)
+  int    child_begin;       // dense index of first child, -1 if leaf
+  unsigned char child_mask; // which of the 8 children exist
+  unsigned char depth;
+};
+```
+
+**Per-process forest -> one tree.** The device needs a single root, not
+~100 TreePiece roots. Under oct decomposition the TreePiece keys ARE
+oct-node keys, so the interior above them is reconstructible from the
+keys alone: the process's home PE builds a small top tree (~100 leaves,
+microseconds, host-side) whose leaves point at the flattened TreePiece
+roots. No canopy communication, no new tree build.
+
+**Sizing at N = 15.6M:** ~3M nodes x 44 B = ~130 MB uploaded once per
+tree build, ~4 ms over Infinity Fabric. That upload is the only genuinely
+new cost of keeping the tree. Dense node indices are also a CPU-side
+win the walk-unification doc already noted: they turn `cert_rep` /
+`cert_tip` from pointer-keyed hash maps into dense arrays.
+
+**Leaf size.** `max_particles_per_leaf = 12` (examples/fof3/Main.C:35)
+is a CPU tuning; 12 lanes of a 64-wide wavefront is thin. Mitigation in
+the kernel (lanes cooperate over the candidate fan-out and over the
+flattened leaf-pair cross product) rather than by retuning the build,
+because the leaf size also moves phase 3. Keep it out of the phase-1
+A/B; sweep it separately if the kernel proves leaf-bound.
+
+---
+
+## 4. What downstream code requires (the contract that keeps this contained)
 
 Everything after phase 1 — `applyTipEncoding`, `relabelBody`,
 `applyGlobalMap`, `applyUF2Labels`, `depositLabelCounts`,
 `materializeLabels` — touches only `uf_parent`, `roots`, `rep_label`,
-`root_counts` (design/relabel-representative.md). If the device stage
-produces those four arrays with the same meaning, **every downstream
-stage, phase 3, UF_2 and the histogram are unchanged**. That is the
-property that keeps this change contained, and it is the interface
-contract the device stage must meet.
+`root_counts` (design/relabel-representative.md). **If the device stage
+produces those four with the same meaning, phase 3, UF_2, the histogram
+and the tip encoding are unchanged.** That is the interface contract.
 
-One caveat found while reading for this plan, which the refactor in
-section 5.3 makes load-bearing: `applyTipEncoding` writes `rep_label[r]`
-for its own roots and then calls `materializeLabels()`, which READS
-`rep_label` for roots that may belong to other PEs, with only a
-trailing `contribute(cb)` — no barrier between the write phase and the
-read phase. Today that is safe because `rep_label` is per-PE and each
-PE's roots are its own. Once `rep_label` becomes process-wide (which
-the device stage forces, because a component's min-order root can live
-in any PE's range), **a deposit barrier must be inserted between the
-encode and the materialize**. Same hazard in `applyGlobalMap` /
-`applySliceOnPE` and in `relabelBody`. This is a correctness bug the
-port would otherwise introduce silently, and it is precisely the class
-`fof1` catches only sometimes.
+One hazard found while reading for this plan, which section 6.3 makes
+load-bearing: `applyTipEncoding` writes `rep_label[r]` for its own
+roots and then calls `materializeLabels()`, which reads `rep_label` for
+roots that may belong to other PEs, with only a trailing
+`contribute(cb)` — no barrier between the write phase and the read
+phase. Safe today only because `rep_label` is per-PE. Once it becomes
+process-wide (which a process-wide union-find forces, since a
+component's min-order root can live in any PE's range), **a deposit
+barrier is required between encode and materialize** — same in
+`applyGlobalMap`/`applySliceOnPE` and `relabelBody`. Write the barrier
+first; the failure mode is a silent wrong label on a fraction of
+particles.
 
 ---
 
-## 3. Portability layer: Kokkos, and how it is wired to Charm
-
-### 3.1 Kokkos over raw HIP
-
-For: one source for MI250X and NVIDIA; `Kokkos::sort` /
-`sort_by_key` already dispatching to rocThrust (enabled in the local
-build) or CUB, so no per-vendor sort dependency; `TeamPolicy` with
-`AUTO` team size absorbs wavefront-64 vs warp-32; device
-`UnorderedMap`, atomics and `ScatterView` are portable; and — the
-argument that decides it for this codebase — **the same kernel source
-compiles for the Serial host backend**, giving an A/B that separates
-"the algorithm changed" from "the device changed". Given how this
-project gates changes (byte-identical component output, oracle arms
-kept permanently: `-u serial`, `-w transposed`, `FOF_GRID_ROOT_ONLY`),
-a host-executable arm of the device kernels is worth more here than it
-would be in most codes.
-
-Against: another dependency and a build seam. Not decisive — the
-alternative (a hand-rolled HIP/CUDA macro layer) still needs
-rocPRIM/CUB for the sort, which reintroduces the same seam with none
-of the host-arm benefit.
-
-**Decision: Kokkos 4.7, HIP + Serial backends. No Kokkos::OpenMP** —
-Charm already owns the host threads and an OpenMP backend inside a
-14-PE process would oversubscribe.
-
-### 3.2 The Charm/Kokkos boundary
-
-Hard constraints on this stack (verified): charm 8.0.0's HAPI is
-CUDA-only and reconverse has no GPU support at all ("device" there is
-an LCI network device). So there is no runtime-integrated stream
-support; kernels launch from ordinary entry methods. Two consequences:
-
-- **Single Kokkos owner per process.** `Kokkos::initialize` is not
-  thread-safe and Kokkos does not promise that concurrent `View`
-  allocation from 14 Charm PE threads is safe. The process's home PE
-  (`CkNodeFirst(CkMyNode())`, already the PE that hosts the UF_2
-  element and runs `mergeBody`) is the only thread that calls into
-  Kokkos. With one GCD per process this costs nothing: the GPU is the
-  parallel resource, and serializing dispatch through one host thread
-  is the correct shape.
-- **Completion without blocking the scheduler.** v1 may simply
-  `Kokkos::fence()` on the home PE — the deposit chain has that PE
-  doing nothing else, and network progress is on the comm thread
-  (`+backend_poll_thread 2` is already in the production run line).
-  v2 replaces it with an event poll from `CcdCallFnAfter`
-  (`CcdCallOnConditionKeep`/`CcdCallFnAfter` do exist in reconverse:
-  reconverse/src/conv-conds.cpp:247,280), which slots exactly where
-  `a_done.fetch_add` sits in the chain today and re-enables overlap.
-
-Device selection: `Kokkos::InitializationSettings().set_device_id(local
-rank)` from `SLURM_LOCALID` (or `CkMyNode() % procs_per_node`), and
-pass explicit settings rather than `argv` so Kokkos never parses
-Charm's command line.
-
-### 3.3 Compilation
-
-The device translation unit includes **no Charm and no paratreet
-headers** — same discipline as tests/treecache. It is compiled by
-`hipcc` (or `nvcc_wrapper`) with the Kokkos flags and exposes a plain
-C++ POD interface; `charmc` links the resulting object. Concretely:
-
-```
-fof/gpu/FoFDevice.h    // POD interface, includes <cstdint> and nothing else
-fof/gpu/FoFDevice.cpp  // Kokkos; built by hipcc
-fof/gpu/Makefile       // KOKKOS_PATH, arch flags, -ffp-contract=off
-```
-
-`-DFOF_GPU` gates the host side; without it the binary is byte-identical
-to today's. A runtime flag (`fof3 --gpu`, default off until the gates in
-section 6 pass) selects the path, so both arms live in one binary and
-can be interleaved in one job — the measurement discipline this project
-already uses.
-
-**Floating point:** `Real` is `float` by default (src/common.h:28;
-`USE_DOUBLE_FP` is not set by any Makefile here), so positions are
-float3 and the device kernel is a float kernel — good for bandwidth and
-for NVIDIA consumer parts. But `-ffp-contract` differs between hipcc
-(fast by default) and the host build, and a fused vs unfused
-`dx*dx+dy*dy+dz*dz` can flip a pair sitting exactly on b. Pin
-`-ffp-contract=off` on BOTH sides for the A/B arms. Expect the
-component-identity gate to catch it if this is missed; that is what it
-is for.
-
----
-
-## 4. The device algorithm
+## 5. The device algorithm
 
 Index space: **process-flat**, the concatenation of the process's
-TreePiece particle blocks in registration order. `int32` indices (a
-process never holds 2^31 particles — the same assumption `uf_parent`
-already makes per PE).
+TreePiece particle blocks in registration order, `int32` indices (the
+same assumption `uf_parent` already makes per PE).
 
-Device state (per process, N ~ 10-16M):
+### K0 — pack and upload (host-parallel, per PE)
 
-| array | type | bytes at N=15.6M |
-|---|---|---|
-| `pos` | float3 | 187 MB |
-| `order` | int64 | 125 MB |
-| `parent` | int32 | 62 MB |
-| `cell_key` / `cell_id` | int64 / int32 | 187 MB (scratch) |
-| `root_counts`, `label` | int32/int64 | 190 MB |
+Each PE packs its OWN TreePieces into its slice of a pinned SoA buffer
+(`float3 pos`, `int64 order`), replacing today's `phaseABody`. This
+matters: `Particle` is ~112 B, so a single-threaded gather of 15.6M
+particles reads 1.75 GB (~0.1 s); split across the process's 14 PEs it
+is ~10-30 ms. Device payload is 20 B/particle (the same 20 B
+`FoFCachedParticle` already ships on the wire) = 312 MB, ~8 ms. Each PE
+issues its own async H2D copy on its own HAPI stream
+(`ExecSpace(hapiGetStream())`, the jacobi2D pattern); the owner joins
+on an event.
 
-~750 MB against 64 GB of HBM per GCD. Memory is a non-issue; this could
-hold a 10x larger process.
+### K1 — union-find primitives
 
-### K0 — pack and upload (host-parallel)
-
-Every PE packs its OWN TreePieces into its slice of a pinned SoA
-staging buffer (positions + orders), in parallel, replacing today's
-`phaseABody`. This matters: the AoS `Particle` is ~112 B, so a
-single-threaded gather of 15.6M particles reads 1.75 GB (~0.1 s
-serial); split across the process's 14 PEs it is ~10-30 ms. Upload is
-312 MB, ~8 ms over Infinity Fabric.
-
-### K1 — cell binning (c = b)
-
-`cell_key = morton_or_linear(floor((p - origin)/b))` over the
-process's bounding box (at 2B a process box is ~1235 b per side, so
-3 x 21 bits is ample). `sort_by_key` on (cell_key, index) via
-rocThrust/CUB, then a segmented scan to build the compressed occupied
-cell list `(key, begin, end)`. ~15M keys sorts in a few ms.
-Neighbor-cell lookup is a binary search over the sorted unique keys
-(as the CPU `findOcc` does) or a `Kokkos::UnorderedMap` — measure both;
-the UnorderedMap removes the log factor and the divergence the CPU
-comment already flags.
-
-### K2 — union-find on device
-
-```
-parent[i] init i;  // representative = min global order, by construction
-KOKKOS_INLINE_FUNCTION int find(i):    // path-splitting, no locks
-  while (parent[i] != i) { int g = parent[parent[i]];
-                           parent[i] = g; i = g; }
-KOKKOS_INLINE_FUNCTION void unite(a, b):
-  for (;;) { a = find(a); b = find(b); if (a == b) return;
-             // attach the LARGER global order under the SMALLER
-             if (order[a] > order[b]) swap(a, b);
-             if (atomic_compare_exchange(&parent[b], b, a) == b) return; }
+```c++
+parent[i] = i;                       // root = min global order, by construction
+KOKKOS_INLINE_FUNCTION int find(int i) {          // path splitting, lock-free
+  while (parent[i] != i) { int g = parent[parent[i]]; parent[i] = g; i = g; }
+  return i;
+}
+KOKKOS_INLINE_FUNCTION void unite(int a, int b) {
+  for (;;) {
+    a = find(a); b = find(b);  if (a == b) return;
+    if (order[a] > order[b]) { int t = a; a = b; b = t; }  // attach larger under smaller
+    if (Kokkos::atomic_compare_exchange(&parent[b], b, a) == b) return;
+  }
+}
 ```
 
-Correctness: union-by-min-global-order is a total order, so the
-parent graph is acyclic by construction and the CAS loop cannot
-livelock into a cycle — this is stronger than the rank/size schemes
-usual in GPU union-find, and the codebase already relies on the same
-property on the CPU (`unite`, FoFPhase1.h:2362). The result is
-**order-independent**: union-find is a semilattice, so the device's
-nondeterministic execution order cannot change the final partition, and
-the tip (root order = min order in the component) is deterministic.
-This is the reason the exactness gates in section 6 are meaningful
-despite the atomics.
+Union-by-min-global-order is a total order, so the parent graph is
+acyclic by construction and the CAS loop cannot livelock into a cycle —
+stronger than the rank/size schemes usual in GPU union-find, and the
+CPU `unite` (FoFPhase1.h:2362) already relies on the same property.
+**The result is order-independent**: union-find is a semilattice, so
+the device's nondeterministic execution order cannot change the final
+partition, and the tip (root order = min order in the component) is
+deterministic. That is what makes the exactness gates in section 7
+meaningful despite the atomics.
 
-### K3 — cell-pair traversal (the base kernel)
+### K2 — leaf-batched traversal (the base kernel)
 
-One team (wavefront) per occupied cell; each team walks the 13
-forward-half neighbor offsets plus its own cell:
+One team per leaf L, an explicit stack of node indices (depth <= 32,
+team scratch), descending the process forest:
 
-- probe the neighbor cell; skip if absent;
-- **early-out:** if every particle of A and of B already shares one
-  root, the pair can contribute nothing — skip. (O(n_a + n_b) finds
-  against O(n_a x n_b) tests; this is the device form of the CPU's
-  connectivity suppression, and in a merged dense core it is what keeps
-  repeat visits O(1).)
-- otherwise test the cross product with `Kokkos::TeamThreadRange` x
-  `ThreadVectorRange`, `unite` on each hit.
+- **Negative certificate:** `mindist2(box_L, box_M) > b2` -> prune.
+  Identical predicate to the CPU walk.
+- **Positive certificate:** `maxdist2(box_L, box_M) <= b2` -> every
+  cross pair is a friend. Union `rep(L)` with `certRep(M)` and STOP
+  descending. `certRep(M)` is the device form of the CPU memo
+  (FoFPhase1.h:2186): a dense `int node_rep[n_nodes]` array; the first
+  certificate on M unions M's CONTIGUOUS particle range
+  `[part_begin, part_begin + n_below)` through one representative and
+  publishes it with a CAS; every later certificate is O(1). Contiguity
+  is what makes this a flat loop instead of a subtree walk. Keep the
+  CPU's cheap gate (`(measure_a+measure_b)^2 <= 12 b^2`) before the
+  full `maxdist2`.
+- **Suppression:** if `node_rep[L]` and `node_rep[M]` are both
+  published and `find` to the same root, the pair can contribute
+  nothing -> prune at any level. Monotone positive memo, exactly the
+  CPU's `connectedRep`; races are benign (worst case, repeated work).
+- **Each pair once:** descend only into candidate leaves with
+  `leaf_id > my_id`, plus the self-leaf triangle — the structural
+  i<j rule (optimization-inventory gap 1, whose CPU fix measured ~30%
+  at 80M/480 PEs).
+- **Leaf-leaf:** lanes cooperate over the flattened cross product
+  (12x12 = 144 -> ~3 wavefront iterations), `unite` on each hit, with
+  the single-witness early exit when both leaves are already known
+  connected.
 
-Same-cell pairs are the i<j triangle, handled by the same team.
-Coalescing: after K1 the particle arrays are permuted into cell order,
-so a cell's particles are contiguous.
+Pass ordering: run an intra-TreePiece pass before the cross pass, the
+device analog of the CPU's self-pairs-first "merge-early" ordering, so
+the cross pass sees maximal suppression. Correctness does not depend on
+it (semilattice); throughput does.
 
-This kernel alone is an exact FoF for the process. Stages 1 of the plan
-stops here.
+### K3 — dense-node grid fast path
 
-### K4 — dense refinement (required for the cusps, section 2.1)
+The CPU's per-level `-G` gate (walk's self branch, FoFPhase1.h:1949)
+transliterated: a node whose occupancy `n_below * c^3 / vol >= thresh`
+(c = b/sqrt(6)) is solved by the cell grid instead of descending —
+same-cell pairs are friends (diagonal b/sqrt(2)), FACE-ADJACENT cell
+pairs are friends (max separation exactly b), and only the ~160-offset
+residual stencil needs distance tests, with first-witness exit. Because
+a node's particles are contiguous, the grid runs over a range exactly
+as `gridSelfUnionRange` does (FoFPhase1.h:2028). On device: bin, sort
+by cell key (rocThrust/CUB via `Kokkos::sort_by_key`, `libkokkos
+algorithms.a` is in the local install), segmented scan for occupied
+cell runs, dense cell index instead of the CPU's `findOcc` binary
+search (the divergence the CPU comment already flags).
 
-For cells whose occupancy exceeds a threshold, refine to the CPU's
-`b/sqrt(6)` sub-grid and inherit its two test-free guarantees: same
-sub-cell pairs are friends (diagonal b/sqrt(2)) and FACE-ADJACENT
-sub-cell pairs are friends (max separation exactly b). Both become
-`unite` with no distance test; only the residual stencil
-(`gridOffsets()`, ~160 forward offsets, reachability rule
-sum(((|d|-1)+)^2) <= 6) needs tests, with first-witness exit. This is
-`gridSelfUnionRange` (FoFPhase1.h:2028) transliterated — an algorithm
-already carrying a byte-identical exactness oracle on the CPU
-(`-G 0.0001` under fof1, 80M grid on/off), which is a large de-risking
-asset. Cross-pairs between two dense cells use the same sub-cell
-stencil.
+This is the piece that keeps dense cusps from going quadratic: pair
+tests per particle scale as 0.216 x overdensity, i.e. 0.2 in the field,
+43 at Delta=200, ~2x10^5 at Delta=10^6. It is required work, not an
+optimization. It also arrives with a byte-identical CPU oracle already
+in the tree (`-G 0.0001` under fof1; 80M grid on/off).
 
-Threshold: start at the CPU's `-G 4` semantics (expected particles per
-b/sqrt(6) cell) and sweep. Note the CPU measured -29% phaseA at 2B from
-the root-gated version; on device the trade is different (the free
-unions cost nothing, the extra probes do), so re-measure rather than
-inherit the tuning.
+Threshold: start from the CPU's `-G 4` semantics and sweep. Do NOT
+inherit the CPU tuning — on device the free unions cost nothing and the
+extra probes do, so the trade moves.
 
-### K5 — freeze, tips, counts
+### K4 — freeze, tips, counts
 
 `find` every index (full compression), write
 `label[i] = order[root[i]]` (the tip = global order of the min-order
-member — the same globally unique, stable name the CPU produces), and
-`atomic_fetch_add` into `root_counts[root]`. A stream compaction
-produces the compact `roots` list. All three are single data-parallel
-passes.
+member, the same globally unique stable name the CPU produces), and
+`atomic_fetch_add` into `root_counts[root]`; stream-compact the
+`roots` list. Three data-parallel passes.
 
-Deliberately NOT ported: the fused annotation pass
-(`freezeAndAnnotate` writing `min_frag`/`max_frag`). That annotation
-exists only to serve phaseB's certificates, and phaseB is gone;
-`TreePiece::upwardPass` already recomputes the real annotations after
-relabel, which is what phase 3 reads. Dropping it removes a device
-tree-walk requirement from the critical path.
+Deliberately NOT ported: the fused `min_frag`/`max_frag` annotation
+(`freezeAndAnnotate`). It exists only to serve phaseB's certificates,
+and phaseB is gone; `TreePiece::upwardPass` already recomputes the real
+annotations after relabel, which is what phase 3 reads.
 
-### K6 — download and scatter (host-parallel)
+### K5 — download and scatter (host-parallel, per PE)
 
-Download `label` (125 MB) and `parent` (62 MB, as the per-particle root
-index) into pinned host buffers, then every PE scatters its own slice
-into its own `Particle::group_number` and fills its `uf_parent` /
-`roots` view — the same owner-writes shape as `materializeLabels()`
-today, and parallel across the process's PEs.
+Download `label` and `parent` into pinned buffers; each PE scatters its
+own slice into its own `Particle::group_number` and fills its
+`uf_parent` view and its `roots` list (roots falling in its own index
+range) — the same owner-writes shape as `materializeLabels()` today.
+Completion of the D2H copy is signalled with `hapiAddCallback`, so the
+deposit chain stays message-driven.
+
+**Memory at N = 15.6M:** pos 187 MB + order 125 MB + parent 62 MB +
+labels 125 MB + tree 130 MB + node memos 12 MB + grid scratch (dense
+nodes only) — well under 1 GB against 64 GB of HBM. Memory is not a
+constraint; this would hold a 10x larger process.
 
 ---
 
-## 5. Host-side changes, concretely
+## 6. Host-side changes
 
-### 5.1 New
+### 6.1 Kokkos ownership and initialization (jacobi2D pattern, one fix)
 
-- `fof/gpu/FoFDevice.{h,cpp}` — the Charm-free device library above.
-  Interface, roughly:
-  ```c++
-  struct FoFDeviceConfig { float b2; float period[3]; float dense_gate; };
-  class FoFDevice {                       // one instance per process
-    static bool available();
-    void  init(int device_id);
-    float* stagePositions(size_t n);      // pinned, PEs fill their slices
-    long*  stageOrders(size_t n);
-    void   run(const FoFDeviceConfig&);   // K1-K5
-    const long* labels() const;           // pinned, PEs read their slices
-    const int*  roots()  const;
-    void   stats(FoFDeviceStats*) const;  // per-kernel walls, occupancy tail
-  };
-  ```
-- `FoFPhase1::packDeviceSlice()` (per-PE entry) and
-  `FoFPhase1::scatterDeviceLabels()` (per-PE entry) — the K0/K6 host
-  halves, deposited through the existing counter pattern.
-- `FoFPhase1Node::deviceStage()` — runs on the home PE, calls `run()`,
-  then triggers `scatterDeviceLabels` on the process's PEs, exactly
-  where `buildPoolSlice`'s last depositor triggers `phaseBChained`
-  today.
+jacobi2D initializes Kokkos in a `KokkosGroup` **group** constructor:
 
-### 5.2 Modified
+```c++
+int device; hapiCheck(hapiGetDevice(&device));
+Kokkos::InitializationSettings args; args.set_device_id(device);
+Kokkos::initialize(args);
+hapiCreateStreams();
+```
 
-- `startPhase1Chain` gains a branch: device path =
-  pack -> deviceStage -> scatter -> (relabel becomes a no-op identity,
-  since there is no tip map) -> the same final reduction with the same
-  `FoFPhase1Stages` shape (report device kernel walls in the phaseA
-  slot and 0 in phaseB, so every existing scaling table stays
-  comparable).
-- `FoFPhase1Node` gains the device instance and the process-wide
-  `rep_label` / `root_counts` (section 5.3).
+A Charm *group* has one branch per PE, so at `+ppn 14` that calls
+`Kokkos::initialize` fourteen times in one process. **Use a nodegroup**
+(one branch per process) — which is also where phase 1's process-scoped
+state already lives (`FoFPhase1Node`) and which is the natural owner of
+the device instance under the one-process-one-GPU invariant. Pass
+`InitializationSettings` explicitly so Kokkos never parses Charm's
+argv. `Kokkos::finalize()` from the same nodegroup at exit. (Worth
+fixing in jacobi2D too if it is ever run at ppn > 1.)
 
-### 5.3 The one real refactor: process-wide representatives
+Per-PE Kokkos use is limited to staging (View allocation + async copies
+on that PE's own HAPI stream) — a pattern jacobi2D already exercises
+from many chares in one process. All compute kernels are launched by
+the process's home PE (`CkNodeFirst(CkMyNode())`, already the PE that
+hosts the UF_2 element and runs `mergeBody`).
 
-A component's root is its min-order particle and can live in any PE's
-range, so `rep_label`/`root_counts` must move from the per-PE
-`FoFPhase1` to the process-wide `FoFPhase1Node`; each PE keeps a
-`roots` list holding only the roots that fall in ITS index range, so
-every root is still owned by exactly one writer and all the
-`for (int r : roots)` loops stay per-PE and parallel.
+### 6.2 New files
 
-**This introduces the read-after-write hazard flagged in section 2.3.**
-`applyTipEncoding`, `applyGlobalMap`/`applySliceOnPE` and
-`relabelBody` each write their own roots and then call
-`materializeLabels()`, which reads roots owned by other PEs. Each of
-those needs a deposit barrier between its write phase and its
-materialize phase. Cheap (the existing counter pattern) and
-non-negotiable; write it into the code as a comment naming the hazard,
-because the failure mode is a silent wrong label on a fraction of
-particles that only a full component-identity check catches.
+```
+fof/gpu/FoFDevice.h     // POD interface: no Kokkos, no Charm in the header
+fof/gpu/FoFDevice.cpp   // Kokkos kernels; compiled by hipcc
+fof/gpu/Makefile        // KOKKOS_DIR, arch flags, -ffp-contract=off
+src/DeviceTree.h        // POD DNode + the recursiveBuild emit hook
+```
 
-### 5.4 Deleted from the device path (kept for the CPU arm)
+The interface is POD so `FoFPhase1.h` (heavy Charm templates) is never
+seen by hipcc:
+
+```c++
+struct FoFDeviceConfig { float b2; float dense_gate; };
+class FoFDevice {                          // one per process
+  static bool available();
+  void   init(int device_id);
+  float* stagePositions(size_t n);         // pinned; PEs fill their slices
+  long*  stageOrders(size_t n);
+  void   uploadTree(const DNode*, int n_nodes, const int* tp_roots, int n_tp);
+  void   run(const FoFDeviceConfig&, void* completion_cb);  // K1-K4
+  const long* labels() const; const int* parents() const;
+  void   stats(FoFDeviceStats*) const;     // per-kernel walls, occupancy tail
+};
+```
+
+Build (paratreet2 is Makefile-based; jacobi2D's CMake is the reference
+for the flags): compile `FoFDevice.cpp` with `hipcc` +
+`-I$(KOKKOS_DIR)/include --offload-arch=gfx90a`, link with charmc plus
+`-L$(KOKKOS_DIR)/lib64 -lkokkoscore -lkokkoscontainers
+-lkokkosalgorithms`, against
+`CHARM_HOME=.../reconverse-linux-x86_64-amd`. `-DFOF_GPU` gates the
+host side; without it the binary is byte-identical to today's. A
+runtime flag (`fof3 --gpu`, default off until section 7 passes) selects
+the arm, so both live in one binary and can be interleaved in one job —
+the measurement discipline this project already uses.
+
+**Floating point:** `Real` is `float` by default (src/common.h:28;
+no Makefile here sets `USE_DOUBLE_FP`), so this is a float kernel —
+good for bandwidth and for NVIDIA parts. But hipcc defaults to
+`-ffp-contract=fast`, and a fused vs unfused `dx*dx+dy*dy+dz*dz` can
+flip a pair sitting exactly on b. Pin `-ffp-contract=off` on BOTH
+sides for the A/B arms.
+
+### 6.3 Modified
+
+- `startPhase1Chain` gains a device branch: pack -> `deviceStage` ->
+  scatter -> (relabel is identity: no tip map exists) -> the same final
+  reduction with the same `FoFPhase1Stages` shape, so every existing
+  scaling table stays comparable (device kernel walls reported in the
+  phaseA slot, 0 in phaseB).
+- `FoFPhase1Node` owns the `FoFDevice` and the now process-wide
+  `rep_label` / `root_counts`; each PE keeps a `roots` list holding
+  only roots in its own index range, so every root still has exactly
+  one writer and all `for (int r : roots)` loops stay per-PE.
+- **Deposit barriers** between the write and materialize phases of
+  `applyTipEncoding`, `applyGlobalMap`/`applySliceOnPE` and
+  `relabelBody` (section 4). Non-negotiable.
+- `TreePiece::recursiveBuild` / `buildTree`: emit the flat `DNode`
+  array beside `flat_subtree` (section 3.2).
+
+### 6.4 Unused on the device path (kept, as the permanent CPU oracle)
 
 `phaseBBody`, the pool (`poolPushInto`, `buildPoolSlice`,
 `phaseb_pool`, the claim cursor), `mergeBody`, `tip_map`, the SEEN
-sets, `edge_buf`, `cert_rep`/`cert_tip`, `connectedRep`, `certRep`,
-`leafLeafEmit`, `emitSubtreeTips`. Nothing else in the codebase reads
-them. The CPU path keeps all of it and stays the permanent oracle —
-same policy as `-w transposed` and `-u serial`.
+sets, `edge_buf`, `leafLeafEmit`, `emitSubtreeTips`. Same policy as
+`-w transposed` and `-u serial`: the CPU arm stays and is the oracle.
 
 ---
 
-## 6. Correctness gates (nothing merges without these)
+## 7. Correctness gates
 
-Reusing the harness that already exists (fof-algorithm-report.md §10):
+Reusing the harness that exists (fof-algorithm-report.md §10):
 
-1. **fof1 vs serial O(n^2)**, the only true phase-1 test, on
-   100/1k/10k — GPU arm and CPU arm, single process. Under a device
-   path this test is now the whole algorithm, so it is a much stronger
-   gate than it is for the CPU code (where phase 3 could mask a phase-1
+1. **fof1 vs serial O(n^2)** on 100/1k/10k, GPU and CPU arms. Under a
+   device path this is the whole algorithm, so it is a much stronger
+   gate than it is for the CPU code (where phase 3 can mask a phase-1
    under-merge).
-2. **Multi-process runs are mandatory** (2 and 4 processes) — the
-   standing rule here, and doubly relevant because the device stage
-   changes what "process-local" means.
-3. **80M lambb.00500: 23,707,197 components**, exact, at 1/2/4/8/16
-   nodes, plus `FOF_COUNT_VERIFY=1` silent on every run.
-4. **2B: 424,897,832 components, max 185,317,566**, at 8-128 nodes.
+2. **Multi-process runs mandatory** (2 and 4 processes) — the standing
+   rule, and doubly relevant since the device stage changes what
+   "process-local" means.
+3. **80M lambb.00500: 23,707,197 components** at 1/2/4/8/16 nodes, with
+   `FOF_COUNT_VERIFY=1` silent on every run.
+4. **2B: 424,897,832 components, max 185,317,566** at 8-128 nodes.
 5. **Tips, not just counts.** Tips are stable names (min-order member),
-   so the existing cross-configuration labeling comparison applies
-   unchanged — compare the GPU arm's labeling against the CPU arm's
-   directly, not only the histogram.
-6. **Kokkos Serial arm**: the same device kernels compiled for the host
-   backend, run at 1k/10k. A divergence between the Serial arm and the
-   HIP arm is a race or an FP-contraction difference; a divergence
-   between the Serial arm and the CPU walk is an algorithm error. Being
-   able to tell those two apart is the main practical reason to take
-   the Kokkos dependency.
+   so compare the GPU arm's labeling directly against the CPU arm's,
+   not only the histogram.
+6. **Kokkos Serial arm**: the same kernels compiled for the host
+   backend, at 1k/10k. Serial-vs-HIP divergence = a race or an
+   FP-contraction difference; Serial-vs-CPU-walk divergence = an
+   algorithm error. Telling those apart is the main practical reason to
+   take the Kokkos dependency rather than hand-rolled HIP.
+7. **Per-kernel A/B arms**, so a regression bisects: `FOF_GPU_NO_CERT`
+   (drop the positive certificate), `FOF_GPU_NO_SUPPRESS`,
+   `FOF_GPU_GRID_ONLY` (tree-free cell list, the arm that tests
+   section 3.1's claim directly), `FOF_GPU_DENSE_GATE=<t>`.
 
 ---
 
-## 7. Staged plan
+## 8. Staged plan
 
-Each stage is separately measurable and separately revertible.
+**Stage 0 — integration spike. DONE 2026-08-12, both gates green; see
+section 11 for the measurements and the seven traps it cost.** A
+nodegroup that takes `hapiGetDevice()`, initializes Kokkos, asserts the
+1:1 process/GCD mapping, and completes through `hapiAddCallback` —
+under the production run line (8 procs/node, `+ppn 14`, LCI/CXI).
+Remaining half of the stage: the same K0/K5 round trip wired into FoF3
+against real particle blocks, with the CPU still computing the answer.
 
-**Stage 0 — integration spike (days, no algorithm).** Build a Charm
-nodegroup that initializes Kokkos on the home PE, runs a trivial
-`parallel_reduce`, and prints the GCD it landed on, under the
-production run line (8 procs/node, `+ppn 14`, srun GPU binding). Then
-add K0/K6 only: pack -> upload -> download -> scatter, with the CPU
-still computing the answer. **Gate:** byte-identical output; staging
-cost measured in isolation. This retires nearly all the integration
-risk (charmc + hipcc + Kokkos + reconverse + srun binding) before any
-algorithm work.
+**Stage 1 — flat device tree, built at tree-build time.** `DNode` emit
+in `recursiveBuild`, the per-process top tree from TreePiece keys, and
+upload. **Gate:** CPU results unchanged (the emit is additive);
+tree-build delta and upload time measured. Side benefit to bank
+immediately: dense node indices let `cert_rep`/`cert_tip` become dense
+arrays on the CPU too.
 
-**Stage 1 — device union-find + cell list (K1-K5), c = b.** Replaces
-phaseA+phaseB+merge on the device path. **Gate:** all of section 6.
-**Measure:** against CPU phaseA+phaseB at 80M/1-16 nodes and 2B/8-128
-nodes. Expect the sparse-bulk win immediately and a possible dense-cusp
-tail; the per-kernel walls from `stats()` tell you which.
+**Stage 2 — device union-find + leaf-batched traversal (K1, K2).**
+Replaces phaseA + phaseB + merge on the device path. **Gate:** all of
+section 7. **Measure:** against CPU phaseA+phaseB at 80M/1-16 nodes and
+2B/8-128 nodes; the per-kernel `stats()` walls say whether the residue
+is sparse-bulk traversal or dense-cusp pair work.
 
-**Stage 2 — dense refinement (K4) + cell-pair early-out.** Sweep the
-occupancy gate. **Measure:** the 2B occupancy tail specifically — the
-regime where `-G 4` bought -29% on the CPU.
+**Stage 3 — dense-node grid fast path (K3)** and the dense-gate sweep.
+**Measure:** the 2B occupancy tail specifically — the regime where
+`-G 4` bought -29% on the CPU.
 
-**Stage 3 — overlap and the idle-CPU question.** During the device
-stage the process's 14 PEs are idle. Options in increasing order of
-ambition: (a) accept it (phase 1 becomes ~2% of the iteration, so this
-is defensible); (b) shrink `ppn` for GPU runs and give the cores back
-to other processes — but tree build and the phase-3 walk still want
-them; (c) genuine overlap, splitting the process's particles into a
-device share and a CPU share with the CPU side emitting edges into the
-device union-find between kernels. Decide on stage 1/2 measurements,
-not now.
+**Stage 4 — the idle-CPU question.** During the device stage the
+process's 14 PEs are idle. Options in increasing ambition: (a) accept
+it (phase 1 becomes ~2% of the iteration — defensible); (b) shrink
+`ppn` for GPU runs, though tree build and the phase-3 walk still want
+the cores; (c) real overlap — a CPU share of the particles feeding
+`unite` between kernels, or CPU work pulled forward from other phases.
+Decide on stage 2/3 measurements, not now.
 
-**Stage 4 — only if stage 2 leaves a dense-cusp floor:** the device
-tree walk (walk-unification stages 0+4), i.e. flat POD nodes + a
-stackless traversal + the positive certificate. Deliberately last: it
-is the largest piece of work in the entire program and the cell-list
-formulation may well make it unnecessary for phase 1. The flat-tree
-work is not wasted either way — the device phase-3 walk needs it.
+**Explicitly later, not in this plan:** phase 3 on the device and
+cross-GPU tree walks. The device-to-device path is proven on this stack
+(jacobi2D, `+gpushm`/`+gpuipceventpool`), and the flat tree from stage
+1 is exactly what a device phase-3 walk would consume — but phase 3's
+hot path calls `ckLocalBranch()`, takes a mutex and can send a message
+mid-leaf, so it is a separate design. Nothing in this plan forecloses
+it; the device tree and the device particle arrays can simply stay
+resident.
 
 ---
 
-## 8. Risks, and what each one costs
+## 9. Risks
 
 | risk | mitigation | residual |
 |---|---|---|
-| Kokkos + Charm SMP thread safety | single Kokkos owner PE per process | none; costs nothing at 1 GCD/process |
-| GPU binding with 8 procs/node under srun | explicit `set_device_id(SLURM_LOCALID)`; verified in stage 0 | low |
-| `Kokkos::initialize` parsing Charm's argv | pass `InitializationSettings` explicitly | none |
+| Kokkos init once per process | nodegroup, not group (section 6.1) | none, once written this way |
+| >1 process per GCD | startup abort (section 2) | none; unsupported by design |
 | FP contraction (hipcc fast vs host) flipping pairs at exactly b | `-ffp-contract=off` both sides; gate 5 catches it | low, but it WILL be the first mystery diff if missed |
-| dense-cusp quadratic blowup at c = b | stage 2 (K4), which is a transliteration of already-exact CPU code | medium; the reason stage 2 is planned, not optional |
-| process-wide `rep_label` read-after-write | deposit barriers, section 5.3 | this is a real bug being introduced; write the barrier first, not after the first wrong answer |
-| `Kokkos::fence()` blocking the home PE's scheduler | acceptable in v1 (comm thread does progress); Ccd event poll in v2 | low |
-| pinned-buffer staging cost (~30 ms) | parallel per-PE pack; persistent buffer across iterations | low; measured in stage 0 before anything depends on it |
+| dense-cusp quadratic blowup before stage 3 | stage 3 is planned work, not optional; it transliterates already-exact CPU code | medium until stage 3 lands |
+| process-wide `rep_label` read-after-write | deposit barriers (section 4), written first | this is a bug being introduced — treat it as such |
+| 12-particle leaves under-filling a 64-wide wavefront | lane cooperation over fan-out and leaf-pair cross product; leaf size swept separately | medium; the most likely source of a disappointing first number |
+| staging cost (~30 ms pack + ~8 ms upload) | per-PE parallel pack; persistent pinned buffers across iterations | low; measured in stage 0 before anything depends on it |
+| build matrix (HIP charm build + sibling rebuild) | pinned in stage 0 | low, but it is a full rebuild of unionfind/prefix/htram/paratreet/fof |
 
-Out of scope, explicitly: phase 3 (the cross-process walk consults
-`ckLocalBranch()`, a mutex and a possible mid-leaf send in its hot
-path — not portable as written), the software cache, UF_2, and the
-component histogram. All of them keep working unchanged because the
-device stage honors the contract in section 2.3.
+## 10. Open questions for review
 
-## 9. Open questions for the review
-
-1. **Process geometry.** This plan assumes 1 process per GCD, which is
-   the geometry already in production on Frontier. If a future
-   configuration puts 2 processes on a GCD, the single-owner rule still
-   holds but the two processes contend; worth stating as a supported
-   or unsupported configuration up front.
-2. **PBC.** The device kernel plans plain Euclidean distance plus an
-   assertion that the process's box is smaller than L/2 per axis —
-   which is the same condition `gridSelfUnionRange` already checks
-   before it will run (FoFPhase1.h:2042). Confirm that is acceptable
-   for production PBC runs, or plan the cell-index wrap.
-3. **Leaf size.** `max_particles_per_leaf = 12` is a CPU tuning
-   (examples/fof3/Main.C:35). The device path does not use leaves at
-   all, but phase 3 does; if the tree build is retuned for the GPU
-   runs, phase-3 numbers move with it. Keep the knob out of the phase-1
-   A/B.
-4. **Where the ArborX comparison lands.** Their 37M/0.15 s on an A100
+1. **PBC.** The device kernel plans plain Euclidean distance plus an
+   assertion that the process's box is under L/2 per axis — the same
+   condition `gridSelfUnionRange` already checks before it will run
+   (FoFPhase1.h:2042). Confirm that is acceptable for production PBC
+   runs, or plan the cell-index wrap.
+2. **Where the ArborX comparison lands.** Their 37M/0.15 s on an A100
    is per-rank shared-memory scope = our within-process phase 1
-   exactly, so after stage 2 we have a directly comparable number for
-   the first time — and, unlike them, we still have the distributed
+   exactly. After stage 3 there is a directly comparable number for the
+   first time — and, unlike them, we still have the distributed
    closure. Worth publishing the pair.
+3. **Does the CPU arm keep phaseB at all long-term**, or does the
+   process-wide union-find idea come back to the CPU as a locked/
+   sharded variant? The device result will say whether phaseB's floor
+   was ever anything but an artifact of the no-atomics discipline.
+
+---
+
+## 11. Stage 0: measured (2026-08-12)
+
+Both gates pass on Frontier. Code: `fof/gpu/` (device library +
+standalone gate) and `tests/kokkos-spike/` (Charm integration gate);
+run with `fof/gpu/run_stage0.sbatch`. Job 5254721.
+
+### 11.1 What ran
+
+- **Standalone gate** (`fof/gpu/fof-device-test`, no Charm, no HAPI —
+  the tests/treecache discipline): 4M particles, exact label round trip
+  and exact bounding box against a host recomputation.
+- **Integration gate** (`tests/kokkos-spike`): 8 processes x 14 PEs on
+  one node, 4M particles per process, every PE filling its own slice of
+  one pinned buffer, atomic deposit counter, launch on the home PE,
+  completion by `hapiAddCallback`, per-PE verification, reduction.
+  Every particle round-tripped on every process.
+
+HAPI's own line confirms the invariant of section 2 without any work on
+our side: `HAPI> Config: 1 device(s) per process, 14 PE(s) per device,
+8 device(s) per host`, with the eight processes binding devices 0-7.
+
+### 11.2 Numbers
+
+| | 4M particles/process |
+|---|---|
+| upload (80 MB: float3 + int64) | 3.76 ms (~21 GB/s) |
+| identity kernel + bbox + checksum | 1.43 ms |
+| download (32 MB) | 1.28 ms |
+| async round trip, enqueue -> Charm callback, 8 processes at once | 8.3-11.9 ms |
+
+Extrapolating the staging to a 2B-scale process (15.6M particles):
+~15 ms upload, ~5 ms download. That is consistent with section 5's
+budget and small against the 5.4 s it is meant to replace. The gap
+between 6.5 ms of measured device work and the 8-12 ms async wall is
+callback latency plus eight processes sharing node bandwidth; worth
+re-measuring once real work sits between the copies.
+
+**Do not quote these as performance numbers yet**: the HIP charm build
+(`reconverse-linux-x86_64-amd`) is `CMAKE_BUILD_TYPE=Debug`. It must be
+rebuilt Release before any stage-2 timing claim. The device library
+itself is `-O3` and unaffected.
+
+### 11.3 The seven traps (all now encoded in the Makefiles)
+
+1. **A `Kokkos::HIP` member cannot exist before `Kokkos::initialize`.**
+   Holding an `ExecSpace` in the pimpl aborts at chare construction with
+   `Kokkos::HIP::HIP instance constructor : ERROR device not
+   initialized`, because the nodegroup constructs the Device long before
+   `init()`. Store the stream handle and wrap it on demand — wrapping is
+   a handle copy, not an acquisition.
+2. **A nodegroup entry method does NOT run on the process's home PE.**
+   Measured: the `start` broadcast landed on PEs 9, 20, 30, 46, 61, 72,
+   88, 105 — none of them `CkNodeFirst` values. The single-owner design
+   of section 6.1 therefore has to be *made* true: the nodegroup entry
+   immediately hops to `CkNodeFirst(CkMyNode())` through a PE-addressed
+   group entry, and every Kokkos/HAPI call happens there. (The
+   completion callback likewise lands on an arbitrary PE, which is
+   harmless — the HAPI event was recorded on, and polled by, the home
+   PE.)
+3. **Two ROCm installs.** charm's HIP support was configured against
+   `/opt/rocm-default` (-> 6.4.2) and charmc hardcodes
+   `-L/opt/rocm-default/lib` on every link; Kokkos was built with hipcc
+   from 6.2.4, which is also what the run environment loads. Naming
+   6.2.4's lib dir in the link makes ld resolve 6.4.2's libamdhip64
+   against 6.2.4's libhsa-runtime64 and fail on
+   `hsa_amd_enable_logging@ROCR_1`. Worked around with
+   `-Wl,--allow-shlib-undefined` (nothing we call is involved) so the
+   runtime resolves one consistent 6.2.4 stack through LD_LIBRARY_PATH.
+   **Proper fix, recommended before stage 2: rebuild the HIP charm with
+   `ROCM_PATH=/opt/rocm-6.2.4`.**
+4. **`-D__HIP_PLATFORM_AMD__` is required** on any charmc-compiled TU
+   that includes `hapi.h`. hipcc defines it implicitly, g++ does not, and
+   without it `hip_runtime_api.h` declares no `hipStream_t` — so every
+   `hapi*` prototype naming one silently fails to declare, and the error
+   surfaces as "hapiAddCallback was not declared in this scope".
+   `hapi_portable.h` does not include the vendor header itself, so the
+   TU must include `<hip/hip_runtime_api.h>` (host-only; not
+   `hip_runtime.h`) before `hapi.h`.
+5. **hipcc compiles archives as source.** It puts `-x hip` in front of
+   every positional argument, so `hipcc ... libfoo.a` fails with "source
+   file is not valid UTF-8". Archives must arrive through `-L`/`-l`.
+6. **charmc's link line names liblci.so but not liblct.so**, so ld
+   cannot resolve the transitive DT_NEEDED ("undefined reference to
+   `LCT_*`"). Needs `-Wl,-rpath-link` into `charm_reconverse/lci/lib64`;
+   adding `-Wl,-rpath` for it and for the charm build's own `lib` also
+   makes the binary runnable without LD_LIBRARY_PATH setup
+   (`libreconverse.so` is not on any default path either).
+7. **charmc defaults to `-std=gnu++11`** here; Kokkos needs C++17 in any
+   TU that sees it, and the firewall header is cleaner at 17. Pass
+   `-c++-option -std=gnu++17`.
+
+None of these are deep, but together they are most of what "does the
+integration work" meant, and all of them would have been discovered
+inside the much larger stage-2 change instead.
+
+### 11.4 What the firewall bought
+
+`tests/kokkos-spike/spike.C` is compiled by charmc and includes **no
+Kokkos header**; `fof/gpu/FoFDevice.cpp` is compiled by hipcc and
+includes **no Charm header**. They meet at a POD interface. This is a
+deliberate departure from the jacobi2D precedent, which compiles the
+Charm translation unit itself with hipcc — workable for a single-file
+program, but paratreet2's template stack should not go through hipcc,
+and with the firewall it does not have to. The standalone gate is the
+payoff: when something breaks, it says whether the problem is Kokkos or
+the integration before you start looking.
