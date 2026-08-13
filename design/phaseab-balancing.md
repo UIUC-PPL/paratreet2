@@ -885,3 +885,30 @@ v2 (commit "S3 v2: parallel foreign drain...") gates:
   laptop: extend the keep-alive ring into phase 1 while FOF_S3 is
   armed. Laptop reconverse gates use -n 4 until then; Frontier's CXI
   fabric is the real test.
+
+## 26. v2 at 2B/16 Frontier (job 5250364): FIRST NET WIN
+
+Four-generation table in the relayed report (stored below §25's file
+pointer; reps x3, all exact incl. traced):
+- WALL BELOW BASELINE FOR THE FIRST TIME: Pre-traversal 4.47-4.53 s vs
+  5.32 unsliced (~15% under); Iteration 0 6.98-7.24 vs 8.01 (~13%).
+- Per-PE phaseB max 3.29 -> 1.98-2.11 s (36-40% off); imbalance ratio
+  17x -> 12x. Improved, not solved.
+- 4.3-4.8% of units moved (95-106k) at 206-224 units/grant — HALF the
+  448 sizing. Explanation (to verify): costliest-first concatenation
+  puts the coordinator's favorite partitions FIRST in the local drain
+  order, so orders land on half-eaten partitions; the local cursor and
+  the coordinator compete for the same end of the pool. declines also
+  highest of any generation (~1420) — same signature.
+- The phaseB timer excludes inter-slice gaps; the report correctly
+  judges by wall-clock rows (which moved WITH it this time — unlike
+  v1-sliced where they diverged).
+
+Next levers, ranked (not yet built):
+1. Grant attrition compensation: FOF_S3_GRANT_UNITS_PER_PE 32 -> 64
+   (pure env knob, zero code) — tests whether grant size is binding.
+2. Partition pick beyond the cursor: order partitions the local drain
+   will reach LAST (with costliest-first concatenation that is the
+   tail), trading per-unit m2 for intactness. One-line pick change.
+3. Multiple outstanding grants per helper (removes the
+   order->ship->return->drained serialization; moderate change).
