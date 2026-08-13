@@ -65,7 +65,7 @@ module fof {
     // #ifdef FOF_GPU in FoFPhase1.h and are stubs in a CPU-only build, so
     // the generated code is identical in shape and the entries are simply
     // never invoked (paratreet::runFoFPhase1 gates on FOF_GPU_STAGE0).
-    entry void deviceStage0(const CkCallback&);
+    entry void deviceStage0(double b2, const CkCallback&);
     entry void deviceInitOnHome();
     entry void devicePack();
     entry void deviceLaunchOnHome();

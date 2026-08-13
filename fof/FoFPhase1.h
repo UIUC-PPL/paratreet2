@@ -421,6 +421,7 @@ public:
   std::atomic<int> dev_count_done{0};
   std::atomic<int> dev_pack_done{0};
   double dev_t_launch = 0;          // enqueue -> completion callback
+  fofgpu::WalkStats dev_walk;
 #endif
 
   FoFPhase1Node() {}
@@ -1123,7 +1124,8 @@ public:
   // Round 1 (broadcast, every PE): reserve this PE's slice of the
   // process-flat index space. fetch_add gives disjoint bases with no
   // ordering requirement — the PE that gets base 0 is not special.
-  void deviceStage0(const CkCallback& cb) {
+  void deviceStage0(double b2, const CkCallback& cb) {
+    b2_ = b2;
     dev_done_cb_ = cb;
     dev_t_pack_ = 0;
     auto* nb = node_proxy.ckLocalBranch();
@@ -1300,14 +1302,24 @@ public:
     auto oit = nb->dev_piece_node_off.find(CkMyPe());
     if (hn != nullptr && oit != nb->dev_piece_node_off.end()) {
       size_t k = 0;
+      long part_at = dev_base_;
       for (auto& s : treepieces) {
         if (k >= oit->second.size()) break;
         const int off = oit->second[k++];
-        if (off < 0 || s.dnodes == nullptr) continue;
-        std::memcpy(hn + off, s.dnodes,
-                    (size_t)s.n_dnodes * sizeof(fofgpu::DDNode));
-        for (int i = 0; i < s.n_dnodes; i++)
-          if (hn[off + i].child_begin >= 0) hn[off + i].child_begin += off;
+        if (off >= 0 && s.dnodes != nullptr) {
+          std::memcpy(hn + off, s.dnodes,
+                      (size_t)s.n_dnodes * sizeof(fofgpu::DDNode));
+          // Rebase both index spaces into the process-flat ones: child
+          // links into the concatenated node array, and part_begin into
+          // the concatenated particle array. The SOURCE tree stays
+          // piece-local (so it survives being built once at tree build
+          // and reused); only this per-process copy is rebased.
+          for (int i = 0; i < s.n_dnodes; i++) {
+            if (hn[off + i].child_begin >= 0) hn[off + i].child_begin += off;
+            hn[off + i].part_begin += (int)part_at;
+          }
+        }
+        part_at += s.n;
       }
     }
     dev_t_tree_pack_ = CkWallTimer() - t1;
@@ -1322,31 +1334,50 @@ public:
     auto* nb = node_proxy.ckLocalBranch();
     deviceFinishTree(nb);
     nb->dev_t_launch = CkWallTimer();
-    nb->device.enqueueRoundTrip();
-#ifdef FOF_GPU_HAS_HAPI
-    // Delivered to THIS PE's group branch, so the event is polled by the
-    // PE that recorded it (the HAPI event queue is per-PE).
-    hapiAddCallback((hapiStream_t)nb->dev_stream,
-                    CkCallback(CkIndex_FoFPhase1<Data>::deviceCompleteOnHome(),
-                               this->thisProxy[CkMyPe()]));
-#else
-    nb->device.fence();
+    // Stage 2: the real pass — whole-process union-find over the staged
+    // particles and the uploaded tree, replacing phaseA + phaseB + merge.
+    // Synchronous so the per-kernel walls are real; the async form
+    // (enqueue + hapiAddCallback) is proven in stage 0 and is a two-line
+    // change once the kernel is settled.
+    nb->device.runPhase1((float)b2_, &nb->dev_walk);
+    nb->dev_t_launch = CkWallTimer() - nb->dev_t_launch;
+    const fofgpu::WalkStats& w = nb->dev_walk;
+    CkPrintf("[FOF3GPU] proc %d walk: %ld leaves, %ld top nodes | prepare "
+             "%.1f ms | walk %.1f ms | freeze %.1f ms | download %.1f ms | "
+             "certificates %ld | leaf pairs %ld | stack overflows %ld\n",
+             CkMyNode(), w.n_leaves, w.n_top_nodes, w.t_prepare * 1e3,
+             w.t_walk * 1e3, w.t_freeze * 1e3, w.t_download * 1e3,
+             w.certificates, w.leaf_pairs, w.stack_overflows);
+    // A stack overflow means the traversal DROPPED work, which shows up
+    // as silently under-merged components. Never a warning.
+    if (w.stack_overflows != 0)
+      CkAbort("FoF GPU: traversal stack overflowed %ld times - work was "
+              "dropped; raise kStack in FoFDevice.cpp",
+              w.stack_overflows);
     this->thisProxy[CkMyPe()].deviceCompleteOnHome();
-#endif
   }
 
   void deviceCompleteOnHome() {
     auto* nb = node_proxy.ckLocalBranch();
-    nb->dev_t_launch = CkWallTimer() - nb->dev_t_launch;
+    // dev_t_launch is already elapsed (deviceLaunchOnHome converts it).
+    // Subtracting again here turned it into an absolute timestamp and
+    // reported a 6-second "device round trip" against a 1.6 s total wall.
     const int first = CkNodeFirst(CkMyNode());
     for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
       this->thisProxy[pe].deviceVerify();
   }
 
-  // Round 5 (every PE): the K5 scatter, verified. Stage 0's device pass
-  // is the identity, so the value that comes back for a particle must be
-  // that particle's own order — which checks the base/offset arithmetic
-  // end to end, not just that a transfer happened.
+  // Round 5 (every PE): compare the device's answer against the CPU's,
+  // PARTICLE BY PARTICLE.
+  //
+  // This is the strongest gate available and it is exact, not statistical:
+  // the CPU chain has already run (phaseA + phaseB + merge + relabel), so
+  // every particle's group_number holds its PROCESS-level tip — the
+  // global order of the minimum-order member of its process-level
+  // component. The device union-find is process-wide from the start and
+  // uses the same union-by-min-order rule, so it must produce THE SAME
+  // VALUE for every particle. Not "the same number of components": the
+  // same label, everywhere.
   void deviceVerify() {
     auto* nb = node_proxy.ckLocalBranch();
     const long* label = nb->device.hostLabels();
@@ -1354,11 +1385,18 @@ public:
     long bad = 0, at = dev_base_;
     for (auto& s : treepieces)
       for (int i = 0; i < s.n; i++, at++)
-        if (label[at] != s.parts[i].order) bad++;
+        if (label[at] != s.parts[i].group_number) {
+          if (bad == 0)
+            CkPrintf("[FOF3GPU] proc %d pe %d MISMATCH at flat %ld "
+                     "(order %ld): device %ld, cpu %ld\n",
+                     CkMyNode(), CkMyPe(), at, s.parts[i].order, label[at],
+                     s.parts[i].group_number);
+          bad++;
+        }
     double t_scatter = CkWallTimer() - t0;
     if (bad)
-      CkPrintf("[FOF3GPU] proc %d pe %d: %ld of %d particles failed the "
-               "device round trip\n", CkMyNode(), CkMyPe(), bad, dev_n_);
+      CkPrintf("[FOF3GPU] proc %d pe %d: %ld of %d particles disagree with "
+               "the CPU labeling\n", CkMyNode(), CkMyPe(), bad, dev_n_);
     // max-reduced: pack (per PE), launch->completion (per process),
     // scatter (per PE), failures (summed in as a max so any nonzero
     // survives to the driver).
@@ -1380,9 +1418,9 @@ public:
   // callback so a caller that asks for the stage without a GPU build gets
   // an immediate, honest "nothing happened" rather than a hang; the rest
   // are unreachable.
-  void deviceStage0(const CkCallback& cb) {
-    double vals[4] = {0, 0, 0, 0};
-    this->contribute(4 * sizeof(double), vals, CkReduction::max_double, cb);
+  void deviceStage0(double, const CkCallback& cb) {
+    double vals[6] = {0, 0, 0, 0, 0, 0};
+    this->contribute(6 * sizeof(double), vals, CkReduction::max_double, cb);
   }
   void deviceInitOnHome() {}
   void devicePack() {}
@@ -2913,35 +2951,6 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
         CkCallbackResumeThread());
   }
   local.register_s = CkWallTimer() - t;
-  // GPU staging measurement (design/phase1-gpu.md stage 0, second half).
-  // Off unless FOF_GPU_STAGE0=1. Runs BETWEEN registration and the chain,
-  // where the registered particle blocks are live and nothing has written
-  // group_number yet, and it changes no state the chain reads — the CPU
-  // below still computes the answer. Stage 2 replaces the round trip with
-  // the device union-find and this becomes the phase.
-  {
-    static const bool gpu_stage0 = [] {
-      const char* e = std::getenv("FOF_GPU_STAGE0");
-      return e && std::atoi(e) != 0;
-    }();
-    if (gpu_stage0) {
-      double tg = CkWallTimer();
-      void* gres = nullptr;
-      fof.deviceStage0(CkCallbackResumeThread(gres));
-      CkReductionMsg* gm = (CkReductionMsg*)gres;
-      const double* gv = (const double*)gm->getData();
-      CkPrintf("[FOF3GPU] stage0 wall %.3f s | particle pack(max PE) %.1f ms "
-               "| tree pack(max PE) %.1f ms | tree upload(max proc) %.1f ms "
-               "| device round trip(max proc) %.1f ms | scatter(max PE) %.1f "
-               "ms | round-trip failures %ld\n",
-               CkWallTimer() - tg, gv[0] * 1e3, gv[4] * 1e3, gv[5] * 1e3,
-               gv[1] * 1e3, gv[2] * 1e3, (long)gv[3]);
-      if (gv[3] != 0)
-        CkAbort("FoF GPU stage 0: particles did not round-trip through the "
-                "device");
-      delete gm;
-    }
-  }
   // One broadcast starts the within-process chain; the single global
   // reduction at its end delivers the max-reduced stage walls.
   void* result = nullptr;
@@ -2955,6 +2964,37 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
     local.merge = v[2];
     local.relabel = v[3];
     delete m;
+  }
+  // GPU arm (design/phase1-gpu.md stages 0-2). Off unless
+  // FOF_GPU_STAGE0=1. Runs AFTER the CPU chain, deliberately: the chain
+  // has then written every particle's PROCESS-level tip into
+  // group_number, which is exactly what the device union-find computes,
+  // so the check is an exact per-particle comparison against an answer
+  // this codebase already trusts. The device pass reads only positions,
+  // orders and the flat tree, and writes only its own buffers, so it
+  // cannot perturb the result it is being checked against.
+  {
+    static const bool gpu_stage0 = [] {
+      const char* e = std::getenv("FOF_GPU_STAGE0");
+      return e && std::atoi(e) != 0;
+    }();
+    if (gpu_stage0) {
+      double tg = CkWallTimer();
+      void* gres = nullptr;
+      fof.deviceStage0(b2, CkCallbackResumeThread(gres));
+      CkReductionMsg* gm = (CkReductionMsg*)gres;
+      const double* gv = (const double*)gm->getData();
+      CkPrintf("[FOF3GPU] stage0 wall %.3f s | particle pack(max PE) %.1f ms "
+               "| tree pack(max PE) %.1f ms | tree upload(max proc) %.1f ms "
+               "| device round trip(max proc) %.1f ms | scatter(max PE) %.1f "
+               "ms | LABEL MISMATCHES %ld\n",
+               CkWallTimer() - tg, gv[0] * 1e3, gv[4] * 1e3, gv[5] * 1e3,
+               gv[1] * 1e3, gv[2] * 1e3, (long)gv[3]);
+      if (gv[3] != 0)
+        CkAbort("FoF GPU: the device labeling disagrees with the CPU "
+                "labeling on %ld particles", (long)gv[3]);
+      delete gm;
+    }
   }
   if (stages) *stages = local;
 }

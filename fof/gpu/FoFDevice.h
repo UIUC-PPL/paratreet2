@@ -56,6 +56,20 @@ struct TreeStats {
   long bad_nodes = 0;              // device-counted structural violations
 };
 
+// Stage 2: the device union-find pass (design/phase1-gpu.md section 5,
+// K1-K4). Replaces phaseA + phaseB + merge for the process.
+struct WalkStats {
+  long n_leaves = 0;
+  long n_top_nodes = 0;
+  double t_prepare = 0;   // leaf list, top tree, parent init
+  double t_walk = 0;      // the traversal itself
+  double t_freeze = 0;    // find-all + label write
+  double t_download = 0;
+  long stack_overflows = 0;   // must be 0; a nonzero count means LOST WORK
+  long certificates = 0;      // positive certificates fired
+  long leaf_pairs = 0;        // leaf-leaf pair tests performed
+};
+
 struct RoundTripStats {
   long   n = 0;
   double t_upload = 0;
@@ -139,6 +153,17 @@ class Device {
   // chain will use (design/phase1-gpu.md section 0). hostLabels() is
   // valid only after that callback fires.
   void enqueueRoundTrip();
+
+  // Stage 2: whole-process FoF on the device. Reads the staged positions
+  // and orders and the uploaded tree; writes hostLabels() with each
+  // particle's TIP (the global order of its component's minimum-order
+  // member) — the same value the CPU chain writes into
+  // Particle::group_number after phaseA+phaseB+merge+relabel.
+  //
+  // Synchronous, with a fence between kernels so the per-kernel walls are
+  // real. The async form (enqueue + hapiAddCallback) is proven in stage 0
+  // and is what production will use; measurement comes first.
+  void runPhase1(float b2, WalkStats* out);
 
   void fence();
 
