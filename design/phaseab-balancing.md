@@ -1100,3 +1100,38 @@ design/frontier-grantm2-reserve-verdict-2026-08-13.md (jobs 5253386 +
    plus the displacement redesign of reservation (item 2) and the
    never-analyzed sum-detail per-PE profile (Anvil traces at
    2b-resv-sumd-19860455, section 29).
+
+### 30 addendum (full report received, same morning)
+
+The full report (now stored complete in the verdict file) sharpens and
+extends the excerpt:
+
+- SECTION 27'S PREMISE IS FALSIFIED BY ITS OWN INSTRUMENT, not merely
+  inverted in outcome: without reservation, grants already carried
+  7.1x the pool-mean m2/unit (the coordinator's costliest-partition
+  ordering was working); the reserved cursor windows fence 1.06x the
+  pool mean — average work, not giants. msg2's "helpers get dust" rested
+  on a relative trend with no denominator; tot_m2 supplied the
+  denominator and reversed the reading. Also: the trigger itself fired
+  fine at Frontier (68-70 windows, no recalibration needed) — the
+  Anvil over-fire of section 29 remains a real but secondary
+  observation (Anvil pools were near-drained; Frontier's were not).
+- 5250425 (b210b6f, never relayed; all 6 cells exact): section 26
+  lever 1 confirmed — GRANT 32->128 at PARTS=16 raises units/ship
+  221.7->531.2 and cuts phaseB_s max 2.221->1.529; PARTS=16 beats 32
+  at every grant size and halves declines. This, not v2's 32/32, is
+  the best-known configuration (reproduced at 0f30988 with the budget
+  lifted: 1.572/1.637).
+- 5250906 (80M split-size, the predecessor's post-blocker recovery,
+  never relayed; all exact at 23707197): SPLITTING UNITS IS A CLEAN
+  LOSS AT 80M — phaseB 0.093->0.336 monotonically with finer C while
+  per-PE max barely moves; drift control exact. Verdict scoped to
+  80M (mean unit 0.014 ms); re-test at 2B where the giants live.
+- Dataset restored via proj-shared (Ritvik): both 2B and 80M inputs
+  now at /lustre/orion/csc710/proj-shared/ (2B copy header-verified
+  complete by the Frontier session before use). rrao scratch remains
+  closed; campaign runs use proj-shared.
+- Open TODO from recommendation 1: express the grant m2 budget
+  relative to measured pool m2 (e.g. a multiple of mean unit m2 x the
+  count cap) rather than any bare constant — 1e10 is right for THIS
+  pool; a constant will silently re-break at the next problem size.
