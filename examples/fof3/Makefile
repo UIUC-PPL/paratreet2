@@ -2,7 +2,7 @@ include ../../src/Makefile.common
 
 LBS = CommonLBs PrefixLB OrbLB
 LB_LIBS = $(foreach m, $(LBS), -module $(m))
-OPTS = -g -O3 $(INCLUDES) $(FOF_INCLUDES) -DCOUNT_INTERACTIONS=0 -DDEBUG=0 $(MAKE_OPTS)
+OPTS = -g -O3 $(INCLUDES) $(FOF_INCLUDES) -DCOUNT_INTERACTIONS=0 -DDEBUG=0 $(GPU_OPTS) $(MAKE_OPTS)
 CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 
 all: FoF3
@@ -14,8 +14,8 @@ VISITORS = FragCheckVisitor.h
 Main.decl.h: Main.ci $(DATA)
 	$(CHARMC) $<
 
-FoF3: Main.decl.h Main.o FoF3.o $(PARATREET_PATH)/libparatreet.a $(FOF_PATH)/libfof.a $(TRACE_STAMP)
-	$(CHARMC) -language charm++ -module CommonLBs -o FoF3 FoF3.o Main.o $(TRACE_FLAGS) $(FOF_LD_LIBS) $(LD_LIBS)
+FoF3: Main.decl.h Main.o FoF3.o $(PARATREET_PATH)/libparatreet.a $(FOF_PATH)/libfof.a $(FOF_GPU_LIB) $(TRACE_STAMP)
+	$(CHARMC) -language charm++ -module CommonLBs -o FoF3 FoF3.o Main.o $(TRACE_FLAGS) $(FOF_LD_LIBS) $(FOF_GPU_LD_LIBS) $(LD_LIBS)
 
 FoF3.o: FoF3.C Main.h $(VISITORS) $(DATA) Main.decl.h
 	$(CHARMC) -c $<

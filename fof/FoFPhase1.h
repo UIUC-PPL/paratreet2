@@ -52,6 +52,22 @@
 #include "OrientedBox.h"
 #include "unionFindLib.h"
 
+#ifdef FOF_GPU
+// design/phase1-gpu.md section 6.2: the device library's header names
+// neither Kokkos nor HIP, so this translation unit stays a charmc TU.
+// hapi.h is the exception — it needs the vendor's stream typedef, and
+// hapi_portable.h does not pull the vendor header in itself. Build with
+// -D__HIP_PLATFORM_AMD__ or hip_runtime_api.h declares nothing (trap 4).
+#include "gpu/FoFDevice.h"
+#if defined(CMK_HIP)
+#include <hip/hip_runtime_api.h>
+#endif
+#if defined(CMK_HIP) || defined(CMK_CUDA)
+#define FOF_GPU_HAS_HAPI 1
+#include <hapi.h>
+#endif
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -382,6 +398,24 @@ public:
 
   std::mutex seen3_lock;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3_pairs;
+
+#ifdef FOF_GPU
+  // --- GPU staging (design/phase1-gpu.md stage 0, second half).
+  // The process's single device, owned here because FoFPhase1Node is the
+  // per-PROCESS branch and one process maps to one GPU by invariant.
+  // Everything in this block is measurement scaffolding: it stages the
+  // process's particles onto the device, round-trips them, and verifies
+  // them, while the CPU chain below still computes the answer. Stage 2
+  // replaces the round trip with the union-find; the staging halves
+  // (K0/K5) are what survive.
+  fofgpu::Device device;
+  void* dev_stream = nullptr;
+  bool dev_inited = false;
+  std::atomic<long> dev_total{0};   // process-flat particle count
+  std::atomic<int> dev_count_done{0};
+  std::atomic<int> dev_pack_done{0};
+  double dev_t_launch = 0;          // enqueue -> completion callback
+#endif
 
   FoFPhase1Node() {}
 
@@ -1615,6 +1649,173 @@ public:
       for (int i = 0; i < s.n; i++)
         s.parts[i].group_number = rep_label[uf_parent[s.offset + i]];
   }
+
+#ifdef FOF_GPU
+  // --- GPU staging chain (design/phase1-gpu.md stage 0, second half).
+  //
+  // Purely additive: it stages this process's particles onto the device,
+  // round-trips them and verifies them, and the CPU chain below still
+  // computes the answer. What it measures is exactly what stages 2-3 will
+  // depend on and nothing else — the AoS -> SoA pack out of real
+  // Particle blocks (K0), the transfer, and the scatter back (K5).
+  //
+  // Shape is the production one: per-PE work, atomic deposit counters,
+  // every device call on the process's home PE, completion by
+  // hapiAddCallback. A nodegroup entry does NOT run on the home PE
+  // (measured, design/phase1-gpu.md section 11.3 trap 2), so the hops
+  // are explicit and go through this PE-indexed GROUP proxy.
+  static bool gpuStage0Enabled() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_GPU_STAGE0");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+
+  // Round 1 (broadcast, every PE): reserve this PE's slice of the
+  // process-flat index space. fetch_add gives disjoint bases with no
+  // ordering requirement — the PE that gets base 0 is not special.
+  void deviceStage0(const CkCallback& cb) {
+    dev_done_cb_ = cb;
+    dev_t_pack_ = 0;
+    auto* nb = node_proxy.ckLocalBranch();
+    dev_n_ = 0;
+    for (auto& s : treepieces) dev_n_ += s.n;
+    dev_base_ = nb->dev_total.fetch_add(dev_n_);
+    if (nb->dev_count_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode()))
+      this->thisProxy[CkNodeFirst(CkMyNode())].deviceInitOnHome();
+  }
+
+  // Round 2 (home PE only): bind the device and size the staging buffers.
+  void deviceInitOnHome() {
+    auto* nb = node_proxy.ckLocalBranch();
+    int device_id = -1;
+#ifdef FOF_GPU_HAS_HAPI
+    hapiCheck(hapiGetDevice(&device_id));
+#endif
+    if (!nb->dev_inited) {
+      nb->device.init(device_id);
+      const int procs_per_node = CmiNumNodes() / CmiNumPhysicalNodes();
+      // One process per GPU is an invariant, not a preference
+      // (design/phase1-gpu.md section 2): sharing a GCD silently halves
+      // every later measurement, so refuse rather than run.
+      if (!nb->device.checkMapping(procs_per_node))
+        CkAbort("FoF GPU: processes would SHARE a GPU (%d processes on "
+                "this physical node, only %d devices visible). Launch at "
+                "most one process per GCD.",
+                procs_per_node, nb->device.info().n_visible);
+#ifdef FOF_GPU_HAS_HAPI
+      hapiCreateStreams();
+      nb->dev_stream = (void*)hapiGetStream();
+#endif
+      nb->device.setStream(nb->dev_stream);
+      nb->dev_inited = true;
+      fofgpu::DeviceInfo di = nb->device.info();
+      CkPrintf("[FOF3GPU] proc %d pe %d backend=%s device=%d gpu=\"%s\" "
+               "%.1f GB, staging %ld particles\n",
+               CkMyNode(), CkMyPe(), di.backend, di.device_id, di.name,
+               di.total_global_mem / 1073741824.0, (long)nb->dev_total);
+    }
+    nb->device.resize((size_t)nb->dev_total.load());
+    const int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      this->thisProxy[pe].devicePack();
+  }
+
+  // Round 3 (every PE): the K0 pack. Reads this PE's own Particle blocks
+  // (~112 B stride) and writes the 20 B device form into its own slice of
+  // the pinned buffer. Owner-writes, disjoint slices, no locking — and
+  // parallel across the process's PEs, which is the whole point: the same
+  // gather on one thread is ~0.1 s at 2B chare sizes.
+  void devicePack() {
+    double t0 = CkWallTimer();
+    auto* nb = node_proxy.ckLocalBranch();
+    float* pos = nb->device.hostPositions();
+    long* order = nb->device.hostOrders();
+    long at = dev_base_;
+    for (auto& s : treepieces) {
+      for (int i = 0; i < s.n; i++, at++) {
+        pos[3 * at] = (float)s.parts[i].position.x;
+        pos[3 * at + 1] = (float)s.parts[i].position.y;
+        pos[3 * at + 2] = (float)s.parts[i].position.z;
+        order[at] = s.parts[i].order;
+      }
+    }
+    dev_t_pack_ = CkWallTimer() - t0;
+    if (nb->dev_pack_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode()))
+      this->thisProxy[CkNodeFirst(CkMyNode())].deviceLaunchOnHome();
+  }
+
+  // Round 4 (home PE): enqueue and return. No fence — the scheduler keeps
+  // running and completion arrives as a message.
+  void deviceLaunchOnHome() {
+    auto* nb = node_proxy.ckLocalBranch();
+    nb->dev_t_launch = CkWallTimer();
+    nb->device.enqueueRoundTrip();
+#ifdef FOF_GPU_HAS_HAPI
+    // Delivered to THIS PE's group branch, so the event is polled by the
+    // PE that recorded it (the HAPI event queue is per-PE).
+    hapiAddCallback((hapiStream_t)nb->dev_stream,
+                    CkCallback(CkIndex_FoFPhase1<Data>::deviceCompleteOnHome(),
+                               this->thisProxy[CkMyPe()]));
+#else
+    nb->device.fence();
+    this->thisProxy[CkMyPe()].deviceCompleteOnHome();
+#endif
+  }
+
+  void deviceCompleteOnHome() {
+    auto* nb = node_proxy.ckLocalBranch();
+    nb->dev_t_launch = CkWallTimer() - nb->dev_t_launch;
+    const int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      this->thisProxy[pe].deviceVerify();
+  }
+
+  // Round 5 (every PE): the K5 scatter, verified. Stage 0's device pass
+  // is the identity, so the value that comes back for a particle must be
+  // that particle's own order — which checks the base/offset arithmetic
+  // end to end, not just that a transfer happened.
+  void deviceVerify() {
+    auto* nb = node_proxy.ckLocalBranch();
+    const long* label = nb->device.hostLabels();
+    double t0 = CkWallTimer();
+    long bad = 0, at = dev_base_;
+    for (auto& s : treepieces)
+      for (int i = 0; i < s.n; i++, at++)
+        if (label[at] != s.parts[i].order) bad++;
+    double t_scatter = CkWallTimer() - t0;
+    if (bad)
+      CkPrintf("[FOF3GPU] proc %d pe %d: %ld of %d particles failed the "
+               "device round trip\n", CkMyNode(), CkMyPe(), bad, dev_n_);
+    // max-reduced: pack (per PE), launch->completion (per process),
+    // scatter (per PE), failures (summed in as a max so any nonzero
+    // survives to the driver).
+    double vals[4] = {dev_t_pack_, nb->dev_t_launch, t_scatter, (double)bad};
+    this->contribute(4 * sizeof(double), vals, CkReduction::max_double,
+                     dev_done_cb_);
+  }
+
+  long dev_base_ = 0;
+  int dev_n_ = 0;
+  double dev_t_pack_ = 0;
+  CkCallback dev_done_cb_;
+#else
+  // CPU-only build: fof.ci declares these entries unconditionally (it has
+  // no preprocessor), so they need definitions. deviceStage0 closes its
+  // callback so a caller that asks for the stage without a GPU build gets
+  // an immediate, honest "nothing happened" rather than a hang; the rest
+  // are unreachable.
+  void deviceStage0(const CkCallback& cb) {
+    double vals[4] = {0, 0, 0, 0};
+    this->contribute(4 * sizeof(double), vals, CkReduction::max_double, cb);
+  }
+  void deviceInitOnHome() {}
+  void devicePack() {}
+  void deviceLaunchOnHome() {}
+  void deviceCompleteOnHome() {}
+  void deviceVerify() {}
+#endif  // FOF_GPU
 
   // --- Within-process chain (design/phase1-scaling.md, 2026-07-25).
   // Every stage of phaseA -> phaseB -> merge -> relabel reads and writes
@@ -3622,6 +3823,34 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
         CkCallbackResumeThread());
   }
   local.register_s = CkWallTimer() - t;
+  // GPU staging measurement (design/phase1-gpu.md stage 0, second half).
+  // Off unless FOF_GPU_STAGE0=1. Runs BETWEEN registration and the chain,
+  // where the registered particle blocks are live and nothing has written
+  // group_number yet, and it changes no state the chain reads — the CPU
+  // below still computes the answer. Stage 2 replaces the round trip with
+  // the device union-find and this becomes the phase.
+  {
+    static const bool gpu_stage0 = [] {
+      const char* e = std::getenv("FOF_GPU_STAGE0");
+      return e && std::atoi(e) != 0;
+    }();
+    if (gpu_stage0) {
+      double tg = CkWallTimer();
+      void* gres = nullptr;
+      fof.deviceStage0(CkCallbackResumeThread(gres));
+      CkReductionMsg* gm = (CkReductionMsg*)gres;
+      const double* gv = (const double*)gm->getData();
+      CkPrintf("[FOF3GPU] stage0 wall %.3f s | pack(max PE) %.1f ms | "
+               "device round trip(max proc) %.1f ms | scatter(max PE) %.1f ms "
+               "| round-trip failures %ld\n",
+               CkWallTimer() - tg, gv[0] * 1e3, gv[1] * 1e3, gv[2] * 1e3,
+               (long)gv[3]);
+      if (gv[3] != 0)
+        CkAbort("FoF GPU stage 0: particles did not round-trip through the "
+                "device");
+      delete gm;
+    }
+  }
   // One broadcast starts the within-process chain; the single global
   // reduction at its end delivers the max-reduced stage walls.
   void* result = nullptr;

@@ -81,6 +81,42 @@ PREFIX_LIB_DIR = $(UNION_FIND_DIR)/prefixLib
 #   make AGGREGATION="-DAGGREGATION -DUNIONFIND"
 AGGREGATION ?= -DUNIONFIND
 
+# ---- GPU arm (design/phase1-gpu.md). OFF by default: with GPU unset the
+# compile and link lines are byte-identical to the CPU build.
+#   make GPU=1        in fof/ and the FoF examples (and build fof/gpu first)
+# Requires a HIP-enabled charm (CHARM_HOME=.../reconverse-linux-x86_64-amd);
+# -D__HIP_PLATFORM_AMD__ is what makes hapi.h's hipStream_t prototypes
+# declare under g++ (design/phase1-gpu.md section 11.3 trap 4).
+KOKKOS_DIR ?= /ccs/home/rrao/kokkos
+FOF_GPU_PATH = $(FOF_PATH)/gpu
+
+# A HIP-ENABLED charm makes charm++.h pull in <hip/hip_runtime.h>
+# (charm++.h -> ckrdmadevice.h -> conv-rdmadevice.h -> hapi_portable.h),
+# and the HIP headers hard-#error unless the platform macro is set. So
+# EVERY translation unit built against such a charm needs it, GPU code or
+# not — this is a property of the charm build, not of the GPU arm, which
+# is why it is detected here rather than tied to GPU=1.
+HAS_HAPI := $(wildcard $(CHARM_HOME)/include/hapi.h)
+ifneq ($(HAS_HAPI),)
+	INCLUDES := $(INCLUDES) -D__HIP_PLATFORM_AMD__
+endif
+ifeq ($(GPU),1)
+	GPU_OPTS = -DFOF_GPU -I$(FOF_PATH)
+	FOF_GPU_LD_LIBS = -L$(FOF_GPU_PATH) -lfofdevice \
+	                  -L$(KOKKOS_DIR)/lib64 -lkokkoscontainers \
+	                  -lkokkosalgorithms -lkokkoscore -ldl
+	# Name the archive as a LINK PREREQUISITE, not just as -l: without it
+	# `make` reports the application up to date after the device library
+	# is rebuilt and silently relinks nothing (the stale-.a trap
+	# design/frontier-labeling-ab.md records for libunionFind.a — it cost
+	# a wasted job here on 2026-08-12).
+	FOF_GPU_LIB = $(FOF_GPU_PATH)/libfofdevice.a
+else
+	GPU_OPTS =
+	FOF_GPU_LD_LIBS =
+	FOF_GPU_LIB =
+endif
+
 FOF_INCLUDES = -I$(FOF_PATH) -I$(PREFIX_LIB_DIR) -I$(UNION_FIND_DIR) -I$(HTRAM_DIR) $(AGGREGATION)
 FOF_LD_LIBS = -L$(FOF_PATH) -lfof -L$(UNION_FIND_DIR) -lunionFind -L${PREFIX_LIB_DIR} -lprefix -L${HTRAM_DIR} -lhtram_group_unionfind
 

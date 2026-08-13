@@ -68,6 +68,17 @@ module fof {
     // (0 per axis = open, the default = exact current behavior) before phaseA.
     entry void setPeriod(Vector3D<Real> period, const CkCallback&);
     entry void startPhase1Chain(double b2, double grid_thresh, const CkCallback&);
+    // GPU staging chain (design/phase1-gpu.md stage 0). Declared
+    // unconditionally — the .ci has no preprocessor — but the bodies are
+    // #ifdef FOF_GPU in FoFPhase1.h and are stubs in a CPU-only build, so
+    // the generated code is identical in shape and the entries are simply
+    // never invoked (paratreet::runFoFPhase1 gates on FOF_GPU_STAGE0).
+    entry void deviceStage0(const CkCallback&);
+    entry void deviceInitOnHome();
+    entry void devicePack();
+    entry void deviceLaunchOnHome();
+    entry void deviceCompleteOnHome();
+    entry void deviceVerify();
     entry void phaseBChained();
     entry void buildPoolSlice();
     // Campaign S2b: mid-phase relabel/re-annotate between the B1 and B2
