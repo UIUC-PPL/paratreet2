@@ -583,6 +583,9 @@ public:
     std::vector<std::pair<long, long>> edges;
     std::vector<std::vector<Particle>> particles; // rebuilt-tree storage
     std::vector<Node<Data>*> roots;
+    // One arena per tree (roots[i] points into arenas[i].first);
+    // released via destroyStealArena at graveyard cleanup.
+    std::vector<std::pair<void*, size_t>> arenas;
   };
   std::atomic<S3ForeignShip*> s3_active_ship{nullptr};
   std::vector<S3ForeignShip*> s3_ship_graveyard; // under s3_lock
@@ -881,9 +884,12 @@ public:
     rec->part_idx = ship.part_idx;
     rec->particles.resize(ship.trees.size());
     rec->roots.assign(ship.trees.size(), nullptr);
+    rec->arenas.assign(ship.trees.size(), {nullptr, 0});
     for (size_t t = 0; t < ship.trees.size(); t++) {
       rec->particles[t] = ship.trees[t].particles;
-      rec->roots[t] = fof->buildStealTree(ship.trees[t], rec->particles[t]);
+      void* arena = nullptr;
+      rec->roots[t] = fof->buildStealTree(ship.trees[t], rec->particles[t], arena);
+      rec->arenas[t] = {arena, ship.trees[t].nodes.size()};
     }
     rec->units.reserve(ship.unit_pairs.size());
     for (auto& up : ship.unit_pairs)
@@ -1283,7 +1289,7 @@ public:
       for (auto* g : s3_ship_graveyard) {
         auto* fof = group_proxy.ckLocalBranch();
         if (fof)
-          for (auto* r : g->roots) fof->deleteStealTree(r);
+          for (auto& a : g->arenas) fof->destroyStealArena(a.first, a.second);
         delete g;
       }
       s3_ship_graveyard.clear();
@@ -3939,59 +3945,70 @@ private:
   // Preorder flatten of a pool-unit node's subtree: (key, spatial node)
   // per node, leaf particles appended in the same preorder.
   void flattenStealTree(Node<Data>* n, paratreet::StealTree<Data>& out) {
-    if (n == nullptr) {
-      // Absent child slot: key 0 marks it (real keys start at 1), so the
-      // preorder rebuild stays aligned without any key arithmetic.
-      out.nodes.emplace_back(Key(0), SpatialNode<Data>());
-      return;
-    }
-    out.nodes.emplace_back(n->key, SpatialNode<Data>(*n));
+    flattenStealNode(n, out, -1, -1);
+  }
+  void flattenStealNode(Node<Data>* n, paratreet::StealTree<Data>& out,
+                        int parent_idx, int slot) {
+    if (n == nullptr) return; // absent children carry no wire record
+    int idx = (int)out.nodes.size();
+    out.nodes.emplace_back();
+    auto& w = out.nodes.back();
+    w.key = n->key;
+    w.parent = parent_idx;
+    w.slot = (int8_t)slot;
+    w.sn = SpatialNode<Data>(*n);
     if (n->isLeaf()) {
       const Particle* p = n->particles();
       for (int i = 0; i < n->n_particles; i++) out.particles.push_back(p[i]);
       return;
     }
     for (int i = 0; i < n->n_children; i++)
-      flattenStealTree(n->getChild(i), out);
+      flattenStealNode(n->getChild(i), out, idx, i);
   }
 
   // Rebuild a shipped tree as private FullNodes over the (caller-owned)
-  // particle vector. FoF is oct-only (enforced at startup), so the branch
-  // factor is 8. Children are reconstructed by preorder position.
+  // particle vector. FoF is oct-only (enforced at startup), so the
+  // branch factor is 8. ONE arena allocation and a single linear pass:
+  // every child/parent pointer is arena + wire-index (the offsets the
+  // donor recorded), so there is no recursion and no per-node malloc —
+  // the 31-addendum fix for the 59-423 ms serial s3Shipment head.
+  // Preorder guarantees a parent precedes its children, so the parent's
+  // slot is linked as each child constructs. Caller frees the returned
+  // arena with destroyStealArena(arena, t.nodes.size()).
   Node<Data>* buildStealTree(const paratreet::StealTree<Data>& t,
-                             std::vector<Particle>& parts) {
-    size_t ni = 0, pi = 0;
-    return buildStealNode(t, parts, ni, pi, nullptr);
-  }
-  Node<Data>* buildStealNode(const paratreet::StealTree<Data>& t,
-                             std::vector<Particle>& parts, size_t& ni,
-                             size_t& pi, Node<Data>* parent) {
-    if (ni >= t.nodes.size()) return nullptr;
-    const auto& kv = t.nodes[ni++];
-    if (kv.first == Key(0)) return nullptr; // absent child slot marker
-    const SpatialNode<Data>& sn = kv.second;
-    bool leaf = sn.n_particles >= 0;
-    auto type = leaf ? (sn.n_particles == 0 ? Node<Data>::Type::EmptyLeaf
-                                            : Node<Data>::Type::Leaf)
-                     : Node<Data>::Type::Internal;
-    Particle* pp = nullptr;
-    if (leaf && sn.n_particles > 0) {
-      pp = parts.data() + pi;
-      pi += sn.n_particles;
-    }
-    auto* node = new FullNode<Data, 8>(kv.first, type, sn, pp, parent, -1, -1);
-    if (!leaf) {
-      for (int i = 0; i < node->n_children; i++) {
-        Node<Data>* c = buildStealNode(t, parts, ni, pi, node);
-        node->exchangeChild(i, c);
+                             std::vector<Particle>& parts, void*& arena_out) {
+    using FN = FullNode<Data, 8>;
+    arena_out = nullptr;
+    size_t n = t.nodes.size();
+    if (n == 0) return nullptr;
+    FN* arena = static_cast<FN*>(::operator new(n * sizeof(FN)));
+    size_t pi = 0;
+    for (size_t i = 0; i < n; i++) {
+      const auto& w = t.nodes[i];
+      const SpatialNode<Data>& sn = w.sn;
+      bool leaf = sn.n_particles >= 0;
+      auto type = leaf ? (sn.n_particles == 0 ? Node<Data>::Type::EmptyLeaf
+                                              : Node<Data>::Type::Leaf)
+                       : Node<Data>::Type::Internal;
+      Particle* pp = nullptr;
+      if (leaf && sn.n_particles > 0) {
+        pp = parts.data() + pi;
+        pi += sn.n_particles;
       }
+      Node<Data>* parent =
+          (w.parent >= 0) ? static_cast<Node<Data>*>(arena + w.parent) : nullptr;
+      auto* node = new (arena + i) FN(w.key, type, sn, pp, parent, -1, -1);
+      if (w.parent >= 0) arena[w.parent].exchangeChild(w.slot, node);
     }
-    return node;
+    arena_out = arena;
+    return arena; // root is wire index 0 (preorder)
   }
-  void deleteStealTree(Node<Data>* n) {
-    if (n == nullptr) return;
-    for (int i = 0; i < n->n_children; i++) deleteStealTree(n->getChild(i));
-    delete n;
+  void destroyStealArena(void* arena, size_t n_nodes) {
+    if (arena == nullptr) return;
+    using FN = FullNode<Data, 8>;
+    FN* a = static_cast<FN*>(arena);
+    for (size_t i = 0; i < n_nodes; i++) a[i].~FN();
+    ::operator delete(arena);
   }
 
   // Self-test (FOF_S3_LOOPBACK=1, debug): for every locally claimed pool
@@ -4019,12 +4036,14 @@ private:
     ship2.pup(fm);
     std::vector<Particle> pa = ship2.trees[0].particles;
     std::vector<Particle> pb = ship2.trees[1].particles;
-    Node<Data>* ra = buildStealTree(ship2.trees[0], pa);
-    Node<Data>* rb = buildStealTree(ship2.trees[1], pb);
+    void* aa = nullptr;
+    void* ab = nullptr;
+    Node<Data>* ra = buildStealTree(ship2.trees[0], pa, aa);
+    Node<Data>* rb = buildStealTree(ship2.trees[1], pb, ab);
     std::vector<std::pair<long, long>> rebuilt;
     walkUnitEdges(ra, rb, rebuilt);
-    deleteStealTree(ra);
-    deleteStealTree(rb);
+    destroyStealArena(aa, ship2.trees[0].nodes.size());
+    destroyStealArena(ab, ship2.trees[1].nodes.size());
     std::sort(direct.begin(), direct.end());
     std::sort(rebuilt.begin(), rebuilt.end());
     if (direct != rebuilt) {

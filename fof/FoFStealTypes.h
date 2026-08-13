@@ -18,12 +18,29 @@
 
 namespace paratreet {
 
-// One flattened subtree of a shipped phaseB pool unit: nodes in preorder,
-// key 0 marking an absent child slot (real keys start at 1), leaf
-// particles appended in the same preorder.
+// One flattened subtree of a shipped phaseB pool unit: nodes in
+// preorder, leaf particles appended in the same preorder. Structure is
+// carried as integer offsets (parent index + child slot) instead of
+// absent-slot marker records, so the receiver can rebuild with ONE
+// arena allocation and a single linear pass — child/parent pointers are
+// just arena + index (the varsize-message offset->pointer idiom; a
+// literal in-buffer swizzle is barred by FullNode's vtable/atomics and
+// would ship FullNode-sized slots, ~2x the bytes of this form).
 template <typename Data>
 struct StealTree {
-  std::vector<std::pair<Key, SpatialNode<Data>>> nodes;
+  struct WireNode {
+    Key key = Key(0);
+    int32_t parent = -1;  // index into nodes[]; -1 = root
+    int8_t slot = -1;     // child slot in parent
+    SpatialNode<Data> sn;
+    void pup(PUP::er& p) {
+      p | key;
+      p | parent;
+      p | slot;
+      p | sn;
+    }
+  };
+  std::vector<WireNode> nodes;  // preorder; absent children omitted
   std::vector<Particle> particles;
   void pup(PUP::er& p) {
     p | nodes;
