@@ -913,7 +913,7 @@ Next levers, ranked (not yet built):
 3. Multiple outstanding grants per helper (removes the
    order->ship->return->drained serialization; moderate change).
 
-## 27. The composition finding, and reservation (PROPOSED — Kale review)
+## 27. The composition finding, and reservation (IMPLEMENTED overnight 2026-08-13, commit 309673c on phaseab-campaign; Kale approved implementing while asleep)
 
 Frontier msg2 (2026-08-12 night, ~30 exact runs): STEALING MOVES THE
 CHEAPEST WORK BY CONSTRUCTION. The pool is costliest-first (deliberate,
