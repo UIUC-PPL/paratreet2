@@ -349,3 +349,247 @@ literal `7` because every recorded run used `+ppn 14`. Compute it
 (`ndev=min(8, ppn/2)`) rather than copying the literal. Corollary: per-step
 `srun -t` guards turn this class of mistake into a 6-minute loss instead of a
 whole-job loss.
+
+---
+
+# FOF_PHASEB_SLICE_MS=2 experiment — job 5248978 (2B, 16 nodes)
+
+s3-serial configuration identical to job 5248429 (`FOF_S3=1 FOF_STEALA=1
+FOF_STEALA_GEO=1 FOF_PB_PARTS=32 FOF_PB_M2KEY=1`, `-u serial`), same input,
+same srun line, control placed BETWEEN the two treated reps so intra-allocation
+drift is visible rather than confounded.
+
+Binary: `~/software/FoF3.2b.prod` (untraced, `nm | grep -c TraceSummary` = 0) —
+NOT `examples/fof3/FoF3`, which was linked against the traced charm at the
+time and would have added tracing overhead to the numbers under test.
+
+srun line (identical to the S3 A/B s3-serial arm):
+
+```
+srun -N 16 --ntasks-per-node=8 -t 6 \
+     --mpi=cray_shasta --network=job_vni --unbuffered \
+     --cpu-bind=none --distribution=block:block \
+     ~/software/FoF3.2b.prod -f /lustre/orion/csc710/scratch/rrao/cosmo25cmb.768g2_dm.001024 \
+     -d oct -u serial +ppn 14 \
+     +pemap 1-7,65-71,9-15,73-79,17-23,81-87,25-31,89-95,33-39,97-103,41-47,105-111,49-55,113-119,57-63,121-127 \
+     +lci_ndevices 7 +backend_poll_thread 2 +traceoff
+```
+
+## Results — all three exact (424,897,832)
+
+| run | phaseB (timer) | phaseB_s min/avg/max | out_ships | out_units | ret_edges | declines |
+|---|---|---|---|---|---|---|
+| slice2-rep1 | 2.721 | 0.000/0.177/**2.688** | **287** | 82718 | 3195 | 1105 |
+| control (no slice) | 3.176 | 0.000/0.191/**3.148** | 4 | 138 | 23 | 978 |
+| slice2-rep2 | 2.824 | 0.002/0.170/**2.101** | **298** | 75805 | 2350 | 1133 |
+
+## Verdict: mechanism CONFIRMED, intervention is a NET LOSS at this setting
+
+**The hypothesis is right about the cause.** out_ships jumps 4 -> 287/298
+(~72x) and out_units 138 -> ~79,000 (~570x). The hot process's PEs really
+were sitting inside the unsliced drain loop and never serving ship orders;
+slicing surfaces them exactly as predicted (mechanism documented at
+fof/FoFPhase1.h:1560 — the claim loop returns at the deadline and re-enters
+by self-send so the scheduler runs between slices).
+
+**But two things did not follow.**
+
+1. **The per-PE max only partly drops** — 3.148 -> 2.688 / 2.101, i.e. 15-33%,
+   not "well below 3.2" and nowhere near the ~0.18 avg. Reason: only ~79k of
+   ~2.26M units ship (**3.5%**). Shipping 3.5% of the work cannot fix a ~15x
+   imbalance even if it were free. The rep-to-rep spread (2.688 vs 2.101) is
+   also large.
+2. **THE phaseB TIMER IS NOT A VALID METRIC UNDER SLICING — and real wall time
+   got much WORSE.**
+
+## The metric trap (important for reading the table above)
+
+`fof/FoFPhase1.h:1680`:
+
+```
+t_phaseB = pb_t_accum_ + (CkWallTimer() - t0);   // summed over slices
+```
+
+`pb_t_accum_` accumulates only time spent INSIDE `phaseBBody`; the gaps
+between slices (scheduler, message handling, network progress) are excluded
+by construction. So the apparent phaseB improvement 3.176 -> 2.72/2.82 is
+**largely an artifact of the timer no longer counting the inter-slice gaps**,
+not a wall-clock speedup.
+
+Wall-clock tells the opposite story. `Pre-traversal` (which for the control is
+essentially phase1: 5.32 s vs a 5.29 s phase1_stages sum) balloons:
+
+| run | phase1_stages sum | Pre-traversal | Iteration 0 total |
+|---|---|---|---|
+| control | ~5.29 s | **5.32 s** | **8.01 s** |
+| slice2-rep1 | ~4.83 s | **14.65 s** | **17.32 s** |
+| slice2-rep2 | ~4.94 s | **25.04 s** | **27.71 s** |
+
+**10-20 s appears inside pre-traversal that phase1_stages does not account
+for, and it is highly variable between identical reps (14.65 vs 25.04 s).**
+Iteration 0 goes from 8.0 s to 17.3-27.7 s — a 2.2-3.5x regression. Whatever
+slicing buys in responsiveness, a 2 ms slice costs far more in scheduler /
+self-send overhead at 1792 PEs.
+
+## Suggested next steps
+
+- **Re-measure with `Iteration 0 total` / `Pre-traversal` as the metric**, not
+  the phaseB field, for any sliced configuration. The phaseB timer
+  systematically flatters slicing.
+- **Sweep the slice length upward** (20 ms, 100 ms). 2 ms at 1792 PEs is
+  likely far below the point where re-entry overhead is amortized; a coarser
+  slice may retain most of the 72x shipment gain at a fraction of the cost.
+- The 3.5%-of-units-shipped ceiling suggests that even a perfectly responsive
+  donor cannot fix this imbalance by whole-partition stealing alone — worth
+  weighing against the S3-v2 escalation question.
+
+---
+
+# Sliced S3 rerun at paratreet2 7b4b3f2 — job 5250048 (2B, 16 nodes)
+
+Commit `7b4b3f2` "S3 helper: use the shipped uniformity annotations; cap grant
+size" (previous: `fbc04ed`). Same s3-serial + `FOF_PHASEB_SLICE_MS=2`
+treatment, same srun line/pemap/env. One rep untraced (`FoF3.2b.prod`), one
+traced with `+sumDetail` (`FoF3.slice2.sumd`), same allocation.
+Both exact at **424,897,832**.
+
+Trace: `~/software/sumd2b-slice-v2-frontier.tar.gz` (13.2 MB, 3585 files,
+prefix `FoF3.slice2.sumd.`, traceroot `sumd2b_slice_v2`).
+
+## Headline: the slicing wall-time regression is GONE, and grants are ~120x smaller
+
+| metric | unsliced base (5249400) | sliced @ fbc04ed (5248978) | **sliced @ 7b4b3f2 (5250048)** |
+|---|---|---|---|
+| Pre-traversal | 5.32 s | 14.65 / 25.04 s | **5.53 / 5.49 s** |
+| Iteration 0 | 8.01 s | 17.32 / 27.71 s | **8.22 / 8.06 s** |
+| phaseB (timer) | 3.30 | 2.721 / 2.824 | 3.323 / 3.304 |
+| phaseB_s max (per PE) | 3.148-3.221 | 2.688 / 2.101 | 3.290 / 3.271 |
+| out_ships | 10 | 287 / 298 | **1112 / 1135** |
+| out_units | 1320 | 82718 / 75805 | **2423 / 2590** |
+| **units per shipment** | 132 | **288 / 254** | **2.18 / 2.28** |
+| ret_edges | 92 | 3195 / 2350 | 1623 / 1816 |
+| declines | 1216 | 1105 / 1133 | 883 / 891 |
+
+**1. Utilization holds — confirmed.** Wall time returns to the unsliced
+baseline: Pre-traversal 5.53 s vs 5.32 s unsliced (was 14.65-25.04 s at
+`fbc04ed`), Iteration 0 8.22 s vs 8.01 s (was 17.32-27.71 s). The 2.2-3.5x
+regression that made slicing unusable is eliminated.
+
+**2. The grant cap is working, dramatically.** Units per shipment falls from
+~288/254 to **2.18/2.28 — a ~120x reduction** — while the shipment COUNT rises
+3.8x (287 -> 1112). That is exactly the signature of "many small grants
+instead of few whole-pool dumps", and is consistent with the expectation that
+the s3Shipment bars shrink from 10+ s to sub-second. (Bar durations
+themselves are a render-side measurement; the units-per-shipment ratio is the
+runtime-side proxy, and it moved as predicted.)
+
+**3. But the phaseB straggler is NOT fixed.** `phaseB_s` max is 3.290/3.271 —
+essentially the UNSLICED value (3.148-3.221), and worse than the `fbc04ed`
+sliced runs (2.688/2.101). phaseB total is back to 3.32/3.30, i.e. the
+unsliced baseline. Total units shipped collapses to 2423 of ~2.35M = **0.10%**
+of the work (it was 3.5% at `fbc04ed`).
+
+So the net position at `7b4b3f2`: slicing + S3 is now **free but inert** —
+it costs nothing and moves almost nothing. Previously it was expensive and
+moved a little. The imbalance (max 3.29 s vs 0.19 s avg, ~17x) is untouched
+either way.
+
+Interpretation offered cautiously: capping grant size fixed the COST of
+stealing (which was the whole-pool shipment stalls), but the cap now also
+limits how much work can migrate, so the straggler keeps its backlog. If the
+goal is to flatten phaseB, the cap may need to be sized against the straggler's
+backlog rather than held small — or the bottleneck is not addressable by
+whole-partition stealing at all, consistent with the 3.5%-ceiling observation
+from the `fbc04ed` run.
+
+**Note on the phaseB timer**: it excludes inter-slice gaps
+(fof/FoFPhase1.h:1680). At `fbc04ed` that made sliced phaseB look BETTER
+(2.72 vs 3.18) while wall time was 3x worse. Here phaseB reads higher (3.32)
+while wall time is fine. Judge by Pre-traversal / Iteration 0.
+
+## Provenance
+
+| | |
+|---|---|
+| paratreet2 | `7b4b3f27973ec40ebfc23f3309ddd5fafcf98e66` (`phaseab-campaign`) |
+| unionfind | `8933bae434abc51c9bcef54fdb6c83dbe08786df` |
+| charm (production) | `3d1fdd89f2f53bdb06e2cb4d7989b432a7b812d7` |
+| charm (traced) | `90f05d8cba0ac500d7620491637ed27de07fe3c4` (trace-summary close fix, now upstream) |
+| pre-pull binaries kept | `FoF3.2b.prod.fbc04ed`, `FoF3.2b.sumd.fbc04ed` |
+
+---
+
+# S3 v2 at paratreet2 b210b6f — job 5250364 (2B, 16 nodes)
+
+Commit `b210b6f` "S3 v2: parallel foreign drain, unit-count grants,
+re-orderable partitions, remaining-work polls" (fof/FoFPhase1.h +221/-55,
+fof/fof.ci +3 — new entry methods, so the full `make clean` rebuild was
+required, not optional). s3-serial + `FOF_PHASEB_SLICE_MS=2`; two untraced
+reps + one traced, one allocation.
+
+**All exact**: 10k sanity 3549 (2 processes x 4 PEs), all three 2B reps
+424,897,832.
+
+Trace: `~/software/sumd2b-slice-v3-frontier.tar.gz` (14.2 MB, 3585 files,
+traceroot `sumd2b_slice_v3`). No mid-run flush.
+
+## Four generations, side by side
+
+| metric | unsliced base 5249400 | v1 sliced `fbc04ed` 5248978 | v1 capped `7b4b3f2` 5250048 | **v2 `b210b6f` 5250364** |
+|---|---|---|---|---|
+| **Pre-traversal** | 5.32 s | 14.65 / 25.04 s | 5.53 / 5.49 s | **4.53 / 4.47 / 4.51 s** |
+| **Iteration 0** | 8.01 s | 17.32 / 27.71 s | 8.22 / 8.06 s | **7.24 / 7.17 / 6.98 s** |
+| phaseB (timer) | 3.30 | 2.72 / 2.82 | 3.32 / 3.30 | **2.18 / 2.08 / 2.16** |
+| **phaseB_s per-PE max** | 3.148-3.221 | 2.688 / 2.101 | 3.290 / 3.271 | **2.113 / 1.983 / 2.046** |
+| phaseB_s avg | 0.190 | 0.177 / 0.170 | 0.191 / 0.193 | 0.162 / 0.160 / 0.162 |
+| phaseA | 1.99 | 2.019 / 1.987 | 2.029 / 2.036 | 1.962 / 1.918 / 1.937 |
+| out_ships | 10 | 287 / 298 | 1112 / 1135 | 437 / 506 / 473 |
+| out_units | 1320 | 82718 / 75805 | 2423 / 2590 | **95992 / 104402 / 105899** |
+| units per ship | 132 | 288 / 254 | 2.18 / 2.28 | **219.7 / 206.3 / 223.9** |
+| ret_edges | 92 | 3195 / 2350 | 1623 / 1816 | 2596 / 2626 / 2892 |
+| declines | 1216 | 1105 / 1133 | 883 / 891 | 1412 / 1434 / 1412 |
+| phaseB_units total | 2.35M | 2.26-2.28M | 2.35M | 2.21-2.23M |
+
+## Scoring the three v2 predictions
+
+**1. "Wall time below the 5.32 s baseline for the first time" — CONFIRMED.**
+Pre-traversal **4.47-4.53 s**, ~15% under the unsliced baseline, and
+Iteration 0 **6.98-7.24 s** vs 8.01 s (~13% under). This is the first
+configuration of any generation to beat the baseline rather than merely
+return to it. Reproduced across all three reps, including the traced one.
+
+**2. "Per-PE phaseB max 3.29 s -> ~1 s" — PARTIALLY met.** It falls to
+**1.983-2.113 s**, a 36-40% reduction from the capped run and the best figure
+of any generation (v1-sliced managed 2.101 only once, at 3x the wall cost).
+But it is ~2 s, not ~1 s, and the imbalance ratio is still ~12x
+(2.0 s max vs 0.162 s avg) versus ~17x before. Improved, not solved.
+
+**3. "out_units up ~100x from capped, grants 448 units" — PARTIALLY met.**
+out_units rises **37-44x** (2423/2590 -> 95992/104402/105899), not ~100x, and
+the realised grant is **206-224 units per shipment**, roughly HALF the
+predicted 448. Shipped work is now **4.3-4.8% of total units** (capped:
+0.10%; v1-sliced: 3.5%).
+
+## Reading
+
+v2 is the first generation where the mechanism and the outcome agree. The
+capped run made stealing free but inert (0.1% of work moved, straggler
+untouched); v1-sliced moved 3.5% but cost 3x the wall time. v2 moves ~4.5% at
+a wall time BELOW the no-stealing baseline — so the parallel foreign drain
+and unit-count grants are paying for themselves rather than merely being
+affordable.
+
+Two honest caveats:
+
+- The phaseB timer still excludes inter-slice gaps
+  (fof/FoFPhase1.h:1680), so its 3.30 -> 2.15 drop is not by itself
+  evidence. What makes the v2 improvement believable is that
+  **Pre-traversal and Iteration 0 moved the same direction** — which they
+  did NOT in the v1-sliced run, where phaseB "improved" while wall time
+  tripled. Judge by the wall-clock rows.
+- `declines` rises to ~1420 (from 883-891 capped), the highest of any
+  generation, while grants are half the predicted size. If the intent was
+  448-unit grants, something is trimming them — worth checking whether the
+  cap, the remaining-work poll, or helper availability is the binding
+  constraint, since closing that gap is the obvious next lever on the
+  ~2 s straggler.
