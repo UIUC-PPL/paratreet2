@@ -530,6 +530,7 @@ public:
   // still-unowned units, decremented at each claim/collection CAS.
   // The coordinator polls it (s3Poll/s3Report) to pick real stragglers.
   std::atomic<long> s3_remaining_m2{0};
+  double s3_total_m2 = 0; // arm-time pool m2: the denominator for out_m2
   std::atomic<int> s3_poll_armed{0};
   // Helper-side foreign work (v2 parallel drain): ONE shipment in
   // flight per helper (coordinator busy flag), drained by ALL the
@@ -554,17 +555,26 @@ public:
   // cannot distinguish "a few giants over dust" from a smooth heavy
   // tail — and those imply different fixes. Accumulated per process,
   // printed once at the merge.
-  static constexpr int kUnitHistBuckets = 24;
+  static constexpr int kUnitHistBuckets = 28;
   std::atomic<long> pb_unit_hist[kUnitHistBuckets] = {};
+  // m2 composition of SHIPPED units, fed at the donor's collection (the
+  // helper's own print fires at its merge, often before it helps, so a
+  // helper-side histogram would silently undercount).
+  std::atomic<long> s3_ship_hist[kUnitHistBuckets] = {};
   void printUnitHist() {
+    printOneHist("pb_unit_hist", pb_unit_hist, "log2us");
+    printOneHist("s3_grant_m2_hist", s3_ship_hist, "log2m2");
+  }
+  void printOneHist(const char* name, std::atomic<long>* hist,
+                    const char* unit) {
     long total = 0;
-    for (int i = 0; i < kUnitHistBuckets; i++) total += pb_unit_hist[i].load();
+    for (int i = 0; i < kUnitHistBuckets; i++) total += hist[i].load();
     if (total == 0) return;
     char buf[512];
-    int off = snprintf(buf, sizeof(buf),
-                       "FOF3STAT pb_unit_hist: node %d log2us", CkMyNode());
+    int off = snprintf(buf, sizeof(buf), "FOF3STAT %s: node %d %s",
+                       name, CkMyNode(), unit);
     for (int i = 0; i < kUnitHistBuckets; i++) {
-      long c = pb_unit_hist[i].load();
+      long c = hist[i].load();
       if (c > 0 && off < (int)sizeof(buf) - 24)
         off += snprintf(buf + off, sizeof(buf) - off, " %d:%ld", i, c);
     }
@@ -731,6 +741,12 @@ public:
       if (!s3_unit_taken[k].compare_exchange_strong(expect, 2)) continue;
       s3_units_owned.fetch_add(1);
       s3_remaining_m2.fetch_sub((long)phaseb_pool[k].m2);
+      {
+        long v = (long)phaseb_pool[k].m2;
+        int b = 0;
+        while (v > 1 && b < kUnitHistBuckets - 1) { v >>= 1; b++; }
+        s3_ship_hist[b].fetch_add(1, std::memory_order_relaxed);
+      }
       ship.unit_pairs.emplace_back(place(phaseb_pool[k].a),
                                    place(phaseb_pool[k].b));
       m2 += phaseb_pool[k].m2;
@@ -831,11 +847,11 @@ public:
     if (s3On())
       CkPrintf("FOF3STAT s3: node %d out_ships %ld out_units %ld out_m2 "
                "%.3g in_ships %ld in_units %ld ret_edges %ld declines %ld "
-               "rem_m2 %ld\n",
+               "rem_m2 %ld tot_m2 %.4g\n",
                CkMyNode(), s3_out_ships.load(), s3_out_units.load(),
                s3_out_m2, s3_in_ships.load(), s3_in_units.load(),
                s3_ret_edges.load(), s3_declines.load(),
-               s3_remaining_m2.load());
+               s3_remaining_m2.load(), s3_total_m2);
     printUnitHist();
     int first = CkNodeFirst(CkMyNode());
     for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
@@ -1150,8 +1166,12 @@ public:
     s3_out_m2 = 0;
     s3_members.clear();
     s3_remaining_m2 = 0;
+    s3_total_m2 = 0;
     s3_poll_armed = 0;
-    for (int i = 0; i < kUnitHistBuckets; i++) pb_unit_hist[i] = 0;
+    for (int i = 0; i < kUnitHistBuckets; i++) {
+      pb_unit_hist[i] = 0;
+      s3_ship_hist[i] = 0;
+    }
     {
       auto* sh = s3_active_ship.exchange(nullptr);
       if (sh) s3_ship_graveyard.push_back(sh);
@@ -2459,6 +2479,7 @@ public:
           double tot = 0;
           for (double c : nb->pb_part_cost) tot += c;
           nb->s3_remaining_m2.store((long)tot);
+          nb->s3_total_m2 = tot;
           CkPrintf("FOF3STAT s3_arm: node %d parts %zu units %zu m2 %.3g\n",
                    CkMyNode(), nb->pb_part_cost.size(), n, tot);
           node_proxy[nb->s3Coord()].s3Publish(CkMyNode(), tot,
