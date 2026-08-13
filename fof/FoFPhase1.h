@@ -472,7 +472,9 @@ public:
   static long s3GrantUnits() {
     static const long per_pe = [] {
       const char* e = std::getenv("FOF_S3_GRANT_UNITS_PER_PE");
-      return e ? std::atol(e) : 32L;
+      // 128: the best 2B cell of the GRANT ladder (Frontier jobs
+      // 5250425 + 5253475; 32 left the straggler at ~2x the best max).
+      return e ? std::atol(e) : 128L;
     }();
     return per_pe * CkNodeSize(CkMyNode());
   }
@@ -481,13 +483,17 @@ public:
   // m2 budget stops a grant that scoops giants, the count cap stops a
   // grant that is all dust. First unit always ships (budget checked
   // before collecting), so the v1 giant-collapse cannot recur.
-  // Section 27 reservation knobs. Reservation itself defaults ON when
-  // S3 is armed (S3 is already opt-in); FACTOR=0 forces every member to
-  // reserve — the correctness-gate configuration.
+  // Section 27 reservation knobs. Reservation defaults OFF pending
+  // redesign (section 30): at 2B with properly sized grants it moved
+  // LESS work in LARGER grants — draining the cursor window BEFORE the
+  // ordered range swaps giant units for average ones (Frontier job
+  // 5253475: phaseB +84%, work moved 38%->22%). FOF_S3_RESERVE=1
+  // re-enables; FACTOR=0 then forces every member to reserve — the
+  // correctness-gate configuration.
   static bool s3ReserveOn() {
     static const bool on = [] {
       const char* e = std::getenv("FOF_S3_RESERVE");
-      return !e || std::atoi(e) != 0;
+      return e && std::atoi(e) != 0;
     }();
     return on;
   }
@@ -508,7 +514,12 @@ public:
   static double s3GrantM2() {
     static const double v = [] {
       const char* e = std::getenv("FOF_S3_GRANT_M2");
-      return e ? std::atof(e) : 5e7;
+      // 1e10: high enough that the unit-count cap binds first on any
+      // sane composition (5e7 strangled every 2B grant to ~5-18 units
+      // and was the ENTIRE v2->0f30988 regression, Frontier job
+      // 5253386); low enough to still clip a pathological all-giants
+      // scoop, the v1 failure this budget exists for.
+      return e ? std::atof(e) : 1e10;
     }();
     return v;
   }
