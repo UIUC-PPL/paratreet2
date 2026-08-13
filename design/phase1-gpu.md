@@ -1,11 +1,14 @@
 # Phase 1 on GPU: a Kokkos device port of the intra-process FoF
 
-**STATUS: stages 0-3 IMPLEMENTED AND GATED (sections 11-16). The device
-pass reproduces the CPU chain's labels particle-for-particle at 80M and
-runs ~10x faster than phaseA+phaseB+merge on 14 cores (section 16). It
-still runs BESIDE the CPU chain rather than replacing it — that is the
-section-4 contract work, and with staging now double the walk it is the
-next task alongside section 12.1. Sections 1-10 are the original plan and
+**STATUS: stages 0-3 IMPLEMENTED AND GATED (sections 11-17). The device
+pass reproduces the CPU chain's labels particle-for-particle at 2B
+particles on 16 nodes under -u dist, and runs 18x faster than
+phaseA+phaseB+merge there (section 17); ~10x at 80M on one node.
+**The APPLICATION is currently 56% slower per iteration**, because the
+device pass still runs BESIDE the CPU chain rather than replacing it and
+because it costs phase 3 ~3 s that is not yet explained (section 17.3).
+Removing both is the next task: the section-4 contract work, the phase-3
+regression, and section 12.1's staging. Sections 1-10 are the original plan and
 are left as written; where measurement has since contradicted them
 (section 5's K3 on the cell grid, section 14.4 on where the walk's time
 goes, and section 14.3's walk shape) the later sections say so
@@ -1388,3 +1391,171 @@ comparison used above.
     should carry the condition it was measured under, and the ones that
     gate a hot path are worth re-running after any change that moves the
     work by an order of magnitude.
+
+---
+
+## 17. 2B particles on 16 nodes, with traces (2026-08-13)
+
+Job 5258284, 16 Frontier nodes, 128 processes x 14 PEs,
+`cosmo25cmb.768g2_dm.001024` (2B particles, 77 GB), `-u dist`,
+Projections traces for every arm. Script:
+`fof/gpu/run_gpu_scale_16.sbatch`. Three arms, 1:42 of wall for all
+three.
+
+This is the first run of the device path at production scale, the first
+against `-u dist`, and the first at more than 8 processes. **It is also
+where the device path stops being merely faster and starts being a
+different cost curve**: the speedup goes from ~10x at 80M on one node to
+18x here, because the thing it deletes grows with process count.
+
+### 17.1 The gate, at 2B
+
+| arm | tree | mismatches | components |
+|---|---|---|---|
+| gpu_l12 | leaf 12 (solo) | **0** | 424,897,832 |
+| gpu_l128 | leaf 128 (team) | **0** | 424,897,832 |
+| cpu_l12 | leaf 12 | — | 424,897,832 |
+
+Exact per-particle agreement across 2 billion particles and 128
+processes, and an identical component count from all three arms. That
+last column is a stronger statement than it looks: the two GPU arms used
+DIFFERENT trees (leaf 12 vs 128), which means different leaf sets,
+different traversal orders, different certificate and suppression
+sequences, and — via the section-16 auto-selection — different KERNEL
+SHAPES (solo at 3.9 particles/leaf, team at ~29). All of it lands on the
+same 424,897,832 components with the same maximum component of
+185,317,566. That is the order-independence argument of section 5 (K1)
+holding at scale, not just in principle.
+
+The CPU numbers in `gpu_l12` (phaseA 2.378, phaseB 2.988) and in
+`cpu_l12` (2.375, 2.983) agree to 3 ms, which confirms the device arm
+does not perturb the chain it is checked against.
+
+### 17.2 Result: the win grows with process count
+
+| | gpu_l12 | gpu_l128 |
+|---|---|---|
+| CPU phaseA | 2.378 s | 6.135 s |
+| CPU phaseB | 2.988 s | 1.859 s |
+| CPU merge | 0.013 s | 0.013 s |
+| **CPU total replaced** | **5.379 s** | 8.007 s |
+| **device pass (max proc)** | **445 ms** | **292 ms** |
+| staging (pack/tree pack/upload/scatter) | 329 ms | 236 ms |
+
+- **Same tree (leaf 12): 5.379 s -> 445 ms, 12.1x.**
+- **Best config to best config: 5.371 s (CPU, leaf 12) -> 292 ms
+  (device, leaf 128), 18.4x on the kernel; 10.2x including staging.**
+
+**Why it improves with scale, and this is the important part.** At 80M on
+one node (8 processes) phaseB was 0.078 s against phaseA's 1.19 s —
+6% of the cost, easy to dismiss. At 2B on 16 nodes (128 processes) phaseB
+is **2.988 s against phaseA's 2.378 s**: it is now the LARGER half.
+Per-process particle count only grew 1.56x (10.0M -> 15.6M) while phaseB
+grew 39x, because phaseB is cross-PE boundary work and scales with the
+number of PE pairs, not with particles.
+
+The device path does not make phaseB faster. It **does not have a
+phaseB** — section 5's decision to make the process, not the PE, the
+unit of union-find deletes the phase outright. So the CPU baseline
+carries a term that grows with concurrency and the device baseline
+carries none, and the ratio widens as the machine does. That was the
+structural bet in section 1 and this is the first measurement that
+actually tests it.
+
+Section 16's leaf-size finding also replicates at scale: the device
+prefers the coarse tree (445 -> 292 ms) while the CPU is punished by it
+(phaseA 2.378 -> 6.135 s). Interestingly phaseB moves the other way
+(2.988 -> 1.859 s), so coarse leaves are not uniformly bad for the CPU —
+they trade phaseA against phaseB — but the net for the CPU is still
+clearly worse (5.379 -> 8.007 s).
+
+### 17.3 The application is SLOWER, and by more than the shadow explains
+
+Everything above measures a component that currently runs IN ADDITION TO
+the thing it replaces. `FOF_GPU_STAGE0=1` is a shadow mode by
+construction — the device pass runs after phaseA+phaseB+merge+relabel
+because the gate compares against the `group_number` they produce — so
+end to end the device arm cannot be faster today, and is not:
+
+| | cpu_l12 | gpu_l12 | delta |
+|---|---|---|---|
+| tree build | 1016 ms | 1145 ms | +129 ms |
+| phase 1 | 5.416 s | 6.985 s | **+1.569 s** |
+| phase 3 traversal | 2244 ms | 4820 ms | **+2.576 s** |
+| component histogram | 1.024 s | 1.445 s | +0.421 s |
+| **average iteration** | **9.361 s** | **14.594 s** | **+5.233 s** |
+| process RSS (avg/PE) | 8395 MB | 9805 MB | +1.41 GB |
+
+**The kernel is 12-18x faster and the application is 56% slower per
+iteration.** Both statements are true and only the second one is the
+status of the work.
+
+Two of the three deltas are understood and expected. The +1.569 s in
+phase 1 is the shadow pass itself (`stage0 wall` 1.560 s) and is exactly
+what the section-4 contract work deletes. The +129 ms tree build is the
+flat-tree emit, consistent with the +83 ms measured at 80M (section 13.2).
+
+**The +3.0 s in phase 3 and the histogram is neither, and it was missed
+on the first read of these numbers.** Phase 3 does IDENTICAL work in both
+arms — 491,173 edges emitted, 3.36M leaf visits, the same components —
+and runs 2.15x slower in the arm that merely had a device attached during
+phase 1. Two candidates, neither measured yet:
+
+- **Memory.** +1.41 GB per process against a phase 3 dominated by the
+  node cache (238 GB across 128 processes). The device holds pinned
+  staging (~440 MB) and the pinned node array (~300 MB), and
+  `TreePiece::device_nodes` keeps a SECOND host copy of every flat tree
+  alive for the whole run — nothing frees it after `uploadTree`.
+- **HAPI polling.** `hapiCreateStreams()` installs `hapiPollEvents` as a
+  `CcdSCHEDLOOP` callback, which then fires on every scheduler-loop
+  iteration for the rest of the run. Phase 3 is fine-grained
+  message-driven work, so a per-iteration hook sits on its hot path.
+
+The first is cheap to test (free `device_nodes` after upload, release the
+pinned buffers after the device pass); the second by tearing the streams
+down once phase 1 completes. Until one of them is measured, the device
+path costs the application more than phase 1 saves it, and no
+end-to-end claim should be made from these runs.
+
+### 17.4 Traces
+
+1794 files per arm (1792 PE logs + `.sts` + `.projrc`), gzip-verified,
+~5.8 GB total, under
+`/lustre/orion/csc710/scratch/rrao/fof3_traces/5258284/{gpu_l12,gpu_l128,cpu_l12}`.
+`cpu_l12` is the device-free timeline to diff phase 1 against.
+
+Traces went to Lustre rather than the example directory: 1792 PEs is not
+a thing to point at a home filesystem sitting at 85% full. `+logsize` is
+20M entries rather than the CPU script's 100M — `LogPool` `reserve()`s
+the pool up front, and at 112 PEs per node 100M entries reserves ~900 GB
+of address space per node against 512 GB of RAM, which survives only
+because reserve() commits nothing until written. Measured usage is ~1.5
+MB compressed per PE. logsize changes buffering, never trace content.
+
+### 17.5 Three traps, two of which would have cost the allocation
+
+16. **`--enable-tracing` on charm is necessary and not sufficient.**
+    Projections also needs `-tracemode projections` at the APPLICATION
+    link (`make PROJECTIONS=1` here). Without it `+traceroot` is accepted
+    in silence, the run completes normally, and the traceroot is empty.
+    Caught by a 2-node smoke run; at 16 nodes it would have been three
+    arms of nothing.
+
+17. **`CmiNumPhysicalNodes()` gates the GPU path.**
+    `deviceInitOnHome` computes `CmiNumNodes()/CmiNumPhysicalNodes()` and
+    ABORTS if that exceeds the visible device count. Every prior run was
+    single-node, where the ratio is trivially right; if reconverse had
+    reported 1 physical node the 16-node job would have computed 128
+    processes per node and aborted after reading 77 GB. Verified on 2
+    physical nodes first (devices 0-7 on each, 16 processes, no sharing).
+    Anything that depends on physical-node topology deserves a
+    multi-node smoke test before a large allocation.
+
+18. **Sizing a request by the ceiling instead of the work.** The first
+    submission asked for the debug QOS maximum of 2 hours and sat behind
+    priority; the work took **1:42**. The requeue at 45 minutes started
+    almost immediately and was still 26x oversized. The walltime guard
+    added with it (skip an arm rather than be killed mid-write and
+    truncate 1792 trace files) never fired — worth keeping anyway, since
+    it costs nothing and the failure it prevents destroys a whole arm's
+    traces plus every arm after it.
