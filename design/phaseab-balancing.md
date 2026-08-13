@@ -956,3 +956,32 @@ Expected effect: grants carry giants (s3_grant_m2_hist shifts high),
 straggler max falls toward the 0.25 s granularity floor. Decision
 knobs for review: reserve trigger factor, reserve budget (fraction of
 remaining), and whether UNRESERVE is needed in v1 of this.
+
+## 28. Measured: Anvil 2B S3 pair harvested late (job 19842202, run 2026-08-12 evening, harvested 2026-08-13)
+
+The resubmission of the cancelled 19839458. Six arms, 1920 PEs, all
+timing arms exact (424897832):
+
+| arm | phaseA | phaseB | phaseB_s max | ships / units | declines |
+|---|---|---|---|---|---|
+| base1 | 35.81 | 1.572 | 1.549 | 0 | 0 |
+| baseslice | 39.02 | 1.570 | 1.547 | 0 | 0 |
+| s3slice | 36.49 | 1.343 | 1.288 | 421 / 85,505 | 1,504 |
+| s3noslice | 27.32 | 1.571 | 1.549 | 57 / 9,034 | 1,658 |
+| s3forced | 113.1 | 9.149 | 6.328 | 2,029 / 1.22M | 1,015 |
+
+Readings:
+- SLICING IS WHAT LETS S3 ENGAGE, independently confirmed on a second
+  machine: s3noslice ships 57 grants and changes nothing; s3slice
+  ships 421 and cuts phaseB 15% / per-PE max 17%. Consistent with the
+  Frontier v2 story at a much milder straggler (Anvil max 1.55 s vs
+  Frontier 3.29 s at the same dataset — different node count/CPU).
+- The S3-SUMDETAIL ARM CRASHED (rc=1, no components, 0 trace files),
+  so the section-22 discriminator (per-PE phaseB wall distribution
+  under S3) is STILL unanswered on Anvil. Rerun it when Anvil work
+  resumes; the balance: line's min/avg/max is the interim proxy.
+- phaseA noise on Anvil is large (27.3-39.0 s across arms with
+  identical phaseA config) — phaseA deltas in this job are not
+  interpretable; phaseB rows are the signal.
+- Forced arm exact at 1.22M units shipped — S3 correctness at 2B now
+  demonstrated on five transport configurations.
