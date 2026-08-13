@@ -8,7 +8,12 @@ CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 all: FoF3
 # FragData/FoFPhase3 live in the fof module; track them explicitly since
 # Makefile.common only adds -I flags, not header dependencies.
-DATA = $(FOF_PATH)/FoFData.h $(FOF_PATH)/FoFPhase3.h $(FOF_PATH)/FoFPhase1.h
+# FoFPhase1.h was MISSING here until 2026-08-12: Main.h includes it, so a
+# change to phase 1 did not rebuild Main.o and the link silently kept a
+# stale instantiation of the templated chare (this cost a job when the
+# GPU tree-upload stage appeared to do nothing at all). Any fof header
+# reachable from Main.h belongs in this list.
+DATA = $(FOF_PATH)/FoFData.h $(FOF_PATH)/FoFPhase1.h $(FOF_PATH)/FoFPhase3.h
 VISITORS = FragCheckVisitor.h
 
 Main.decl.h: Main.ci $(DATA)

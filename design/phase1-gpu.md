@@ -147,12 +147,15 @@ Three facts make the device tree essentially free:
 
 1. **The tree is built anyway.** upwardPass, the cache and phase 3 all
    need it; phase 1 is not what pays for it.
-2. **Flattening rides an existing walk.** `TreePiece::recursiveBuild`
-   (src/TreePiece.h:461) already descends pre-order and already fills
-   `flat_subtree`. Emitting a POD `DNode` per node there is one struct
-   store per node inside a walk that already happens — this is
-   walk-unification stage 0, done at tree-build time instead of inside
-   phase 1, so it never appears in the phase-1 wall at all.
+2. **Flattening happens at tree build, not in phase 1.** It is done as a
+   separate breadth-first pass after `populateTree()`, which is what
+   makes children contiguous; `recursiveBuild`'s depth-first order does
+   not. **MEASURED CORRECTION (section 13): this is not free** — it cost
+   +83 ms on a 561 ms tree build at 80M. It stays out of the phase-1
+   wall, which is what matters for the comparison, but the "one store
+   inside a walk that already happens" claim in the first draft of this
+   plan was wrong, and emitting from inside `recursiveBuild` is the way
+   to make it true.
 3. **Node particle ranges are contiguous by construction.** A node's
    particles are `node_particles + start`, a slice of the TreePiece's
    key-sorted vector. So a `DNode` is just
@@ -790,3 +793,134 @@ design/frontier-labeling-ab.md.
 Next: stage 1 (flat `DNode` emitted from `TreePiece::recursiveBuild`,
 uploaded once per tree build), which is additive on the CPU side and
 gated on "CPU results unchanged".
+
+---
+
+## 13. Stage 1: the flat device tree (2026-08-12)
+
+Jobs 5255153 and 5255194, one Frontier node, 8 processes. Code:
+`src/DeviceTree.h` (the `DNode` type, `flattenTree`, `verifyFlatTree`),
+`TreePiece::buildTree` (the emit), `fof/FoFPhase1.h`
+(`devicePlanTree`/`deviceFinishTree` + the per-PE copy), and the
+`resizeTree`/`hostNodes`/`uploadTree` half of `fof/gpu/FoFDevice`.
+Gate script: `fof/gpu/run_stage1.sbatch`.
+
+### 13.1 Gates
+
+| arm | components |
+|---|---|
+| 100k, tree off | 33,933 (`TEST PASSED`, full O(n^2)) |
+| 100k, tree + host verify | 33,933 (`TEST PASSED`) |
+| 100k, tree + verify + upload | 33,933 (`TEST PASSED`) |
+| 80M, tree off | 23,707,197 |
+| 80M, tree on | 23,707,197 |
+| 80M, tree + host verify | 23,707,197 |
+| 80M, tree + upload | 23,707,197 |
+
+The emit is additive and nothing on the CPU path reads it, so identical
+components across all seven arms is the "CPU results unchanged" gate.
+Three independent structural checks back it:
+
+- **Host, at build**: `verifyFlatTree` walks the flat array and the live
+  tree together and compares boxes, child counts, leaf `part_begin` and
+  the root's particle total (`PARATREET_DEVICE_TREE_VERIFY=1`, ~22 ms at
+  80M — cheap enough to leave on in regressions).
+- **Device, after upload**: a `parallel_reduce` over every node checking
+  that it holds particles, that its children live inside the array and
+  *after* it, that child `n_below` sums to the parent's, and that the box
+  is non-inverted. 0 bad nodes.
+- **Device, coverage**: particles reachable from the piece roots, summed
+  on the device, must equal the staged particle count. 10,023,529 /
+  10,023,529 exactly — this is what catches a bad index rebase, which is
+  otherwise invisible until a traversal reads the wrong particles.
+
+### 13.2 Cost, and a correction to section 3.2
+
+At 80M, per process: 10.0M particles, **3,216,269 nodes over 539
+TreePieces, 122.7 MB**. (Section 5 estimated ~3M nodes / ~130 MB at
+15.6M particles; the node count per particle is higher than assumed.)
+
+| step | cost |
+|---|---|
+| tree build, flat tree OFF | 561.5 ms |
+| tree build, flat tree ON | 644.7 ms (**+83 ms, +15%**) |
+| tree build, ON + host verify | 666.2 ms (+22 ms more) |
+| concat + rebase, max PE (parallel) | 23.9 ms |
+| device copy of 122.7 MB | 8.1 ms |
+| device structural check | 4.0 ms |
+
+**The flat tree is not free.** The first draft of this plan claimed the
+emit "rides an existing walk" and so costs nothing; it measured +83 ms on
+a 561 ms tree build. The reason is structural: children must be
+CONTIGUOUS for the device traversal to address them by an add, and
+`recursiveBuild`'s depth-first order does not produce that, so the emit
+is a separate breadth-first pass that re-walks the live tree —
+26 ns/node, which is what pointer-chasing heap-scattered nodes through a
+virtual `getChild` costs. Making it genuinely free means emitting from
+inside `recursiveBuild` with reserve-then-recurse (each node reserving a
+contiguous block for its children before descending). Worth doing, but
+it touches core tree build and belongs in its own change with its own
+gate, not smuggled into stage 2.
+
+What survives of the original claim is the part that matters for the
+comparison: this cost is at TREE BUILD, not in the phase-1 wall, and it
+is paid once per build no matter how many phase-1 calls follow.
+
+### 13.3 The serial concatenation, found and fixed
+
+First measurement had concat + upload at **248 ms, of which 236 ms was
+the host-side concatenation** — one PE memcpy'ing 123 MB and rebasing
+3.2M `child_begin` links while thirteen other PEs idled. Fixed by
+splitting it the same way the particle pack is split: the home PE
+computes only the LAYOUT (per-piece node offsets, piece roots, piece
+particle bases) into pinned buffers, and each PE then copies and rebases
+its OWN pieces in the same round as its particle pack. **236 ms -> 23.9
+ms.** The layout plan needs no extra bookkeeping because
+`FoFPhase1Node::pe_treepieces` holds the pieces in the same registration
+order each PE's own `treepieces` vector does.
+
+Worth stating as a pattern, since stage 2 will face it repeatedly: any
+per-process device preparation step that touches O(particles) or
+O(nodes) data must be structured as per-PE slices with a home-PE
+planner. One PE doing it is 14x too slow and the code looks perfectly
+reasonable until measured.
+
+### 13.4 Design notes worth keeping
+
+- **`part_begin` stays PIECE-local** in the flat tree and is paired with a
+  per-piece particle base in a separate array. The alternative — baking
+  the process-flat offset into the nodes — would tie the tree to one
+  particular particle layout and force a rewrite of all 3.2M nodes
+  whenever the staging order changed. As it is, the tree is a pure
+  function of the TreePiece and can be built once and reused.
+- **Empty nodes are dropped entirely.** Every `DNode` has `n_below > 0`,
+  so device traversal never tests for them. The pruning test must be
+  `n_particles == 0`, never `<= 0`: internal nodes carry -1 by design
+  (Node.h), and `<= 0` would drop every internal node and silently
+  produce a depth-1 tree. This is the same rule `firstFlat` learned the
+  hard way in FoFPhase1.h.
+- **The `PerTreePieceAble` extension is additive**: a second
+  `operator()` overload carrying `(const DNode*, int)` whose default
+  implementation forwards to the existing 3-argument form, so every
+  existing visitor compiles and behaves identically.
+
+### 13.5 Two more traps
+
+11. **The application Makefile did not list `FoFPhase1.h`.**
+    `examples/fof3/Makefile` tracked `FoFData.h` and `FoFPhase3.h` as
+    header dependencies of `Main.o`, but `Main.h` includes `FoFPhase1.h`
+    too — so phase-1 changes did not rebuild `Main.o`, and the link kept
+    a stale instantiation of the templated chare. Symptom: the new tree
+    upload stage ran and printed nothing at all. Cost a job. Same family
+    as trap 9; both are "the build system does not know what the code
+    depends on", which in a header-only templated codebase is the
+    default failure mode rather than an unusual one.
+12. **Default member initializers make a struct a non-aggregate under
+    C++11**, which is what charmc compiles at by default here. Adding
+    `= nullptr` to `TreePieceRef`'s new fields broke the existing
+    `TreePieceRef{root, parts, n}` brace initialization. Field
+    assignment instead.
+
+Next: stage 2 — the device union-find and the leaf-batched traversal
+(K1/K2), which is where the flat tree stops being staged data and starts
+being read by a kernel.

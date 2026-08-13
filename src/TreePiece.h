@@ -7,6 +7,7 @@
 #include "ParticleMsg.h"
 #include "NodeWrapper.h"
 #include "Node.h"
+#include "DeviceTree.h"
 #include "Utility.h"
 #include "Reader.h"
 #include "CacheManager.h"
@@ -39,6 +40,10 @@ public:
   Key tp_key; // Should be a prefix of all particle keys underneath this node
   Node<Data>* local_root; // Root node of this TreePiece, TreeCanopies sit above this node
   MultiData<Data> flat_subtree;
+  // Flat, pointer-free copy of this TreePiece's local tree, built at tree
+  // build under PARATREET_DEVICE_TREE=1 (src/DeviceTree.h). Empty
+  // otherwise, and nothing in the CPU paths reads it.
+  std::vector<paratreet::DNode> device_nodes;
   std::vector<int> copy_requesters; // CacheManager indices that took a flat_TreePiece copy
 
   CProxy_TreeCanopy<Data> tc_proxy;
@@ -454,6 +459,21 @@ void TreePiece<Data>::buildTree(CProxy_Partition<Data> part, CkCallback cb) {
 
   // Populate the tree structure (including TreeCanopy)
   populateTree();
+
+  // Flat device tree (design/phase1-gpu.md section 3.2). AFTER
+  // populateTree, which is what accumulates the internal nodes' boxes;
+  // before that they are the empty default and the flat copy would carry
+  // garbage geometry.
+  if (paratreet::deviceTreeEnabled()) {
+    paratreet::flattenTree(local_root, particles.data(), device_nodes);
+    if (paratreet::deviceTreeVerify()) {
+      std::string err;
+      if (!paratreet::verifyFlatTree(local_root, particles.data(),
+                                     device_nodes, &err))
+        CkAbort("TreePiece %d: flat device tree does not match the live "
+                "tree: %s", this->thisIndex, err.c_str());
+    }
+  }
   thread_state_holder.ckLocalBranch()->countTreePieceParticles(particles.size());
   initCache();
 
@@ -636,7 +656,9 @@ void TreePiece<Data>::rebucket(BoundingBox universe, bool if_flush) {
 template <typename Data>
 void TreePiece<Data>::callPerTreePieceFn(paratreet::PerTreePieceAble<Data>& fn, const CkCallback& cb) {
   if (local_root != nullptr && !particles.empty()) {
-    fn(local_root, particles.data(), (int)particles.size());
+    fn(local_root, particles.data(), (int)particles.size(),
+       device_nodes.empty() ? nullptr : device_nodes.data(),
+       (int)device_nodes.size());
   }
   this->contribute(cb);
 }
