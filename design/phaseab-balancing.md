@@ -1049,3 +1049,54 @@ traced-bin/FoF3.2b.resv-sumd).
    known at the trigger site) — plus, eventually, the same floor as
    an UNRESERVE condition. Frontier's reservation pair should wait
    for this decision if it has not already run.
+
+## 30. The Frontier grant-m2 verdict (2026-08-13 morning): the 5e7 budget was the whole regression; reservation INVERTS composition once grants are sized; defaults changed
+
+Full report verbatim in
+design/frontier-grantm2-reserve-verdict-2026-08-13.md (jobs 5253386 +
+5253475, 21 2B runs, all exact). The distillation:
+
+1. FOF_S3_GRANT_M2=5e7 (default shipped with 0963ded) strangled every
+   grant to ~18 mean-cost units — ~25x tighter than the count cap,
+   which was dead code at 2B. Arithmetic, and confirmed by ladder:
+   noreserve at GRANT_M2=1e11 reproduces v2 (5250364) on all five
+   metrics. Nothing else between b210b6f and 0f30988 costs anything;
+   aba7833 is exonerated (base arm matches pre-v2 base).
+   THIS — not "orders chasing drained pools" — is also the real cause
+   of section 29's dust grants on Anvil (3.7-6.5 units/ship at the
+   same 5e7 default; Anvil mean m2/unit ~2.3e6). Section 29 item 5's
+   fragmentation attribution is corrected accordingly; its
+   trigger-over-fire observation (72/128 windows, window m2 down to
+   0.2) stands on its own evidence.
+2. RESERVATION LOSES ONCE GRANTS ARE PROPERLY SIZED, and loses worse
+   the better the grants: at the best cell (GRANT=128, PARTS=16,
+   M2=1e11) reserve vs noreserve = phaseB +84%, Pre-traversal +85%,
+   work moved 38.0%->22.2%, ret_edges 6.7x. Mechanism: grants drain
+   the cursor window BEFORE the ordered range, so they fill with
+   average-cost units (1.89e7 -> 6.75e6 m2/unit) — the composition
+   fix inverted into a composition pessimizer. Section 27's premise
+   needs revisiting: if retried, reservation should DISPLACE the
+   costliest-partition path, not preempt it.
+3. BEST CONFIG FOUND at 2B/16 Frontier: GRANT_UNITS_PER_PE=128,
+   PB_PARTS=16, GRANT_M2 lifted, RESERVE off -> phaseB_s max 1.572 s
+   (6.3x the 0.25 s floor, vs 12.6x as-specified), Iteration 0
+   7.138 s — campaign best.
+4. DEFAULTS CHANGED (1996ebd on phaseab-campaign, same morning):
+   FOF_S3_GRANT_M2 5e7 -> 1e10 (count cap binds first on sane
+   compositions; still clips an all-giants scoop, the v1 failure the
+   budget exists for), FOF_S3_GRANT_UNITS_PER_PE 32 -> 128,
+   FOF_S3_RESERVE default OFF pending redesign (=1 re-enables;
+   FACTOR=0 remains the correctness-gate config). PB_PARTS stays a
+   run knob; best-known value at 2B is 16.
+   Laptop classic gates all exact at 3549: base, s3 natural, forced
+   2x4 (9 ships/1520 units) and 4x2 (16 ships), and forced with
+   RESERVE=1 FACTOR=0 (2 windows) — the reservation path stays gated
+   though non-default.
+5. Standing gap after all of this: phaseB_s max 1.572 s vs the 0.25 s
+   granularity floor — 6.3x headroom that neither grant sizing nor
+   reservation-as-built recovers. Open levers from section 26's
+   ranking: multiple outstanding grants per helper; partition pick
+   beyond the cursor (order what the local drain reaches LAST);
+   plus the displacement redesign of reservation (item 2) and the
+   never-analyzed sum-detail per-PE profile (Anvil traces at
+   2b-resv-sumd-19860455, section 29).
