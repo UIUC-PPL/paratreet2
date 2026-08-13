@@ -181,6 +181,13 @@ public:
       CkStartQD(CkCallbackResumeThread());
       CkPrintf("Flushing particles to TreePieces: %.3lf ms\n",
           (CkWallTimer() - start_time) * 1000);
+      // Peak RSS of THIS process (PE 0's) since start. The flush is the largest
+      // memory event in decomposition, so this is the number the flush window is
+      // meant to hold down; compare across PARATREET_FLUSH_WINDOW settings.
+      // One process only -- it does not capture the skew that decides which
+      // rank actually OOMs, so read it as an A/B signal, not an absolute bound.
+      CkPrintf("PARATREET vmhwm_mb after decomposition: %ld (flush window %ld)\n",
+          paratreet::procHighWaterMB(), Reader::flushWindow());
       CkPrintf("**Total Decomposition time: %.3lf ms\n",
           (CkWallTimer() - decomp_time) * 1000);
       return;

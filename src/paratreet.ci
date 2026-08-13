@@ -189,8 +189,21 @@ module paratreet {
     entry void receive(ParticleMsg*);
     entry void localSort(const CkCallback&);
     entry void checkSort(const Key, const CkCallback&);
+    // flush windows its sends: it posts messages only while the number of
+    // unacknowledged particles is under the window, and TreePiece::receive
+    // drives the rest through flushAck. In-flight memory is therefore bounded
+    // regardless of how slowly the network is draining.
+    //
+    // Deliberately NOT [threaded]: the Charm translator cannot generate a
+    // templated threaded entry method (it casts the template-id in
+    // CthCreate((CthVoidFn)_callthr_flush_marshallN, ...), which does not
+    // resolve), so the continuation is ack-driven instead of suspend-driven.
     template <typename Data>
     entry void flush(int, CProxy_TreePiece<Data>);
+    // Carries the TreePiece proxy back so the non-templated Reader state can
+    // resume posting without storing a templated proxy as a member.
+    template <typename Data>
+    entry void flushAck(int, CProxy_TreePiece<Data>);
     template <typename Data>
     entry void assignPartitions(int, CProxy_Partition<Data>);
   };

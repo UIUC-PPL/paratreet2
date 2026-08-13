@@ -202,6 +202,12 @@ void TreePiece<Data>::receive(ParticleMsg* msg) {
   incoming_particles.resize(initial_size + msg->n_particles);
   std::memcpy(&incoming_particles[initial_size], msg->particles,
               msg->n_particles * sizeof(Particle));
+  // Release the sender's flush window. Sent only when the producer asked for it
+  // (Reader::flush with windowing on); -1 means no ack expected, which is every
+  // other ParticleMsg producer. Acked after the copy, so the window reflects
+  // particles actually landed rather than merely delivered.
+  if (msg->sender >= 0)
+    readers[msg->sender].flushAck(msg->n_particles, this->thisProxy);
   delete msg;
 }
 
