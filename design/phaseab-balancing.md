@@ -1135,3 +1135,59 @@ extends the excerpt:
   relative to measured pool m2 (e.g. a multiple of mean unit m2 x the
   count cap) rather than any bare constant — 1e10 is right for THIS
   pool; a constant will silently re-break at the next problem size.
+
+## 31. Sum-detail anatomy of the v2 net win (trace of 5250364, analyzed 2026-08-13 laptop; Kale's Projections read + raw-file parse agree)
+
+Trace: traces/frontier/sumd2b_slice_v3 (3585 files, 1792 PEs, 1 ms
+intervals); parser kept at traces/frontier/sumd_fanout.py. Images:
+images/timeprofile-sliced-v3-phase1.png, overview_slicedv3.png.
+
+1. THE PARALLEL FOREIGN DRAIN WORKS AS DESIGNED. drainForeign runs on
+   13.4 of 14 PEs per helper process on average (top PE only 12% of a
+   process's drain time); confirmed visually. The confined-to-one-PE
+   marks are s3Shipment — the receipt/rebuild entry — which is
+   one-PE-per-shipment by construction. v2's machinery is not the
+   problem.
+2. THE RESIDUAL STRAGGLER IS ONE PROCESS (with a second tier). proc 55
+   (PEs 770-783, Kale's long blue bars): 23.9 s of local phaseB exec
+   = 14.9x the median process (1.60 s), all 14 PEs ~1.5-2.0 s, ending
+   together at 12.74 s. Second tier: proc 87 (15.4 s), then 80, 54,
+   107, 83 (7-10 s). Two hot blocks (48-55, 80-87), and the top
+   drainForeign processes are exactly their block-mates (48-53, 81,
+   85) — the block steal scope engaged correctly around the
+   stragglers.
+3. THE PROTOCOL PAYS ~1 SECOND OF OVERHEAD PER SECOND OF WORK MOVED.
+   Totals over the window: drainForeign (stolen exec) 55.9 s;
+   s3Shipment (helper-side rebuild) 27.8 s; s3ShipOrder (donor-side
+   collection) 29.9 s; s3Return 0.2 s. At ~460 grants that is ~65 ms
+   of donor collection + ~60 ms of helper rebuild per grant, i.e.
+   ~0.6 ms/unit of protocol cost against ~0.57 ms/unit of executed
+   value. Stealing wins ONLY because the machine is idle anyway
+   (3,800 PE-s idle in the tail vs 56 PE-s drained) — and this is why
+   dust-sized grants (the 5e7 budget) and reservation's inflated
+   grants were so destructive: overhead scales with grants and
+   shipped volume, value does not.
+4. THE OVERHEAD LANDS PARTLY ON THE STRAGGLER. proc 55 spent 4.87 s
+   in s3ShipOrder — 20% of its exec time — collecting grants mid-drain
+   (Kale's purple streaks inside the blue). Donor-side collection is
+   critical-path time on the hottest process.
+5. HELPERS ARRIVE LATE AND STAGGERED: block-mates first drain at
+   10.55-10.70 s (procs 48-52), 11.6 (53), 12.1 (54) against a tail
+   ending 12.74 s — order->ship->rebuild->drain->return serialization
+   limits throughput exactly as section 26 lever 3 predicted.
+6. CAPACITY CHECK: proc 55's 23.9 s spread over its block's 112 PEs
+   would be 0.21 s/PE — within-block stealing has the capacity to
+   reach the 0.25 s floor; no cross-node escalation needed at this
+   scale.
+
+Lever ranking refreshed by this evidence:
+(a) fewer/bigger grants (already landed: GRANT=128 PARTS=16 M2 lifted
+    — this is WHY it wins: amortizes the ~125 ms/grant fixed costs);
+(b) multiple outstanding grants per helper (kills the serialization
+    behind the staggered late arrivals);
+(c) cut donor-side collection cost off the critical path — candidates:
+    grant collection from a precomputed partition manifest instead of
+    a per-unit scan+CAS at order time, or servicing orders on the
+    donor's least-loaded PE;
+(d) helper rebuild cost (27.8 s) is real but paid by idle PEs — lowest
+    priority.
