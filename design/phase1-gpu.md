@@ -481,13 +481,11 @@ Reusing the harness that exists (fof-algorithm-report.md §10):
 
 ## 8. Staged plan
 
-**Stage 0 — integration spike. DONE 2026-08-12, both gates green; see
-section 11 for the measurements and the seven traps it cost.** A
-nodegroup that takes `hapiGetDevice()`, initializes Kokkos, asserts the
-1:1 process/GCD mapping, and completes through `hapiAddCallback` —
-under the production run line (8 procs/node, `+ppn 14`, LCI/CXI).
-Remaining half of the stage: the same K0/K5 round trip wired into FoF3
-against real particle blocks, with the CPU still computing the answer.
+**Stage 0 — integration spike. COMPLETE 2026-08-12, all gates green;
+section 11 has the measurements and the traps it cost.** Both halves
+done: the standalone/Charm integration gates, and the K0/K5 staging
+round trip inside FoF3 against real TreePiece particle blocks with the
+CPU chain still computing the answer.
 
 **Stage 1 — flat device tree, built at tree-build time.** `DNode` emit
 in `recursiveBuild`, the per-process top tree from TreePiece keys, and
@@ -663,3 +661,132 @@ program, but paratreet2's template stack should not go through hipcc,
 and with the firewall it does not have to. The standalone gate is the
 payoff: when something breaks, it says whether the problem is Kokkos or
 the integration before you start looking.
+
+---
+
+## 12. Stage 0 second half: staging inside FoF3 (2026-08-12)
+
+Job 5254944, one Frontier node. `FOF_GPU_STAGE0=1` runs the staging
+chain between registration and the phase-1 chain, where the registered
+particle blocks are live and nothing has written `group_number` yet. It
+is purely additive — the CPU chain still computes the answer — so the
+gate is that BOTH the round trip is exact and the components are
+unchanged.
+
+| arm | components | round-trip failures |
+|---|---|---|
+| 100k, 2 processes, CPU-only | 33,933 (`TEST PASSED`, full O(n^2)) | — |
+| 100k, 2 processes, staging | 33,933 (`TEST PASSED`) | 0 |
+| 80M lambb.00500, 8 processes, CPU-only | 23,707,197 | — |
+| 80M lambb.00500, 8 processes, staging | 23,707,197 | 0 |
+
+23,707,197 is the standing gate value for this dataset
+(design/fof3-lambb500-scaling.md), so the staging arm reproduces it
+exactly. "Round-trip failures 0" is the stronger of the two checks: the
+device pass is the identity, so every particle's returned value must be
+that particle's own `order` — which verifies the per-PE base/offset
+arithmetic through the process-flat index space end to end, not merely
+that a transfer happened.
+
+### 12.1 What staging costs (10.0-10.1M particles per process)
+
+| step | max over PEs/processes |
+|---|---|
+| K0 pack (AoS `Particle` -> 20 B SoA, per PE, parallel) | 88 ms |
+| device round trip (enqueue -> Charm callback) | 25 ms |
+| K5 read-back pass (per PE, parallel) | 45 ms |
+| whole stage wall | 0.80 s |
+
+Two things to read off this:
+
+- **The pack is node-bandwidth-bound, not thread-bound.** Each PE gathers
+  ~715k particles out of 112-byte structs — 80 MB read for 14 MB written
+  — and 14 PEs x 8 processes is ~9 GB of strided reads per node in 88 ms,
+  i.e. ~100 GB/s. Splitting it further will not help; the fix, if it ever
+  matters, is to stop gathering (write the device form at tree build,
+  where the sort already touches every particle).
+- **The 0.80 s wall is mostly first-touch allocation**, not the 158 ms of
+  work above it: `resize()` does ~200 MB of `hipHostMalloc` per process
+  inside the timed region, and pinned allocation runs around 1 GB/s. In
+  stage 2 the buffers are allocated once per tree build and reused across
+  the phase, so this cost does not recur per phase-1 call. Do not read
+  0.80 s as the staging overhead; 158 ms is, and that is ~9% of the
+  1.71 s of phaseA+phaseB it is meant to replace at this scale.
+
+### 12.2 Charm rebuilt (production + tracing + local reconverse)
+
+    ./build charm++ reconverse-linux-x86_64 amd \
+      --with-production --enable-tracing \
+      --with-fetch-reconverse-dir=$HOME/charm_reconverse/reconverse \
+      --force -j16
+
+with `rocm/6.2.4` loaded (script: `fof/gpu/rebuild_charm_hip.sh`).
+Result: `CMAKE_BUILD_TYPE=Release`, `TRACING=1`, `BUILD_HIP=1`,
+`FETCHCONTENT_SOURCE_DIR_RECONVERSE` = the local checkout. In buildcmake
+`--with-production` only sets the build type and `--enable-tracing` only
+sets `-DTRACING`, so unlike the old `buildold` they compose — production
+does not silently disable tracing.
+
+**This retires trap 3.** `conv-mach-hip.sh` prefers `$ROCM_PATH` and only
+falls back to `/opt/rocm-default` (6.4.2) when it is unset; with the
+module loaded, charmc now emits 6.2.4 paths throughout and matches the
+Kokkos build. `-Wl,--allow-shlib-undefined` has been removed from
+tests/kokkos-spike and is no longer needed anywhere.
+
+**Side effect worth knowing:** the top-level `charm_reconverse/include`
+and `lib` symlinks now point at `reconverse-linux-x86_64-amd`, so a plain
+`CHARM_HOME=$HOME/charm_reconverse` resolves to the HIP Release build.
+That is convenient (one charm for both arms, and the production
+`LD_LIBRARY_PATH=.../charm_reconverse/lib` keeps working) but it means
+CPU-only builds now also link a HIP-enabled runtime.
+
+Dependency rebuild (`fof/gpu/rebuild_deps.sh`, order per the top-level
+README): prefixLib -> htram -> unionfind -> fof/gpu -> src -> fof ->
+examples/fof3, with `AGGREGATION=`/`PROFILE=` per
+design/frontier-labeling-ab.md.
+
+### 12.3 Three more traps, from the rebuild and the FoF3 wiring
+
+8. **A HIP-enabled charm makes EVERY client need
+   `-D__HIP_PLATFORM_AMD__`.** `charm++.h` -> `ckrdmadevice.h` ->
+   `conv-rdmadevice.h` -> `hapi_portable.h` pulls in
+   `<hip/hip_runtime.h>`, which hard-`#error`s without a platform macro.
+   This broke prefixLib — plain Charm code with no GPU content — the
+   moment charm started pointing at 6.2.4's headers. It is a property of
+   the charm build, not of the GPU arm, so `src/Makefile.common` detects
+   it (`$(wildcard $(CHARM_HOME)/include/hapi.h)`) rather than tying it
+   to `GPU=1`, and `rebuild_deps.sh` passes it to the siblings through
+   their charmc override. Arguably charm should define it itself.
+9. **A rebuilt archive does not relink the application.** `examples/fof3`
+   named `-lfofdevice` in its link line but not `libfofdevice.a` among
+   the FoF3 prerequisites, so after fixing the device library `make`
+   reported everything up to date and ran a stale binary — costing one
+   job and producing a confusing abort. Same class as the stale-`.a`
+   trap design/frontier-labeling-ab.md records for libunionFind.a. Fixed
+   by making the archive a prerequisite (`FOF_GPU_LIB`).
+10. **The mapping invariant is "no two processes share a GPU", which is
+    `<=`, not `==`.** The first check required
+    `processes == visible devices` and so aborted a 2-process debug run
+    on an 8-GCD node, where HAPI had in fact given the two processes
+    devices 0 and 4 and nothing was shared. Small-scale debugging runs
+    are exactly where this check gets exercised most, so getting the
+    comparison right matters more than it looks.
+
+### 12.4 Where the code is
+
+- `fof/gpu/{FoFDevice.h,FoFDevice.cpp,standalone.cpp,Makefile}` — the
+  device library and its Charm-free gate.
+- `fof/gpu/{rebuild_charm_hip.sh,rebuild_deps.sh}` — the two rebuilds.
+- `fof/gpu/{run_stage0.sbatch,run_stage0_fof3.sbatch}` — the gates.
+- `tests/kokkos-spike/` — the Charm/HAPI/Kokkos integration gate.
+- `fof/FoFPhase1.h` — the `#ifdef FOF_GPU` staging chain (deviceStage0 ->
+  deviceInitOnHome -> devicePack -> deviceLaunchOnHome ->
+  deviceCompleteOnHome -> deviceVerify) plus CPU-only stubs, and the
+  `FOF_GPU_STAGE0` hook in `runFoFPhase1`.
+- `src/Makefile.common` — the `GPU=1` arm; off by default, and with it
+  unset the compile and link lines are unchanged apart from the
+  auto-detected HIP platform macro.
+
+Next: stage 1 (flat `DNode` emitted from `TreePiece::recursiveBuild`,
+uploaded once per tree build), which is additive on the CPU side and
+gated on "CPU results unchanged".

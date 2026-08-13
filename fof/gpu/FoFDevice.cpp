@@ -166,12 +166,14 @@ bool Device::checkMapping(int n_procs_on_physical_node) const {
   if (!available()) return true;  // host backend: nothing to share
   DeviceInfo di = info();
   if (di.n_visible <= 0) return false;
-  // Each process must see (or be bound to) its own GPU. Two shapes are
-  // acceptable: the launcher gave this process exactly one device
-  // (n_visible == 1, the --gpus-per-task case), or all devices are
-  // visible and there are exactly as many processes as devices.
+  // The invariant is that no two processes SHARE a GPU, which is not the
+  // same as using every GPU: 2 processes on an 8-GCD node share nothing
+  // (HAPI hands them devices 0 and 4). So the test is <=, not ==. Two
+  // acceptable shapes: the launcher bound this process to exactly one
+  // device (n_visible == 1, the --gpus-per-task case), or all devices are
+  // visible and there are no more processes than devices.
   if (di.n_visible == 1) return true;
-  return n_procs_on_physical_node == di.n_visible;
+  return n_procs_on_physical_node <= di.n_visible;
 }
 
 void Device::setStream(void* stream) { p_->stream = stream; }

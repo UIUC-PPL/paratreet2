@@ -62,7 +62,7 @@ RPATH_LINK = -L$(LCI_LIB_DIR) -Wl,-rpath-link,$(LCI_LIB_DIR) \
 # first and the whole process is then consistently 6.2.4.
 # PROPER FIX (not ours to make here): rebuild the HIP charm with
 # ROCM_PATH=/opt/rocm-6.2.4 so charmc stops naming rocm-default at all.
-ALLOW_UNDEF = -Wl,--allow-shlib-undefined
+ALLOW_UNDEF =
 
 all: kokkos-spike
 
