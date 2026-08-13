@@ -138,6 +138,11 @@ namespace paratreet {
 
             CkIndex_Reader::idx_request<T>( static_cast<void (Reader::*)(const CProxy_TreePiece<T> &, int, int)>(NULL));
             CkIndex_Reader::idx_flush<T>( static_cast<void (Reader::*)(int, const CProxy_TreePiece<T> &)>(NULL));
+            // flushAck is the windowed flush's continuation and is just as
+            // templated as flush itself; without this the runtime aborts with
+            // "late entry method registration happened after init" on the
+            // first ack.
+            CkIndex_Reader::idx_flushAck<T>( static_cast<void (Reader::*)(int, const CProxy_TreePiece<T> &)>(NULL));
             CkIndex_Reader::idx_assignPartitions<T>( static_cast<void (Reader::*)(int, const CProxy_Partition<T> &)>(NULL));
         }
     };

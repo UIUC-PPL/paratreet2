@@ -47,4 +47,22 @@ typedef SFC::Key Key;
 #define BITS_PER_DIM (KEY_BITS/NDIM)
 #define BOXES_PER_DIM (1<<(BITS_PER_DIM))
 
+namespace paratreet {
+// Peak resident set size of the calling PROCESS in MB, from VmHWM in
+// /proc/self/status (Linux high-water mark, so it survives the transient it
+// is measuring). Returns -1 where unavailable. Cheap enough to call at phase
+// boundaries; do not put it in an inner loop.
+inline long procHighWaterMB() {
+  FILE* f = fopen("/proc/self/status", "r");
+  if (!f) return -1;
+  char line[256];
+  long kb = -1;
+  while (fgets(line, sizeof(line), f)) {
+    if (strncmp(line, "VmHWM:", 6) == 0) { sscanf(line + 6, "%ld", &kb); break; }
+  }
+  fclose(f);
+  return kb < 0 ? -1 : kb / 1024;
+}
+}  // namespace paratreet
+
 #endif // PARATREET_COMMON_H_

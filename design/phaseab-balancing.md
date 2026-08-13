@@ -742,3 +742,217 @@ all three serial arms exact (23707197); forced arm 511 out_ships /
 pools correctly on classic-netlrts (laptop), reconverse-local (laptop),
 InfiniBand (Anvil), and Slingshot/CXI (Frontier). The 16-node 2B 2x2
 A/B (design/frontier-s3-ab.md) is cleared to run.
+
+## 22. The Frontier 2B verdict (2026-08-12, design/frontier-s3-ab-results-2026-08-12.md)
+
+9/9 exact at 2B/16 nodes, serial AND dist. The forced arm moved 2,035
+shipments / 1.15M units / 611k returned edges, still exact — S3 v1 is
+CORRECT at full scale on Slingshot. But the natural arms shipped 1-8
+grants against ~1,100 declines, and phaseB is unchanged (3.25 s +-
+noise, both modes).
+
+READ THE DECLINES CAREFULLY — they falsify one hypothesis and sharpen
+another:
+- The order-servicing-starvation suspicion is WRONG: ~1,100 declines
+  per run means donors served every order promptly (a starved donor
+  yields silence, not declines). The coordinator solicited all phase.
+- What the declines actually say: WHENEVER A HELPER WAS FREE, EVERY
+  ORDERED PARTITION WAS ALREADY FULLY CLAIMED. Under the v1
+  drain-event protocol, helpers appear only when a process's cursor
+  exhausts — and by then, apparently, everyone's cursor is exhausted.
+
+Two candidate explanations, and the discriminator between them is the
+PER-PROCESS phaseB wall distribution, which no current print shows:
+(a) S2 already balanced phaseB: m2-LPT + costliest-first partitions
+    flattened the per-process walls, so processes finish nearly
+    together and there is genuinely nothing to steal. Then S3 is
+    insurance, not a lever, and the 3.25 s phaseB is a THROUGHPUT
+    problem (walk speed), not a balance problem.
+(b) The imbalance survives but the protocol misses it: claims (one CAS
+    ahead of each walking PE) do not exhaust a hot pool early, but if
+    the hot process's cursor nevertheless runs out before the fast
+    processes' LAST units complete (helpers announce drain once, at
+    cursor exhaustion, possibly while still executing), the match
+    window is narrow. Needs the distribution to judge.
+The queued Anvil 2B job's S3 SUM-DETAIL arm answers this visually
+(per-PE time profile), and a one-line FOF3STAT pb_wall per-process
+print is the cheap permanent instrument. DECISION DEFERRED until that
+evidence: if (a), the campaign pivots from balance to phaseB
+throughput; if (b), S3 v2 = polls + earlier helper availability.
+
+Also measured: Frontier phaseB 3.25 s vs Anvil 1.55-1.61 s at the same
+2B/16-node scale (different CPUs, 14 vs 15 workers/process) — worth
+keeping in mind when comparing campaigns across machines. Frontier
+cross-skew point: 1.40-1.42 at 128 processes (phaseA), stable across
+all arms. FOF_S3_TEST deadlocks single-process (rank 0 refuses claims,
+no helper exists) — documented limitation, >= 2 processes required.
+
+## 23. Frontier follow-up (same day): SMT split verdict, the straggler's
+## anatomy, and the starvation mechanism recovered
+
+From the updated Frontier report (design/frontier-s3-ab-results-2026-08-12.md,
+sections added after the first A/B):
+
+- THE HOT PROCESS IS ALIVE under full campaign flags: per-PE phaseB
+  min/med/max = 0.008/0.190/3.221 s. Median process finishes in ~0.19 s;
+  the wall is one straggler at 3.2 s. Explanation (a) of section 22
+  (S2 balanced it away) is DEAD.
+- THE STRAGGLER IS AN ACCUMULATION, NOT A GIANT: max single unit
+  0.256 s against a 3.2 s PE wall (~13 units deep at minimum). The
+  work is divisible — it just never moved.
+- THE STARVATION MECHANISM, CORRECTLY LOCALIZED: section 22 dismissed
+  order-servicing starvation because declines flowed freely — but the
+  declines come from the IDLE donors, whose PEs serve entries
+  instantly. The HOT donor's 14 PEs sit inside the unsliced drain loop
+  for the full 3.2 s and serve its ship orders only at the end, when
+  everything is claimed. The idle donors' promptness masked the hot
+  donor's silence. Fix: FOF_PHASEB_SLICE_MS on S3 arms (the sliced
+  drain surfaces between units); under test in Anvil job 19842202
+  (arms: base, S3+slice, base+slice, S3-no-slice, sum-detail on the
+  fix, forced). If the fix ships, make slicing the S3 default.
+- SMT SPLIT VERDICT (16-node 2B, same 56 physical cores, ppn 14 vs 7):
+  phaseA +27% from SMT (2.037 vs 2.584) — Kale's pointer-chasing
+  intuition confirmed there; phaseB -31% (3.285 vs 2.504); net phase1
+  4.4% faster WITHOUT SMT. CONFOUND to respect: halving ppn changed
+  the decomposition (max_piece_n doubled, pool units 3.2x fewer), so
+  the phaseB number is not pure SMT — bigger pieces shift work between
+  self-pairs, the grid gate, and the pool. Per-core the machines are
+  ~comparable (the 1.9x aggregate gap is mostly the 15-cores-vs-7
+  accounting).
+- OPERATIONAL: +lci_ndevices must track ppn (min(8, ppn/2)); 7 devices
+  on ppn 7 hangs at cache-manager init. Frontier per-core baselines
+  need 1M-8M inputs (10k/100k sit at timer resolution).
+
+## 24. S3 v2 scheme (PROPOSED 2026-08-12 evening — awaiting Kale's review)
+
+Where v1 stands after the 7b4b3f2 Frontier round (job 5250048): slicing
++ S3 is FREE (wall back to the unsliced baseline; the 2.2-3.5x
+regression is gone) but INERT (0.10% of units moved; straggler
+untouched at 3.29 s vs 0.19 s median). Root cause of inertness: the
+grant cap is denominated in m2 against SINGLE-PE helpers, and the
+coordinator orders the costliest partitions — whose units are the m2
+giants (the 2B giant alone is 7x the cap), so grants collapsed to 1-3
+units. The v1 serial helper is the binding constraint everywhere.
+
+v2 = four coupled changes, all inside the existing machinery:
+
+1. PARALLEL FOREIGN DRAIN (the structural fix): s3Shipment (served by
+   any helper PE) rebuilds trees and appends units to a helper-local
+   FOREIGN QUEUE (atomic cursor, same shape as the home pool), then
+   wakes every PE of the process (self-sends, steal-branch idiom).
+   PEs drain foreign units through the same sliced loop into
+   per-origin edge buffers; a per-shipment completion counter fires
+   s3Return from the last finisher. Helper capacity: 1 PE -> all 14/15.
+2. GRANT SIZED TO CAPACITY: with parallel helpers the cap rises to
+   FOF_S3_MAX_GRANT_M2 ~ 1e8 (or a predicted-seconds knob x worker
+   count); a grant should be a few hundred ms x the WHOLE helper.
+3. RE-ORDERABLE PARTITIONS: the coordinator's ordered[] flag becomes
+   in-flight[]; cleared when the shipment returns or is declined; only
+   an EMPTY decline retires a partition permanently. The coordinator
+   can return to the straggler's partitions until they are drained.
+4. REMAINING-WORK POLLS (from Kale's original design): every branch
+   maintains remaining_m2 (one atomic subtract at each claim CAS);
+   the coordinator polls its block every FOF_S3_POLL_MS (default 10)
+   and picks donors by CURRENT remaining, not initial cost — so orders
+   chase the actual straggler.
+
+Unchanged: per-unit CAS ownership, the owned-units + returns
+termination ledger, forced mode, the loopback self-test, exactness
+gates both runtimes. Capacity check: a block's idle capacity once the
+median process drains (~7 procs x 14 PEs x ~3 s ~ 290 core-s) dwarfs
+the straggler backlog (~45 core-s) — the movable fraction is not the
+constraint once helpers are parallel.
+
+Kale's standing review point also attaches here: the yield mechanism
+(FOF_PHASEB_SLICE_MS wall-clock) should eventually become per-unit or
+every-k-units yields — the natural message-driven grain.
+
+## 25. v2 gate results (2026-08-12 night) and a known-stall encounter
+
+v2 (commit "S3 v2: parallel foreign drain...") gates:
+- CLASSIC: all 7 exact — 1M loopback zero-mismatch, forced 2x4/4x2
+  with ships, natural, base, 10k full-oracle, and the dataset guard
+  (100k-uniform: S3-off == S3-forced at 98275).
+- RECONVERSE: -n 4 forced PASS (39 s; ships BIDIRECTIONAL — nodes 0/2
+  shipped 18/19 grants and also helped 9/8 in; exact). -n 2 with S3
+  armed STALLS: lldb attach shows every PE of both processes idle in
+  CsdScheduler -> LCI poll_comp, no app code on any stack — the known
+  reconverse LCI IDLE-PROGRESS STALL (keep-alive-ring family), not an
+  S3 logic fault. Discriminators: classic -n 2 identical scenario
+  passes; reconverse -n 2 with S3 OFF passes; pre-v2 -n 2 with v1 S3
+  passed (v1's serial helper kept a PE busy; v2's efficient wait is
+  what goes fully idle). Cheap candidate fix if it matters beyond the
+  laptop: extend the keep-alive ring into phase 1 while FOF_S3 is
+  armed. Laptop reconverse gates use -n 4 until then; Frontier's CXI
+  fabric is the real test.
+
+## 26. v2 at 2B/16 Frontier (job 5250364): FIRST NET WIN
+
+Four-generation table in the relayed report (stored below §25's file
+pointer; reps x3, all exact incl. traced):
+- WALL BELOW BASELINE FOR THE FIRST TIME: Pre-traversal 4.47-4.53 s vs
+  5.32 unsliced (~15% under); Iteration 0 6.98-7.24 vs 8.01 (~13%).
+- Per-PE phaseB max 3.29 -> 1.98-2.11 s (36-40% off); imbalance ratio
+  17x -> 12x. Improved, not solved.
+- 4.3-4.8% of units moved (95-106k) at 206-224 units/grant — HALF the
+  448 sizing. Explanation (to verify): costliest-first concatenation
+  puts the coordinator's favorite partitions FIRST in the local drain
+  order, so orders land on half-eaten partitions; the local cursor and
+  the coordinator compete for the same end of the pool. declines also
+  highest of any generation (~1420) — same signature.
+- The phaseB timer excludes inter-slice gaps; the report correctly
+  judges by wall-clock rows (which moved WITH it this time — unlike
+  v1-sliced where they diverged).
+
+Next levers, ranked (not yet built):
+1. Grant attrition compensation: FOF_S3_GRANT_UNITS_PER_PE 32 -> 64
+   (pure env knob, zero code) — tests whether grant size is binding.
+2. Partition pick beyond the cursor: order partitions the local drain
+   will reach LAST (with costliest-first concatenation that is the
+   tail), trading per-unit m2 for intactness. One-line pick change.
+3. Multiple outstanding grants per helper (removes the
+   order->ship->return->drained serialization; moderate change).
+
+## 27. The composition finding, and reservation (IMPLEMENTED overnight 2026-08-13, commit 309673c on phaseab-campaign; Kale approved implementing while asleep)
+
+Frontier msg2 (2026-08-12 night, ~30 exact runs): STEALING MOVES THE
+CHEAPEST WORK BY CONSTRUCTION. The pool is costliest-first (deliberate,
+twice: slice claiming and partition concatenation — the +60% regression
+proved LPT matters); the local cursor eats from the front; grants
+collect only what the cursor has not reached — the cheap tail. Donor
+eats giants, helpers get dust. Evidence: m2/shipped-unit FALLS as
+grants grow (19.1 -> 16.4M across GRANT 32->128); straggler = 3x units
+x 3x cost/unit; phaseB_s max floor 1.53 s across every knob of four
+generations; granularity NOT binding (floor would be 0.25 s under
+perfect balance — 6x headroom). Instruments to confirm shipped-dust
+directly (tot_m2 denominator, s3_grant_m2_hist) are in at 0963ded+.
+
+PROPOSED FIX — donor-side reservation, with one refinement over the
+Frontier suggestion: reservation must be DYNAMIC AND CONDITIONAL.
+A static ship-only prefix on every process re-creates the giants-last
+pathology (+60%) on every NON-straggler. So:
+- All processes start normal (LPT drain, no reservation).
+- The coordinator already polls remaining_m2. When a member's remaining
+  exceeds FOF_S3_RESERVE_FACTOR (~2x) x the block mean EXCLUDING SELF
+  ((sum - mine)/(P-1)), the coordinator sends it RESERVE. (Frontier
+  review point 2026-08-12: a self-inclusive mean with one 12x straggler
+  among 8 members inflates the average to 2.375x, so a nominal 2x
+  trigger really fires at ~4.75x and misses second-tier ~3x hotspots;
+  self-excluded mean restores the stated intent. Keying on m2 rather
+  than unit count is confirmed by the straggler's decomposition — 3x
+  units AND 3x cost per unit — a count trigger under-detects ~3x.) the donor then treats its top-m2 unclaimed units
+  (up to a budget) as ship-only: local claims skip them while other
+  units remain, grants collect them FIRST.
+- Starvation valve: a local PE that finds ONLY reserved units left
+  takes them anyway (reservation is advisory; termination ledger
+  unchanged). Coordinator can send UNRESERVE when balance is restored
+  or helpers dry up.
+- Mechanism sketch: reservation = an index threshold into the
+  costliest-first pool order (the top-m2 prefix IS the pool front), so
+  "reserved" is just k < R with R set by the RESERVE message; local
+  drain starts its cursor at R and wraps to [0, R) at the starvation
+  valve; grants scan [0, R) first. One extra cursor, no new locks.
+Expected effect: grants carry giants (s3_grant_m2_hist shifts high),
+straggler max falls toward the 0.25 s granularity floor. Decision
+knobs for review: reserve trigger factor, reserve budget (fraction of
+remaining), and whether UNRESERVE is needed in v1 of this.
