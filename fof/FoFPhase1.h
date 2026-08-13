@@ -342,6 +342,8 @@ public:
     Node<Data>* root;
     Particle* parts;
     int n;
+    const paratreet::DNode* dnodes = nullptr;  // src/DeviceTree.h; may be null
+    int n_dnodes = 0;
   };
 
   std::mutex lock;
@@ -403,10 +405,19 @@ public:
   // them, while the CPU chain below still computes the answer. Stage 2
   // replaces the round trip with the union-find; the staging halves
   // (K0/K5) are what survive.
+  static_assert(sizeof(paratreet::DNode) == sizeof(fofgpu::DDNode),
+                "DNode and the device library's DDNode must stay identical");
   fofgpu::Device device;
   void* dev_stream = nullptr;
   bool dev_inited = false;
   std::atomic<long> dev_total{0};   // process-flat particle count
+  std::map<int, long> dev_pe_base;  // PE -> its base in that space (under lock)
+  // Flat-tree layout plan, computed once on the home PE and then written
+  // against concurrently: PE -> per-piece node offset (-1 = no tree).
+  std::map<int, std::vector<int> > dev_piece_node_off;
+  long dev_total_nodes = 0;
+  double dev_t_tree_upload = 0, dev_t_tree_check = 0;
+  long dev_tree_pieces = 0;
   std::atomic<int> dev_count_done{0};
   std::atomic<int> dev_pack_done{0};
   double dev_t_launch = 0;          // enqueue -> completion callback
@@ -510,9 +521,17 @@ public:
 
   // Called synchronously (ckLocalBranch) by same-process group branches
   // during registration; hence the lock.
-  void registerTreePiece(int pe, Node<Data>* root, Particle* parts, int n) {
+  void registerTreePiece(int pe, Node<Data>* root, Particle* parts, int n,
+                         const paratreet::DNode* dnodes = nullptr,
+                         int n_dnodes = 0) {
     std::lock_guard<std::mutex> g(lock);
-    pe_treepieces[pe].push_back(TreePieceRef{root, parts, n});
+    // Field assignment, not brace init: TreePieceRef has default member
+    // initializers, which under charmc's -std=gnu++11 makes it a
+    // non-aggregate.
+    TreePieceRef ref;
+    ref.root = root; ref.parts = parts; ref.n = n;
+    ref.dnodes = dnodes; ref.n_dnodes = n_dnodes;
+    pe_treepieces[pe].push_back(ref);
   }
 
   // Called synchronously by group branches at the end of phaseB.
@@ -707,15 +726,26 @@ public:
     Particle* parts; // the TreePiece's own particle block (stable until rebuild)
     int n;
     int offset;      // base of this block in the PE-flat index space
+    // Flat device tree for this TreePiece (src/DeviceTree.h), or null
+    // when PARATREET_DEVICE_TREE is off. Owned by the TreePiece and
+    // stable for the same window as `parts`.
+    const paratreet::DNode* dnodes = nullptr;
+    int n_dnodes = 0;
   };
 
   FoFPhase1(CProxy_FoFPhase1Node<Data> node_proxy_) : node_proxy(node_proxy_) {}
 
   // Synchronous, called on this PE by fof::TreePieceRegisterFn (delivered per
   // TreePiece element through the generic TreePiece::callPerTreePieceFn hook).
-  void registerTreePiece(Node<Data>* root, Particle* parts, int n) {
-    treepieces.push_back(TreePieceRef{root, parts, n, 0});
-    node_proxy.ckLocalBranch()->registerTreePiece(CkMyPe(), root, parts, n);
+  void registerTreePiece(Node<Data>* root, Particle* parts, int n,
+                         const paratreet::DNode* dnodes = nullptr,
+                         int n_dnodes = 0) {
+    TreePieceRef ref;
+    ref.root = root; ref.parts = parts; ref.n = n; ref.offset = 0;
+    ref.dnodes = dnodes; ref.n_dnodes = n_dnodes;
+    treepieces.push_back(ref);
+    node_proxy.ckLocalBranch()->registerTreePiece(CkMyPe(), root, parts, n,
+                                                  dnodes, n_dnodes);
   }
 
   // Periodic boundary conditions (design/pbc.md): the box period, broadcast
@@ -1100,6 +1130,12 @@ public:
     dev_n_ = 0;
     for (auto& s : treepieces) dev_n_ += s.n;
     dev_base_ = nb->dev_total.fetch_add(dev_n_);
+    {
+      // Published so the home PE can rebase the flat trees without
+      // reaching into another PE's group branch.
+      std::lock_guard<std::mutex> g(nb->lock);
+      nb->dev_pe_base[CkMyPe()] = dev_base_;
+    }
     if (nb->dev_count_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode()))
       this->thisProxy[CkNodeFirst(CkMyNode())].deviceInitOnHome();
   }
@@ -1135,9 +1171,104 @@ public:
                di.total_global_mem / 1073741824.0, (long)nb->dev_total);
     }
     nb->device.resize((size_t)nb->dev_total.load());
+    devicePlanTree(nb);
     const int first = CkNodeFirst(CkMyNode());
     for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
       this->thisProxy[pe].devicePack();
+  }
+
+  // Stage 1 (design/phase1-gpu.md): concatenate the process's per-TreePiece
+  // flat trees into one array and upload it. The trees are built at TREE
+  // BUILD time (src/DeviceTree.h, gated by PARATREET_DEVICE_TREE), so
+  // nothing here walks a tree — this is a memcpy per piece plus an index
+  // rebase, and it is the only part of the flat tree that phase 1 pays for.
+  //
+  // Rebasing: each piece's node indices are piece-local, so a piece placed
+  // at `node_off` has child_begin shifted by node_off; part_begin stays
+  // piece-local and is paired with the piece's particle base, which is
+  // what piece_part_base carries. Keeping part_begin piece-local means the
+  // flat tree is independent of how the PEs happened to lay the particles
+  // out, so it can be built once and reused across phase-1 calls.
+  // Stage 1 (design/phase1-gpu.md): plan the concatenated flat tree.
+  //
+  // The per-TreePiece trees are built at TREE BUILD time
+  // (src/DeviceTree.h, gated by PARATREET_DEVICE_TREE), so nothing here
+  // walks a tree. What is left is a memcpy per piece plus a rebase of the
+  // child links — and at 80M that is 3.2M nodes / 123 MB per process,
+  // which measured 236 ms when one PE did it. So the home PE only
+  // computes the LAYOUT here; the copying is handed to the PEs alongside
+  // the particle pack, each writing its own disjoint slice.
+  //
+  // pe_treepieces is process-shared and holds the pieces in the same
+  // registration order each PE's own `treepieces` does, so the two sides
+  // agree on which slice belongs to whom without any extra bookkeeping.
+  void devicePlanTree(FoFPhase1Node<Data>* nb) {
+    nb->dev_piece_node_off.clear();
+    nb->dev_total_nodes = 0;
+    nb->dev_tree_pieces = 0;
+    std::vector<int> piece_root, piece_base;
+    long nodes = 0;
+    for (auto& kv : nb->pe_treepieces) {
+      auto bit = nb->dev_pe_base.find(kv.first);
+      if (bit == nb->dev_pe_base.end()) continue;
+      long at = bit->second;  // this PE's base in the process-flat space
+      auto& offs = nb->dev_piece_node_off[kv.first];
+      offs.reserve(kv.second.size());
+      for (auto& s : kv.second) {
+        if (s.dnodes != nullptr && s.n_dnodes > 0) {
+          offs.push_back((int)nodes);
+          piece_root.push_back((int)nodes);
+          // part_begin stays PIECE-local in the flat tree, so it is
+          // paired with the piece's particle base here. That keeps the
+          // tree independent of how the PEs laid the particles out, so it
+          // survives being built once and reused.
+          piece_base.push_back((int)at);
+          nodes += s.n_dnodes;
+        } else {
+          offs.push_back(-1);
+        }
+        at += s.n;
+      }
+    }
+    if (nodes == 0) {
+      CkPrintf("[FOF3GPU] proc %d: no flat trees registered "
+               "(PARATREET_DEVICE_TREE unset?) - no tree on the device\n",
+               CkMyNode());
+      return;
+    }
+    nb->dev_total_nodes = nodes;
+    nb->dev_tree_pieces = (long)piece_root.size();
+    nb->device.resizeTree(nodes, (int)piece_root.size());
+    std::memcpy(nb->device.hostPieceRoot(), piece_root.data(),
+                piece_root.size() * sizeof(int));
+    std::memcpy(nb->device.hostPieceBase(), piece_base.data(),
+                piece_base.size() * sizeof(int));
+  }
+
+  // Home PE, after every PE has filled its slice.
+  void deviceFinishTree(FoFPhase1Node<Data>* nb) {
+    if (nb->dev_total_nodes == 0) return;
+    fofgpu::TreeStats ts;
+    nb->device.uploadTree(&ts);
+    nb->dev_t_tree_upload = ts.t_upload;
+    nb->dev_t_tree_check = ts.t_check;
+    const long staged = nb->dev_total.load();
+    CkPrintf("[FOF3GPU] proc %d tree: %ld nodes over %ld pieces (%.1f MB), "
+             "device copy %.1f ms, check %.1f ms, particles under roots "
+             "%ld/%ld, bad nodes %ld\n",
+             CkMyNode(), ts.n_nodes, ts.n_pieces,
+             ts.n_nodes * sizeof(fofgpu::DDNode) / 1048576.0,
+             ts.t_upload * 1e3, ts.t_check * 1e3, ts.particles_under_roots,
+             staged, ts.bad_nodes);
+    // Both numbers were recomputed BY THE DEVICE from what actually
+    // landed in its memory, so they check the copy and the rebase rather
+    // than echoing the host.
+    if (ts.bad_nodes != 0)
+      CkAbort("FoF GPU: %ld structurally invalid nodes after tree upload",
+              ts.bad_nodes);
+    if (ts.particles_under_roots != staged)
+      CkAbort("FoF GPU: flat trees cover %ld particles but %ld were staged",
+              ts.particles_under_roots, staged);
   }
 
   // Round 3 (every PE): the K0 pack. Reads this PE's own Particle blocks
@@ -1160,6 +1291,27 @@ public:
       }
     }
     dev_t_pack_ = CkWallTimer() - t0;
+
+    // Same round, same owner-writes shape: this PE's slices of the
+    // concatenated flat tree. Rebasing child_begin into the concatenated
+    // array is the only transformation; part_begin stays piece-local.
+    double t1 = CkWallTimer();
+    fofgpu::DDNode* hn = nb->device.hostNodes();
+    auto oit = nb->dev_piece_node_off.find(CkMyPe());
+    if (hn != nullptr && oit != nb->dev_piece_node_off.end()) {
+      size_t k = 0;
+      for (auto& s : treepieces) {
+        if (k >= oit->second.size()) break;
+        const int off = oit->second[k++];
+        if (off < 0 || s.dnodes == nullptr) continue;
+        std::memcpy(hn + off, s.dnodes,
+                    (size_t)s.n_dnodes * sizeof(fofgpu::DDNode));
+        for (int i = 0; i < s.n_dnodes; i++)
+          if (hn[off + i].child_begin >= 0) hn[off + i].child_begin += off;
+      }
+    }
+    dev_t_tree_pack_ = CkWallTimer() - t1;
+
     if (nb->dev_pack_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode()))
       this->thisProxy[CkNodeFirst(CkMyNode())].deviceLaunchOnHome();
   }
@@ -1168,6 +1320,7 @@ public:
   // running and completion arrives as a message.
   void deviceLaunchOnHome() {
     auto* nb = node_proxy.ckLocalBranch();
+    deviceFinishTree(nb);
     nb->dev_t_launch = CkWallTimer();
     nb->device.enqueueRoundTrip();
 #ifdef FOF_GPU_HAS_HAPI
@@ -1209,14 +1362,17 @@ public:
     // max-reduced: pack (per PE), launch->completion (per process),
     // scatter (per PE), failures (summed in as a max so any nonzero
     // survives to the driver).
-    double vals[4] = {dev_t_pack_, nb->dev_t_launch, t_scatter, (double)bad};
-    this->contribute(4 * sizeof(double), vals, CkReduction::max_double,
+    double vals[6] = {dev_t_pack_,  nb->dev_t_launch,     t_scatter,
+                      (double)bad,  dev_t_tree_pack_,
+                      nb->dev_t_tree_upload};
+    this->contribute(6 * sizeof(double), vals, CkReduction::max_double,
                      dev_done_cb_);
   }
 
   long dev_base_ = 0;
   int dev_n_ = 0;
   double dev_t_pack_ = 0;
+  double dev_t_tree_pack_ = 0;
   CkCallback dev_done_cb_;
 #else
   // CPU-only build: fof.ci declares these entries unconditionally (it has
@@ -2672,6 +2828,16 @@ class TreePieceRegisterFn : public paratreet::PerTreePieceAble<Data> {
                           int n_particles) override {
     fof_.ckLocalBranch()->registerTreePiece(local_root, particles, n_particles);
   }
+
+  // Flat-tree form (src/DeviceTree.h). dnodes is null unless
+  // PARATREET_DEVICE_TREE is on, and phase 1's CPU paths never read it,
+  // so this is the same registration either way.
+  virtual void operator()(Node<Data>* local_root, Particle* particles,
+                          int n_particles, const paratreet::DNode* dnodes,
+                          int n_dnodes) override {
+    fof_.ckLocalBranch()->registerTreePiece(local_root, particles, n_particles,
+                                            dnodes, n_dnodes);
+  }
 };
 
 template <typename Data>
@@ -2764,11 +2930,12 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
       fof.deviceStage0(CkCallbackResumeThread(gres));
       CkReductionMsg* gm = (CkReductionMsg*)gres;
       const double* gv = (const double*)gm->getData();
-      CkPrintf("[FOF3GPU] stage0 wall %.3f s | pack(max PE) %.1f ms | "
-               "device round trip(max proc) %.1f ms | scatter(max PE) %.1f ms "
-               "| round-trip failures %ld\n",
-               CkWallTimer() - tg, gv[0] * 1e3, gv[1] * 1e3, gv[2] * 1e3,
-               (long)gv[3]);
+      CkPrintf("[FOF3GPU] stage0 wall %.3f s | particle pack(max PE) %.1f ms "
+               "| tree pack(max PE) %.1f ms | tree upload(max proc) %.1f ms "
+               "| device round trip(max proc) %.1f ms | scatter(max PE) %.1f "
+               "ms | round-trip failures %ld\n",
+               CkWallTimer() - tg, gv[0] * 1e3, gv[4] * 1e3, gv[5] * 1e3,
+               gv[1] * 1e3, gv[2] * 1e3, (long)gv[3]);
       if (gv[3] != 0)
         CkAbort("FoF GPU stage 0: particles did not round-trip through the "
                 "device");

@@ -35,6 +35,27 @@ struct DeviceInfo {
 // The bounding box is real work the later stages need (grid origin), and
 // it is checkable against a host computation — that is what makes this a
 // gate rather than a smoke test.
+// Mirror of paratreet::DNode (src/DeviceTree.h). Duplicated rather than
+// included because this header must not pull in Charm/paratreet headers —
+// the layout is asserted identical on the host side at upload.
+struct DDNode {
+  float lo[3], hi[3];
+  int part_begin;
+  int n_below;
+  int child_begin;
+  int n_children;
+};
+
+// Result of the stage-1 tree upload check.
+struct TreeStats {
+  long n_nodes = 0;
+  long n_pieces = 0;
+  double t_upload = 0;
+  double t_check = 0;
+  long particles_under_roots = 0;  // device-summed: must equal the staged n
+  long bad_nodes = 0;              // device-counted structural violations
+};
+
 struct RoundTripStats {
   long   n = 0;
   double t_upload = 0;
@@ -86,6 +107,25 @@ class Device {
   float* hostPositions();   // 3n floats
   long*  hostOrders();      // n
   long*  hostLabels();      // n, written by roundTrip()
+
+  // Upload this process's flat trees as one concatenated array
+  // (design/phase1-gpu.md stage 1). `piece_root` holds, per TreePiece,
+  // the index of its root in the concatenated array; `piece_part_base`
+  // holds the offset of its particle block in the process-flat particle
+  // space, so a node's particles are
+  // [piece_part_base + part_begin, + n_below).
+  // Two-step, because the concatenation is the expensive half and it
+  // parallelizes: resizeTree() allocates PINNED host buffers, the
+  // process's PEs then fill disjoint slices of them (each PE copies and
+  // rebases its OWN pieces), and uploadTree() copies the finished array
+  // to the device and checks it there. Doing the concatenation on one PE
+  // measured 236 ms of a 248 ms total at 80M — see design/phase1-gpu.md
+  // section 13.
+  void    resizeTree(long n_nodes, int n_pieces);
+  DDNode* hostNodes();       // n_nodes, pinned
+  int*    hostPieceRoot();   // n_pieces
+  int*    hostPieceBase();   // n_pieces
+  void    uploadTree(TreeStats* out);
 
   // Stage 0: upload, one identity pass (labels[i] = orders[i]) plus a
   // bounding-box and checksum reduction, download. Synchronous.

@@ -60,6 +60,15 @@ struct Device::Impl {
   DView<long> d_order;
   DView<long> d_label;
 
+  HView<DDNode> h_nodes;
+  HView<int> h_piece_root;
+  HView<int> h_piece_base;
+  DView<DDNode> d_nodes;
+  DView<int> d_piece_root;
+  DView<int> d_piece_base;
+  long n_nodes = 0;
+  int n_pieces = 0;
+
   // The Charm HAPI stream, or null for the default execution space.
   // Stored as a raw handle and wrapped ON DEMAND rather than held as an
   // ExecSpace member: a Kokkos::HIP instance cannot be constructed
@@ -123,6 +132,14 @@ void Device::finalize() {
   p_->d_pos = DView<float>();
   p_->d_order = DView<long>();
   p_->d_label = DView<long>();
+  p_->h_nodes = HView<DDNode>();
+  p_->h_piece_root = HView<int>();
+  p_->h_piece_base = HView<int>();
+  p_->d_nodes = DView<DDNode>();
+  p_->d_piece_root = DView<int>();
+  p_->d_piece_base = DView<int>();
+  p_->n_nodes = 0;
+  p_->n_pieces = 0;
   p_->n = 0;
   p_->inited = false;
   if (g_we_initialized_kokkos && Kokkos::is_initialized()) {
@@ -205,6 +222,94 @@ long* Device::hostLabels() { return p_->h_label.data(); }
 
 void Device::fence() {
   if (p_->inited) p_->exec().fence();
+}
+
+void Device::resizeTree(long n_nodes, int n_pieces) {
+  if (!p_->inited || n_nodes <= 0) return;
+  if (p_->n_nodes == n_nodes && p_->n_pieces == n_pieces) return;
+  p_->h_nodes = HView<DDNode>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_h_nodes"), n_nodes);
+  p_->h_piece_root = HView<int>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_h_proot"), n_pieces);
+  p_->h_piece_base = HView<int>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_h_pbase"), n_pieces);
+  p_->d_nodes = DView<DDNode>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_d_nodes"), n_nodes);
+  p_->d_piece_root = DView<int>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_d_proot"), n_pieces);
+  p_->d_piece_base = DView<int>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_d_pbase"), n_pieces);
+  p_->n_nodes = n_nodes;
+  p_->n_pieces = n_pieces;
+}
+
+DDNode* Device::hostNodes() { return p_->h_nodes.data(); }
+int* Device::hostPieceRoot() { return p_->h_piece_root.data(); }
+int* Device::hostPieceBase() { return p_->h_piece_base.data(); }
+
+void Device::uploadTree(TreeStats* out) {
+  TreeStats st;
+  st.n_nodes = p_->n_nodes;
+  st.n_pieces = p_->n_pieces;
+  if (!p_->inited || p_->n_nodes == 0) {
+    if (out) *out = st;
+    return;
+  }
+  ExecSpace exec = p_->exec();
+  Kokkos::Timer timer;
+  Kokkos::deep_copy(exec, p_->d_nodes, p_->h_nodes);
+  Kokkos::deep_copy(exec, p_->d_piece_root, p_->h_piece_root);
+  Kokkos::deep_copy(exec, p_->d_piece_base, p_->h_piece_base);
+  exec.fence();
+  st.t_upload = timer.seconds();
+
+  // Structural check ON THE DEVICE, not a host echo: this is what proves
+  // the array arrived intact and that the indices are self-consistent in
+  // device memory. Every node must hold particles, its children must live
+  // inside the array and after it (the layout contract in
+  // src/DeviceTree.h), and its subtree counts must add up.
+  timer.reset();
+  auto d_nodes = p_->d_nodes;
+  const long n_nodes = p_->n_nodes;
+  long bad = 0;
+  Kokkos::parallel_reduce(
+      "fof_tree_check", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_nodes),
+      KOKKOS_LAMBDA(const long i, long& acc) {
+        const DDNode& d = d_nodes(i);
+        bool ok = d.n_below > 0 && d.part_begin >= 0;
+        if (d.child_begin >= 0) {
+          ok = ok && d.n_children > 0 && d.child_begin > i &&
+               d.child_begin + d.n_children <= n_nodes;
+          if (ok) {
+            long sum = 0;
+            for (int c = 0; c < d.n_children; c++)
+              sum += d_nodes(d.child_begin + c).n_below;
+            ok = ok && sum == d.n_below;
+          }
+        } else {
+          ok = ok && d.n_children == 0;
+        }
+        ok = ok && d.lo[0] <= d.hi[0] && d.lo[1] <= d.hi[1] &&
+             d.lo[2] <= d.hi[2];
+        if (!ok) acc += 1;
+      },
+      bad);
+
+  // Particles reachable from the piece roots, summed on the device:
+  // equals the staged particle count exactly when every tree is complete.
+  auto d_root = p_->d_piece_root;
+  long under_roots = 0;
+  Kokkos::parallel_reduce(
+      "fof_tree_roots", Kokkos::RangePolicy<ExecSpace>(exec, 0, p_->n_pieces),
+      KOKKOS_LAMBDA(const int i, long& acc) {
+        acc += d_nodes(d_root(i)).n_below;
+      },
+      under_roots);
+  exec.fence();
+  st.t_check = timer.seconds();
+  st.bad_nodes = bad;
+  st.particles_under_roots = under_roots;
+  if (out) *out = st;
 }
 
 void Device::enqueueRoundTrip() {
