@@ -1228,3 +1228,29 @@ HIDE rebuild latency behind pipelining but not remove the cost; (A)
 removes the serialization and shortens each grant's turnaround, which
 is the quantity that limits how fast the coordinator can re-order the
 straggler's partitions. (A)+(C) first, then reassess lever 3.
+
+### 31 addendum, implemented (b797e73 on phaseab-campaign, 2026-08-13)
+
+Kale's wire design, built the same morning: StealTree nodes carry
+parent-index + child-slot (integer offsets) instead of absent-slot
+marker records; the helper rebuilds with ONE arena allocation and a
+single linear placement-new pass — child/parent pointers are computed
+as arena + index. No per-node malloc, no recursion, and the message
+sheds the key-0 padding. (A literal in-received-buffer swizzle is
+barred by FullNode's vtable/atomic/const members and would ship
+FullNode-sized slots at ~2x the bytes; this is the legal equivalent.)
+Lazy per-tree rebuild (option A) stays available on top if the arena
+pass is not enough.
+
+Gates, both runtimes: classic loopback self-test ZERO-mismatch at 100k
+and 1M (flatten->pup->rebuild->walk vs direct walk, every unit);
+classic 10k base/natural/forced 2x4/4x2 all exact; reconverse 4-proc
+2-PE forced exact with bidirectional ships (7/8 grants out of the even
+ranks, 3/4 helped in). Note for future gates: single-PE processes
+(+pe == nprocs) leave the stage-0 pool empty and S3 SKIPs arming —
+use >= 2 worker PEs per process for any S3 gate.
+
+Next measurement: Frontier one-job A/B at the best cell (GRANT=128,
+PARTS=16, defaults otherwise) — old vs new transport; readout =
+s3Shipment EP time (sum-detail or a cheap timer), grant turnaround,
+phaseB_s max.
