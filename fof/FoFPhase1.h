@@ -1921,15 +1921,45 @@ public:
     // Synchronous so the per-kernel walls are real; the async form
     // (enqueue + hapiAddCallback) is proven in stage 0 and is a two-line
     // change once the kernel is settled.
-    nb->device.runPhase1((float)b2_, &nb->dev_walk);
+    // Stage 3: the dense-node cell grid, OFF by default on the device
+    // even though the CPU walk defaults to -G 4. Measured on lambb.00500
+    // (design section 15.3) the grid does exactly what it is supposed to
+    // — the walk drops monotonically with the threshold, 263 -> 217 ->
+    // 202 -> 171 ms — and still loses, because its own stencil pass costs
+    // more than it saves at these densities. It is kept, and kept
+    // reachable through FOF_GPU_GRID, because it is the only thing that
+    // stops a genuinely dense input (larger b, or a deeper halo catalogue)
+    // from going quadratic. Do not read "off" as "not needed".
+    double gth = 0.0;
+    if (const char* e = std::getenv("FOF_GPU_GRID")) gth = std::atof(e);
+    nb->device.runPhase1((float)b2_, (float)gth, &nb->dev_walk);
     nb->dev_t_launch = CkWallTimer() - nb->dev_t_launch;
     const fofgpu::WalkStats& w = nb->dev_walk;
+    CkPrintf("[FOF3GPU] proc %d walk shape: %s\n", CkMyNode(),
+             w.walk_solo ? "solo (one thread per leaf)"
+                         : "team (one wavefront per leaf)");
+    CkPrintf("[FOF3GPU] proc %d leaf occupancy: %.1f particles/leaf\n",
+             CkMyNode(), w.leaf_occupancy);
     CkPrintf("[FOF3GPU] proc %d walk: %ld leaves, %ld top nodes | prepare "
-             "%.1f ms | walk %.1f ms | freeze %.1f ms | download %.1f ms | "
-             "certificates %ld | leaf pairs %ld | stack overflows %ld\n",
+             "%.1f ms | grid %.1f ms | walk %.1f ms | freeze %.1f ms | "
+             "download %.1f ms | certificates %ld | leaf pairs %ld | "
+             "suppressed %ld | stack overflows %ld\n",
              CkMyNode(), w.n_leaves, w.n_top_nodes, w.t_prepare * 1e3,
-             w.t_walk * 1e3, w.t_freeze * 1e3, w.t_download * 1e3,
-             w.certificates, w.leaf_pairs, w.stack_overflows);
+             w.t_grid * 1e3, w.t_walk * 1e3, w.t_freeze * 1e3,
+             w.t_download * 1e3, w.certificates, w.leaf_pairs, w.suppressed,
+             w.stack_overflows);
+    CkPrintf("[FOF3GPU] proc %d grid split: mark %.1f | bin %.1f | union "
+             "%.1f | stencil %.1f ms\n",
+             CkMyNode(), w.t_grid_mark * 1e3, w.t_grid_bin * 1e3,
+             w.t_grid_union * 1e3, w.t_grid_nbr * 1e3);
+    CkPrintf("[FOF3GPU] proc %d grid: thresh %.3g | %ld dense nodes | "
+             "%ld particles (%.1f%%) | %ld cells | %ld stencil probes\n",
+             CkMyNode(), gth, w.grid_nodes, w.grid_particles,
+             nb->dev_total.load() > 0
+                 ? 100.0 * (double)w.grid_particles /
+                       (double)nb->dev_total.load()
+                 : 0.0,
+             w.grid_cells, w.grid_probes);
     // A stack overflow means the traversal DROPPED work, which shows up
     // as silently under-merged components. Never a warning.
     if (w.stack_overflows != 0)
