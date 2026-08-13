@@ -822,3 +822,47 @@ sections added after the first A/B):
 - OPERATIONAL: +lci_ndevices must track ppn (min(8, ppn/2)); 7 devices
   on ppn 7 hangs at cache-manager init. Frontier per-core baselines
   need 1M-8M inputs (10k/100k sit at timer resolution).
+
+## 24. S3 v2 scheme (PROPOSED 2026-08-12 evening — awaiting Kale's review)
+
+Where v1 stands after the 7b4b3f2 Frontier round (job 5250048): slicing
++ S3 is FREE (wall back to the unsliced baseline; the 2.2-3.5x
+regression is gone) but INERT (0.10% of units moved; straggler
+untouched at 3.29 s vs 0.19 s median). Root cause of inertness: the
+grant cap is denominated in m2 against SINGLE-PE helpers, and the
+coordinator orders the costliest partitions — whose units are the m2
+giants (the 2B giant alone is 7x the cap), so grants collapsed to 1-3
+units. The v1 serial helper is the binding constraint everywhere.
+
+v2 = four coupled changes, all inside the existing machinery:
+
+1. PARALLEL FOREIGN DRAIN (the structural fix): s3Shipment (served by
+   any helper PE) rebuilds trees and appends units to a helper-local
+   FOREIGN QUEUE (atomic cursor, same shape as the home pool), then
+   wakes every PE of the process (self-sends, steal-branch idiom).
+   PEs drain foreign units through the same sliced loop into
+   per-origin edge buffers; a per-shipment completion counter fires
+   s3Return from the last finisher. Helper capacity: 1 PE -> all 14/15.
+2. GRANT SIZED TO CAPACITY: with parallel helpers the cap rises to
+   FOF_S3_MAX_GRANT_M2 ~ 1e8 (or a predicted-seconds knob x worker
+   count); a grant should be a few hundred ms x the WHOLE helper.
+3. RE-ORDERABLE PARTITIONS: the coordinator's ordered[] flag becomes
+   in-flight[]; cleared when the shipment returns or is declined; only
+   an EMPTY decline retires a partition permanently. The coordinator
+   can return to the straggler's partitions until they are drained.
+4. REMAINING-WORK POLLS (from Kale's original design): every branch
+   maintains remaining_m2 (one atomic subtract at each claim CAS);
+   the coordinator polls its block every FOF_S3_POLL_MS (default 10)
+   and picks donors by CURRENT remaining, not initial cost — so orders
+   chase the actual straggler.
+
+Unchanged: per-unit CAS ownership, the owned-units + returns
+termination ledger, forced mode, the loopback self-test, exactness
+gates both runtimes. Capacity check: a block's idle capacity once the
+median process drains (~7 procs x 14 PEs x ~3 s ~ 290 core-s) dwarfs
+the straggler backlog (~45 core-s) — the movable fraction is not the
+constraint once helpers are parallel.
+
+Kale's standing review point also attaches here: the yield mechanism
+(FOF_PHASEB_SLICE_MS wall-clock) should eventually become per-unit or
+every-k-units yields — the natural message-driven grain.
