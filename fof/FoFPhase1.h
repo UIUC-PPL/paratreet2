@@ -476,6 +476,18 @@ public:
     }();
     return per_pe * CkNodeSize(CkMyNode());
   }
+  // Hybrid grant (Frontier Opus analysis 2026-08-12): units span ~1950x
+  // in cost, so a pure count cap is blind to how much WORK moves — the
+  // m2 budget stops a grant that scoops giants, the count cap stops a
+  // grant that is all dust. First unit always ships (budget checked
+  // before collecting), so the v1 giant-collapse cannot recur.
+  static double s3GrantM2() {
+    static const double v = [] {
+      const char* e = std::getenv("FOF_S3_GRANT_M2");
+      return e ? std::atof(e) : 5e7;
+    }();
+    return v;
+  }
   int s3Coord() const {
     int P = probeProcsPerPnode();
     return (CkMyNode() / P) * P;
@@ -537,6 +549,27 @@ public:
   };
   std::atomic<S3ForeignShip*> s3_active_ship{nullptr};
   std::vector<S3ForeignShip*> s3_ship_graveyard; // under s3_lock
+  // Per-unit walltime histogram (log2 buckets of microseconds; Frontier
+  // Opus ask 2026-08-12): with a ~1950x unit-cost spread, max and mean
+  // cannot distinguish "a few giants over dust" from a smooth heavy
+  // tail — and those imply different fixes. Accumulated per process,
+  // printed once at the merge.
+  static constexpr int kUnitHistBuckets = 24;
+  std::atomic<long> pb_unit_hist[kUnitHistBuckets] = {};
+  void printUnitHist() {
+    long total = 0;
+    for (int i = 0; i < kUnitHistBuckets; i++) total += pb_unit_hist[i].load();
+    if (total == 0) return;
+    char buf[512];
+    int off = snprintf(buf, sizeof(buf),
+                       "FOF3STAT pb_unit_hist: node %d log2us", CkMyNode());
+    for (int i = 0; i < kUnitHistBuckets; i++) {
+      long c = pb_unit_hist[i].load();
+      if (c > 0 && off < (int)sizeof(buf) - 24)
+        off += snprintf(buf + off, sizeof(buf) - off, " %d:%ld", i, c);
+    }
+    CkPrintf("%s\n", buf);
+  }
 
   // Agent -> coordinator, once per process at pool build: partition costs.
   void s3Publish(int fromNode, double total, const std::vector<double>& costs) {
@@ -692,7 +725,8 @@ public:
     double m2 = 0;
     const long cap = s3GrantUnits();
     for (uint32_t k = range.first; k < range.second; k++) {
-      if ((long)ship.unit_pairs.size() >= cap) break; // grant cap (units)
+      if ((long)ship.unit_pairs.size() >= cap) break; // count cap (dust)
+      if (m2 >= s3GrantM2()) break;                   // m2 budget (giants)
       int expect = 0;
       if (!s3_unit_taken[k].compare_exchange_strong(expect, 2)) continue;
       s3_units_owned.fetch_add(1);
@@ -796,10 +830,13 @@ public:
     stage_tM = CkWallTimer() - tm0;
     if (s3On())
       CkPrintf("FOF3STAT s3: node %d out_ships %ld out_units %ld out_m2 "
-               "%.3g in_ships %ld in_units %ld ret_edges %ld declines %ld\n",
+               "%.3g in_ships %ld in_units %ld ret_edges %ld declines %ld "
+               "rem_m2 %ld\n",
                CkMyNode(), s3_out_ships.load(), s3_out_units.load(),
                s3_out_m2, s3_in_ships.load(), s3_in_units.load(),
-               s3_ret_edges.load(), s3_declines.load());
+               s3_ret_edges.load(), s3_declines.load(),
+               s3_remaining_m2.load());
+    printUnitHist();
     int first = CkNodeFirst(CkMyNode());
     for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
       group_proxy[pe].relabelChained(stage_tA, stage_tB, stage_tM);
@@ -1114,6 +1151,7 @@ public:
     s3_members.clear();
     s3_remaining_m2 = 0;
     s3_poll_armed = 0;
+    for (int i = 0; i < kUnitHistBuckets; i++) pb_unit_hist[i] = 0;
     {
       auto* sh = s3_active_ship.exchange(nullptr);
       if (sh) s3_ship_graveyard.push_back(sh);
@@ -1804,6 +1842,15 @@ public:
           // leveling is complete (design/phase1-scaling.md).
           double tp = CkWallTimer() - tp0;
           if (tp > t_phaseB_maxpair) t_phaseB_maxpair = tp;
+          {
+            long us = (long)(tp * 1e6);
+            int b = 0;
+            while (us > 1 && b < FoFPhase1Node<Data>::kUnitHistBuckets - 1) {
+              us >>= 1;
+              b++;
+            }
+            nb->pb_unit_hist[b].fetch_add(1, std::memory_order_relaxed);
+          }
       }
       if (slice > 0 && CkWallTimer() - t0 > slice) {
         pb_t_accum_ += CkWallTimer() - t0;
@@ -2470,6 +2517,7 @@ public:
       double tm0 = CkWallTimer();
       nb->mergeBody();
       nb->stage_tM = CkWallTimer() - tm0;
+      nb->printUnitHist();
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].relabelChained(nb->stage_tA, nb->stage_tB,
