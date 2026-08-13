@@ -985,3 +985,67 @@ Readings:
   interpretable; phaseB rows are the signal.
 - Forced arm exact at 1.22M units shipped — S3 correctness at 2B now
   demonstrated on five transport configurations.
+
+## 29. Measured: Anvil 2B reservation A/B (job 19860455, 2026-08-13 morning) — machinery engages, trigger over-fires late in the drain; a fabric caveat resets the Anvil picture
+
+Five arms, all exact (424897832), including the sum-detail rerun
+(3,841 trace files at traces/2b-resv-sumd-19860455 — the section-22
+per-PE dataset finally exists). Base env = 19842202's + SLICE_MS=2 on
+every arm; binary staged from 0f30988 (campaign-bin/FoF3.2b.resv,
+traced-bin/FoF3.2b.resv-sumd).
+
+| arm | phaseA | phaseB | phaseB_s max | ships / units | resv_shipped | declines |
+|---|---|---|---|---|---|---|
+| base | 1.029 | 1.595 | 1.573 | 0 | 0 | 0 |
+| s3resv1 | 1.038 | 1.868 | 1.688 | 7,340 / 48,034 | 37,294 | 1,524 |
+| s3noresv | 1.027 | 1.782 | 1.609 | 10,540 / 38,674 | 0 | 1,781 |
+| s3resv2 | 1.040 | 1.754 | 1.612 | 7,803 / 43,273 | 33,377 | 1,784 |
+| s3sumd (traced) | 1.045 | 1.745 | 1.579 | 10,074 / 48,868 | 35,968 | 1,381 |
+
+1. FABRIC CAVEAT, and it is large: phaseA fell 27-39 s (every arm of
+   19842202, evening) to 1.03-1.05 s (every arm here, morning), with
+   cross-skew 16.5 -> 1.35 and max_piece_n identical (129019). Nothing
+   in the code delta touches phaseA's walk. Most plausible: the
+   evening job ran in Anvil's degraded messaging mode (the ~100x mode
+   Ritvik's aba7833 comment documents); this morning's fabric is
+   healthy. So section 28's ABSOLUTE numbers — including the s3slice
+   phaseB win — carry a degraded-fabric caveat; morning runs are the
+   trustworthy Anvil baseline. (Not fully excluded: the windowed
+   flush changing network state entering phaseA; a
+   PARATREET_FLUSH_WINDOW=0 arm would discriminate, if ever worth a
+   run.)
+2. The WINDOWED FLUSH (aba7833) is confirmed as the 19842202-sumd OOM
+   fix: per-task MaxRSS 12.2-12.5 GB -> 8.3-9.3 GB untraced; the
+   traced arm completed at 13.5 GB where its predecessor was
+   OOM-killed >14 GB mid-flush. vmhwm after decomposition 6.9 GB
+   (untraced) / 11.5 GB (traced), flush window 131072.
+3. On a HEALTHY-fabric Anvil, S3 at 2B is net overhead: every S3 arm
+   is slower than base (phaseB +0.15-0.27 s), per-PE max not helped
+   (1.58-1.69 vs 1.573). Anvil's straggler is mild (max 1.6 s,
+   17x max/avg concentrated in a few PEs); the ~40k-unit reshuffle
+   plus its 16-22k returned edges costs more than it saves.
+   Reservation is not distinguishable from noreserve in wall time
+   here. Anvil validates MACHINERY, not the composition win — the
+   composition problem (section 27) is Frontier's 3.3 s straggler.
+4. RESERVATION MACHINERY ENGAGES: 69-72 windows per run,
+   resv_shipped = 33-37k of 43-49k shipped units (~78% of shipped
+   units came from reserved windows); s3_grant_m2_hist has real mass
+   in the top buckets (19-27). But noreserve's hist ALSO peaks
+   high — on a fast, balanced drain the cursor has not eaten the
+   giants by grant time, so composition was never Anvil's problem.
+5. THE DESIGN LESSON — the trigger over-fires late in the drain:
+   72 of 128 members received RESERVE, and many windows fence
+   negligible work (window m2 observed at 1.3e3, 1.22e4, even 0.203).
+   The 2x-block-mean-excluding-self trigger has no absolute floor, so
+   as pools drain toward empty the mean shrinks and jitter trips it
+   everywhere. Grants are dust-sized in every S3 arm here (3.7-6.5
+   units/ship vs 203 in 19842202) — that part is v2-on-healthy-fabric
+   behaviour (orders chase remaining work that is nearly gone), not
+   reservation-specific, but reserving a near-empty pool is pure
+   overhead. PROPOSED (pending Kale, per section 27's
+   knobs-for-review): an absolute-work floor on the trigger —
+   RESERVE only if the member's remaining_m2 also exceeds
+   FOF_S3_RESERVE_MIN_FRAC (say 0.05) x its tot_m2 (both already
+   known at the trigger site) — plus, eventually, the same floor as
+   an UNRESERVE condition. Frontier's reservation pair should wait
+   for this decision if it has not already run.
