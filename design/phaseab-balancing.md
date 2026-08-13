@@ -866,3 +866,22 @@ constraint once helpers are parallel.
 Kale's standing review point also attaches here: the yield mechanism
 (FOF_PHASEB_SLICE_MS wall-clock) should eventually become per-unit or
 every-k-units yields — the natural message-driven grain.
+
+## 25. v2 gate results (2026-08-12 night) and a known-stall encounter
+
+v2 (commit "S3 v2: parallel foreign drain...") gates:
+- CLASSIC: all 7 exact — 1M loopback zero-mismatch, forced 2x4/4x2
+  with ships, natural, base, 10k full-oracle, and the dataset guard
+  (100k-uniform: S3-off == S3-forced at 98275).
+- RECONVERSE: -n 4 forced PASS (39 s; ships BIDIRECTIONAL — nodes 0/2
+  shipped 18/19 grants and also helped 9/8 in; exact). -n 2 with S3
+  armed STALLS: lldb attach shows every PE of both processes idle in
+  CsdScheduler -> LCI poll_comp, no app code on any stack — the known
+  reconverse LCI IDLE-PROGRESS STALL (keep-alive-ring family), not an
+  S3 logic fault. Discriminators: classic -n 2 identical scenario
+  passes; reconverse -n 2 with S3 OFF passes; pre-v2 -n 2 with v1 S3
+  passed (v1's serial helper kept a PE busy; v2's efficient wait is
+  what goes fully idle). Cheap candidate fix if it matters beyond the
+  laptop: extend the keep-alive ring into phase 1 while FOF_S3 is
+  armed. Laptop reconverse gates use -n 4 until then; Frontier's CXI
+  fabric is the real test.
