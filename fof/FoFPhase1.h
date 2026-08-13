@@ -461,6 +461,19 @@ public:
     }();
     return v;
   }
+  // Per-grant m2 ceiling: v1 helpers execute a shipment on ONE PE, so an
+  // uncapped grant of the giant partition (8.3x average at 2B) is ~12
+  // core-seconds of serial remote work — the Frontier trace's 10+ s
+  // s3Shipment bars. Units beyond the cap stay unclaimed for the local
+  // drain (or a later order for another partition; this one is spent).
+  // Default 5e6 m2 ~ a few hundred ms of walk at 2B rates.
+  static double s3MaxGrant() {
+    static const double v = [] {
+      const char* e = std::getenv("FOF_S3_MAX_GRANT_M2");
+      return e ? std::atof(e) : 5e6;
+    }();
+    return v;
+  }
   int s3Coord() const {
     int P = probeProcsPerPnode();
     return (CkMyNode() / P) * P;
@@ -583,6 +596,7 @@ public:
     };
     double m2 = 0;
     for (uint32_t k = range.first; k < range.second; k++) {
+      if (m2 >= s3MaxGrant()) break; // cap the grant; locals keep the rest
       int expect = 0;
       if (!s3_unit_taken[k].compare_exchange_strong(expect, 2)) continue;
       s3_units_owned.fetch_add(1);
@@ -3484,9 +3498,17 @@ private:
   // Execute one unit over any node pair (live or rebuilt) into a local,
   // per-call edge set — the identical walk, certificate, and dedup
   // semantics as phaseBBody, with no shared state. Used by the helper
-  // executor and the self-test. (No uniform-node shortcuts here: the
-  // rebuilt side must produce the same edges as the live side, and the
-  // self-test compares raw sets.)
+  // executor and the self-test. CARRIES THE SAME UNIFORMITY SHORTCUTS
+  // as leafLeafEmit/certTipRep: their absence here made shipped units
+  // orders of magnitude costlier than local ones at 2B (the shortcuts
+  // were introduced when 7.8e9 redundant emissions kept 1.1M edges) —
+  // the Frontier sum-detail trace of 2026-08-12 showed single helper
+  // PEs grinding s3Shipment for 10+ s while 1792 PEs idled. The
+  // shortcuts preserve the emitted edge SET exactly (a uniform-uniform
+  // pair contributes either nothing or one deduplicated edge either
+  // way), so the loopback self-test remains valid with them on: both
+  // its sides run this same function. The shipment's rebuilt nodes
+  // carry the frozen-tip annotations (SpatialNode is copied whole).
   void walkUnitEdges(Node<Data>* a, Node<Data>* b,
                      std::vector<std::pair<long, long>>& out) {
     std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> lseen;
@@ -3509,6 +3531,9 @@ private:
       for (int i = 0; i < n->n_children; i++) starLocal(n->getChild(i), rep);
     };
     auto certLocal = [&](Node<Data>* n) -> long {
+      // One fragment under this node: no star needed (certTipRep's
+      // shortcut, verbatim).
+      if (tipAnnotate() && n->data.uniform()) return n->data.min_frag;
       auto it = lmemo.find(n);
       if (it != lmemo.end()) return it->second;
       long rep = firstTip(n);
@@ -3518,6 +3543,11 @@ private:
     };
     walk(a, b,
          [&](Node<Data>* x, Node<Data>* y) {
+           // leafLeafEmit's shortcut, verbatim: single-fragment leaves
+           // can only ever produce one edge (or none).
+           const bool both_uniform =
+               tipAnnotate() && x->data.uniform() && y->data.uniform();
+           if (both_uniform && x->data.min_frag == y->data.min_frag) return;
            const Particle* px = x->particles();
            const Particle* py = y->particles();
            for (int i = 0; i < x->n_particles; i++)
@@ -3525,6 +3555,7 @@ private:
                if (paratreet::periodicDistSq(px[i].position, py[j].position,
                                              period_) > b2_) continue;
                emitLocal(px[i].group_number, py[j].group_number);
+               if (both_uniform) return; // one edge is all this pair yields
              }
          },
          [&](Node<Data>* x, Node<Data>* y) {
