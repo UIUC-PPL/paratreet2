@@ -924,3 +924,148 @@ reasonable until measured.
 Next: stage 2 — the device union-find and the leaf-batched traversal
 (K1/K2), which is where the flat tree stops being staged data and starts
 being read by a kernel.
+
+---
+
+## 14. Stage 2: the device union-find and traversal (2026-08-12)
+
+Jobs 5256843 / 5256925 / 5256946 / 5256985, one Frontier node, 8
+processes x 14 PEs, lambb.00500 (80M). Code: the `runPhase1` half of
+`fof/gpu/FoFDevice.cpp` (union-find, top tree, traversal, freeze) and
+the launch/verify wiring in `fof/FoFPhase1.h`. Gate script:
+`fof/gpu/run_stage2.sbatch`.
+
+### 14.1 The gate: exact per-particle agreement
+
+The device pass runs AFTER the CPU chain, deliberately. By then every
+particle's `group_number` holds its PROCESS-level tip — the global order
+of the minimum-order member of its process-level component — which is
+exactly what a process-wide device union-find computes. Both use
+union-by-minimum-global-order, a total order, so both answers are
+order-independent and must agree **particle by particle**, not merely in
+component count.
+
+| arm | result |
+|---|---|
+| 1k, 2 processes | 0 mismatches; 390 components (`TEST PASSED`, full O(n^2)) |
+| 100k, 2 processes | 0 mismatches; 33,933 components (`TEST PASSED`, full O(n^2)) |
+| 80M, 8 processes | 0 mismatches; 23,707,197 components |
+
+This is a much stronger gate than the component histogram: a labeling
+that got the partition right by luck but named a component differently
+would fail it, and so would any single particle placed in the wrong
+component anywhere on any process.
+
+### 14.2 Result
+
+Per process (10.0M particles), against the same run's CPU numbers:
+
+| | time |
+|---|---|
+| CPU phaseA + phaseB + merge (max PE) | **1.207 s** |
+| device walk (max process) | **516 ms** |
+| device pass total: prepare 28 + walk 516 + freeze 0.3 + download 3.2 | 548 ms |
+| + staging: particle pack 94, tree pack 27, tree upload 10, scatter 36 | ~731 ms |
+
+**2.3x on the kernel against 14 CPU cores, ~1.65x end to end.** Real,
+but well short of the 10-30x section 1 projected from ArborX's
+37M/0.15 s on an A100 (which scales to roughly 80 ms for 10M on half an
+A100 — we are ~6x off that). Section 14.4 is the diagnosis.
+
+Note the baseline moved: the ledger's 1-node row
+(design/fof3-lambb500-scaling.md) reads phaseA 1.563 s, but this build
+measures 1.127 s for the same configuration. Comparisons here use the
+number from the same job, not the ledger.
+
+### 14.3 Two optimizations, one of which was wrong
+
+**Wrong: the certificate thundering herd.** The first version's memo was
+a plain check-then-set, so thousands of leaf threads could reach the same
+hot node simultaneously, all read "unpublished", and all run the same
+O(n_below) star-union. That is genuinely unbounded redundant work and it
+looked like the obvious culprit. Fixing it — claim with a CAS (-1 -> -2
+-> rep), losers unite with the node's first particle instead of waiting,
+which is correct because the winner is committed to collapsing that node
+and union-find is order-independent — **made no difference at all**
+(walk went 531-766 ms to 578-848 ms, i.e. slightly worse, within the
+noise of the extra atomic). The fix is kept because it is correct and
+bounds a real worst case, but it was not the bottleneck. Reordering the
+leaf list from atomic-compaction order to node order (a `parallel_scan`,
+for locality and determinism) likewise did nothing measurable.
+
+**Right: put the wavefront on the work.** The leaf-size sweep settled it,
+and it runs the opposite way to intuition:
+
+| max_particles_per_leaf | leaves/process | device walk (max) |
+|---|---|---|
+| 12 (default) | 2.7M | 850 ms |
+| 32 | 1.2M | 2306 ms |
+| 64 | 0.6M | 4075 ms |
+
+Bigger leaves mean 4.5x fewer traversals and were still 4.8x SLOWER.
+That can only happen if the per-thread leaf-pair product — leaf_size^2,
+run serially by one lane — dominates, which also rules out traversal
+node loads as the primary cost. So the kernel became **one team
+(wavefront) per leaf instead of one thread**: every lane runs the same
+traversal on a shared stack in team scratch (so node loads are one
+broadcast per team rather than 64 scattered gathers), and the leaf-pair
+cross product and the star-union are split across the 64 lanes over
+consecutive particles (so they coalesce). Lane 0 owns push/pop and
+broadcasts the popped entry, which is what keeps the shared stack
+consistent. **850 ms -> 516 ms on the worst process, 1.6x**, with the
+labels still bit-exact.
+
+### 14.4 Where the remaining time goes
+
+Certificate count tracks walk time across processes almost linearly:
+
+| process | certificates | walk |
+|---|---|---|
+| 0 | 31.5M | 320 ms |
+| 6 | 61.5M | 516 ms |
+
+1.95x the certificates, 1.61x the time. The positive certificate is the
+dominant cost, and it is concentrated in the dense processes — which is
+precisely the regime stage 3's cell grid exists for (section 5, K3). The
+CPU answers this with the same two mechanisms we have not ported yet:
+connectivity suppression (a pair both-connected and already in the same
+component prunes at ANY level — measured 4-7x on phaseA at 80M) and the
+`-G` cell grid inside dense nodes. Expect stage 3 to move this number
+much more than further kernel tuning would.
+
+Second-order items visible in the same numbers: `prepare` doubled from
+12 ms to 26 ms when the leaf compaction moved from an atomic counter to
+a `parallel_scan` (kept anyway — determinism is worth 14 ms when chasing
+a mismatch), and staging is now 166 ms, comparable to a third of the
+walk, so the "write the device form at tree build" idea in section 12.1
+stops being premature if the walk keeps dropping.
+
+### 14.5 Design notes
+
+- **The traversal starts at a top tree**, not at 539 piece roots: without
+  it every leaf would test every piece (539 x 2.7M box tests). It is a
+  median-split BVH over the piece root boxes, built on the host in
+  microseconds, and traversal entries are tagged (`>= 0` a node index,
+  `< 0` a top-tree index) so one stack serves both levels.
+- **`runPhase1` is synchronous**, with a fence between kernels so the
+  per-kernel walls are real. The async form (enqueue + `hapiAddCallback`,
+  no fence, no blocked scheduler) is proven in stage 0 and is a two-line
+  change; measurement came first.
+- **PBC is not implemented on the device.** The device distance test is
+  plain Euclidean. Runs with `-P` must use the CPU arm until the cell
+  wrap is written (section 10, open question 1).
+
+### 14.6 One more trap
+
+13. **A kernel entry point that silently reads stale device memory.**
+    `runPhase1` did not upload positions and orders — that copy lived in
+    `enqueueRoundTrip`, the stage-0 method it replaced — so every label
+    came back 0. It failed loudly only because the gate compares every
+    particle; a component-count check would have reported a plausible
+    wrong number. Each device entry point now owns the uploads it reads,
+    rather than relying on a sibling method having run first.
+
+Next: stage 3 (the dense-node cell grid), which section 14.4 identifies
+as the largest remaining lever, and then the section-4 contract work
+(process-wide `rep_label` + deposit barriers) that lets the device
+labeling actually replace the CPU chain rather than run beside it.

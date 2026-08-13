@@ -9,6 +9,9 @@
 
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
+#include <climits>
+#include <vector>
 
 #if defined(KOKKOS_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -31,6 +34,16 @@ using PinnedSpace = Kokkos::CudaHostPinnedSpace;
 #else
 using PinnedSpace = Kokkos::HostSpace;
 #endif
+
+// Top tree over the process's TreePiece roots. The pieces are ~500
+// scattered boxes; without a tree over them every leaf's traversal would
+// start by testing all of them (500 x 2.6M leaf tests at 80M). Built on
+// the host at upload, it is tiny (2 x n_pieces nodes).
+struct DTopNode {
+  float lo[3], hi[3];
+  int left, right;  // indices into the top array, or -1
+  int piece;        // >= 0: a leaf, index into piece_root; else -1
+};
 
 template <typename T>
 using DView = Kokkos::View<T*, MemSpace>;
@@ -64,6 +77,13 @@ struct Device::Impl {
   HView<int> h_piece_root;
   HView<int> h_piece_base;
   DView<DDNode> d_nodes;
+  DView<DTopNode> d_top;
+  DView<int> d_leaves;     // node indices of the leaves
+  DView<int> d_parent;     // union-find over process-flat particle indices
+  DView<int> d_node_rep;   // positive-certificate memo, -1 = unpublished
+  long n_leaves = 0;
+  int n_top = 0;
+  std::vector<DTopNode> h_top;
   DView<int> d_piece_root;
   DView<int> d_piece_base;
   long n_nodes = 0;
@@ -90,6 +110,126 @@ struct Device::Impl {
 #endif
   }
 };
+
+
+// ---------------------------------------------------------------------
+// Stage 2 kernels (design/phase1-gpu.md section 5).
+// ---------------------------------------------------------------------
+
+namespace {
+
+// Box predicates, transliterated from paratreet::mindist2 / maxdist2
+// (fof/FoFPhase1.h). Same operation order, and the whole library is
+// built -ffp-contract=off, so a pair sitting exactly on b decides the
+// same way it does on the CPU.
+KOKKOS_INLINE_FUNCTION float boxMinDist2(const float* alo, const float* ahi,
+                                         const float* blo, const float* bhi) {
+  float d2 = 0.f;
+  for (int k = 0; k < 3; k++) {
+    const float g = fmaxf(alo[k] - bhi[k], blo[k] - ahi[k]);
+    if (g > 0.f) d2 += g * g;
+  }
+  return d2;
+}
+
+KOKKOS_INLINE_FUNCTION float boxMaxDist2(const float* alo, const float* ahi,
+                                         const float* blo, const float* bhi) {
+  float d2 = 0.f;
+  for (int k = 0; k < 3; k++) {
+    const float d = fmaxf(fabsf(alo[k] - bhi[k]), fabsf(ahi[k] - blo[k]));
+    d2 += d * d;
+  }
+  return d2;
+}
+
+// Lock-free union-find over process-flat particle indices.
+//
+// UNION BY MINIMUM GLOBAL ORDER, exactly as the CPU's unite() does
+// (FoFPhase1.h): particle orders are globally unique, so this is a TOTAL
+// order, every parent link points to a strictly smaller order, and the
+// parent graph is acyclic BY CONSTRUCTION — which is what makes the CAS
+// attach safe with no rank scheme and no lock. Path compression uses
+// plain stores: they only ever move a link closer to the root, so a race
+// with another thread's compression or CAS cannot invert the order.
+//
+// The result is ORDER-INDEPENDENT (union-find is a semilattice), so the
+// nondeterministic execution order cannot change the final partition and
+// the tip — the minimum order in the component — is deterministic. That
+// is what makes an exact comparison against the CPU arm meaningful.
+KOKKOS_INLINE_FUNCTION int ufFind(const Kokkos::View<int*, MemSpace>& parent,
+                                  int i) {
+  while (true) {
+    const int p = parent(i);
+    if (p == i) return i;
+    const int g = parent(p);
+    parent(i) = g;  // path splitting
+    i = g;
+  }
+}
+
+KOKKOS_INLINE_FUNCTION void ufUnite(const Kokkos::View<int*, MemSpace>& parent,
+                                    const Kokkos::View<long*, MemSpace>& order,
+                                    int a, int b) {
+  while (true) {
+    a = ufFind(parent, a);
+    b = ufFind(parent, b);
+    if (a == b) return;
+    int lo = a, hi = b;
+    if (order(a) > order(b)) { lo = b; hi = a; }
+    // Attach the larger-order root under the smaller-order one.
+    if (Kokkos::atomic_compare_exchange(&parent(hi), hi, lo) == hi) return;
+  }
+}
+
+// Star-union every particle under node m into its first particle, at most
+// once process-wide. Returns immediately (doing nothing) if another
+// thread already owns or has finished the job — see the call site for why
+// that is safe.
+KOKKOS_INLINE_FUNCTION void starUnion(
+    const Kokkos::View<DDNode*, MemSpace>& nodes,
+    const Kokkos::View<int*, MemSpace>& parent,
+    const Kokkos::View<long*, MemSpace>& order, 
+    const Kokkos::View<int*, MemSpace>& node_rep, int m) {
+  if (node_rep(m) != -1) return;  // claimed or done
+  if (Kokkos::atomic_compare_exchange(&node_rep(m), -1, -2) != -1) return;
+  const DDNode d = nodes(m);
+  for (int i = 1; i < d.n_below; i++)
+    ufUnite(parent, order, d.part_begin, d.part_begin + i);
+  Kokkos::atomic_store(&node_rep(m), d.part_begin);
+}
+
+// Team form of the star-union: claim the node once process-wide, then
+// split its particles across the lanes. The barrier before publishing is
+// required — the memo must not read "done" until every lane's unite has
+// landed.
+template <typename TeamMember>
+KOKKOS_INLINE_FUNCTION void teamStarUnion(
+    const TeamMember& team, const Kokkos::View<DDNode*, MemSpace>& nodes,
+    const Kokkos::View<int*, MemSpace>& parent,
+    const Kokkos::View<long*, MemSpace>& order,
+    const Kokkos::View<int*, MemSpace>& node_rep, int m) {
+  int claimed = 0;
+  Kokkos::single(Kokkos::PerTeam(team),
+                 [&](int& out) {
+                   out = (node_rep(m) == -1 &&
+                          Kokkos::atomic_compare_exchange(&node_rep(m), -1,
+                                                          -2) == -1)
+                             ? 1
+                             : 0;
+                 },
+                 claimed);
+  if (!claimed) return;
+  const DDNode d = nodes(m);
+  Kokkos::parallel_for(Kokkos::TeamThreadRange(team, 1, d.n_below),
+                       [&](const int i) {
+                         ufUnite(parent, order, d.part_begin, d.part_begin + i);
+                       });
+  team.team_barrier();
+  Kokkos::single(Kokkos::PerTeam(team),
+                 [&]() { Kokkos::atomic_store(&node_rep(m), d.part_begin); });
+}
+
+}  // namespace
 
 bool Device::available() {
 #if defined(KOKKOS_ENABLE_HIP) || defined(KOKKOS_ENABLE_CUDA)
@@ -136,6 +276,13 @@ void Device::finalize() {
   p_->h_piece_root = HView<int>();
   p_->h_piece_base = HView<int>();
   p_->d_nodes = DView<DDNode>();
+  p_->d_top = DView<DTopNode>();
+  p_->d_leaves = DView<int>();
+  p_->d_parent = DView<int>();
+  p_->d_node_rep = DView<int>();
+  p_->n_leaves = 0;
+  p_->n_top = 0;
+  p_->h_top.clear();
   p_->d_piece_root = DView<int>();
   p_->d_piece_base = DView<int>();
   p_->n_nodes = 0;
@@ -309,6 +456,305 @@ void Device::uploadTree(TreeStats* out) {
   st.t_check = timer.seconds();
   st.bad_nodes = bad;
   st.particles_under_roots = under_roots;
+  if (out) *out = st;
+}
+
+// Host-side top tree over the piece root boxes: recursive median split on
+// the longest axis of the centroid bounds. n_pieces is a few hundred, so
+// this is microseconds and its quality barely matters — what matters is
+// that a leaf's traversal starts at ONE node instead of testing every
+// piece.
+static int buildTopTree(std::vector<DTopNode>& out, const DDNode* nodes,
+                        const int* piece_root, int* idx, int begin, int end) {
+  const int me = (int)out.size();
+  out.push_back(DTopNode());
+  DTopNode t;
+  for (int k = 0; k < 3; k++) { t.lo[k] = 1e30f; t.hi[k] = -1e30f; }
+  for (int i = begin; i < end; i++) {
+    const DDNode& r = nodes[piece_root[idx[i]]];
+    for (int k = 0; k < 3; k++) {
+      if (r.lo[k] < t.lo[k]) t.lo[k] = r.lo[k];
+      if (r.hi[k] > t.hi[k]) t.hi[k] = r.hi[k];
+    }
+  }
+  if (end - begin == 1) {
+    t.left = t.right = -1;
+    t.piece = idx[begin];
+    out[me] = t;
+    return me;
+  }
+  int axis = 0;
+  float best = t.hi[0] - t.lo[0];
+  for (int k = 1; k < 3; k++)
+    if (t.hi[k] - t.lo[k] > best) { best = t.hi[k] - t.lo[k]; axis = k; }
+  const int mid = begin + (end - begin) / 2;
+  std::nth_element(idx + begin, idx + mid, idx + end,
+                   [&](int a, int b) {
+                     const DDNode& ra = nodes[piece_root[a]];
+                     const DDNode& rb = nodes[piece_root[b]];
+                     return (ra.lo[axis] + ra.hi[axis]) <
+                            (rb.lo[axis] + rb.hi[axis]);
+                   });
+  t.piece = -1;
+  const int l = buildTopTree(out, nodes, piece_root, idx, begin, mid);
+  const int r = buildTopTree(out, nodes, piece_root, idx, mid, end);
+  t.left = l;
+  t.right = r;
+  out[me] = t;
+  return me;
+}
+
+void Device::runPhase1(float b2, WalkStats* out) {
+  WalkStats st;
+  if (!p_->inited || p_->n == 0 || p_->n_nodes == 0) {
+    if (out) *out = st;
+    return;
+  }
+  ExecSpace exec = p_->exec();
+  Kokkos::Timer timer;
+
+  // ---- upload the staged particles (K0's device half) ----
+  // Must happen here, not in some earlier call: this is the only entry
+  // point that reads them, and leaving the H2D copy to a sibling method
+  // silently produced all-zero labels the first time (the orders were
+  // never on the device at all).
+  Kokkos::deep_copy(exec, p_->d_pos, p_->h_pos);
+  Kokkos::deep_copy(exec, p_->d_order, p_->h_order);
+
+  // ---- prepare: top tree, leaf list, union-find, certificate memo ----
+  if (p_->h_top.empty()) {
+    std::vector<int> idx(p_->n_pieces);
+    for (int i = 0; i < p_->n_pieces; i++) idx[i] = i;
+    p_->h_top.reserve(2 * p_->n_pieces);
+    buildTopTree(p_->h_top, p_->h_nodes.data(), p_->h_piece_root.data(),
+                 idx.data(), 0, p_->n_pieces);
+    p_->n_top = (int)p_->h_top.size();
+    p_->d_top = DView<DTopNode>(
+        Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_d_top"),
+        p_->n_top);
+    Kokkos::View<const DTopNode*, Kokkos::HostSpace,
+                 Kokkos::MemoryTraits<Kokkos::Unmanaged> >
+        h(p_->h_top.data(), p_->n_top);
+    Kokkos::deep_copy(exec, p_->d_top, h);
+  }
+
+  const long n_nodes = p_->n_nodes;
+  const size_t n_part = p_->n;
+  auto d_nodes = p_->d_nodes;
+  auto d_top = p_->d_top;
+  auto d_piece_root = p_->d_piece_root;
+
+  // Leaf list, compacted by a SCAN rather than by an atomic counter.
+  // Atomic compaction was the obvious way to write this and it is wrong
+  // for the wrong reason: it is correct (the pair-once rule compares node
+  // indices, not list positions) but it hands each wavefront 64 unrelated
+  // leaves, so 64 lanes traverse 64 unrelated parts of the tree together.
+  // Node order is spatially coherent — children are contiguous and the
+  // particles under them are key-sorted — so preserving it gives lanes in
+  // a wavefront overlapping descents. It also makes the launch
+  // deterministic, which matters when chasing a mismatch.
+  p_->d_leaves = DView<int>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_d_leaves"), n_nodes);
+  auto d_leaves = p_->d_leaves;
+  long n_leaves = 0;
+  Kokkos::parallel_scan(
+      "fof_leaf_list", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_nodes),
+      KOKKOS_LAMBDA(const long i, long& acc, const bool final) {
+        const bool is_leaf = d_nodes(i).child_begin < 0;
+        if (is_leaf && final) d_leaves(acc) = (int)i;
+        if (is_leaf) acc += 1;
+      },
+      n_leaves);
+
+  p_->d_parent = DView<int>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_d_parent"), n_part);
+  p_->d_node_rep = DView<int>(
+      Kokkos::view_alloc(Kokkos::WithoutInitializing, "fof_d_node_rep"),
+      n_nodes);
+  auto d_parent = p_->d_parent;
+  auto d_node_rep = p_->d_node_rep;
+  auto d_pos = p_->d_pos;
+  auto d_order = p_->d_order;
+  auto d_label = p_->d_label;
+  Kokkos::parallel_for(
+      "fof_uf_init", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_part),
+      KOKKOS_LAMBDA(const long i) { d_parent(i) = (int)i; });
+  Kokkos::parallel_for(
+      "fof_rep_init", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_nodes),
+      KOKKOS_LAMBDA(const long i) { d_node_rep(i) = -1; });
+  exec.fence();
+  st.t_prepare = timer.seconds();
+  st.n_leaves = n_leaves;
+  st.n_top_nodes = p_->n_top;
+
+  // ---- the walk ----
+  // ONE TEAM (wavefront) PER LEAF, not one thread.
+  //
+  // The first version ran one thread per leaf and was ~2x the CPU rather
+  // than the ~10x the plan projected. The leaf-size sweep said why: 12 ->
+  // 32 -> 64 particles per leaf made the kernel 2.3x then 4.5x SLOWER,
+  // the opposite of the expected direction, which can only happen if the
+  // per-thread leaf-pair product (leaf_size^2, run serially by one lane)
+  // dominates. Both halves of that are fixed by putting the wavefront on
+  // the work instead of on independent leaves:
+  //
+  //   - every lane runs the SAME traversal on the SAME stack, so the node
+  //     loads are one broadcast per team instead of 64 scattered gathers;
+  //   - the leaf-pair cross product and the certificate star-union are
+  //     split across the 64 lanes and read consecutive particles, so they
+  //     coalesce.
+  //
+  // The stack lives in team scratch (LDS) once per team rather than once
+  // per lane: 64 identical copies in private memory would be 32 KB per
+  // wavefront and would wreck occupancy. Lane 0 owns push/pop and
+  // broadcasts, which is what keeps the shared stack consistent.
+  timer.reset();
+  Kokkos::View<long*, MemSpace> counters("fof_counters", 3);
+  Kokkos::deep_copy(exec, counters, 0L);
+  const int kStack = 128;
+  const int kTeam = 64;  // MI250X wavefront; a warp on NVIDIA is 32
+  using policy_t = Kokkos::TeamPolicy<ExecSpace>;
+  using member_t = policy_t::member_type;
+  const size_t shmem = (size_t)kStack * sizeof(int) + 2 * sizeof(int);
+  policy_t policy(exec, (int)n_leaves, kTeam);
+  policy.set_scratch_size(0, Kokkos::PerTeam((int)shmem));
+  Kokkos::parallel_for(
+      "fof_walk", policy, KOKKOS_LAMBDA(const member_t& team) {
+        const int li = d_leaves(team.league_rank());
+        const DDNode L = d_nodes(li);
+
+        int* stack = (int*)team.team_shmem().get_shmem(kStack * sizeof(int));
+        int* sp = (int*)team.team_shmem().get_shmem(2 * sizeof(int));
+        Kokkos::single(Kokkos::PerTeam(team), [&]() {
+          stack[0] = -1;  // top-tree root
+          sp[0] = 1;
+        });
+        team.team_barrier();
+
+        while (true) {
+          // Pop once for the whole team and broadcast; INT_MIN = done.
+          int e = 0;
+          Kokkos::single(Kokkos::PerTeam(team),
+                         [&](int& out) {
+                           out = (sp[0] > 0) ? stack[--sp[0]] : INT_MIN;
+                         },
+                         e);
+          if (e == INT_MIN) break;
+
+          if (e < 0) {  // top tree
+            const DTopNode t = d_top(-e - 1);
+            if (boxMinDist2(L.lo, L.hi, t.lo, t.hi) <= b2) {
+              Kokkos::single(Kokkos::PerTeam(team), [&]() {
+                if (t.piece >= 0) {
+                  if (sp[0] < kStack) stack[sp[0]++] = d_piece_root(t.piece);
+                  else Kokkos::atomic_fetch_add(&counters(0), 1L);
+                } else if (sp[0] + 2 <= kStack) {
+                  stack[sp[0]++] = -(t.left + 1);
+                  stack[sp[0]++] = -(t.right + 1);
+                } else {
+                  Kokkos::atomic_fetch_add(&counters(0), 1L);
+                }
+              });
+            }
+            team.team_barrier();
+            continue;
+          }
+
+          const DDNode M = d_nodes(e);
+          if (boxMinDist2(L.lo, L.hi, M.lo, M.hi) > b2) {
+            team.team_barrier();
+            continue;
+          }
+
+          // Positive certificate: every cross pair is a friend, so both
+          // sides collapse with no distance test and no descent. The memo
+          // is CLAIMED with a CAS, not merely checked: thousands of teams
+          // can reach a hot node at once, and without the claim they all
+          // run the same O(n_below) star-union.
+          if (boxMaxDist2(L.lo, L.hi, M.lo, M.hi) <= b2) {
+            teamStarUnion(team, d_nodes, d_parent, d_order, d_node_rep, li);
+            if (e != li) {
+              teamStarUnion(team, d_nodes, d_parent, d_order, d_node_rep, e);
+              Kokkos::single(Kokkos::PerTeam(team), [&]() {
+                // Uniting the two FIRST particles is enough: whoever won
+                // each claim is committed to collapsing that node, and
+                // union-find is order-independent, so it does not matter
+                // which finishes first.
+                ufUnite(d_parent, d_order, L.part_begin, M.part_begin);
+                Kokkos::atomic_fetch_add(&counters(1), 1L);
+              });
+            }
+            team.team_barrier();
+            continue;
+          }
+
+          if (M.child_begin < 0) {
+            // Leaf pair, owned by the smaller node index so the mirror
+            // visit from M's own team does nothing (the structural
+            // each-pair-once rule).
+            if (e >= li) {
+              const int ab = L.part_begin, bb = M.part_begin;
+              const int nb_ = (e == li) ? L.n_below : M.n_below;
+              // Flatten the product over the lanes: consecutive lanes
+              // take consecutive j, so the inner reads of the partner's
+              // positions coalesce.
+              Kokkos::parallel_for(
+                  Kokkos::TeamThreadRange(team, L.n_below), [&](const int i) {
+                    const float xi = d_pos(3 * (ab + i));
+                    const float yi = d_pos(3 * (ab + i) + 1);
+                    const float zi = d_pos(3 * (ab + i) + 2);
+                    const int j0 = (e == li) ? i + 1 : 0;
+                    for (int j = j0; j < nb_; j++) {
+                      const int p = (e == li) ? ab + j : bb + j;
+                      const float dx = xi - d_pos(3 * p);
+                      const float dy = yi - d_pos(3 * p + 1);
+                      const float dz = zi - d_pos(3 * p + 2);
+                      if (dx * dx + dy * dy + dz * dz <= b2)
+                        ufUnite(d_parent, d_order, ab + i, p);
+                    }
+                  });
+              Kokkos::single(Kokkos::PerTeam(team), [&]() {
+                Kokkos::atomic_fetch_add(&counters(2), 1L);
+              });
+            }
+            team.team_barrier();
+            continue;
+          }
+
+          Kokkos::single(Kokkos::PerTeam(team), [&]() {
+            if (sp[0] + M.n_children <= kStack) {
+              for (int c = 0; c < M.n_children; c++)
+                stack[sp[0]++] = M.child_begin + c;
+            } else {
+              Kokkos::atomic_fetch_add(&counters(0), 1L);
+            }
+          });
+          team.team_barrier();
+        }
+      });
+  exec.fence();
+  st.t_walk = timer.seconds();
+
+  // ---- freeze: full path compression + the tip write ----
+  timer.reset();
+  Kokkos::parallel_for(
+      "fof_freeze", Kokkos::RangePolicy<ExecSpace>(exec, 0, n_part),
+      KOKKOS_LAMBDA(const long i) {
+        d_label(i) = d_order(ufFind(d_parent, (int)i));
+      });
+  exec.fence();
+  st.t_freeze = timer.seconds();
+
+  timer.reset();
+  Kokkos::deep_copy(exec, p_->h_label, d_label);
+  exec.fence();
+  st.t_download = timer.seconds();
+
+  auto h_counters = Kokkos::create_mirror_view(counters);
+  Kokkos::deep_copy(h_counters, counters);
+  st.stack_overflows = h_counters(0);
+  st.certificates = h_counters(1);
+  st.leaf_pairs = h_counters(2);
   if (out) *out = st;
 }
 
