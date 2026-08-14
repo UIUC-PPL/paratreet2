@@ -1297,3 +1297,65 @@ window; cf. section 29 item 1) — treat all timing as low-confidence.
    Not attributable yet; watch the Frontier A/B — if teardown aborts
    recur on wire binaries only, suspect the arena path and escalate
    to Guard Malloc / valgrind on a small case.
+
+## 33. The Frontier afternoon+overnight (relay1, 2026-08-13/14): bytes-bound
+## transport, self-limiting stealing corrected to grant-count, the POD-wire
+## win, and a wrong default fixed
+
+Full record: design/frontier-relay1-2026-08-13.txt (23 sections incl.
+its own retractions — read them; three interim conclusions were
+corrected in place) and design/frontier-s3-transport-ab-results-*.md.
+41/41 2B runs exact across 8+ jobs. Distillation, in dependency order:
+
+1. TRANSPORT A/B (b797e73): works (s3Shipment -13-16%/unit, stable
+   across grant sizes) but NOT the lever — end-to-end within noise.
+   Kept: free and correct.
+2. GRANT_M2=1e10 (my 1e11-era default from section 30) WAS WRONG at
+   the best cell — tuned on 4x-smaller grants; cost ~37% straggler and
+   stranded a third of movable work. FIXED: default now 1e11
+   (a10f7be). Third bare-constant incident; the relative budget (vs
+   SHIPPED mean m2/unit ~5.9x pool mean) is still the real fix.
+3. PROJECTIONS DECOMPOSITION (full .log.gz, +traceprocessors 224-PE
+   subset; Kale's suggestion made it possible): s3Shipment cost is
+   ~100% BYTE-PROPORTIONAL (r=0.999 vs msglen, zero intercept,
+   ~300 MB/s). Shipments are enormous: median 28-36 MB, max 226 MB,
+   ~73 KB per stolen unit. Charm's unpack is 1 us; everything is
+   inside the entry.
+4. GRANT COUNT, not work moved, predicts the straggler (r=+0.919 vs
+   +0.693 confounded) — each grant costs its donor ~fixed collection
+   time, and marginal grants ship non-binding work. Every packing
+   lever tried (byte cap, marginal-density, partition spanning) was
+   neutral-to-negative AT TODAY'S PER-GRANT COST; retest after the
+   cost changes. Per-grant PE-second accounting: donor pays ~0.18 to
+   offload ~0.96 spread over idle helpers — 1:5.4, scarce-for-free.
+5. DONOR COLLECTION DECOMPOSED (s3_time instrument, validated -5.4%
+   vs projections msglen): the send is ~1 ms (sits at 99.2% through
+   the block — Kale's read); the cost was charm's SIZER+PACK
+   marshalling of ~379 vectors. Zero-copy therefore targets ~1 ms
+   (retired as a straggler lever; still blocked upstream anyway:
+   CMK_NOCOPY_DIRECT_BYTES=32 too small for CXI rmr — WIP parked on
+   Frontier).
+6. THE WIN — POD WIRE + BULK PUP (Kale: "every real node is the same
+   subclass; the wire needs no polymorphism"): WireSpatial replaces
+   the embedded SpatialNode whose virtual dtor forced field-by-field
+   pup. Donor collection 117.8 -> 49.4 ms/grant; campaign-best on all
+   three headline rows: phaseB_s max 1.229/1.322, Pre-trav
+   3.596/3.744, Iter0 6.278/6.416. Straggler 4.9x the 0.25 s floor
+   (was 6.1x best, 12.6x as-specified). Landed as d5dc60d after
+   laptop vetting found one real defect in the relayed patch: the
+   Data-by-value wire still carried a vptr (OrientedBox inherits
+   Shape's virtual dtor) — raw vptr bytes on the wire, exact only
+   because receivers copy fields out. WireSpatial now mirrors
+   FragData's pupped fields; static_asserts enforce triviality
+   permanently. Gated both runtimes + loopback 100k/1M.
+7. SHMEM: do not enable (2x SLOWER below 8 MB, ~5% above). Real
+   finding en route: a 4.1x bandwidth cliff at 16->32 MB in both
+   builds — every S3 shipment lives past it. Unexplained; candidate
+   levers (split large grants) interact with everything above.
+8. NEXT LEVERS (relay's closing ranking): (i) per-TreePiece
+   contiguous tree build — the flatten (30 ms/grant) is now the
+   dominant donor term; FullNodePool bump-allocates but per-LANE, and
+   the CacheManager shares the pool; (ii) zero-copy once the upstream
+   constant is raised (~17.5 ms); (iii) option (A) lazy/parallel
+   helper rebuild (idle-PE side). Helper-side timers still print too
+   early to trust (move to phase3Stats first).

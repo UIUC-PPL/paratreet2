@@ -1,0 +1,866 @@
+FRONTIER RELAY 1 -- 2026-08-13 afternoon
+Supersedes temp3.txt (unrelayed) and covers everything since the s3-reserve-2b
+report. Reports: ~/software/reports/s3-transport-ab.md (full),
+~/software/reports/s3-reserve-2b.md (this morning, already conveyed).
+41/41 2B runs exact (424897832), 14/14 10k gates (3549).
+Jobs 5255130 5255137 5255613 5255652 5255653 5255724 5256055 5256164.
+
+=============================================================
+1. TRANSPORT A/B (b797e73 wire+arena vs d5c24f4 prewire): WORKS, NOT THE LEVER
+=============================================================
+Clean A/B: d5c24f4..tip has exactly ONE code commit (b797e73); knob defaults
+byte-identical at both commits; WireNode symbols present in wire, absent in
+prewire.
+
+s3Shipment cost, per shipped unit (sum-detail, 2 grant sizes):
+  ~300 units/grant:  prewire 0.284 -> wire 0.239 ms/unit   -15.8%
+  ~500 units/grant:  prewire 0.210 -> wire 0.182 ms/unit   -13.4%
+Stable 13-16%. Does NOT grow with grant size.
+
+End-to-end: NOT distinguishable from noise. Corrected A/B at GRANT_M2=1e11:
+  prewire phaseB_s max 1.535 / 1.901    mean 1.718
+  wire    phaseB_s max 1.608 / 1.666    mean 1.637
+The single BEST run of the job is a PREWIRE run. prewire's own rep spread
+(0.366 s) is 4x the prewire-wire mean gap (0.081 s).
+Unchanged by transport: shipped volume, fan-out (13.5/14 PEs), helper
+staggering, straggler identity (proc 55) and ratio.
+=> the spec's "flat" branch. Binding constraint is elsewhere. KEEP the change
+   (it is free and correct), but it is not what moves the straggler.
+
+Power caveat: 2 reps/arm against this scatter excludes a large win, not a ~5%
+one. If the 13-16% matters once lever 3 removes the serialization hiding it,
+that needs more reps to see.
+
+=============================================================
+2. THE 31-ADDENDUM DIAGNOSIS WAS ~15% RIGHT -- 99 ms UNEXPLAINED
+=============================================================
+s3Shipment was diagnosed as allocator-bound ("one new FullNode per node,
+allocator-bound"). One arena alloc + linear placement-new removed ONE SEVENTH
+of it. Remaining ~99 ms/call at ~500 units/grant is UNEXPLAINED.
+Candidates: the pup/deserialize itself; the placement pass being
+bandwidth/cache-bound rather than allocator-bound; unit enqueue; PE wake.
+
+Also: the addendum predicted the serial head would grow toward 0.25-1.7 s per
+grant at GRANT=128. It did not -- 104 ms at ~500 units/grant.
+Per-unit cost DOES fall with grant size (0.284 -> 0.210), so there IS a real
+per-shipment fixed cost being amortised. Just not malloc.
+
+=> DO NOT BUILD option (A) (lazy per-tree rebuild) yet. Its premise is the
+   rebuild being the cost, and that premise is measurably only ~15% right.
+   Decide after the projections analysis (item 5).
+
+=============================================================
+3. FOF_S3_GRANT_M2=1e10 (shipped this morning) IS WRONG -> USE 1e11. MY ERROR.
+=============================================================
+At the best cell (PARTS=16, GRANT_UNITS=128), phaseB_s max:
+  1e10 (shipped)  2.839 / 2.735      units/ship 299/308    28-31% of pool m2
+  3e10            2.309              388                   34%
+  1e11            n=9, mean 1.677    ~460-520              40-44%
+  3e11            n=3, mean 1.681
+  1e12            n=6, mean 1.621
+1e10 costs ~1.05 s on the straggler (37%) and leaves a THIRD of the movable
+work unmoved. A no-S3 base anchor in the same allocation rules out drift.
+
+CAUSE (mine, not the adopter's): my s3-reserve-2b report gave "5e9-1e10" from
+a PARTS=32/GRANT_UNITS=32 ladder, and separately recommended PARTS=16/
+GRANT_UNITS=128, which I had only measured at 1e11. Grants at that cell are
+~4x larger and need ~4x the budget. 1996ebd adopted both faithfully; the
+COMBINATION was never tested.
+
+RECOMMENDATION: raise the default 1e10 -> 1e11. Nothing beyond that.
+1e11 / 3e11 / 1e12 are NOT distinguishable (means 1.677 / 1.681 / 1.621, all
+ranges overlapping). 1e11 is the smallest, which is the right tie-break: the
+budget exists to stop the v1 all-giants scoop, so the least-slack value that
+clears the regression preserves the most guard.
+
+RETRACTION -- please do not act on what I said mid-session. I earlier claimed
+1e12 was ~6% better and that 1e11 "sits on the knee and clips grants"
+(citing units/ship dips to 453/477). Job 5256055 reverses it: within one
+allocation, 1e11 mean 1.681 vs 1e12 mean 1.719, with 1e11 showing NO dips
+(519.6/508.1) while 3e11 gave 462.1 and 1e12 gave 485.3. The dips are
+run-to-run variation in partition consumption, not the budget binding. Three
+jobs contain both settings: two favour 1e12, one favours 1e11. Not a real
+effect. I over-read a single job.
+
+STANDING CAUTION (third time this campaign): every one of these is a bare
+constant tuned to THIS pool at THIS cell. The relative formulation (the
+section 30 addendum's open TODO) is the actual fix. Note my proposed formula
+in the report was ALSO wrong once: I used the POOL mean m2/unit (2.67e6), but
+shipped units are ~5.9x costlier than pool-average (1.56e7) because the
+coordinator orders the costliest partition -- the same effect as the morning's
+7.1x finding. Use the SHIPPED mean.
+
+=============================================================
+4. PROTOCOL OVERHEAD IS FINE AT THE RIGHT BUDGET (corrects an interim reading)
+=============================================================
+overhead(s3ShipOrder + s3Shipment + s3Return) : value(drainForeign):
+  5250364 GRANT=32          1.03 : 1
+  prewire @1e10 (wrong)     1.65 : 1
+  wire    @1e10 (wrong)     1.45 : 1
+  prewire @1e11             0.97 : 1
+  wire    @1e11             0.93 : 1
+Section 31 lever (a) (fewer/bigger grants amortise fixed costs) is CONFIRMED.
+The 1.65 was the clipped budget, not GRANT=128. I reported the 1.65 as a
+finding before the confound was found; it is marked corrected in place.
+
+Straggler at the correct budget: proc 55 local exec 34.1 -> 19.5 s,
+top/median 21.5x -> 12.0x. drainForeign (the value side) 44 -> 70 s.
+
+=============================================================
+5. FULL PROJECTIONS TRACES CAPTURED -- AWAITING YOUR .log.gz READER
+=============================================================
+Kale's point was right and my "needs a code change" was wrong: a regular
+projections trace confined to a PE subset captures the intra-s3Shipment
+decomposition, because event records carry per-call timestamps AND MESSAGE
+LENGTH. So s3Shipment duration can be regressed against bytes (pup/
+deserialize -- shrunk by the offset wire format) vs units/nodes (rebuild --
+attacked by the arena). It is a -tracemode projections REBUILD, no code change.
+
+Done: FoF3.2b.{wire,prewire}.proj (TraceProjections=475), job 5256164, both
+exact, no mid-run flush, GRANT_M2=1e11 so it matches the @1e11 sum-detail pair.
+  +traceprocessors 672-783,1120-1231  (procs 48-55 and 80-87 = 224/1792 PEs)
+  proj2b_prewire 184 .log.gz / 59 MB;  proj2b_wire 174 .log.gz / 56 MB
+  packaged: ~/software/proj2b-transport-frontier.tar.gz (366 MB)
+Subset is safe: proc 55 is top straggler in ALL FIVE sum-detail traces today
+across three configs, proc 87 second in all of them.
+
+I did NOT write a reader, per your instruction to wait for yours.
+
+THE QUESTION THESE ANSWER: of s3Shipment's ~99 ms/call at ~550 units/grant,
+how much is BYTES and how much is NODES? That decides which of three
+laptop-side changes is worth writing.
+
+Operational notes for the skill:
+- +traceprocessors RSS caveat: NO OOM at 2B recording 12.5% of PEs. Wall 23/17 s
+  vs 17-19 s untraced, ~1.8 MB per recorded PE. (Not separated whether the flag
+  avoids the RSS cost or 224 PEs is just small enough.)
+- Do NOT `du` a traceroot immediately after srun returns -- writes are still
+  landing on Lustre. I measured 531 KB for a directory that is actually 59 MB.
+- 174-184 files against 224 requested PEs, and PE 0 records regardless. Some
+  in-range PEs wrote nothing. Not investigated; hot blocks all present.
+
+=============================================================
+6. NEXT LEVER, ON THIS EVIDENCE
+=============================================================
+Section 26 lever 3 (multiple outstanding grants per helper), with section 31
+lever (c) as the other half:
+- helper arrival staggering is the ONE thing that got WORSE at the correct
+  budget (1.7 -> 2.9 s spread) -- one outstanding shipment per helper;
+- the order->ship->rebuild->drain->return chain is untouched by transport;
+- s3ShipOrder is the LARGEST single S3 cost (15-16 ms/call, ~37 s total) and
+  runs on the DONOR's critical path -- unaffected by anything done so far.
+  It more than doubled per call at GRANT=128 (6.5 -> 15.4 ms) while calls
+  nearly halved, so its TOTAL rose 29.9 -> 37.9 s.
+
+STANDING GAP: phaseB_s max 1.535-1.666 s vs the 0.25 s granularity floor --
+still ~6x. Transport did not move it; only the grant-size correction did.
+
+=============================================================
+7. THE sumdetail-analysis SKILL
+=============================================================
+Worked well, nothing in it needed changing. Validated before use against the
+5250364 trace on disk -- reproduced every section 31 figure exactly:
+  phaseBChained 291.06 s / 97627 calls
+  drainForeign   55.93 s / 18016 calls
+  s3Shipment     27.80 s / 473 calls / 58.8 ms mean
+  s3ShipOrder    29.88 s / 4569 calls / 6.5 ms
+That is what let me state the 15% transport number rather than hedge it.
+
+ONE CORRECTION: the documented cost of "~2 s per 2B trace per invocation" is
+~6x optimistic on Frontier. Measured on a 1792-PE 2B trace on Lustre:
+  cold 18.2 s wall (7.2 s user, 42% CPU); warm 11.8 s, stable on repeat.
+Partly I/O-bound but there is real compute too -- it does not fall to 2 s even
+warm. If your ~2 s was on laptop SSD, worth saying so in the skill, since the
+cluster sessions are the intended audience. Practical consequence: BATCH all
+--ep regexes into ONE invocation (they are repeatable and each is its own
+group) rather than issuing several. A five-entry roster sweep is one 12 s call
+instead of five.
+
+=============================================================
+8. HOUSEKEEPING
+=============================================================
+- App tree restored to PRODUCTION charm and re-verified (TraceSummary=0) after
+  both traced-stack cycles. Nothing left traced for the next session.
+- paratreet2 on 4091cd0, clean. Queue empty.
+- Job 5255080 FAILED in 4 s: my sbatch bug, not code or machine.
+  `local label=$1 bin=$2 log=$OUT/x-$label.log` -- bash expands ALL of the
+  local builtin's arguments before any assignment takes effect, so $label was
+  unset and `set -u` aborted. bash -n does not catch it. I now smoke-test
+  sbatch logic against a stubbed srun before submitting.
+- Build is NOT byte-reproducible: same commit rebuilt gives a different md5
+  with an identical symbol set. md5 inequality proves "different binary";
+  md5 equality proves nothing.
+
+=============================================================
+9. *** PROJECTIONS ANALYSIS: s3Shipment IS BYTES-BOUND. THE 99 ms IS EXPLAINED,
+    AND THE SECTION-31 ADDENDUM DIAGNOSIS IS OVERTURNED. ***
+    (appended after items 1-8; supersedes item 2 and part of item 5)
+=============================================================
+Kale supplied the missing capability (full projections trace, PE subset) and
+pointed at github.com/charmplusplus/projections. Reader written:
+~/software/scripts/projlog_tool.py (stdlib; totals/calls/regress/entries).
+Format verified empirically AND against ProjDefs.java (2/3 = BEGIN/END_
+PROCESSING, 18/19 = BEGIN/END_UNPACK; field 7 of a BEGIN record = msglen).
+
+s3Shipment duration vs message bytes:
+  run       calls  mean msglen  mean dur   slope        pearson r  intercept
+  prewire     39    47,193 KB   164.7 ms   0.0034 us/B    0.999     +0.33 ms
+  wire        41    39,608 KB   126.9 ms   0.0031 us/B    0.997     -0.60 ms
+Binned means hold the same slope from 1.4 MB to 226 MB, so it is genuinely
+linear, not a fit averaging over curvature.
+
+=> r=0.999 with ~ZERO intercept: message size explains essentially ALL of
+   s3Shipment. No fixed per-shipment cost to amortise, no separable
+   allocation-count term. A flat streaming cost of ~0.003 us/byte ~ 300 MB/s.
+
+WHAT THE TWO CHANGES ACTUALLY BOUGHT:
+  bytes/shipment (the WIRE FORMAT):  47,193 -> 39,608 KB   -16%
+  us/byte        (the ARENA):        0.0034 -> 0.0031      -9%
+  combined mean duration:            164.7 -> 126.9 ms     -23%
+The offset wire format did the larger share. The arena -- the part the
+addendum expected to dominate ("allocator-bound") -- bought 9%.
+
+THE MESSAGES ARE ENORMOUS (this is the real finding):
+                prewire      wire
+  median        36.1 MB      27.9 MB
+  p90           90.3 MB      70.1 MB
+  MAX          225.9 MB     170.9 MB
+  max duration   777 ms       549 ms
+A single grant ships up to 226 MB and holds one helper PE for 777 ms of
+uninterruptible entry time. At ~550 units/grant that is ~73 KB PER STOLEN
+UNIT -- against ret_edges of only ~3,300 for the whole run.
+
+CHARM'S UNPACK IS NOT THE COST -- IT IS ALL INSIDE THE ENTRY.
+Raw records around one call (PE 1139):
+  18 10611543 1139                           BEGIN_UNPACK
+  19 10611544 1139                           END_UNPACK    <- 1 microsecond
+  2 19 450 10611544 ... 41019920 ...         s3Shipment BEGIN, msglen 41 MB
+  1  5 414 10743888 ...                      first drainForeign CREATION
+Charm unpacks 41 MB in 1 us (arrives contiguous). Then 132 ms elapse INSIDE
+s3Shipment before the first drainForeign is even created -- the helper's 14
+PEs idle that whole window. Your "no helper PE starts until the entry ends",
+now timed.
+
+*** THIS FLIPS MY EARLIER ADVICE ON OPTION (A) ***
+Item 2 above said "do not build option (A) yet". That was based on the arena
+result alone. With the decomposition done, the evidence SUPPORTS (A), though
+for a different reason than section 31 gave:
+ - the cost is LINEAR IN BYTES WITH NO FIXED TERM, so it is perfectly
+   divisible: spreading it over the helper's 14 PEs should give near-linear
+   speedup of the serial head (132 ms -> ~10 ms);
+ - it is NOT in charm's unpack, so it is inside code we control.
+
+ONE DESIGN CAVEAT THE TRACE CANNOT SETTLE: s3Shipment takes a MARSHALLED
+parameter (const StealShipment<Data>&), so charm's generated wrapper
+deserialises the whole 41 MB BEFORE user code runs. That is inside the timed
+entry but NOT deferrable by (A) as described. Splitting "marshalled
+deserialise" from "tree rebuild" needs code (user bracket events, or a raw
+message type). If deserialise is most of the 0.003 us/byte, then (A) must ALSO
+change the entry signature to a custom message -- not merely defer the
+rebuild. Worth deciding before writing (A).
+
+ORTHOGONAL AND POSSIBLY CHEAPER: SHIP FEWER BYTES. 73 KB per stolen unit to
+return ~3,300 edges is the number that stands out. Any thinning of the shipped
+subtree representation multiplies directly through a cost that is 100%
+byte-proportional. That is a design question for you/fable.
+
+Reader cost: ~28 s per 2B subset trace (174 files, 56 MB), single-threaded.
+It sits at ~/software/scripts/projlog_tool.py; if useful it belongs next to
+sumd_tool.py in the skill.
+
+=============================================================
+10. HOUSEKEEPING: ~/software REORGANISED
+=============================================================
+  bin/      staged binaries (were at top level; ARCHIVED sbatch files still
+            contain the old $HOME/software/FoF3.2b.* paths -- fix the path if
+            one is ever re-run)
+  sbatch/   every sbatch submitted, for provenance
+  scripts/  build scripts + projlog_tool.py
+  reports/  the .md reports and relay<i>.txt
+  notes/    older working notes (s3-ab-results, frontier-corrections,
+            lci-cxi-error, BLOCKER-input-access)
+  traces/   packaged tarballs
+BUILDS.md stays at top level and now documents the layout, the new binary
+paths, and that the app tree is currently PRODUCTION-linked (it said
+tracedcharm before -- exactly the trap that file exists to prevent).
+
+=============================================================
+11. CODE CHANGE MADE HERE -- PATCH FOR VETTING AND PUSH
+=============================================================
+~/software/patches/0003-s3-packing-instrumentation.patch
+  base 4091cd0 (phaseab-campaign), fof/FoFPhase1.h only.
+  (This section was written when the patch was 0001/+70. It grew through the
+   afternoon and was renumbered twice; 0003 is the only file in patches/ and
+   supersedes both earlier ones, which are deleted. See section 16.)
+  Contains a suggested commit message and reviewer notes.
+  Apply with `git apply` (or --3way if the branch moved).
+
+WHAT IT DOES: accumulates shipment BYTES and work-per-byte, because the
+projections finding (item 9) is that s3Shipment's cost is ~100%
+byte-proportional while grant selection sorts only by m2 -- we pay by the
+byte and choose by the estimate. Running counters only, no per-shipment
+storage:
+  s3_out_bytes / s3_out_nodes / s3_out_parts
+  s3_wpb_min / s3_wpb_max, and a 28-bucket log2(m2/byte) histogram
+New output: FOF3STAT s3_bytes: ... and FOF3STAT s3_wpb_hist: ...
+
+shipmentBytes() avoids a PUP::sizer pass on purpose -- vector::size() is
+O(1), so it is O(#trees) not O(#nodes). It runs inside s3ShipOrder, which
+section 31 flags as donor-side CRITICAL-PATH time, so the instrument must
+not cost anything there.
+
+The Frontier working tree is left UNCOMMITTED deliberately, so the sbatch
+divergence guard keeps flagging paratreet2 as MODIFIED for any run built
+from patched sources. Never pushed from here.
+
+=============================================================
+12. SHMEM VERDICT: DO NOT ENABLE. But a 4x BANDWIDTH CLIFF found at 16->32 MB.
+=============================================================
+Built ~/software/charm-shmem: same commit 3d1fdd89f, same compiler,
+-DCMK_USE_SHMEM=ON the ONLY difference (verified #define vs /* #undef */).
+Production untouched. Tested on the converse pingpong per your suggestion
+(PE0<->PE1, 1 node, 2 processes, +ppn 1 = exactly the S3 intra-node case).
+
+  bytes     prod GB/s   shmem GB/s   speedup
+  8B-2KB    latency-bound            ~1.0x
+  1 MB        12.7         7.4       0.58x
+  4 MB        15.3         8.0       0.52x
+  8 MB        16.2         7.9       0.49x   <- shmem 2x SLOWER
+  16 MB       17.3        18.2       1.05x
+  32 MB        4.2         3.1       0.73x
+  64 MB        4.2         4.4       1.06x
+  128 MB       4.2         4.5       1.07x
+
+SHMEM is up to 2x SLOWER from 128 KB to 8 MB and only ~5-7% faster at the
+32-128 MB sizes our shipments occupy. RECOMMEND NOT ENABLING IT. My
+hypothesis (intra-node traffic paying a needless fabric cost) is NOT
+supported -- LCI's intra-node path already beats this shm implementation
+over most of the range.
+
+*** THE REAL FINDING: a 4.1x CLIFF BETWEEN 16 MB AND 32 MB, in BOTH builds ***
+  peak ~17 GB/s at 16 MB -> flat ~4.2 GB/s at 32 MB and above.
+This explains the ~1.9 GB/s measured in flight for real shipments: at a
+median 28-36 MB and max 171-226 MB, EVERY S3 shipment lives past the cliff.
+
+ACTIONABLE WITHOUT A NEW CHARM BUILD: cap shipment size at ~16 MB and send a
+large grant as several messages. A 40 MB grant split 3 ways should move at
+~17 GB/s instead of ~4.2 (transit ~27 ms -> ~7 ms), AND the helper could
+start on the first chunk instead of waiting for the whole grant -- which
+also attacks the 132 ms serial head from a second direction.
+Caveats: measured with a 2-process pingpong at +ppn 1, not 8 procs x 14 PEs
+under contention; cause unidentified (rendezvous/registration threshold is
+the obvious suspect); interacts with the marshalled-parameter deserialise.
+
+TWO BUGS IN MY FIRST ATTEMPT, both worth knowing:
+ - --network=job_vni on a SINGLE-NODE job aborts in LCI (fi_domain ENOSYS).
+   notes/lci-cxi-error.md documents it: single-node needs single_node_vni.
+ - LD_LIBRARY_PATH (set to charm/lib by the login profile) made the SHMEM
+   binary resolve PRODUCTION's libreconverse.so -- the A/B would have read
+   as "SHMEM changes nothing". The rerun sets it per arm AND refuses to
+   report a number unless ldd proves the right library loaded.
+
+=============================================================
+13. BYTE INSTRUMENT VALIDATED; WORK-PER-BYTE SPANS 8.8e7x
+=============================================================
+Job 5256808, exactness held with the code change (10k 3549, 2B 424897832).
+
+shipmentBytes() estimate vs projections msglen ground truth:
+  estimate 68.5 KB per shipped unit ; measured 72.4 KB ; error -5.4%
+  (gap = charm's envelope/framing, which the analytic sum omits)
+  total shipped 11.07 GB per run -- confirms the ~12 GB estimate.
+
+WORK PER BYTE across the 57 processes that shipped:
+  min 1.0e-05   p10 0.087   p50 15.1   p90 117.4   max 880.8
+  spread 8.8e7x ; even p10->p90 is 1350x ; aggregate mean 211.7
+
+*** This is the quantitative case for your work-per-byte proposal. ***
+Selection sorts by m2; cost is 100% byte-proportional; grants differ by
+ORDERS OF MAGNITUDE in what they buy per unit of cost, and the ordering
+cannot see it. More headroom than any transport change measured today.
+(These are per-process means over that process's shipments, so the true
+per-grant spread is wider still.)
+
+HISTOGRAM FIX: my flagged concern was real. Unshifted log2 put 90 of 314
+shipments (29%) in bucket 0 -- everything below 1.0, five orders of
+magnitude, in one bin. Now shifted (kWpbShift=17): bucket b means
+m2/byte ~ 2^(b-17). Still no stored values. The patch was regenerated with
+this fix and re-validated (git apply --check --reverse).
+
+=============================================================
+14. GRANT PACKING: THREE LEVERS TRIED, THREE NEGATIVES
+    (jobs 5257740 / 5257769 / 5257964 -- every arm exact)
+=============================================================
+Your steer was right that plain m2/bytes would be shortsighted, and for a
+deeper reason than tiny jobs: A UNIT'S BYTE COST IS NOT A PROPERTY OF THE
+UNIT. place() dedups subtrees, so the first unit to pull one in pays and
+later units sharing it cost ~nothing. Standalone per-unit density is not
+even well defined. So the filter prices MARGINAL bytes, and is evaluated
+BEFORE the ownership CAS -- a rejected unit stays unclaimed for the local
+drain; skipping after claiming would strand it and corrupt the ledger.
+
+  arm                       phaseB_s max  units/ship  KB/unit  work moved
+  BASELINE (all off)          1.52-1.71      478-562    65-71   0.41-0.46
+  GRANT_BYTES=16M             2.94/2.94          209       72   0.39
+  GRANT_BYTES=8M              3.04               110       79   0.33
+  DENSITY=0.25                1.88               426       --   0.59
+  DENSITY=0.5                 2.07/2.17      252-258       --   0.61-0.64
+  DENSITY=1.0                 2.36               140       --   0.57
+  SPAN_PARTS=2                1.72/1.71      807-869    80-87   0.36-0.40
+  SPAN_PARTS=4                1.85              1106       95   0.36
+  SPAN=4 DENSITY=0.25         1.79               967     33.3   0.55
+
+BASELINE WINS. Nothing beat it; SPAN_PARTS=2 tied.
+
+ - BYTE CAP: clear loss. Halves units/grant, so doubles grant COUNT, and
+   per-grant fixed cost (~125 ms, section 31) swamps the transport saving.
+   DECISIVE DETAIL: 8M is WORSE than 16M. Moving FURTHER from the 16-32 MB
+   cliff made it worse, so the loss is not about the cliff at all -- the
+   binding cost is per-GRANT, not per-BYTE. (Knob since removed; see 16.)
+ - DENSITY: succeeded at its own goal and still lost. m2/byte roughly
+   doubled (217->421 vs its matched control), work moved rose to 0.55-0.64.
+   It loses because as implemented it SHRINKS the grant.
+ - SPANNING: works mechanically -- 542 -> 1106 units/grant, through the
+   partition ceiling toward the 1792 count cap -- and does not help.
+
+A "partition", for the record: a KD-split SPATIAL region of one process's
+pool (~1/PB_PARTS of it), key-ordered internally, concatenated
+costliest-first. It exists purely as a shipping granule (section 19).
+
+TWO PREDICTIONS TESTED. Right: spanning breaks dedup locality, so bytes/unit
+rose 64.9 -> 95.0. WRONG: I predicted density and spanning would FIGHT (the
+filter rejects units bringing new subtrees, which is what a freshly spanned
+partition offers). They COMPOSE -- filtering drains a partition sooner, which
+triggers MORE spanning (1143 spans, the most of any arm), and the filter then
+skims the dense units from each new region: KB/unit HALVES to 33.3 at the
+best work-moved of any arm. That pair is the one worth retesting after (A).
+
+RETRACTION: mid-afternoon I reported phaseB_s max tracking
+log(units/shipment) at r=-0.775 across six size mechanisms and called grant
+size the control variable. THE SPANNING ARMS FALSIFY IT -- 1106 units/grant
+did not help. Confounded; do not build on it.
+
+=============================================================
+15. *** THE FINDING THAT REFRAMES THE DAY: THE DONOR PAYS TO SHIP ***
+=============================================================
+Across the 14 arms without a byte cap:
+
+    work moved   vs   phaseB_s max      r = +0.693
+
+    work moved   phaseB_s max
+      0.355         1.708
+      0.426         1.705
+      0.454         1.520   <- best
+      0.549         1.794
+      0.607         2.165
+      0.645         2.071
+
+MOVING MORE WORK MAKES THE STRAGGLER WORSE. Not a fitted curiosity --
+section 31 measured the mechanism independently and nobody drew the
+conclusion: proc 55 spent 4.87 s inside s3ShipOrder, 20% OF ITS OWN
+EXECUTION TIME, collecting grants mid-drain. Collection runs ON THE DONOR,
+and the donor IS the straggler. Past a point, what the straggler pays to
+ship exceeds what it saves by shipping.
+
+*** S3 IS SELF-LIMITING. Stealing harder is counterproductive until
+    donor-side collection comes off the critical path (section 31 lever c). ***
+
+This explains why all three packing levers failed: none of them touched the
+term that binds. It also RE-RANKS THE NEXT BUILD. Option (A) fixes the
+HELPER's ~100 ms serial rebuild -- but the helper is idle anyway, and the
+term that correlates with the straggler is the DONOR's collection. (A) is
+still worth having (it kills the serial head and the one-outstanding-
+shipment-per-helper limit) but should not be expected to move phaseB_s max
+much alone. Lever (c) -- collect from a precomputed partition manifest, or
+serve orders on the donor's least-loaded PE -- attacks the term that does.
+
+COMPARISON DISCIPLINE (your point, and it is stronger than you put it):
+every packing result in section 14 is valid ONLY at today's per-grant cost.
+(A) changes that cost. The packing arms must be re-run ON TOP OF (A) with a
+no-(A) control in the SAME allocation, and nothing in section 14 should be
+carried forward as settled until then.
+
+=============================================================
+16. THE PATCH: patches/0003-s3-packing-instrumentation.patch
+=============================================================
+Base 4091cd0, fof/FoFPhase1.h only. Supersedes patches 1 and 2 (deleted, so
+there is no stale-patch trap). Validated with git apply --check --reverse.
+
+PART 1 -- INSTRUMENTATION (the reason to merge)
+  FOF3STAT s3_bytes + s3_wpb_hist, shipmentBytes()/treeBytes(), and a
+  self-calibrating O(1) subtree-size predictor. Running counters only.
+  Validated at -5.4% against a projections msglen ground truth.
+  Everything in sections 9, 13, 14 and 15 came out of this.
+  It runs inside s3ShipOrder (donor critical path), which is why it uses NO
+  PUP::sizer pass: vector::size() is O(1), so it is O(#trees) not O(#nodes).
+
+PART 2 -- TWO PACKING KNOBS, BOTH DEFAULT OFF, 38 lines of code
+  FOF_S3_DENSITY, FOF_S3_SPAN_PARTS. Kept because the post-(A) re-test needs
+  exactly these controls.
+  FOF_S3_GRANT_BYTES WAS REMOVED at your request (bloat behind env guards).
+  Its lessons are preserved in the patch header and report section 17b.
+
+Exactness: 10k = 3549 and 2B = 424,897,832 on every arm of all three jobs.
+The Frontier tree is left UNCOMMITTED so the sbatch divergence guard keeps
+flagging any run built from patched sources. Never pushed from here.
+
+=============================================================
+17. THE AFTERNOON IN ONE PARAGRAPH
+=============================================================
+Shipments are huge (40 MB median, 226 MB max, ~73 KB per stolen unit, 11 GB
+per run) and their cost is ~100% byte-proportional (r=0.999 vs msglen, zero
+fixed cost). Neither faster transport nor smarter selection helps: pxshm is
+up to 2x SLOWER at the sizes below ours and only ~5-7% faster at ours, and
+every packing lever tried was neutral-to-negative. The reason is that the
+binding cost is neither transport nor selection -- it is DONOR-SIDE
+COLLECTION ON THE CRITICAL PATH, which makes moving more work actively
+counterproductive (r=+0.693). Along the way: a validated byte/work-per-byte
+instrument, a .log.gz projections reader, an 8.8e7x measured spread in
+work-per-byte, a 4.1x bandwidth cliff at 16-32 MB, the correction of a
+shipped default (GRANT_M2 1e10 -> 1e11), and the finding that section 31's
+"allocator-bound" diagnosis of s3Shipment was only ~15% right.
+
+=============================================================
+18. ADDENDUM (18:23): WHAT "COLLECTION" COSTS -- LEVER (c) IS AIMED AT THE
+    WRONG HALF, AND THE DONOR'S FLATTEN IS THE BIGGEST CRITICAL-PATH TERM
+=============================================================
+"Collection" = s3ShipOrder: scan the partition range, CAS-claim units,
+FLATTEN the deduplicated subtrees, send. So: selecting AND packing.
+
+s3ShipOrder duration distribution (projections traces):
+              calls    p50       p90      p99      max     total
+  prewire      244   0.013 ms  101.2 ms  540 ms  858 ms   6.93 s
+  wire         232   0.015 ms  102.6 ms  353 ms  667 ms   6.67 s
+
+THE MEDIAN CALL IS 13 MICROSECONDS. ~84% of calls scan, find nothing
+claimable, return free. ALL the cost is in the ~16% that build a shipment.
+(The roster already hinted at this: 4,569 order calls served 473 ships.)
+
+PER SHIPMENT:
+  donor flatten  (s3ShipOrder)  ~178 ms   ON THE STRAGGLER, CRITICAL PATH
+  helper rebuild (s3Shipment)   ~165 ms   on an idle helper PE
+  transit                        ~27 ms   fabric
+
+*** THE DONOR'S FLATTEN IS THE LARGEST CRITICAL-PATH COST PER GRANT, AND IT
+    IS BIGGER THAN THE HELPER REBUILD THAT OPTION (A) TARGETS. *** This is
+the mechanism behind section 15's r=+0.693: each extra grant adds ~178 ms to
+the hottest process.
+
+SO LEVER (c) AS WRITTEN DOES NOT FIT THE MEASUREMENT:
+ - "precomputed partition manifest instead of per-unit scan+CAS" attacks the
+   SCAN, which costs 13 us. Saves nothing.
+ - "service orders on the donor's least-loaded PE" moves the flatten, but the
+   straggler's 14 PEs are all busy draining -- it relocates cost inside a
+   saturated process.
+
+WHAT THE DATA SUPPORTS INSTEAD: PRECOMPUTE THE FLATTEN, not the manifest.
+Partitions are known before any order arrives, so their deduplicated subtrees
+can be flattened ONCE -- during idle time, or spread across PEs -- leaving
+s3ShipOrder as little more than handing over a prepared blob. That is option
+(A)'s trick applied to the DONOR side.
+
+REVISED LEVER RANKING:
+  1. Precompute/parallelise the DONOR-side flatten (revision of 31(c)):
+     ~178 ms on the critical path, the term that correlates with the straggler.
+  2. Option (A) lazy/parallel helper rebuild: ~165 ms, but paid by idle PEs.
+     Still worth having (serial head + one-outstanding-shipment limit).
+  3. The packing knobs: retest only after 1 and 2 change per-grant cost.
+
+Caveat: 39-41 shipments in a 224-PE subset is small n; the 13 us vs 100+ ms
+separation is not subtle, but per-shipment averages carry small-sample error.
+
+=============================================================
+19. CORRECTION (18:31) -- KALE'S CPU-SECOND OBJECTION IS RIGHT.
+    SECTIONS 15 AND 18 ARE PARTLY RETRACTED. READ THIS WITH THEM.
+=============================================================
+Kale: "the collection cost is borne by 1 PE, but the shipment is worked on by
+14 PEs on the recipient -- so in CPU seconds it is a net gain for the donor,
+or at least the loss is 1/14th." Correct on both counts.
+
+PER SHIPMENT (projections @1e11, 39 shipments in the traced subset):
+    donor flatten  (s3ShipOrder)   0.178 PE-s   on 1 PE
+    helper rebuild (s3Shipment)    0.165 PE-s   on 1 PE
+    stolen work    (drainForeign)  0.964 PE-s   spread over ~13.7 PEs
+
+  => donor pays 0.178 PE-s to offload 0.964 PE-s: a 1 : 5.4 NET GAIN.
+  => donor wall cost is 177.7 ms OF ONE PE = 12.7 ms process-equivalent,
+     NOT the 178 ms of critical path section 18 implied.
+  (Section 18 also used the wrong drainForeign figure, 69.70 s from the
+   sum-detail run instead of 37.59 s from the projections trace, which
+   inflated the ratio to 1:10.1. Corrected here.)
+
+Refinement worth keeping: PE-SECONDS ARE NOT FUNGIBLE. The donor spends
+SCARCE capacity (its 14 PEs are the busy ones -- that is what makes it the
+straggler) to offload onto FREE capacity (helpers are idle by construction).
+Trading scarce for free at 1:5.4 is unambiguously good.
+
+*** AND THE REAL PREDICTOR IS GRANT COUNT, NOT WORK MOVED ***
+Over the same 14 no-byte-cap arms:
+    grant COUNT vs phaseB_s max : r = +0.919
+    work MOVED  vs phaseB_s max : r = +0.693
+    grant COUNT vs work MOVED   : r = +0.829   <- the confound
+Section 15's claim was picking up grant count through that confound: the
+density arms moved more work BY MAKING 3-5x MORE GRANTS (1082-1503 vs ~315
+at baseline). Section 15 is RETRACTED AS STATED -- its data stands, its
+explanation does not.
+
+REVISED MECHANISM: declining marginal VALUE at fixed marginal COST. Each
+grant is individually a 1:5.4 win, but early grants take work off the
+critical path while later ones increasingly ship work that was not binding,
+at the same fixed ~178 PE-ms to their donor. Past some count the marginal
+grant is net negative. The density arms ran deep into that region: most work
+moved, most grants, worst straggler.
+
+LEVER RANKING (sharpened, not overturned):
+  1. Precompute/parallelise the DONOR-side flatten -- justification is now
+     "RAISE THE BREAK-EVEN GRANT COUNT", not "the donor pays too much".
+  2. Option (A), helper rebuild: 0.165 PE-s on IDLE PEs, so cheap in CPU
+     terms already; its value is the serial head and the one-outstanding-
+     shipment-per-helper limit, not CPU seconds.
+  3. Fewer, larger grants remain right AT TODAY'S COSTS -- which is why
+     baseline beat every packing lever and the byte cap lost worst.
+
+HONESTY NOTE: two of my explanations were retracted this afternoon -- the
+log(units/ship) correlation (section 14) and work-moved (this section). Both
+were correlations across heterogeneous arms where mechanisms co-vary. The
+per-grant PE-second accounting above is the first account grounded in
+measured costs rather than a fitted trend; build on that one.
+
+=============================================================
+20. *** THE DONOR IS BLOCKED ON THE SEND. KALE'S ZERO-COPY IDEA IS THE
+    HIGHEST-VALUE CHANGE AVAILABLE. *** (job 5259335, both runs exact)
+=============================================================
+New FOF3STAT s3_time counters (work in UNTRACED production binaries, no trace
+capture needed). Donor-side split of s3ShipOrder at GRANT_M2=1e11:
+
+    flatten (tree walk + build)     28.8 ms/grant    26.3%
+    MARSHAL + SEND                  80.1 ms/grant    73.3%   <<<
+    scan / CAS / everything else     0.4 ms/grant     0.4%
+    total s3ShipOrder              109.3 ms/grant    over 315 shipments
+
+A field-by-field PUP pass over 40 MB benchmarks at ~4 ms (~8 ms for
+sizer+pack), so ~72 of those 80 ms is THE DONOR BLOCKED IN THE SEND PATH,
+waiting on a 40 MB message whose completion it does not need.
+
+=> The zero-copy POST API (control message, receiver posts a buffer, RDMA
+   moves the payload, donor returns immediately) targets 73% of donor
+   collection cost, ON THE STRAGGLER'S CRITICAL PATH. Highest-value change
+   available on current evidence.
+
+=> IT ALSO EXPLAINS THE TIMELINE PICTURE: the six overlapping ~600 ms orange
+   bars on proc 55's PEs are largely SIX PEs BLOCKED ON SENDS, not six PEs
+   computing. Section 19's concurrency finding and this are one phenomenon.
+
+TWO OF MY OWN CONCLUSIONS RETIRED:
+ - Lever (c)'s "precomputed partition manifest" is DEAD: scan+CAS is 0.4%,
+   0.4 ms of a 109 ms grant. Nothing to reclaim.
+ - My "cache misses / object construction" diagnosis was WRONG. I argued from
+   a pup microbenchmark that the cost could not be data movement because
+   packing runs at ~10 GB/s. Right about packing, wrong about the conclusion:
+   the cost is the NETWORK WAIT, which the benchmark never modelled.
+
+REVISED RANKING:
+  1. Zero-copy post API for s3Shipment          -- 73% of donor collection
+  2. Per-TreePiece contiguous tree build        -- the 26% flatten; the
+     FullNodePool machinery is largely there (it already bump-allocates
+     contiguously, but the pool is per-LANE so TreePieces interleave; the
+     catch is the CacheManager shares that pool for async remote arrivals)
+  3. Option (A), lazy/parallel helper rebuild   -- helper side, idle PEs
+  4. Lever (c) manifest                          -- retired, 0.4%
+
+CAVEATS: the helper-side split did NOT take -- only 23 of ~302 shipments
+counted, because helper counters print at the helper's OWN merge, which can
+precede its helping (campaign doc section 20 records this as cosmetic; it now
+blocks a measurement -- print from phase3Stats before trusting helper timing).
+109.3 ms/grant here vs 178 ms in the traced run is expected (tracing
+overhead); do not mix them. "marshal + send" is one bracket -- splitting pup
+from send needs a timer inside charm's generated code.
+
+=============================================================
+21. MARSHAL vs SEND (job 5260928, both exact) -- KALE'S CONTIGUITY OBJECTION
+    WAS LOAD-BEARING. BUILD ARENA-FLATTEN FIRST.
+=============================================================
+Kale: "even with post API you need a contiguous message at the source -- what
+is marshal? didn't the flatten do it?"
+
+FLATTEN DID HALF. b797e73 gave the wire FORMAT (offset-based nodes, no
+pointers to fix up -- the hard prerequisite). It did NOT give contiguity: a
+shipment is vector<StealTree>, each holding two vectors, plus unit_pairs.
+MARSHAL is charm's sizer+toMem pass that GATHERS those into one buffer.
+
+MEASURED (timed PUP::sizer walks what toMem walks, without copying):
+  s3ShipOrder           134.9 ms/grant  (17.1 ms is measurement scaffolding)
+    flatten              30.3 ms         22.5%
+    marshal+send         87.1 ms         64.5%
+      sizer walk         17.1 ms
+    TREES PER SHIPMENT  189.1  =>  379 SEPARATE VECTORS TO GATHER
+
+Net of the scaffolding, per grant:
+    flatten (tree walk)   ~30 ms   26%   <- arena flatten helps
+    MARSHAL GATHER        ~34 ms   29%   <- arena flatten REMOVES
+    SEND (donor blocked)  ~53 ms   45%   <- post API removes
+    total                ~117 ms
+
+189 trees per shipment is why a pass that COPIES NOTHING still costs 17 ms.
+
+BUILD ORDER -- ARENA-FLATTEN FIRST:
+  1. it removes the ~34 ms gather outright;
+  2. it needs no new charm API;
+  3. it is the PREREQUISITE for the post API, which needs a registered
+     contiguous source buffer -- nothing produces one until marshal does.
+Post API then takes the ~53 ms send block. Together ~74% of donor collection.
+
+HONESTY ON THE SEND NUMBER: send~53 ms assumes pack ~ 2x sizer. If the copy
+is cheap, pack~17 and send~70; if pack~3x sizer, send~36. SEND IS SOMEWHERE
+IN 36-70 ms; narrowing it needs a timer inside charm's generated marshalling.
+The gather figure (17 ms of pure traversal over 379 vectors) is MEASURED.
+
+The extra sizer pass inflates s3ShipOrder in this run only (134.9 vs ~117).
+It is scaffolding, flagged in the code, and must come out before merge.
+
+=============================================================
+22. *** FINAL CORRECTION: THE SEND IS ~1 ms. THE MARSHAL PACK IS THE COST.
+    ARENA-FLATTEN IS WORTH ~73% OF DONOR COLLECTION. *** (Kale, 23:39)
+=============================================================
+Kale: "the entry method record records any sends coming out of that block, and
+the sends are close to the END of the block, so they are not a major part of
+the cpu overhead... zero-copy is good to do overall, but I won't expect
+significant gain."
+
+VERIFIED from the projections traces. Position of the s3Shipment CREATION
+within its enclosing s3ShipOrder block (0 = start, 1 = end), n = 39 blocks:
+    min 0.970   p10 0.981   p50 0.992   p90 0.995   max 0.995
+THE SEND SITS AT 99.2% THROUGH THE BLOCK -- roughly the last 1 ms of a ~135 ms
+block. THE DONOR NEVER BLOCKS ON THE FABRIC.
+
+CORRECTED DONOR COST PER GRANT:
+    flatten (tree walk)                       ~30 ms   26%
+    charm SIZER pass                          ~17 ms   15%   <- arena removes
+    charm PACK: gather 379 vectors + copy 40MB ~69 ms   59%   <- arena removes
+    send                                       ~1 ms    1%   <- post API
+    total                                    ~117 ms
+
+*** ARENA-FLATTEN IS WORTH ~86 ms OF ~117 ms: ~73% OF DONOR COLLECTION. ***
+If flattenStealTree writes straight into one contiguous arena there is nothing
+to size and nothing to gather -- the buffer IS the message.
+
+*** THE ZERO-COPY POST API ADDRESSES ~1 ms. *** Kale's own call was right:
+worth doing for latency and RDMA offload, NOT a lever on the straggler.
+
+MY ERROR, TWICE, ON THE SAME 80 ms: relay sections 20 and 21 said "donor
+blocked in the send path" and then "send is 36-70 ms". Both wrong, same cause:
+my timer bracketed AROUND THE SEND CALL, so charm's sizer, pack and send all
+landed in one number and I attributed it to the send because that was the part
+I could name. The disproof was already in the traces -- CREATION records sit
+inside the enclosing entry block, so "where in the block is the send" was
+answerable all afternoon and I never asked.
+
+PATTERN WORTH CARRYING FORWARD: the aggregate counters repeatedly gave CORRECT
+TOTALS WITH WRONG ATTRIBUTIONS (grant size, work moved, concurrency, send).
+Every correction came from reasoning about what the records MEAN -- the
+timeline and the event-record semantics -- not from more counters.
+
+FINAL BUILD RANKING:
+  1. ARENA-BUILDING FLATTEN            ~86 ms/grant, 73%. No new charm API.
+                                       Also the prerequisite for zero-copy.
+  2. Per-TreePiece contiguous treebuild attacks the residual ~30 ms flatten
+                                       by improving locality. Composes with 1.
+  3. Option (A) lazy/parallel rebuild  helper side, idle PEs. NOTE the
+                                       helper-side timers still don't work.
+  4. Zero-copy post API                ~1 ms. Latency/RDMA offload only.
+  5. Lever (c) manifest                retired (0.4%).
+
+=============================================================
+23. OVERNIGHT (2026-08-14): KALE'S VTABLE OBSERVATION IS THE WIN.
+    ZERO-COPY IS BLOCKED UPSTREAM. ARENA NOT NEEDED.
+=============================================================
+
+*** STEP 1 -- POD WIRE + BULK PUP: THE CAMPAIGN'S BEST RESULT ***
+patches/0005-s3-pod-wire-bulk-pup.patch  (supersedes patches 1-4)
+
+Kale, 23:50: "that vtable issue feels like an unnecessary price to pay. All
+the actual nodes belong to the same subclass. Can we leverage that somehow?"
+
+WireNode embedded SpatialNode<Data> by value; SpatialNode declares
+`virtual ~SpatialNode()`, so WireNode was not trivially copyable, so charm
+pupped it FIELD BY FIELD -- ~15 dispatches x ~285k elements per grant.
+Every real node is FullNode<Data,8>, so the WIRE needs no polymorphism.
+WireNode now carries a POD WireSpatial with exactly the five fields
+SpatialNode::pup shipped; each array moves in ONE raw-bytes call.
+
+  donor collection, per grant     order    flatten   marshal+send   sizer
+    before                       117.8 ms  30.3 ms     87.1 ms     17.1 ms
+    POD WIRE                      49.4 ms  30.6 ms     18.5 ms      0.0 ms
+                                  -58%                   -78%
+
+  end to end            phaseB_s max   Pre-traversal   Iteration 0
+    best before             1.520          4.322          6.98
+    POD WIRE          1.229 / 1.322   3.596 / 3.744   6.278 / 6.416
+
+BEST ON ALL THREE HEADLINE ROWS SIMULTANEOUSLY, both reps, all exact, and
+gated with FOF_S3_LOOPBACK=1 (flatten->pup->rebuild->walk vs direct walk).
+Straggler now 4.9x the 0.25 s floor, vs 6.1x at the previous best and 12.6x
+for the campaign as originally specified.
+
+The sizer walk going 17.1 -> 0.0 ms is the direct proof of mechanism: a bulk
+pup sizes an array with one addition instead of walking 285k elements.
+
+*** STEP 2 -- ARENA: NEUTRAL, NOT MERGED ***
+Concatenating all trees into shipment-level vectors. First version was a
+REGRESSION (+9 ms flatten: repeated realloc of a ~30 MB vector). Fixed with
+reserve(); flatten returned to 29.4 ms. But normalised for grant size the
+arena is neutral -- order/MB 1.62 (step 1) vs 1.64 (arena) -- and end to end
+it stays behind. THE ARENA WAS BUILT TO FIX A COST STEP 1 HAD ALREADY
+REMOVED: with bulk pup, gathering N vectors is N memcpys, so vector count
+stopped mattering. Preserved only because zero-copy needs contiguity.
+
+*** STEP 3 -- ZERO-COPY: BLOCKED BY AN UPSTREAM RECONVERSE LIMIT ***
+Implemented (nocopypost entry, on-demand post EM, heap-owned shipment freed
+by a refcounted completion callback). At 2B it aborts on every process:
+
+    CMK_NOCOPY_DIRECT_BYTES is too small   (reconverse/src/conv-rdma.cpp:528)
+
+    // include/conv-rdma.h
+    // 8-byte for mr, 16-byte for rmr
+    // TODO: better to use dynamic allocation and PUP
+    #define CMK_NOCOPY_DIRECT_BYTES 32
+
+CXI's remote memory-region key does not fit in charm's 32-byte layer-info
+buffer. Upstream reconverse limitation, already flagged TODO in the source.
+NOT fixed here because ~/software/charm is PINNED at 3d1fdd89f for provenance.
+Full write-up + working files: ~/software/patches/wip/README-zero-copy.md
+To resume: raise the constant in a SCRATCH charm tree, rebuild, relink, and
+gate at 2B or 80M FORCED -- not at 10k (see below).
+
+Worth: section 23 showed the send itself is ~1 ms, so zero-copy targets the
+~17.5 ms charm spends copying ~30 MB into a message -- ~35% of what REMAINS
+of donor collection after step 1.
+
+*** MY TWO VACUOUS VALIDATIONS -- THE LESSON OF THE NIGHT ***
+I twice reported evidence that could not have caught this failure:
+ 1. "All four 10k gates passed, including zc-loopback." AT 10k S3 SHIPS
+    NOTHING (the pool drains before a helper is matched), so the zero-copy
+    send never ran. zc-loopback tests flatten->pup->rebuild LOCALLY -- the
+    wire format, not the transport.
+ 2. "The standalone probe moved 8 MB, contents verified." Two processes on
+    ONE node take the CmiUseCopyBasedRDMA path, which NEVER REGISTERS MEMORY
+    -- the exact step that fails.
+Both ran at a scale where the code under test does not execute. Same failure
+mode as the earlier retractions, one level down: there I trusted correlations
+whose mechanisms co-varied; here I trusted tests whose scale excluded the
+mechanism. The number was real; the inference was not.
+
+*** ALSO: A TRANSIENT FABRIC FAULT ***
+Job 5262486's marshalled control died with post_send_impl "Input/output
+error" with FOF_S3_ZC UNSET (none of the new code ran). A triage job re-ran
+the identical binary and settings: PASSED. Transient. Recorded so it is not
+mistaken for a regression.
+
+*** REVISED LEVER RANKING AFTER STEP 1 ***
+Donor cost is now flatten 30.6 ms (62%), marshal+send 18.5 ms (37%), scan
+0.4 ms. So:
+  1. PER-TREEPIECE CONTIGUOUS TREE BUILD (Kale's other idea) -- the flatten
+     is now the dominant donor term. FullNodePool already bump-allocates
+     contiguously; the pool is per-LANE, so TreePieces interleave. Caveat:
+     the CacheManager shares that pool for async remote arrivals.
+  2. Zero-copy, once CMK_NOCOPY_DIRECT_BYTES is fixed -- ~17.5 ms.
+  3. Option (A) lazy/parallel helper rebuild -- helper side, idle PEs.
