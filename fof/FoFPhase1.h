@@ -511,14 +511,49 @@ public:
     }();
     return v;
   }
+  // Marginal-density packing. A unit's byte cost is NOT a property of the
+  // unit: place() dedups subtrees, so a unit reusing trees already in the
+  // shipment costs ~nothing extra. Bytes-added is therefore submodular in
+  // the unit set, and greedy on MARGINAL density is the standard
+  // approximation. Skip a candidate whose marginal m2-per-byte is below
+  // this fraction of the shipment's running mean density. 0 = off (take
+  // everything in pool order, the pre-2026-08-13 behaviour).
+  // NOTE: this orders GRANT PACKING ONLY. The local drain stays
+  // costliest-first -- section 26 measured +60% when giants went last, and
+  // section 27's reservation failed partly by conflating the two.
+  // Let one grant SPAN up to N extra partitions rather than ending when its
+  // own partition runs dry. 0 = off (one partition per grant, as before).
+  // A partition is a KD-split SPATIAL region of the pool (~1/PB_PARTS of it),
+  // key-ordered inside, so subtree dedup hits hard within one and much less
+  // across two -- spanning buys units per grant at worse bytes per unit.
+  static int s3SpanParts() {
+    static const int v = [] {
+      const char* e = std::getenv("FOF_S3_SPAN_PARTS");
+      return e ? std::atoi(e) : 0;
+    }();
+    return v;
+  }
+  static double s3DensityFrac() {
+    static const double v = [] {
+      const char* e = std::getenv("FOF_S3_DENSITY");
+      return e ? std::atof(e) : 0.0;
+    }();
+    return v;
+  }
   static double s3GrantM2() {
     static const double v = [] {
       const char* e = std::getenv("FOF_S3_GRANT_M2");
-      // 1e10: high enough that the unit-count cap binds first on any
-      // sane composition (5e7 strangled every 2B grant to ~5-18 units
-      // and was the ENTIRE v2->0f30988 regression, Frontier job
-      // 5253386); low enough to still clip a pathological all-giants
-      // scoop, the v1 failure this budget exists for.
+      // 1e11: smallest value indistinguishable from budget-off at the
+      // best cell (Frontier job 5256055: 1e11/3e11/1e12 all ~1.62-1.68
+      // straggler max), keeping the most guard against the v1
+      // all-giants scoop this budget exists for. The earlier 1e10 was
+      // tuned at PARTS=32/GRANT=32 whose grants are ~4x smaller; at
+      // the PARTS=16/GRANT=128 cell it clipped grants to ~300 units
+      // and cost ~37% on the straggler (relay1 item 3; 5e7 before it
+      // strangled grants to ~5-18 units, the entire v2 regression,
+      // job 5253386). CAUTION: still a bare constant tuned to THIS
+      // pool; the real fix is a budget relative to the SHIPPED mean
+      // m2/unit (~5.9x the pool mean — coordinator orders costliest).
       return e ? std::atof(e) : 1e10;
     }();
     return v;
@@ -549,6 +584,43 @@ public:
   std::atomic<long> s3_out_ships{0}, s3_out_units{0}, s3_in_ships{0},
       s3_in_units{0}, s3_declines{0}, s3_ret_edges{0};
   double s3_out_m2 = 0; // under s3_lock
+  // Shipment SIZE accounting (Kale 2026-08-13). Frontier projections traces
+  // showed s3Shipment's cost is ~100% proportional to message BYTES
+  // (pearson r 0.999, ~zero intercept, ~0.003 us/byte) while grant selection
+  // sorts only by m2 -- so we pay by the byte and choose by the estimate.
+  // These make work-per-byte measurable so ordering can eventually use it.
+  // All RUNNING accumulators: no per-shipment values are stored.
+  std::atomic<long> s3_out_bytes{0};   // estimated serialized bytes shipped
+  std::atomic<long> s3_out_nodes{0};   // wire nodes shipped
+  std::atomic<long> s3_out_parts{0};   // particles shipped
+  double s3_wpb_min = 1e300, s3_wpb_max = 0;  // m2 per byte, under s3_lock
+  // (the log2(m2/byte) histogram is declared with the other histograms,
+  //  below kUnitHistBuckets -- an array bound cannot forward-reference it)
+  // Serialized size WITHOUT a PUP::sizer pass: vector::size() is O(1), so
+  // this is O(#trees), not O(#nodes) -- it must not add cost to s3ShipOrder,
+  // which section 31 already flags as donor-side critical-path time. It is
+  // the pup'd member sum (no struct padding), validated against the msglen
+  // field of a projections trace -- see reports/s3-transport-ab.md.
+  static long treeBytes(const paratreet::StealTree<Data>& t) {
+    return (long)t.nodes.size()
+             * (long)sizeof(typename paratreet::StealTree<Data>::WireNode)
+         + (long)t.particles.size() * (long)sizeof(Particle);
+  }
+  static long shipmentBytes(const paratreet::StealShipment<Data>& ship,
+                            long* nodes_out, long* parts_out) {
+    long nn = 0, np = 0;
+    for (const auto& t : ship.trees) {
+      nn += (long)t.nodes.size();
+      np += (long)t.particles.size();
+    }
+    *nodes_out = nn; *parts_out = np;
+    const long wire_node =
+        (long)sizeof(typename paratreet::StealTree<Data>::WireNode);
+    const long hdr = (long)(2 * sizeof(int) + sizeof(double))
+                   + (long)(ship.trees.size() * 2 * sizeof(size_t));
+    return hdr + nn * wire_node + np * (long)sizeof(Particle)
+               + (long)ship.unit_pairs.size() * 2 * (long)sizeof(int);
+  }
   std::mutex s3_lock;
   struct S3Member {
     std::vector<double> part_cost; // initial partition costs (publish)
@@ -626,6 +698,47 @@ public:
   // helper's own print fires at its merge, often before it helps, so a
   // helper-side histogram would silently undercount).
   std::atomic<long> s3_ship_hist[kUnitHistBuckets] = {};
+  // log2 of m2-per-byte per shipment: the work-per-byte distribution. Grant
+  // selection sorts by m2 but pays by bytes (projections: cost is ~100%
+  // byte-proportional), so this is the spread that a work-per-byte ordering
+  // would exploit. Running counts only -- no per-shipment values stored.
+  // bucket b of s3_wpb_hist means m2/byte ~ 2^(b - kWpbShift). 17 puts the
+  // measured 2^-16.6 .. 2^9.8 range inside [0, 27] with headroom both ways.
+  static constexpr int kWpbShift = 17;
+  // Self-calibrating bytes-per-particle-below, for predicting a subtree's
+  // wire size in O(1) from Data::n_below BEFORE flattening it. Updated from
+  // every flatten we actually do (exact bytes / exact n_below), so it needs
+  // no constants and adapts to the tree shape. Running sums only.
+  std::atomic<long> s3_cal_bytes{0}, s3_cal_below{0};
+  std::atomic<long> s3_span_takes{0};  // grants that spanned a partition
+  // Where the per-grant time actually goes. Frontier measured s3ShipOrder at
+  // ~178 ms and s3Shipment at ~165 ms per grant (~40 MB), i.e. ~242 MB/s --
+  // about 40x slower than memcpy, and a field-by-field PUP-style copy of the
+  // same shape benchmarks at ~10 GB/s. So the cost is NOT data movement, but
+  // which part it IS has never been measured. These split it:
+  //   order  = flatten (tree walk + build) | scan/CAS | marshal+send
+  //   ship   = particle vector COPY (pure memmove) | buildStealTree (object
+  //            construction) | enqueue+wake
+  // Microseconds, running totals, no per-grant storage. CkWallTimer is ~25 ns
+  // and is called O(units) times against ~178 ms of work -- under 0.1%.
+  std::atomic<long> s3_t_order_us{0}, s3_t_flatten_us{0}, s3_t_send_us{0};
+  // MARSHAL vs SEND. The 80 ms "marshal+send" bracket lumps two different
+  // fixes: an arena-building flatten would remove the marshal GATHER (charm
+  // pups 2N+1 scattered vectors into one contiguous message), while the
+  // zero-copy post API would remove the donor's block on the SEND. A timed
+  // PUP::sizer pass walks exactly the structure toMem walks, without the
+  // copy, so it bounds the gather's traversal cost. Measurement only -- it
+  // is an EXTRA pass and should be removed once the split is known.
+  std::atomic<long> s3_t_sizer_us{0};
+  std::atomic<long> s3_trees_shipped{0};
+  std::atomic<long> s3_t_ship_us{0}, s3_t_ship_copy_us{0}, s3_t_ship_build_us{0};
+  double s3BytesPerBelow() const {
+    const long nb = s3_cal_below.load();
+    // 96 B/particle-below is only the bootstrap for the first few subtrees;
+    // after that the measured ratio takes over.
+    return nb > 0 ? (double)s3_cal_bytes.load() / (double)nb : 96.0;
+  }
+  std::atomic<long> s3_wpb_hist[kUnitHistBuckets] = {};
   void printUnitHist() {
     printOneHist("pb_unit_hist", pb_unit_hist, "log2us");
     printOneHist("s3_grant_m2_hist", s3_ship_hist, "log2m2");
@@ -802,18 +915,40 @@ public:
     paratreet::StealShipment<Data> ship;
     ship.origin_node = CkMyNode();
     ship.part_idx = partIdx;
+    const double t_order0 = CkWallTimer();
     auto range = pb_part_range[partIdx];
     auto* fof = group_proxy.ckLocalBranch();
     std::unordered_map<Node<Data>*, int> in_ship;
+    long bytes = 0;  // running wire size of `ship`, exact for placed trees
     auto place = [&](Node<Data>* n) -> int {
       auto it = in_ship.find(n);
-      if (it != in_ship.end()) return it->second;
+      if (it != in_ship.end()) return it->second;  // dedup hit: costs nothing
       int idx = (int)ship.trees.size();
       ship.trees.emplace_back();
+      const double tf0 = CkWallTimer();
       fof->flattenStealTree(n, ship.trees.back());
+      s3_t_flatten_us.fetch_add((long)((CkWallTimer() - tf0) * 1e6),
+                                std::memory_order_relaxed);
       in_ship.emplace(n, idx);
+      const long tb = treeBytes(ship.trees.back());
+      bytes += tb;
+      // feed the O(1) size predictor with ground truth from this flatten
+      if (n != nullptr && n->data.n_below > 0) {
+        s3_cal_bytes.fetch_add(tb, std::memory_order_relaxed);
+        s3_cal_below.fetch_add(n->data.n_below, std::memory_order_relaxed);
+      }
       return idx;
     };
+    // Predicted MARGINAL bytes of adding this node: zero if its subtree is
+    // already in the shipment (place() would dedup it), else O(1) from
+    // n_below x the self-calibrated ratio.
+    auto marginal = [&](Node<Data>* n) -> long {
+      if (n == nullptr) return 0;
+      if (in_ship.find(n) != in_ship.end()) return 0;
+      const long nb = n->data.n_below > 0 ? n->data.n_below : 1;
+      return (long)(s3BytesPerBelow() * (double)nb);
+    };
+    const double dens_frac = s3DensityFrac();
     double m2 = 0;
     const long cap = s3GrantUnits();
     // Section 27: serve grants from the reserved high-m2 window first —
@@ -838,37 +973,119 @@ public:
                                    place(phaseb_pool[k].b));
       m2 += phaseb_pool[k].m2;
     }
-    for (uint32_t k = range.first; k < range.second; k++) {
-      if ((long)ship.unit_pairs.size() >= cap) break; // count cap (dust)
-      if (m2 >= s3GrantM2()) break;                   // m2 budget (giants)
-      int expect = 0;
-      if (!s3_unit_taken[k].compare_exchange_strong(expect, 2)) continue;
-      s3_units_owned.fetch_add(1);
-      s3_remaining_m2.fetch_sub((long)phaseb_pool[k].m2);
-      {
-        long v = (long)phaseb_pool[k].m2;
-        int b = 0;
-        while (v > 1 && b < kUnitHistBuckets - 1) { v >>= 1; b++; }
-        s3_ship_hist[b].fetch_add(1, std::memory_order_relaxed);
+    // One range's worth of collection. Returns true if it took anything.
+    // Factored out so a grant can SPAN partitions: job 5257769 showed the
+    // density filter shrinks a grant (it skips units but the partition then
+    // runs dry), and across 19 runs spanning six different size mechanisms,
+    // phaseB_s max tracks log(units per shipment) at r = -0.775. Shrinking a
+    // grant loses no matter how good the selection is, so density must
+    // choose WHICH units fill a large grant, never make it smaller.
+    auto collect = [&](uint32_t lo, uint32_t hi) -> bool {
+      bool took = false;
+      for (uint32_t k = lo; k < hi; k++) {
+        if ((long)ship.unit_pairs.size() >= cap) break; // count cap (dust)
+        if (m2 >= s3GrantM2()) break;                   // m2 budget (giants)
+        // Marginal-density filter. Evaluated BEFORE the CAS so a rejected
+        // unit stays unclaimed and the local drain simply takes it --
+        // skipping after claiming would strand it and corrupt the ownership
+        // ledger. Needs a baseline, so it engages once the ship has body.
+        if (dens_frac > 0.0 && ship.unit_pairs.size() >= 8 && bytes > 0) {
+          const long mb = marginal(phaseb_pool[k].a) + marginal(phaseb_pool[k].b);
+          if (mb > 0 && phaseb_pool[k].m2 / (double)mb
+                          < dens_frac * (m2 / (double)bytes))
+            continue;   // poor work-per-byte newcomer: leave it local
+        }
+        int expect = 0;
+        if (!s3_unit_taken[k].compare_exchange_strong(expect, 2)) continue;
+        s3_units_owned.fetch_add(1);
+        s3_remaining_m2.fetch_sub((long)phaseb_pool[k].m2);
+        {
+          long v = (long)phaseb_pool[k].m2;
+          int b = 0;
+          while (v > 1 && b < kUnitHistBuckets - 1) { v >>= 1; b++; }
+          s3_ship_hist[b].fetch_add(1, std::memory_order_relaxed);
+        }
+        ship.unit_pairs.emplace_back(place(phaseb_pool[k].a),
+                                     place(phaseb_pool[k].b));
+        m2 += phaseb_pool[k].m2;
+        took = true;
       }
-      ship.unit_pairs.emplace_back(place(phaseb_pool[k].a),
-                                   place(phaseb_pool[k].b));
-      m2 += phaseb_pool[k].m2;
+      return took;
+    };
+    collect(range.first, range.second);
+    // SPAN: keep filling from other partitions until the COUNT cap, rather
+    // than stopping when this partition runs dry. We reach only ~500 units
+    // against a 1792-unit cap because PARTS=16 gives ~1080 units/partition
+    // and much of it is already claimed. Partitions are concatenated
+    // costliest-first, so ascending index order is the right scan order.
+    // SAFE by construction: the per-unit CAS is the ownership authority
+    // (section 20), so overlapping another helper's partition wastes a scan
+    // but can never double-execute. It can leave the coordinator's
+    // in_flight/retired bookkeeping stale, which costs extra declines only.
+    const int span = s3SpanParts();
+    if (span > 0) {
+      int spanned = 0;
+      for (int p = 0; p < (int)pb_part_range.size() && spanned < span; p++) {
+        if (p == partIdx) continue;
+        if ((long)ship.unit_pairs.size() >= cap) break;
+        if (m2 >= s3GrantM2()) break;
+        if (collect(pb_part_range[p].first, pb_part_range[p].second)) {
+          spanned++;
+          s3_span_takes.fetch_add(1, std::memory_order_relaxed);
+        }
+      }
     }
     if (ship.unit_pairs.empty()) {
       s3_declines.fetch_add(1);
       this->thisProxy[s3Coord()].s3Declined(CkMyNode(), helperNode, partIdx);
+      s3_t_order_us.fetch_add((long)((CkWallTimer() - t_order0) * 1e6),
+                              std::memory_order_relaxed);
       return;
     }
     ship.m2 = m2;
     s3_ships_outstanding.fetch_add(1);
     s3_out_ships.fetch_add(1);
     s3_out_units.fetch_add((long)ship.unit_pairs.size());
+    // size accounting: what this grant COSTS (bytes) against what it BUYS (m2)
+    long nn = 0, np = 0;
+    // ship_bytes is the FULL wire size (adds header + unit_pairs to the
+    // running `bytes` the packing loop used for its budget decisions).
+    const long ship_bytes = shipmentBytes(ship, &nn, &np);
+    s3_out_bytes.fetch_add(ship_bytes);
+    s3_out_nodes.fetch_add(nn);
+    s3_out_parts.fetch_add(np);
     {
       std::lock_guard<std::mutex> g(s3_lock);
       s3_out_m2 += m2;
+      if (ship_bytes > 0) {
+        const double wpb = m2 / (double)ship_bytes;
+        if (wpb < s3_wpb_min) s3_wpb_min = wpb;
+        if (wpb > s3_wpb_max) s3_wpb_max = wpb;
+        // log2 bucket of m2-per-byte, SHIFTED so sub-1 ratios resolve.
+        // Measured range at 2B/16 (job 5256808) is 1.0e-5 .. 8.8e2, i.e.
+        // 2^-16.6 .. 2^9.8 -- an unshifted integer log2 collapses everything
+        // below 1.0 into bucket 0 (it held 29% of shipments). Bucket b means
+        // m2/byte ~ 2^(b - kWpbShift); the +0.5 rounds rather than truncates.
+        const double lg = std::log2(wpb) + (double)kWpbShift;
+        int b = (int)(lg + 0.5);
+        if (b < 0) b = 0;
+        if (b > kUnitHistBuckets - 1) b = kUnitHistBuckets - 1;
+        s3_wpb_hist[b].fetch_add(1, std::memory_order_relaxed);
+      }
     }
-    this->thisProxy[helperNode].s3Shipment(ship);
+    {   // bound the marshal walk: same traversal toMem does, no copy
+      const double tz0 = CkWallTimer();
+      PUP::sizer __sz; __sz | const_cast<paratreet::StealShipment<Data>&>(ship);
+      s3_t_sizer_us.fetch_add((long)((CkWallTimer() - tz0) * 1e6),
+                              std::memory_order_relaxed);
+    }
+    s3_trees_shipped.fetch_add((long)ship.trees.size(), std::memory_order_relaxed);
+    const double t_send0 = CkWallTimer();
+    this->thisProxy[helperNode].s3Shipment(ship);   // pup pack + send, ~40 MB
+    s3_t_send_us.fetch_add((long)((CkWallTimer() - t_send0) * 1e6),
+                           std::memory_order_relaxed);
+    s3_t_order_us.fetch_add((long)((CkWallTimer() - t_order0) * 1e6),
+                            std::memory_order_relaxed);
   }
   // Helper (v2 parallel drain): rebuild the shipment ONCE into a foreign
   // ship record, then wake every PE of this process — they all drain the
@@ -878,6 +1095,7 @@ public:
   // flag), so a single active record suffices; finished records go to
   // the graveyard (freed at reset) so racing cursor reads stay safe.
   void s3Shipment(const paratreet::StealShipment<Data>& ship) {
+    const double t_ship0 = CkWallTimer();
     auto* fof = group_proxy.ckLocalBranch();
     auto* rec = new S3ForeignShip();
     rec->origin = ship.origin_node;
@@ -886,9 +1104,15 @@ public:
     rec->roots.assign(ship.trees.size(), nullptr);
     rec->arenas.assign(ship.trees.size(), {nullptr, 0});
     for (size_t t = 0; t < ship.trees.size(); t++) {
-      rec->particles[t] = ship.trees[t].particles;
+      const double tc0 = CkWallTimer();
+      rec->particles[t] = ship.trees[t].particles;   // pure vector copy
+      const double tc1 = CkWallTimer();
+      s3_t_ship_copy_us.fetch_add((long)((tc1 - tc0) * 1e6),
+                                  std::memory_order_relaxed);
       void* arena = nullptr;
       rec->roots[t] = fof->buildStealTree(ship.trees[t], rec->particles[t], arena);
+      s3_t_ship_build_us.fetch_add((long)((CkWallTimer() - tc1) * 1e6),
+                                   std::memory_order_relaxed);
       rec->arenas[t] = {arena, ship.trees[t].nodes.size()};
     }
     rec->units.reserve(ship.unit_pairs.size());
@@ -905,6 +1129,8 @@ public:
     int first = CkNodeFirst(CkMyNode());
     for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
       group_proxy[pe].drainForeign();
+    s3_t_ship_us.fetch_add((long)((CkWallTimer() - t_ship0) * 1e6),
+                           std::memory_order_relaxed);
   }
   // Last foreign drainer calls this: dedup, return edges to the origin,
   // announce availability for the next grant.
@@ -960,6 +1186,39 @@ public:
                s3_ret_edges.load(), s3_declines.load(),
                s3_remaining_m2.load(), s3_total_m2,
                s3_reserved_shipped.load());
+    if (s3On() && s3_out_ships.load() > 0) {
+      const long b = s3_out_bytes.load(), s = s3_out_ships.load();
+      CkPrintf("FOF3STAT s3_bytes: node %d out_bytes %ld bytes_per_ship %ld "
+               "nodes %ld parts %ld bytes_per_unit %ld m2_per_byte_mean %.4g "
+               "m2_per_byte_min %.4g m2_per_byte_max %.4g span_takes %ld\n",
+               CkMyNode(), b, b / s, s3_out_nodes.load(), s3_out_parts.load(),
+               s3_out_units.load() ? b / s3_out_units.load() : 0,
+               b > 0 ? s3_out_m2 / (double)b : 0.0,
+               s3_wpb_max > 0 ? s3_wpb_min : 0.0, s3_wpb_max,
+               s3_span_takes.load());
+      printOneHist("s3_wpb_hist", s3_wpb_hist, "log2m2perbyte");
+      // WHERE THE PER-GRANT TIME GOES. order_us/ships and ship_us/in_ships are
+      // the ~178 ms and ~165 ms per grant measured on Frontier; the splits say
+      // which part is real. copy_us is a pure vector memmove of the particles,
+      // so if the cost were data movement it would dominate -- a field-by-field
+      // PUP-style pass of the same shape benchmarks at ~10 GB/s, i.e. ~4 ms for
+      // a 40 MB grant, against the ~370 ms per grant actually observed.
+      CkPrintf("FOF3STAT s3_time: node %d order_ms %.1f flatten_ms %.1f "
+               "ship_ms %.1f ship_copy_ms %.1f ship_build_ms %.1f "
+               "order_per_ship_ms %.1f flatten_frac %.3f build_frac %.3f "
+               "copy_frac %.3f send_ms %.1f send_frac %.3f sizer_ms %.1f trees %ld\n",
+               CkMyNode(),
+               s3_t_order_us.load() / 1e3, s3_t_flatten_us.load() / 1e3,
+               s3_t_ship_us.load() / 1e3, s3_t_ship_copy_us.load() / 1e3,
+               s3_t_ship_build_us.load() / 1e3,
+               s3_out_ships.load() ? s3_t_order_us.load() / 1e3 / s3_out_ships.load() : 0.0,
+               s3_t_order_us.load() ? (double)s3_t_flatten_us.load() / s3_t_order_us.load() : 0.0,
+               s3_t_ship_us.load() ? (double)s3_t_ship_build_us.load() / s3_t_ship_us.load() : 0.0,
+               s3_t_ship_us.load() ? (double)s3_t_ship_copy_us.load() / s3_t_ship_us.load() : 0.0,
+               s3_t_send_us.load() / 1e3,
+               s3_t_order_us.load() ? (double)s3_t_send_us.load() / s3_t_order_us.load() : 0.0,
+               s3_t_sizer_us.load() / 1e3, s3_trees_shipped.load());
+    }
     printUnitHist();
     int first = CkNodeFirst(CkMyNode());
     for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
@@ -1272,6 +1531,18 @@ public:
     s3_out_ships = s3_out_units = s3_in_ships = s3_in_units = 0;
     s3_declines = s3_ret_edges = 0;
     s3_out_m2 = 0;
+    s3_out_bytes = 0;
+    s3_span_takes = 0;
+    s3_t_order_us = 0; s3_t_flatten_us = 0; s3_t_send_us = 0;
+    s3_t_sizer_us = 0; s3_trees_shipped = 0;
+    s3_t_ship_us = 0; s3_t_ship_copy_us = 0; s3_t_ship_build_us = 0;
+    s3_cal_bytes = 0;
+    s3_cal_below = 0;
+    s3_out_nodes = 0;
+    s3_out_parts = 0;
+    s3_wpb_min = 1e300;
+    s3_wpb_max = 0;
+    for (int i = 0; i < kUnitHistBuckets; i++) s3_wpb_hist[i] = 0;
     s3_members.clear();
     s3_remaining_m2 = 0;
     s3_total_m2 = 0;
@@ -3956,7 +4227,16 @@ private:
     w.key = n->key;
     w.parent = parent_idx;
     w.slot = (int8_t)slot;
-    w.sn = SpatialNode<Data>(*n);
+    // copy exactly the fields SpatialNode::pup used to ship
+    w.sp.box_lesser = n->data.box.lesser_corner;
+    w.sp.box_greater = n->data.box.greater_corner;
+    w.sp.min_frag = n->data.min_frag;
+    w.sp.max_frag = n->data.max_frag;
+    w.sp.n_below = n->data.n_below;
+    w.sp.n_particles = n->n_particles;
+    w.sp.depth = n->depth;
+    w.sp.particle_min_index = n->particle_min_index;
+    w.sp.particle_max_index = n->particle_max_index;
     if (n->isLeaf()) {
       const Particle* p = n->particles();
       for (int i = 0; i < n->n_particles; i++) out.particles.push_back(p[i]);
@@ -3985,7 +4265,16 @@ private:
     size_t pi = 0;
     for (size_t i = 0; i < n; i++) {
       const auto& w = t.nodes[i];
-      const SpatialNode<Data>& sn = w.sn;
+      SpatialNode<Data> sn;            // rebuilt from the POD wire payload
+      sn.data.box.lesser_corner = w.sp.box_lesser;
+      sn.data.box.greater_corner = w.sp.box_greater;
+      sn.data.min_frag = w.sp.min_frag;
+      sn.data.max_frag = w.sp.max_frag;
+      sn.data.n_below = w.sp.n_below;
+      sn.n_particles = w.sp.n_particles;
+      sn.depth = w.sp.depth;
+      sn.particle_min_index = w.sp.particle_min_index;
+      sn.particle_max_index = w.sp.particle_max_index;
       bool leaf = sn.n_particles >= 0;
       auto type = leaf ? (sn.n_particles == 0 ? Node<Data>::Type::EmptyLeaf
                                               : Node<Data>::Type::Leaf)
