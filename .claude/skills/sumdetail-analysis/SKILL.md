@@ -116,3 +116,16 @@ five-entry roster sweep is one ~12 s call, not five.
 - Verify a binary's tracing state with
   `nm -C <bin> | grep -ci TraceSummary` (0 = untraced, ~465-524 =
   traced); never assume from the filename.
+
+## projlog_tool.py (in this directory): full projections .log.gz reader
+
+For -tracemode projections traces (per-PE event logs). Subcommands
+totals/calls/regress/entries; stdlib only; ~28 s per 224-PE 2B subset.
+Format verified against ProjDefs.java: record types 2/3 =
+BEGIN/END_PROCESSING, 18/19 = BEGIN/END_UNPACK; field 7 of a BEGIN
+record = message length (what enabled the bytes-vs-nodes regression).
+TRAP: on BEGIN_PROCESSING, field 6 is the SOURCE PE, not the executing
+PE — the executing PE is the file the record came from; reversing that
+silently attributes work to the wrong process. Use `regress` to fit
+entry duration vs message bytes (the s3Shipment r=0.999 finding);
+`entries` to dump raw records around a timestamp.
