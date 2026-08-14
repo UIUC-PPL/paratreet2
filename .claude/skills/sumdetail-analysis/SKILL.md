@@ -56,7 +56,11 @@ python3 sumd_tool.py profile   --ep 'startPhase1|phaseBChained' --bin 100
     # Profile as an ASCII histogram
 ```
 
-Cost: ~2 s per 1792-PE 2B trace per invocation on a login node.
+Cost: ~2 s per 1792-PE 2B trace on laptop SSD; **12-18 s on a cluster
+login node over Lustre** (Frontier, measured: cold 18.2 s, warm 11.8 s
+— partly I/O, partly real compute). So BATCH every --ep regex you need
+into ONE invocation (repeatable; each regex is its own group): a
+five-entry roster sweep is one ~12 s call, not five.
 
 ## Recipes that have paid off
 
@@ -92,8 +96,22 @@ Cost: ~2 s per 1792-PE 2B trace per invocation on a login node.
 
 - Traced binaries cost RSS (~40% at 2B; a 2B sumd arm OOMed before
   the windowed-flush fix aba7833). `+traceprocessors 0,10,20-30`
-  restricts recording to listed PEs (untested whether it avoids the
-  RSS cost — check before relying on it).
+  restricts recording to listed PEs — measured on Frontier
+  (relay1 item 5): 224/1792 PEs at 2B ran with NO OOM, ~1.8 MB per
+  recorded PE, wall 23/17 s vs 17-19 untraced. (Not separated whether
+  the flag avoids the RSS cost or the subset is just small.) Note PE 0
+  records regardless, and some in-range PEs may write nothing.
+- FULL projections traces (-tracemode projections, .log.gz per PE) go
+  further than sum-detail: event records carry per-call timestamps AND
+  message length, so entry duration can be regressed against bytes —
+  this is what proved s3Shipment ~100% byte-proportional (r=0.999)
+  and located the send at 99.2% through its block. A stdlib reader
+  exists on Frontier at ~/software/scripts/projlog_tool.py
+  (totals/calls/regress/entries; format verified against
+  ProjDefs.java: 2/3 BEGIN/END_PROCESSING, 18/19 BEGIN/END_UNPACK,
+  field 7 of BEGIN = msglen; ~28 s per 224-PE subset trace).
+- Do NOT `du` a traceroot right after srun returns — Lustre writes are
+  still landing (59 MB once measured as 531 KB).
 - TraceSummary writes at EXIT: a killed run leaves an empty trace dir.
 - Verify a binary's tracing state with
   `nm -C <bin> | grep -ci TraceSummary` (0 = untraced, ~465-524 =
