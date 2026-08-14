@@ -1386,8 +1386,8 @@ frontier-s3-parallel-rebuild-results-2026-08-14.md. 21/21 2B exact.
      target per-grant cost -> expect the null result, EXCEPT
      zero-copy's removal of the 27 ms serial unmarshal (that part is
      worth it; still blocked upstream — relay2, stored as
-     design/frontier-relay2-nocopy-bug-2026-08-14.txt, a filed-quality
-     reconverse bug: getRMR scales per LCI device at runtime while
+     design/frontier-relay2-nocopy-bug-2026-08-14.txt, filed upstream as
+     reconverse bug (charmplusplus/reconverse#203): getRMR scales per LCI device at runtime while
      CMK_NOCOPY_DIRECT_BYTES=32 is compile-time; 7 devices need 176).
    - THE CONTIGUOUS-BUILD DESIGN NOTE'S S3 MOTIVATION IS UNDERCUT:
      donor flatten is per-grant cost, and DENSITY's 5x cut of exactly
