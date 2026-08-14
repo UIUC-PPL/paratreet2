@@ -1,6 +1,6 @@
 # Per-TreePiece contiguous tree build (design note, 2026-08-14)
 
-Kale's proposal; assessed and sized this morning. Status: DESIGN — 
+Kale's proposal; assessed and sized this morning. Status: DEFERRED (see section 34 item 2: the S3 motivation is undercut — DENSITY cut donor per-grant cost 5x with no end-to-end effect; surviving case = walk locality + zero-copy on-ramp, pending a locality probe). Original: DESIGN — 
 implementation to start after Frontier's s3Shipment parallel rebuild
 lands (stable A/B baseline).
 

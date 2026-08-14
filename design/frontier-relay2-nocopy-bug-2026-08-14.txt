@@ -1,0 +1,165 @@
+RELAY 2 -- reconverse bug report: CMK_NOCOPY_DIRECT_BYTES cannot be a
+compile-time constant, because getRMR() scales with +lci_ndevices
+Frontier, 2026-08-14. Self-contained; nothing here depends on relay1.
+
+=============================================================
+SUMMARY
+=============================================================
+The Charm++ zero-copy entry-method API (nocopypost / CkSendBuffer) aborts on
+every process on Frontier whenever more than ONE LCI device is used:
+
+    CMK_NOCOPY_DIRECT_BYTES is too small
+    reconverse/src/conv-rdma.cpp:528
+
+Root cause: the LCI backend's getRMR() returns
+sizeof(lci::rmr_t) * m_devices.size() -- i.e. the remote-memory-region
+descriptor is PER DEVICE -- while CMK_NOCOPY_DIRECT_BYTES is a COMPILE-TIME
+constant of 32 and the device count is a RUNTIME flag (+lci_ndevices).
+No fixed constant can be correct.
+
+The value 32 is exactly right for one device and fails for two or more.
+
+=============================================================
+ENVIRONMENT
+=============================================================
+  machine     OLCF Frontier (Slingshot-11 / CXI), 16 nodes, 128 processes,
+              14 worker PEs per process
+  charm       3d1fdd89f2f53bdb06e2cb4d7989b432a7b812d7
+              (Merge branch 'reconverse-specific-build')
+  reconverse  a1207a877bfe0ed6e7cec229e5b2e4e83cbc078b
+              ("Change startup message for reconverse (#201)", 2026-08-10)
+  LCI         70ae5b397dd909fb76ba1fe3bcfddad631158a21
+              ("Report peer ranks for asynchronous completion failures (#180)")
+  backend     LCI_ATTR_BACKEND=ofi, provider cxi
+  runtime     +ppn 14  +lci_ndevices 7  +backend_poll_thread 2
+  app         paratreet2 FoF3 at 2B particles; a nodegroup entry method
+              declared `nocopypost char data[n]` shipping ~30 MB buffers
+
+=============================================================
+THE ARITHMETIC
+=============================================================
+reconverse/src/conv-rdma.cpp (CmiSetRdmaBufferInfo):
+
+    auto mr = comm_backend::registerMemory((void *)ptr, size);
+    CmiAssert(CMK_NOCOPY_DIRECT_BYTES >= sizeof(mr));
+    memcpy(info, &mr, sizeof(mr));
+    info = (char *)info + sizeof(mr);
+    size_t info_size_left = CMK_NOCOPY_DIRECT_BYTES - sizeof(mr);
+    size_t rmr_size = comm_backend::getRMR(mr, info, info_size_left);
+    CmiAssertMsg(rmr_size <= info_size_left, "CMK_NOCOPY_DIRECT_BYTES is too small");
+
+reconverse/src/comm_backend/lci2/comm_backend_lci2.cpp:354:
+
+    size_t CommBackendLCI2::getRMR(mr_t mr, void *addr, size_t size) {
+      lci::mr_t *mrs = (lci::mr_t *)mr;
+      if (addr && size >= sizeof(lci::rmr_t) * m_devices.size()) {
+        for (int i = 0; i < m_devices.size(); i++) { ... }
+      }
+      return sizeof(lci::rmr_t) * m_devices.size();     // <-- PER DEVICE
+    }
+
+Sizes in this build:
+    sizeof(lci::mr_t)   = 8    (single member: mr_impl_t* p_impl)
+    sizeof(lci::rmr_t)  = 24   (uintptr_t base, uintptr_t mr_base,
+                                uint64_t opaque_rkey -- lci.hpp:367)
+
+    CMK_NOCOPY_DIRECT_BYTES                = 32
+    info_size_left = 32 - sizeof(mr_t)     = 24
+    required = sizeof(rmr_t) * ndevices    = 24 * ndevices
+
+      ndevices = 1  ->  24 <= 24   PASSES (exactly)
+      ndevices = 2  ->  48 >  24   ABORTS
+      ndevices = 7  -> 168 >  24   ABORTS      <-- our configuration
+
+    To make ndevices=7 fit:  8 + 24*7 = 176 bytes.
+
+=============================================================
+WHY THIS IS NOT ALREADY FIXED BY #177 / #178
+=============================================================
+Both are present in our checkout (verified with git merge-base --is-ancestor):
+
+    048d4d4  update LCI to the latest version and adapt to the lci rmr_t
+             struct size change (#177)      merged 2026-06-14
+    3bdc010  Add CMK_NOCOPY_DIRECT_BYTES to charm-config (#178)
+
+#177 adapted the constant to a changed rmr_t size; #178 mirrored it into
+charm-config.h (include/charm-config.h:14 carries the comment "This must
+match CMK_NOCOPY_DIRECT_BYTES in reconverse/include/conv-rdma.h"). Both fixes
+address the SINGLE-DEVICE size. Neither addresses the multiplication by
+m_devices.size().
+
+The newest reconverse main we can see (df0af82, "Merge branch
+'reconverse_lci_cache_amd'") still has `#define CMK_NOCOPY_DIRECT_BYTES 32`,
+so pulling forward does not fix it either.
+
+The source already anticipates this. include/conv-rdma.h:28-30:
+
+    // 8-byte for mr, 16-byte for rmr
+    // TODO: better to use dynamic allocation and PUP
+    #define CMK_NOCOPY_DIRECT_BYTES 32
+
+Note the comment budgets 16 bytes for the rmr; the current rmr_t is 24, so
+even the single-device case now fits only because sizeof(mr_t) happens to be
+8 (8 + 24 = 32 exactly, with zero headroom).
+
+=============================================================
+REPRODUCTION, AND THE DISCRIMINATOR
+=============================================================
+Any Charm++ program with a `nocopypost` entry parameter, run on CXI:
+
+  PASSES:  srun -N 1 --ntasks-per-node=2 --network=single_node_vni \
+                ./prog +ppn 1                       # 1 device by default
+  ABORTS:  srun -N 16 --ntasks-per-node=8 --network=job_vni \
+                ./prog +ppn 14 +lci_ndevices 7
+
+We hit exactly this asymmetry: a standalone 8 MB probe between two processes
+on one node passed and verified contents, then the same API aborted at 2B/16
+nodes. The probe was single-device; the application uses seven. If you
+reproduce, vary ONLY +lci_ndevices -- that is the whole discriminator.
+
+(+lci_ndevices is not incidental for us: this campaign found that it must
+track +ppn, min(8, ppn/2); 7 devices on ppn 7 hangs at cache-manager init.)
+
+=============================================================
+SUGGESTED FIXES, IN ORDER OF PREFERENCE
+=============================================================
+1. Make the layer info dynamically sized, as the existing TODO proposes. The
+   required size is known at runtime once the device count is known, and
+   getRMR already returns the needed size when passed a too-small buffer --
+   so the call can be made twice (size, then fill), or the buffer sized from
+   ndevices at init.
+
+2. Failing that, size the constant from the MAXIMUM supported device count
+   rather than 1, and assert at startup rather than at first RDMA:
+       #define CMK_NOCOPY_DIRECT_BYTES (8 + 24 * CMK_MAX_LCI_DEVICES)
+   A late assert inside the first zero-copy send is an expensive way to
+   discover a configuration error -- it aborted 128 processes mid-run for us.
+
+3. At minimum, make the failure diagnosable. The current message does not say
+   how much was needed, how much was available, or that the device count is
+   the multiplier. Suggested:
+       CmiAssertMsg(rmr_size <= info_size_left,
+           "CMK_NOCOPY_DIRECT_BYTES too small: need %zu (mr %zu + rmr %zu x
+            %d devices), have %d. Reduce +lci_ndevices or rebuild with a
+            larger CMK_NOCOPY_DIRECT_BYTES.", ...);
+   We spent a while attributing this to our own code before reading
+   comm_backend_lci2.cpp:363.
+
+=============================================================
+IMPACT
+=============================================================
+The zero-copy entry-method API is unusable on Frontier in any multi-device
+configuration -- which is the configuration anyone tuning for bandwidth will
+choose. It is silently fine in single-device tests, so it is easy to believe
+the API works and only discover otherwise at scale.
+
+For our workload this blocks an estimated ~17.5 ms per grant of donor-side
+message copying (~35% of what remains of donor-side collection cost after an
+unrelated wire-format change), on the critical path of the straggler process
+we are trying to relieve.
+
+We did NOT rebuild charm to test a larger constant: ~/software/charm is
+pinned at 3d1fdd89f as the recorded provenance for this campaign's results.
+The application-side zero-copy code is written and preserved
+(~/software/patches/wip/), but is UNTESTED at any scale that actually
+exercises the RDMA registration path -- see the note in that README.

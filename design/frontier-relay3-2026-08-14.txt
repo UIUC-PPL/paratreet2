@@ -1,0 +1,183 @@
+RELAY 3 -- parallel helper-side rebuild: patch 0006, results, and one
+strategic finding that should change what we do next.
+Frontier, 2026-08-14, ~14:00 EDT. Self-contained; does not depend on
+relay1 or relay2 (both already sent).
+
+=============================================================
+0. WHAT TO COPY OUT
+=============================================================
+  ~/software/patches/0006-s3-parallel-helper-rebuild.patch   (the change)
+  ~/software/reports/s3-parallel-rebuild.md                  (full report)
+  ~/software/reports/relay3.txt                              (this file)
+  ~/software/scripts/projlog_tool.py                         (for the skill)
+  ~/software/reports/prompt-log.md                           (prompt + run log)
+optional, large:
+  ~/software/traces/proj2b-parbuild5-frontier.tar.gz         (189 MB)
+
+The design doc asked for projlog_tool.py to be added to the
+sumdetail-analysis skill. It reads Projections .log.gz files.
+One format note worth carrying into the skill: on BEGIN_PROCESSING,
+field 6 is the SOURCE PE, not the executing PE -- the executing PE is
+the file the record came from. Getting that backwards silently
+attributes work to the wrong process.
+
+=============================================================
+1. THE PATCH
+=============================================================
+0006-s3-parallel-helper-rebuild.patch, against a8d94ab, one file
+(fof/FoFPhase1.h), +122/-23. Contains three things:
+
+(a) PREREQUISITE, and it matters more than it looks. Helper-side S3
+    counters printed at finishPhaseB, which fires at the helper's OWN
+    merge -- and a helper's own merge can precede the helping it does
+    for others. That print was catching about 23 of some 300
+    shipments. Moved to phase3Stats. Every helper-side number we have
+    quoted before this fix was measuring a biased sample.
+
+(b) THE CHANGE. s3Shipment becomes a take-ownership-and-wake entry
+    that builds nothing; drainForeign gains a build pre-pass where
+    every arriving PE claims trees off an atomic cursor and runs the
+    arena pass itself.
+
+    No barrier, no polling. A PE with nothing left to claim returns;
+    whichever PE finishes the LAST tree sends drainForeign to the
+    whole process. Measured cost of that coordination: 127 ms out of
+    a 21819 ms pre-pass, under 1%. So the fallback the design named
+    (lazy per-unit build) is NOT needed -- do not spend time on it.
+
+(c) One follow-on found by measurement: the per-tree particle vector
+    COPY became a MOVE. The old code copied because `ship` was const;
+    we now own the wire data, and buildStealTree reads only t.nodes
+    (it uses the particle vector purely as backing storage to take
+    pointers into). Removes 13 s of aggregate memmove at 2B natural,
+    191 s at 2B forced.
+
+=============================================================
+2. RESULTS -- 2B, 16 nodes, all runs exact (424897832, 21 of 21)
+=============================================================
+A/B vs the unmodified vetted tip, interleaved in the SAME allocation,
+paired by rep, two independent experiments (jobs 5265958, 5265988).
+
+  2B NATURAL, pooled 8 paired reps:
+     Pre-traversal   +3.20%  (122.0 ms, t=3.15, faster in 8/8)
+     Iteration 0     +2.03%  (132.6 ms, t=3.03, faster in 7/8)
+     phaseB_s max    NOT RESOLVED -- spread exceeds the effect
+     (7 df: t=2.36 is p=0.05)
+
+  2B FORCED, one pair per variant:
+     Pre-traversal   -15.3% and -16.6%
+     Iteration 0     -12.9% and -13.4%
+
+The win is real and modest at production settings. It is large only in
+forced mode, which is not how we run.
+
+=============================================================
+3. A CORRECTION I HAD TO MAKE TO MY OWN HEADLINE NUMBER
+=============================================================
+I first reported s3Shipment falling from ~150 ms to 0.03 ms/grant.
+That was an overclaim and the projections trace caught it.
+
+My FOF3STAT timer starts at the first line INSIDE the function body.
+The Projections entry bracket also covers UNMARSHALLING the message,
+which runs on the same PE before any of my code does.
+
+  same traced PE subset, parbuild5 vs the POD-wire baseline:
+     s3Shipment     50.6 ms/call  ->  27.3 ms/call   (-46%/call,
+                    42.5 MB/call      49.1 MB/call    -53%/byte)
+     drainForeign   48.00 s busy  ->  50.41 s busy   (+2.4 s)
+     phaseBChained  50.93 s       ->  50.92 s        (unchanged)
+
+So: the serial entry is HALVED, not eliminated. What remains is
+deserialization -- 49 MB per shipment at about 1.8 GB/s -- which this
+change cannot touch. Removing it needs a different transport, not a
+different build placement.
+
+The work MOVED rather than vanished, which is what the design wanted:
+s3Shipment lost 23.3 ms/call, drainForeign gained about the same in
+aggregate, now spread over 14 PEs instead of held by one.
+
+And this now explains the end-to-end number arithmetically rather than
+leaving it asserted: 477 shipments / 128 processes = 3.7 per process,
+x 23.3 ms = ~87 ms of serial time removed per process, against a 3.8 s
+Pre-traversal = 2.3% predicted vs 3.2% measured.
+
+=============================================================
+4. PACKING KNOBS, RERUN AS THE DESIGN ASKED (job 5266088)
+=============================================================
+relay1 sections 14/15 judged these negative at the OLD per-grant cost.
+Retaken on the new binary, 2 reps per arm, one allocation, all exact:
+
+  arm              ships  donor ms/grant  Pre-trav      Iter0
+  base               483      49.7        3562.2 ms     6237.9 ms
+  DENSITY=0.25      1248       9.9        3595.0 (+0.9%) 6253.2 (+0.2%)
+  SPAN_PARTS=4       243     178.7        3974.8 (+11.6%) 6718.7 (+7.7%)
+  both               496      54.5        3756.8 (+5.5%) 6443.6 (+3.3%)
+
+DENSITY moved from negative to NEUTRAL. SPAN_PARTS=4 is still clearly
+negative. Composed is worse than either alone. Defaults stay.
+
+=============================================================
+5. THE FINDING THAT SHOULD CHANGE WHAT WE DO NEXT
+=============================================================
+Three independent measurements today point the same way:
+
+  - Removing 191 s of aggregate helper-side particle copying
+    (section 1c): NO end-to-end effect.
+  - Cutting donor cost per grant 5x, 49.7 -> 9.9 ms, via DENSITY
+    (section 4): NO end-to-end effect.
+  - Removing a ~23 ms serial block per shipment (section 3): +3.2%,
+    and the arithmetic accounts for it.
+
+Reading: at natural 2B volume, PER-GRANT cost on both the donor and
+the helper side is not what bounds this phase. What paid was removing
+SERIALIZATION -- work stuck on one PE while thirteen idled -- and it
+paid exactly in proportion to how much serial time was removed.
+
+This matters for the agenda. The one-outstanding-shipment-per-helper
+protocol and zero-copy transport both target per-grant cost. On this
+evidence they should be expected to behave like the first two bullets,
+not the third. The exception worth keeping: zero-copy would attack the
+27 ms unmarshal in section 3, which IS serial on one PE -- so it is
+worth doing for that reason, not for the bandwidth reason we first
+gave it. (It is still blocked upstream -- see relay2.)
+
+=============================================================
+6. TWO FAILURES TODAY, BOTH MINE
+=============================================================
+(a) My gate harness ran the 80M gates without +pemap, +lci_ndevices 7,
+    +backend_poll_thread 2. +lci_ndevices must track +ppn or the run
+    hangs at cache-manager init. I started to read this as a defect in
+    the new code; the CONTROL arm settled it by failing too. Keeping a
+    control arm in the gate list is what made that one cheap.
+
+(b) A deadlock I wrote. The build loop breaks when the 2 ms slice
+    expires; I made that exit and the cursor-empty exit both `return`.
+    A PE leaving on the slice has not finished the last tree, so it
+    returned -- but trees could still be UNCLAIMED. If every PE left on
+    the slice before the cursor emptied, nobody built the rest, nobody
+    became the finisher, and no wake ever fired. Reproduced at 80M and
+    2B, never at 10k (too few trees for the slice to expire).
+
+    The error: the loop had two reasons to stop and I gave them one
+    ending. Stopping on the slice means I STILL HAVE WORK -- re-send to
+    myself. Stopping on an empty cursor means OTHERS have work I must
+    wait for -- return and let the callback wake me. The distinction
+    matters generally: re-sending to continue your own work is the
+    normal idiom (the unit drain right below already does it);
+    re-sending to check whether someone else finished is polling.
+
+(c) A reading error, not a coding one. I reported "the barrier costs
+    more than the build" from prepass minus build, without splitting
+    that difference. Coordination was 127 ms; the rest was the
+    particle copy. That pointed at the design's fallback -- a
+    substantial rewrite -- when the actual fix was one std::move.
+
+=============================================================
+7. STATE OF THE TREE
+=============================================================
+~/software/paratreet2 is at a8d94ab with patch 0006 UNCOMMITTED in the
+working tree, as the standing arrangement requires (nothing pushed from
+Frontier; the divergence guard stays honest). Binaries staged in
+~/software/bin/: FoF3.2b.vetted (a8d94ab unmodified, the control),
+FoF3.2b.parbuild5 (the patch), FoF3.2b.parbuild5.proj (traced),
+FoF3.2b.parbuild5.restored (production charm, verified trace-free).
