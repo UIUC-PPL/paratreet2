@@ -1359,3 +1359,49 @@ corrected in place) and design/frontier-s3-transport-ab-results-*.md.
    constant is raised (~17.5 ms); (iii) option (A) lazy/parallel
    helper rebuild (idle-PE side). Helper-side timers still print too
    early to trust (move to phase3Stats first).
+
+## 34. Parallel helper rebuild landed (abfa897); the serialization-not-cost
+## finding re-ranks everything (relay3, 2026-08-14)
+
+Full record: design/frontier-relay3-2026-08-14.txt and
+frontier-s3-parallel-rebuild-results-2026-08-14.md. 21/21 2B exact.
+
+1. THE CHANGE (patch 0006, vetted, gates both runtimes incl. a 1M
+   classic FORCED run for the slice-expiry path): thin s3Shipment +
+   parallel tree-build pre-pass; helper timers finally trustworthy
+   (old print sampled ~23/300 shipments); particle vectors moved not
+   copied. Serial s3Shipment entry 50.6 -> 27.3 ms/call — HALVED, not
+   eliminated: the remainder is charm's unmarshal (~49 MB at
+   ~1.8 GB/s), untouchable from app code. End to end: Pre-traversal
+   +3.2% (t=3.15, faster 8/8), Iter0 +2.0%, phaseB_s max unresolved
+   against rep spread; forced mode -13-16%. The win equals the serial
+   time removed, arithmetically (3.7 shipments/proc x 23.3 ms ~ 87 ms
+   ~ 2.3% predicted vs 3.2% measured).
+2. THE STRATEGIC FINDING — SERIALIZATION, NOT PER-GRANT COST, IS WHAT
+   PAYS at natural 2B volume. Three same-day measurements: 191 s of
+   aggregate helper copying removed -> no end-to-end effect; donor
+   cost/grant cut 5x by DENSITY -> no effect; ~23 ms of SERIAL time
+   per shipment removed -> +3.2%, fully accounted. Consequences:
+   - one-outstanding-shipment (section 26 lever 3) and zero-copy
+     target per-grant cost -> expect the null result, EXCEPT
+     zero-copy's removal of the 27 ms serial unmarshal (that part is
+     worth it; still blocked upstream — relay2, stored as
+     design/frontier-relay2-nocopy-bug-2026-08-14.txt, a filed-quality
+     reconverse bug: getRMR scales per LCI device at runtime while
+     CMK_NOCOPY_DIRECT_BYTES=32 is compile-time; 7 devices need 176).
+   - THE CONTIGUOUS-BUILD DESIGN NOTE'S S3 MOTIVATION IS UNDERCUT:
+     donor flatten is per-grant cost, and DENSITY's 5x cut of exactly
+     that bought nothing. treepiece-contiguous-build.md re-scoped: its
+     surviving justifications are WALK LOCALITY (phaseA/B, the ~90%,
+     unmeasured either way) and the buffer-is-the-message endgame;
+     implementation deferred until a locality probe justifies it.
+3. Packing knobs retested at the new cost (as required): DENSITY
+   negative -> NEUTRAL, SPAN still negative, composed worse. Defaults
+   stay.
+4. Where the straggler stands: ~1.23-1.32 s vs the 0.25 floor (4.9x),
+   phaseBChained on the hot process unchanged by all of this — the
+   residual is the straggler's LOCAL walk execution. Remaining
+   serial-time targets: the 27 ms unmarshal (zero-copy, upstream-
+   blocked) and whatever a fresh timeline of the hot process now
+   shows. The next lever should be chosen from that timeline, not
+   from the cost ledger.
