@@ -554,7 +554,7 @@ public:
       // job 5253386). CAUTION: still a bare constant tuned to THIS
       // pool; the real fix is a budget relative to the SHIPPED mean
       // m2/unit (~5.9x the pool mean — coordinator orders costliest).
-      return e ? std::atof(e) : 1e10;
+      return e ? std::atof(e) : 1e11;
     }();
     return v;
   }
