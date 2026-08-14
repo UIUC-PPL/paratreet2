@@ -1453,6 +1453,45 @@ public:
     pe_treepieces[pe].push_back(TreePieceRef{root, parts, n});
   }
 
+  // Per-process phaseB wall deposit, the phaseA analogue above. Needed
+  // because the load model predicts a PROCESS's phase-1 cost, while the
+  // balance line only reports min/avg/max over PEs globally.
+  double b_time_sum = 0.0, b_time_max = 0.0;
+  void depositPhaseBTime(double t) {
+    std::lock_guard<std::mutex> g(lock);
+    b_time_sum += t;
+    if (t > b_time_max) b_time_max = t;
+  }
+
+  // PREDICTED vs ACTUAL, one line per process (design/piece-load-model.md).
+  // The predictor is the same one TreePiece::UserSetLBLoad migrates by, so
+  // this line is the direct check on the thing we would act on:
+  //   self = sum n^1.2 over this process's pieces          (phaseA model)
+  //   pair = sum n^2 / V^(4/3) over the same pieces        (phaseB model,
+  //          mean-field neighbours; the constant b^4 is absorbed)
+  // Fit sum(actual phaseA) ~ a*self and sum(actual phaseB) ~ c*pair across
+  // processes: the R^2 of those two regressions is the go/no-go, and the
+  // ratio c/a calibrates PARATREET_LB_K for the migration arm.
+  void printLoadModel() {
+    double self = 0, pair = 0, np = 0;
+    int pieces = 0;
+    for (auto& kv : pe_treepieces)
+      for (auto& s : kv.second) {
+        if (s.n <= 0 || s.root == nullptr) continue;
+        double n = (double)s.n;
+        double v = (double)s.root->data.box.volume();
+        self += std::pow(n, 1.2);
+        if (v > 0) pair += n * n / std::pow(v, 4.0 / 3.0);
+        np += n;
+        pieces++;
+      }
+    CkPrintf("FOF3STAT load_model: node %d pieces %d n %.0f self %.6g "
+             "pair %.6g pa_sum_s %.3f pa_max_s %.3f pb_sum_s %.3f "
+             "pb_max_s %.3f\n",
+             CkMyNode(), pieces, np, self, pair, a_time_sum, a_time_max,
+             b_time_sum, b_time_max);
+  }
+
   // Called synchronously by group branches at the end of phaseB.
   void submitEdges(std::vector<std::pair<long, long>>&& es) {
     std::lock_guard<std::mutex> g(lock);
@@ -1605,6 +1644,8 @@ public:
     stage_tM1 = 0.0;
     a_time_sum = 0.0;
     a_time_max = 0.0;
+    b_time_sum = 0.0;
+    b_time_max = 0.0;
     clearSeen();
     this->contribute(cb);
   }
@@ -3451,6 +3492,11 @@ public:
   void phase3Stats(const CkCallback& cb) {
     // one helper-side S3 report per process, now that all helping is done
     if (CkMyRank() == 0) node_proxy.ckLocalBranch()->s3PrintHelperStats();
+    // Piece-load model validation (design/piece-load-model.md): predicted
+    // vs ACTUAL, per process, in one line. This is the gate on whether a
+    // (n, volume) model is good enough to migrate pieces by, and it costs
+    // one print per process — no algorithm change, so it can ride any run.
+    if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printLoadModel();
     // "edges sent" counts streamed batches plus what remains buffered (the
     // two are disjoint: flushUF2Batch clears the buffer as it submits).
     long sums[9] = {phase3_emitted,
@@ -3512,6 +3558,11 @@ public:
   // over the process's PEs.
   void depositNodeRedundant(const CkCallback& cb) {
     node_proxy.ckLocalBranch()->addNodeRedundant(p3_redundant_descents);
+    // Same barrier, same reason: this PE's phaseB wall is final here (the
+    // walk's QD is behind us, so all S3 helping has drained into it), and
+    // it must be deposited before phase3Stats prints the per-process
+    // load-model line.
+    node_proxy.ckLocalBranch()->depositPhaseBTime(t_phaseB);
     this->contribute(cb);
   }
 
