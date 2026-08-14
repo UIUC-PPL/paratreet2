@@ -1473,6 +1473,13 @@ public:
   // processes: the R^2 of those two regressions is the go/no-go, and the
   // ratio c/a calibrates PARATREET_LB_K for the migration arm.
   void printLoadModel() {
+    // Must track TreePiece::lbSelfExp — the instrument is only a check on
+    // the model we ACT on, so a divergent exponent would validate one
+    // formula and migrate by another.
+    static const double self_exp = [] {
+      const char* e = std::getenv("PARATREET_LB_SELF_EXP");
+      return e ? std::atof(e) : 1.2;
+    }();
     double self = 0, pair = 0, np = 0;
     int pieces = 0;
     for (auto& kv : pe_treepieces)
@@ -1480,7 +1487,7 @@ public:
         if (s.n <= 0 || s.root == nullptr) continue;
         double n = (double)s.n;
         double v = (double)s.root->data.box.volume();
-        self += std::pow(n, 1.2);
+        self += std::pow(n, self_exp);
         if (v > 0) pair += n * n / std::pow(v, 4.0 / 3.0);
         np += n;
         pieces++;

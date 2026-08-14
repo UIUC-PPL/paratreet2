@@ -154,14 +154,25 @@ public:
   }
   void UserSetLBLoad()
   {
-    // PARATREET_LB_MODEL=0 restores the historical proxy (inverse bounding
-    // box volume: a density stand-in that ignores n entirely) as the A/B arm.
-    static const bool model = [] {
+    // PARATREET_LB_MODEL: 1 (default) = the cost model below; 0 = the
+    // historical inverse-bounding-box-volume proxy; 2 = uniform load.
+    //
+    // Read 0 carefully as an A/B arm: that proxy reads local_root, which is
+    // NULL in the pre-build migration window, so at iteration 0 it assigns
+    // no load at all — arm "LB with an unset load vector", not "LB with the
+    // old model". The old proxy simply has no inputs before the tree
+    // exists. Mode 2 is the control that question actually wants: uniform
+    // load makes the balancer equalise PIECE COUNT, so a win for mode 1
+    // over mode 2 is attributable to the cost model rather than to the fact
+    // that any LB ran at all.
+    static const int model = [] {
       const char* e = std::getenv("PARATREET_LB_MODEL");
-      return !e || std::atoi(e) != 0;
+      return e ? std::atoi(e) : 1;
     }();
     double n = 0, vol = 0;
-    if (!model) {
+    if (model == 2) {
+      this->load = 1.0;
+    } else if (model == 0) {
       if (local_root) {
         Real volume = local_root->data.box.volume();
         this->load = volume > 0.0 ? 1.0 / volume : 0.0;
