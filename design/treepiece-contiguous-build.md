@@ -18,7 +18,7 @@ lands (stable A/B baseline).
    (phaseA/B, ~90% of runtime) may also gain locality — speculative,
    measured by the A/B either way.
 3. MICROBENCH (laptop M-series, 113 MB working set, faithful node
-   shape: 216 B, vptr, 8 atomic children; scratchpad flatten_bench):
+   shape: 216 B, vptr, 8 atomic children; design/flatten-bench.cpp, clang++ -O2):
      interleaved pointer-chase   47.2 ns/node   (today)
      contiguous, same code       13.0 ns/node   3.6x
      contiguous range sweep       6.7 ns/node   7.0x
