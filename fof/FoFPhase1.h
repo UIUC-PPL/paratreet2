@@ -655,6 +655,16 @@ public:
     std::vector<std::pair<long, long>> edges;
     std::vector<std::vector<Particle>> particles; // rebuilt-tree storage
     std::vector<Node<Data>*> roots;
+    // PARALLEL REBUILD (2026-08-14, Kale's directive). s3Shipment no longer
+    // builds anything: it takes ownership of the wire data and wakes the
+    // PEs, and each arriving PE claims trees off `build_next` and runs the
+    // linear arena pass itself. Build total was ~100-150 ms on ONE PE while
+    // 13 siblings idled (timeline: helper P751); /14 it is ~10 ms each.
+    std::vector<paratreet::StealTree<Data>> trees;   // owned wire data
+    std::vector<std::pair<int, int>> pair_idx;       // unit -> (tree, tree)
+    std::atomic<size_t> build_next{0};               // tree claim cursor
+    std::atomic<int> built_count{0};                 // trees completed
+    int n_trees = 0;
     // One arena per tree (roots[i] points into arenas[i].first);
     // released via destroyStealArena at graveyard cleanup.
     std::vector<std::pair<void*, size_t>> arenas;
@@ -732,6 +742,8 @@ public:
   std::atomic<long> s3_t_sizer_us{0};
   std::atomic<long> s3_trees_shipped{0};
   std::atomic<long> s3_t_ship_us{0}, s3_t_ship_copy_us{0}, s3_t_ship_build_us{0};
+  // wall spent in the parallel build pre-pass (claim + copy + build), per PE
+  std::atomic<long> s3_t_ship_wait_us{0};
   double s3BytesPerBelow() const {
     const long nb = s3_cal_below.load();
     // 96 B/particle-below is only the bootstrap for the first few subtrees;
@@ -739,6 +751,25 @@ public:
     return nb > 0 ? (double)s3_cal_bytes.load() / (double)nb : 96.0;
   }
   std::atomic<long> s3_wpb_hist[kUnitHistBuckets] = {};
+  // HELPER-side S3 stats. These MUST NOT be printed at finishPhaseB: a
+  // helper's own merge can precede its helping, so that print caught only
+  // ~23 of ~300 shipments (relay1 items 16/20) and made helper-side timing
+  // unreadable. phase3Stats runs after all phaseB work, including help
+  // given to other processes, so it is the correct place.
+  void s3PrintHelperStats() {
+    if (!s3On()) return;
+    const long n = s3_in_ships.load();
+    CkPrintf("FOF3STAT s3_helper: node %d in_ships %ld in_units %ld "
+             "ship_ms %.1f ship_copy_ms %.1f ship_build_ms %.1f "
+             "ship_per_grant_ms %.1f build_frac %.3f copy_frac %.3f prepass_ms %.1f\n",
+             CkMyNode(), n, s3_in_units.load(),
+             s3_t_ship_us.load() / 1e3, s3_t_ship_copy_us.load() / 1e3,
+             s3_t_ship_build_us.load() / 1e3,
+             n ? s3_t_ship_us.load() / 1e3 / n : 0.0,
+             s3_t_ship_us.load() ? (double)s3_t_ship_build_us.load() / s3_t_ship_us.load() : 0.0,
+             s3_t_ship_us.load() ? (double)s3_t_ship_copy_us.load() / s3_t_ship_us.load() : 0.0,
+             s3_t_ship_wait_us.load() / 1e3);
+  }
   void printUnitHist() {
     printOneHist("pb_unit_hist", pb_unit_hist, "log2us");
     printOneHist("s3_grant_m2_hist", s3_ship_hist, "log2m2");
@@ -1096,31 +1127,23 @@ public:
   // the graveyard (freed at reset) so racing cursor reads stay safe.
   void s3Shipment(const paratreet::StealShipment<Data>& ship) {
     const double t_ship0 = CkWallTimer();
-    auto* fof = group_proxy.ckLocalBranch();
     auto* rec = new S3ForeignShip();
     rec->origin = ship.origin_node;
     rec->part_idx = ship.part_idx;
-    rec->particles.resize(ship.trees.size());
-    rec->roots.assign(ship.trees.size(), nullptr);
-    rec->arenas.assign(ship.trees.size(), {nullptr, 0});
-    for (size_t t = 0; t < ship.trees.size(); t++) {
-      const double tc0 = CkWallTimer();
-      rec->particles[t] = ship.trees[t].particles;   // pure vector copy
-      const double tc1 = CkWallTimer();
-      s3_t_ship_copy_us.fetch_add((long)((tc1 - tc0) * 1e6),
-                                  std::memory_order_relaxed);
-      void* arena = nullptr;
-      rec->roots[t] = fof->buildStealTree(ship.trees[t], rec->particles[t], arena);
-      s3_t_ship_build_us.fetch_add((long)((CkWallTimer() - tc1) * 1e6),
-                                   std::memory_order_relaxed);
-      rec->arenas[t] = {arena, ship.trees[t].nodes.size()};
-    }
-    rec->units.reserve(ship.unit_pairs.size());
-    for (auto& up : ship.unit_pairs)
-      rec->units.push_back({0.0, rec->roots[up.first], rec->roots[up.second], 0.0});
-    rec->remaining.store((int)rec->units.size());
+    // Take ownership of the deserialized wire data. const_cast-and-move is
+    // safe here: the generated entry wrapper destroys the marshalled
+    // parameter after we return, so nobody reads it again.
+    auto& mut = const_cast<paratreet::StealShipment<Data>&>(ship);
+    rec->trees = std::move(mut.trees);
+    rec->pair_idx = std::move(mut.unit_pairs);
+    rec->n_trees = (int)rec->trees.size();
+    rec->particles.resize(rec->n_trees);
+    rec->roots.assign(rec->n_trees, nullptr);
+    rec->arenas.assign(rec->n_trees, {nullptr, 0});
+    rec->units.assign(rec->pair_idx.size(), {0.0, nullptr, nullptr, 0.0});
+    rec->remaining.store((int)rec->pair_idx.size());
     s3_in_ships.fetch_add(1);
-    s3_in_units.fetch_add((long)ship.unit_pairs.size());
+    s3_in_units.fetch_add((long)rec->pair_idx.size());
     auto* prev = s3_active_ship.exchange(rec);
     if (prev) {
       std::lock_guard<std::mutex> g(s3_lock);
@@ -1178,6 +1201,10 @@ public:
     mergeBody();
     stage_tM = CkWallTimer() - tm0;
     if (s3On())
+      // NB: in_ships/in_units are HELPER-side and are NOT trustworthy here
+      // (this fires at our own merge, which can precede our helping). They
+      // are kept only for continuity with older logs; read s3_helper, printed
+      // from phase3Stats, instead.
       CkPrintf("FOF3STAT s3: node %d out_ships %ld out_units %ld out_m2 "
                "%.3g in_ships %ld in_units %ld ret_edges %ld declines %ld "
                "rem_m2 %ld tot_m2 %.4g resv_shipped %ld\n",
@@ -1536,6 +1563,7 @@ public:
     s3_t_order_us = 0; s3_t_flatten_us = 0; s3_t_send_us = 0;
     s3_t_sizer_us = 0; s3_trees_shipped = 0;
     s3_t_ship_us = 0; s3_t_ship_copy_us = 0; s3_t_ship_build_us = 0;
+    s3_t_ship_wait_us = 0;
     s3_cal_bytes = 0;
     s3_cal_below = 0;
     s3_out_nodes = 0;
@@ -2973,12 +3001,81 @@ public:
     if (rec == nullptr) return;
     double t0 = CkWallTimer();
     const double slice = sliceSeconds();
+    // ---- PARALLEL BUILD PRE-PASS -----------------------------------------
+    // Every PE that arrives claims trees off an atomic cursor and runs the
+    // linear arena placement pass itself, instead of one PE building them
+    // all inside s3Shipment while 13 siblings idled (~100-150 ms serial).
+    //
+    // NO BARRIER, NO POLLING (Kale, 2026-08-14: "never spin on a barrier,
+    // let there be a callback instead"). Units address trees by index, so no
+    // unit may be walked until every tree is ready -- but instead of waiting
+    // for that, a PE with nothing left to claim simply RETURNS, and whichever
+    // PE completes the LAST tree wakes the whole process. That is the same
+    // last-one-out idiom this record already uses to fire s3FinishForeign.
+    // Spinning would block this PE's scheduler (no other messages, no network
+    // progress) and would show up in Projections as one opaque block.
+    if (rec->built_count.load(std::memory_order_acquire) < rec->n_trees) {
+      const double tb0 = CkWallTimer();
+      bool finished_last = false;
+      bool slice_break = false;
+      for (;;) {
+        size_t ti = rec->build_next.fetch_add(1);
+        if (ti >= (size_t)rec->n_trees) break;   // nothing left to claim
+        const double tc0 = CkWallTimer();
+        // MOVE, not copy. The old code copied because `ship` was const; we
+        // now own the wire data, and buildStealTree only reads t.nodes --
+        // it uses `parts` purely as backing storage to take pointers into,
+        // so handing it the wire's own particle buffer is equivalent.
+        // Measured on job 5265850: this copy was 13005 ms of the 21819 ms
+        // pre-pass at 2B (191 s of 344 s forced), all of it pure memmove.
+        rec->particles[ti] = std::move(rec->trees[ti].particles);
+        const double tc1 = CkWallTimer();
+        nb->s3_t_ship_copy_us.fetch_add((long)((tc1 - tc0) * 1e6),
+                                        std::memory_order_relaxed);
+        void* arena = nullptr;
+        rec->roots[ti] = this->buildStealTree(rec->trees[ti],
+                                              rec->particles[ti], arena);
+        nb->s3_t_ship_build_us.fetch_add((long)((CkWallTimer() - tc1) * 1e6),
+                                         std::memory_order_relaxed);
+        rec->arenas[ti] = {arena, rec->trees[ti].nodes.size()};
+        if (rec->built_count.fetch_add(1, std::memory_order_acq_rel) + 1
+            == rec->n_trees)
+          finished_last = true;
+        if (slice > 0 && CkWallTimer() - tb0 > slice) { slice_break = true; break; }
+      }
+      nb->s3_t_ship_wait_us.fetch_add((long)((CkWallTimer() - tb0) * 1e6),
+                                      std::memory_order_relaxed);
+      if (finished_last) {
+        // The trees are ready. Wake the process; we fall through and drain.
+        int first = CkNodeFirst(CkMyNode());
+        for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+          this->thisProxy[pe].drainForeign();
+      } else if (slice_break) {
+        // We stopped to keep the entry method small, but trees may still be
+        // UNCLAIMED. Re-send to continue OUR OWN work. This is not polling:
+        // it is the same yield idiom the unit drain below uses. Returning
+        // here instead would abandon the unclaimed trees -- nothing would
+        // build them and no wake would ever fire, which is exactly how
+        // job 5265437 hung at 80M.
+        this->thisProxy[CkMyPe()].drainForeign();
+        return;
+      } else if (rec->built_count.load(std::memory_order_acquire)
+                 < rec->n_trees) {
+        // Cursor is empty and others are still building: return with no
+        // further work of our own. The finisher will wake us.
+        return;
+      }
+    }
+    // ---- unit drain (unchanged except for resolving roots by index) ------
+    t0 = CkWallTimer();   // slice clock starts at the drain, not the build
     std::vector<std::pair<long, long>> es;
     int done = 0;
     for (;;) {
       size_t k = rec->next.fetch_add(1);
-      if (k >= rec->units.size()) break;
-      walkUnitEdges(rec->units[k].a, rec->units[k].b, es);
+      if (k >= rec->pair_idx.size()) break;
+      Node<Data>* ua = rec->roots[rec->pair_idx[k].first];
+      Node<Data>* ub = rec->roots[rec->pair_idx[k].second];
+      walkUnitEdges(ua, ub, es);
       done++;
       if (slice > 0 && CkWallTimer() - t0 > slice) {
         this->thisProxy[CkMyPe()].drainForeign(); // yield, re-enter
@@ -3352,6 +3449,8 @@ public:
   //     with element 4's X and phaseA sums these give the Pearson r of
   //     predicted density work vs measured phaseA time across PEs.
   void phase3Stats(const CkCallback& cb) {
+    // one helper-side S3 report per process, now that all helping is done
+    if (CkMyRank() == 0) node_proxy.ckLocalBranch()->s3PrintHelperStats();
     // "edges sent" counts streamed batches plus what remains buffered (the
     // two are disjoint: flushUF2Batch clears the buffer as it submits).
     long sums[9] = {phase3_emitted,
