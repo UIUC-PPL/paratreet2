@@ -91,6 +91,16 @@ using namespace paratreet;
              "phaseA %.3f phaseB %.3f merge %.3f relabel %.3f\n",
              p1s.reset, p1s.register_s, p1s.phaseA, p1s.phaseB, p1s.merge,
              p1s.relabel);
+    // Device stages (design/phase1-gpu.md section 18). Printed only when
+    // the device ran, and printed SEPARATELY rather than folded into the
+    // line above: in replace mode the four CPU stages are legitimately
+    // zero, and reporting the device pass as "phaseA" would hide which arm
+    // produced the answer.
+    if (p1s.device_wall > 0)
+      CkPrintf("FOF3STAT time_s: phase1_device wall %.3f pack %.3f tree %.3f "
+               "pass %.3f blocking %.3f scatter %.3f\n",
+               p1s.device_wall, p1s.device_pack, p1s.device_tree,
+               p1s.device_pass, p1s.device_block, p1s.device_scatter);
 
     // Step 4 (-u dist; design/step4.md "Tip encoding" as revised by
     // design/sparse-uf2-encoding.md): rewrite every tip to the

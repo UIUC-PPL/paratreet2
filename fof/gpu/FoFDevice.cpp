@@ -87,6 +87,13 @@ struct Device::Impl {
   long n_leaves = 0;
   int n_top = 0;
   std::vector<DTopNode> h_top;
+  // Stage 4: these two outlive one call because enqueuePhase1() returns
+  // with kernels still reading them and completePhase1() reads them back.
+  // `counters` in particular was a function-local View, which would have
+  // been destroyed while the walk was still incrementing it.
+  Kokkos::View<long*, MemSpace> counters;
+  WalkStats pending;
+  bool in_flight = false;
   DView<int> d_piece_root;
   DView<int> d_piece_base;
   long n_nodes = 0;
@@ -747,6 +754,18 @@ void Device::uploadTree(TreeStats* out) {
     if (out) *out = st;
     return;
   }
+  // A NEW tree has just been staged, so the top tree built over the
+  // previous one is stale. It was cached on `h_top.empty()` alone and
+  // cleared only by finalize(), so from iteration 2 the walk descended a
+  // top tree whose boxes and piece links described the PREVIOUS tree
+  // build. That went unnoticed because the FoF harness does not move
+  // particles between iterations, which makes every rebuild produce an
+  // identical tree — the cache was right for the wrong reason, and would
+  // have silently under-merged the moment anything moved.
+  // Rebuilding is O(n_pieces) on the host (~1000 entries) plus a ~40 KB
+  // upload: below the noise of the node upload it rides along with.
+  p_->h_top.clear();
+  p_->n_top = 0;
   ExecSpace exec = p_->exec();
   Kokkos::Timer timer;
   Kokkos::deep_copy(exec, p_->d_nodes, p_->h_nodes);
@@ -850,7 +869,79 @@ static int buildTopTree(std::vector<DTopNode>& out, const DDNode* nodes,
 }
 
 void Device::runPhase1(float b2, float grid_thresh, WalkStats* out) {
-  WalkStats st;
+  runPhase1Impl(b2, grid_thresh, false);
+  completePhase1(out);
+}
+
+void Device::enqueuePhase1(float b2, float grid_thresh) {
+  runPhase1Impl(b2, grid_thresh, true);
+}
+
+// Fence the stream and collect what only the device knows. In the
+// synchronous form every stage already fenced and this is just the
+// counter readback; in the asynchronous form this is where the walk, the
+// freeze and the download are finally waited on — from a Charm callback,
+// with the scheduler having run the whole time.
+void Device::completePhase1(WalkStats* out) {
+  if (!p_->in_flight) {
+    if (out) *out = p_->pending;
+    return;
+  }
+  p_->in_flight = false;
+  WalkStats& st = p_->pending;
+  ExecSpace exec = p_->exec();
+  Kokkos::Timer timer;
+  exec.fence();
+  // Nonzero only on the async path, where the walk/freeze/download walls
+  // are not separable: it is the whole tail measured from the callback.
+  if (st.t_walk == 0) st.t_device_tail = timer.seconds();
+  auto h_counters = Kokkos::create_mirror_view(p_->counters);
+  Kokkos::deep_copy(h_counters, p_->counters);
+  st.stack_overflows = h_counters(0);
+  st.certificates = h_counters(1);
+  st.leaf_pairs = h_counters(2);
+  st.suppressed = h_counters(3);
+  if (out) *out = st;
+}
+
+// Free the staging that the rest of the iteration does not read.
+// hostLabels() is deliberately kept: the scatter runs after this.
+void Device::releaseStaging() {
+  if (!p_->inited) return;
+  p_->exec().fence();
+  p_->h_pos = HView<float>();
+  p_->h_order = HView<long>();
+  p_->h_nodes = HView<DDNode>();
+  p_->h_piece_root = HView<int>();
+  p_->h_piece_base = HView<int>();
+  p_->d_pos = DView<float>();
+  p_->d_order = DView<long>();
+  p_->d_nodes = DView<DDNode>();
+  p_->d_piece_root = DView<int>();
+  p_->d_piece_base = DView<int>();
+  p_->d_top = DView<DTopNode>();
+  p_->d_leaves = DView<int>();
+  p_->d_parent = DView<int>();
+  p_->d_node_rep = DView<int>();
+  p_->d_grid_root = DView<int>();
+  p_->counters = Kokkos::View<long*, MemSpace>();
+  p_->h_top.clear();
+  p_->n_top = 0;
+  p_->n_leaves = 0;
+  // Forces the next resize()/resizeTree() to reallocate rather than
+  // early-return on a matching size against buffers that no longer exist.
+  p_->n = 0;
+  p_->n_nodes = 0;
+  p_->n_pieces = 0;
+  // d_label/h_label survive: `n` is now 0, so resize() will replace them
+  // on the next iteration, and the scatter still has to read h_label
+  // before then.
+}
+
+void Device::runPhase1Impl(float b2, float grid_thresh, bool async) {
+  p_->pending = WalkStats();
+  p_->in_flight = false;
+  WalkStats& st = p_->pending;
   // Measurement knob only: which shape the traversal takes. Read here
   // rather than plumbed through the interface because it selects between
   // two implementations of the SAME function, not between two behaviours
@@ -878,10 +969,7 @@ void Device::runPhase1(float b2, float grid_thresh, WalkStats* out) {
     solo_walk = true;  // decided below, once the leaf list exists
   }
   const bool walk_forced = wenv != nullptr;
-  if (!p_->inited || p_->n == 0 || p_->n_nodes == 0) {
-    if (out) *out = st;
-    return;
-  }
+  if (!p_->inited || p_->n == 0 || p_->n_nodes == 0) return;
   ExecSpace exec = p_->exec();
   Kokkos::Timer timer;
 
@@ -1302,7 +1390,11 @@ void Device::runPhase1(float b2, float grid_thresh, WalkStats* out) {
   // thread per leaf so that conclusion can be re-tested rather than
   // assumed; see design/phase1-gpu.md section 16.
   timer.reset();
-  Kokkos::View<long*, MemSpace> counters("fof_counters", 4);
+  // Impl-owned, not function-local: on the async path this call returns
+  // while the walk is still incrementing it, and a View destroyed here
+  // would free device memory out from under a running kernel.
+  p_->counters = Kokkos::View<long*, MemSpace>("fof_counters", 4);
+  auto counters = p_->counters;
   Kokkos::deep_copy(exec, counters, 0L);
   const int kStack = 128;
   auto d_leaves_k = d_leaves;
@@ -1343,8 +1435,14 @@ void Device::runPhase1(float b2, float grid_thresh, WalkStats* out) {
                       counters);
         });
   }
-  exec.fence();
-  st.t_walk = timer.seconds();
+  // The ONLY difference between the two forms, and it is three fences.
+  // Everything above this point is identical, which is what makes the
+  // synchronous form a usable oracle for the asynchronous one: the same
+  // kernels, in the same order, on the same stream.
+  if (!async) {
+    exec.fence();
+    st.t_walk = timer.seconds();
+  }
 
   // ---- freeze: full path compression + the tip write ----
   timer.reset();
@@ -1353,21 +1451,18 @@ void Device::runPhase1(float b2, float grid_thresh, WalkStats* out) {
       KOKKOS_LAMBDA(const long i) {
         d_label(i) = d_order(ufFind(d_parent, (int)i));
       });
-  exec.fence();
-  st.t_freeze = timer.seconds();
+  if (!async) {
+    exec.fence();
+    st.t_freeze = timer.seconds();
+  }
 
   timer.reset();
   Kokkos::deep_copy(exec, p_->h_label, d_label);
-  exec.fence();
-  st.t_download = timer.seconds();
-
-  auto h_counters = Kokkos::create_mirror_view(counters);
-  Kokkos::deep_copy(h_counters, counters);
-  st.stack_overflows = h_counters(0);
-  st.certificates = h_counters(1);
-  st.leaf_pairs = h_counters(2);
-  st.suppressed = h_counters(3);
-  if (out) *out = st;
+  if (!async) {
+    exec.fence();
+    st.t_download = timer.seconds();
+  }
+  p_->in_flight = true;
 }
 
 void Device::enqueueRoundTrip() {

@@ -430,7 +430,8 @@ void TreePiece<Data>::handlePossibleLeaf(Node<Data>* node) {
 
 template <typename Data>
 void TreePiece<Data>::buildTree(CProxy_Partition<Data> part, CkCallback cb) {
-  // Copy over received particles
+  // Copy over received particles. reset() is what guarantees this is not
+  // empty on a second iteration; see its comment.
   std::swap(particles, incoming_particles);
 
   // Sort particles
@@ -689,6 +690,25 @@ void TreePiece<Data>::requestNodes(Key key, int cm_index) {
 
 template <typename Data>
 void TreePiece<Data>::reset() {
+  // buildTree() takes its next input by swapping in incoming_particles.
+  // For an app that MOVES particles, Driver::run's perturb/rebucket has
+  // already refilled that buffer by the time reset() runs, so dropping
+  // `particles` here is exactly right.
+  //
+  // For an app that does NOT move particles, Driver::run skips the whole
+  // perturb/rebucket block, so nothing ever refills it — and clearing
+  // here left the next buildTree() swapping in an empty vector. Every
+  // TreePiece lost its particles at the end of iteration 1 and every
+  // later iteration ran on nothing: fof3 -i 3 aborted with "final
+  // gathered 0 records, expected 100000", and under -c stats (no gather)
+  // it did not abort at all, it just reported an empty iteration.
+  //
+  // Hand them back instead. Same block, same order, rebuilt into the same
+  // tree — which is what a static-analysis app asking for N iterations
+  // means by an iteration.
+  if (!paratreet::getConfiguration().perturb_particles &&
+      incoming_particles.empty())
+    incoming_particles.swap(particles);
   particles.clear();
   flat_subtree.clear();
   copy_requesters.clear();
