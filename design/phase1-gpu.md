@@ -1,17 +1,30 @@
 # Phase 1 on GPU: a Kokkos device port of the intra-process FoF
 
-**STATUS: stages 0-3 IMPLEMENTED AND GATED (sections 11-17). The device
-pass reproduces the CPU chain's labels particle-for-particle at 2B
-particles on 16 nodes under -u dist, and runs 18x faster than
-phaseA+phaseB+merge there (section 17); ~10x at 80M on one node.
-**The APPLICATION is currently 56% slower per iteration**, because the
-device pass still runs BESIDE the CPU chain rather than replacing it and
-because it costs phase 3 ~3 s that is not yet explained (section 17.3).
-Removing both is the next task: the section-4 contract work, the phase-3
-regression, and section 12.1's staging. Sections 1-10 are the original plan and
-are left as written; where measurement has since contradicted them
-(section 5's K3 on the cell grid, section 14.4 on where the walk's time
-goes, and section 14.3's walk shape) the later sections say so
+**STATUS: stages 0-4 IMPLEMENTED AND GATED (sections 11-18). The device
+path now REPLACES phaseA+phaseB+merge+relabel rather than shadowing it
+(`FOF_GPU_PHASE1=1`), and the CPU chain is kept as a selectable oracle
+(`FOF_GPU_VERIFY=1`, the old `FOF_GPU_STAGE0=1`). At 2B particles on 16
+nodes under -u dist: **phase 1 5.269 s -> 0.657 s (8.0x) and the
+APPLICATION 8.809 s -> 5.724 s per iteration (1.54x)**, with all 128
+processes reproducing the CPU chain's 424,897,832 components and, in the
+verify arm, its labels particle for particle. Section 17.3's "56% slower"
+is resolved. An 8-to-128-node sweep followed
+(design/fof3-2b-scaling.md): phase 1 is 8-11x faster at EVERY scale and
+the device path's phase-1 wall scales 7.2x over 16x the nodes against the
+CPU chain's 3.1x, because phaseB does not scale at all and is 93% of CPU
+phase 1 by 128 nodes. **But the application speedup falls monotonically
+— 1.95x at 8 nodes, 1.66x, 1.55x, 1.33x, 0.99x at 128 — because every
+message-bound phase AFTER phase 1 regresses 1.4-2.4x on identical work,
+and that penalty grows with the machine while phase 1's saving shrinks.**
+That is the whole remaining problem and it is now the priority (18.9).
+One smaller thing is also open: the asynchronous launch defers 0.3 ms of
+a 308 ms pass because the enqueue itself blocks, which is not understood
+(18.8). Sections 1-10 are
+the original plan and are left as written; where measurement has since
+contradicted them (section 5's K3 on the cell grid, section 14.4 on where
+the walk's time goes, section 14.3's walk shape, section 4's claim that a
+process-wide union-find forces a process-wide `rep_label`, and section
+18.2's own prediction about what blocks) the later sections say so
 explicitly rather than editing the prediction away.**
 
 **Written 2026-08-12; revised the same day after review (Ritvik) on
@@ -1559,3 +1572,427 @@ MB compressed per PE. logsize changes buffering, never trace content.
     truncate 1792 trace files) never fired — worth keeping anyway, since
     it costs nothing and the failure it prevents destroys a whole arm's
     traces plus every arm after it.
+
+---
+
+## 18. Stage 4: the device path REPLACES the CPU chain (2026-08-14)
+
+Through stage 3 the device pass was a shadow. `FOF_GPU_STAGE0=1` ran
+phaseA + phaseB + merge + relabel and THEN ran the device, because the
+gate compared against the `group_number` the CPU chain had just written.
+That is why section 17.3 could report a kernel 12-18x faster and an
+application 56% slower in the same table: the fast thing was running in
+addition to the slow thing, not instead of it.
+
+Stage 4 makes the device path an arm you can select, and selecting it
+means the CPU chain does not run at all.
+
+| `FOF_GPU_PHASE1` / `FOF_GPU_VERIFY` | phaseA/B/merge/relabel | device pass | check |
+|---|---|---|---|
+| neither (default) | runs | — | — |
+| `FOF_GPU_PHASE1=1` | **skipped** | runs, produces the answer | count verify |
+| `FOF_GPU_VERIFY=1` | runs | runs | exact, per particle |
+
+`FOF_GPU_STAGE0=1` still selects Verify, so every script and every
+measurement from sections 11-17 means what it meant.
+
+### 18.1 Section 4's contract, and why it did not need a process-wide `rep_label`
+
+Section 4 named four things everything downstream reads — `uf_parent`,
+`roots`, `rep_label`, `root_counts` — and predicted that a process-wide
+device union-find would force `rep_label` to become process-wide too,
+"since a component's min-order root can live in any PE's range". It then
+flagged the read-after-write hazard that would create in
+`applyTipEncoding`/`materializeLabels`, `applyGlobalMap`/`applySliceOnPE`
+and `relabelBody`, called for deposit barriers, and said: "this is a bug
+being introduced — treat it as such."
+
+**No process-wide array was needed and no barrier was written**, because
+the premise is wrong in a way that only shows up when you read the
+consumers rather than the producer. Every one of them —
+`applyTipEncoding`, `applyGlobalMap`, `applySliceOnPE`, `applyUF2Labels`,
+`depositLabelCounts` — iterates `roots` and does exactly one of two
+things: transform `rep_label[r]`, or contribute `root_counts[r]` keyed BY
+LABEL. None of them reads root identity, and `depositLabelCounts` already
+says so out loud: *"duplicate labels across roots need no pre-merging
+here"*, because `histogramShard` sums by label.
+
+So the representative structure has to satisfy exactly one invariant:
+
+> `rep_label[uf_parent[i]] == label[i]` for every particle `i` of this PE.
+
+It does **not** have to agree with the device's roots, and it can stay
+strictly per-PE. Which makes the cheapest valid construction a **run-
+length encoding of the label array**: walk this PE's particles in order,
+open a new representative every time the label changes.
+
+```
+for each particle i in this PE's flat order:
+    if label[i] != current_run_label:      # open a new representative
+        run = i; roots.push_back(i); rep_label[i] = label[i]
+    uf_parent[i] = run
+    root_counts[run]++
+    particle[i].group_number = label[i]
+```
+
+One linear pass, no hashing, no extra download, and it degrades
+gracefully: in the worst case (every particle a different label) every
+particle becomes its own representative, which is still CORRECT and
+merely no cheaper than a per-particle rewrite. Morton order makes that
+worst case unreachable — `materializeLabels` already depends on
+consecutive particles nearly always sharing a root.
+
+The alternative was to have the device emit, per PE range, the minimum
+flat index sharing each component (three kernels per PE range, each
+touching only that range, so 3n total work). That is also cheap and it
+was the plan until reading `depositLabelCounts` made it unnecessary.
+**The lesson is the one section 4 half-learned: the contract is what the
+consumers actually read, and that is a question about the consumers.**
+
+### 18.2 The idle-CPU question, decided on arithmetic
+
+Section 8 left stage 4 as "the idle-CPU question" with three options: (a)
+accept it, (b) shrink `ppn`, (c) real CPU/GPU co-execution. The stage 2/3
+measurements decide it, and they decide it against the ambitious answers.
+
+**(c) co-execution cannot pay.** At 2B on 16 nodes the process's 14 PEs
+do phaseA+phaseB+merge in 5.379 s and the GPU does the same work in
+0.445 s. The CPU is already fully counted in that 12.1x. Splitting the
+particles and giving the CPU a fraction f:
+
+>  f x 5.379 = (1-f) x 0.445  =>  f = 0.076,  time 0.411 s vs 0.445 s
+
+**7.6% off the device pass** — 34 ms of an iteration that is ~8.4 s once
+the shadow is gone, i.e. **0.4%** — and that is the OPTIMISTIC bound,
+which assumes the work splits with no interaction. It does not: a spatial
+split of a friends-of-friends union-find reintroduces a cross-boundary
+merge term, which is precisely phaseB. PhaseB is the term the device path
+DELETES, and the term that grows with concurrency (39x from 8 to 128
+processes, section 17.2). Option (c) buys 0.4% by reinstating the
+structural cost that made the device path win.
+
+**(b) shrinking `ppn` is worse than the thing it fixes.** The idle window
+is ~0.45 s per iteration. Tree build (1.145 s) and the phase-3 walk
+(2.244 s) are CPU-parallel and scale with PE count; halving `ppn` to
+avoid 0.45 s of idle would add seconds to them. It also violates nothing
+about one-process-per-GPU, which is kept either way — it just trades a
+large CPU-bound cost for a small idle one.
+
+**(a) accept the idle — and the interesting idle is not the CPU's.** Per
+process the device pass is 220 ms on average and 445 ms at the maximum,
+across 128 processes. Every process waits for that maximum at the phase-1
+reduction, so **roughly half of the GPU-seconds in the phase-1 window are
+already lost to imbalance between processes** — about 2x more than
+perfect CPU co-execution could ever recover, and it is the GPUs sitting
+idle, not the CPUs. If phase 1 is worth more attention it belongs there
+(a decomposition question), not in trying to keep 14 CPU threads busy for
+a third of a second.
+
+**What stage 4 does spend effort on is making the idle harmless.**
+Through stage 3 the PEs were not merely idle during the pass: one of them
+was BLOCKED inside an entry method for the whole 445 ms, because
+`runPhase1` fenced and the call was pinned to the process's home PE.
+Neither constraint was real:
+
+- HAPI binds every PE of the process to the SAME device here.
+  `hapiMapping` computes `device_count = visible / (CmiNumNodes() /
+  CmiNumPhysicalNodes())` = 8/8 = 1, so `pes_per_device` = `ppn` and every
+  PE's `my_device` is identical. Any PE can launch.
+- `hapiAddCallback` records its event on the CALLING PE's queue, so the
+  launcher is also the natural completion target — and `hapiPollEvents`
+  is already installed on every PE by `hapiInit`, so arming it costs
+  nothing that was not already being paid.
+
+So the pass is now enqueued by **whichever PE finishes packing last**,
+inline at the tail of `devicePack`, with no hop to the home PE and no PE
+singled out. That part is unconditional and is kept.
+
+Completion by `hapiAddCallback` was built on top of it, on the reasoning
+that only the leaf-list `parallel_scan` forces a host synchronization
+(its count sets both the walk's launch bounds and the section-16 shape
+choice), leaving the tail — walk + freeze + download, 124 of 175 ms in a
+typical process — in flight with the scheduler free. The expected
+throughput value was stated in advance as approximately zero, since there
+is genuinely nothing else for those threads to run inside phase 1, and it
+was still worth doing: blocking a worker thread inside an entry method
+for half a second is a latent hazard next to quiescence detection and the
+LCI idle-stall keep-alive ring.
+
+**Measured, it defers 0.3 ms of a 308 ms pass, because the reasoning
+above is wrong about what blocks — see 18.8.** The completion path
+therefore defaults to synchronous and `FOF_GPU_ASYNC=1` opts in; both are
+kept, because why the enqueue blocks is a real and unanswered question.
+
+### 18.3 Two latent bugs that `-i 1` was hiding
+
+Every device run through section 17 used the default one iteration. The
+path did not survive a second, in two independent ways, and both are the
+same shape: **state that is per-iteration but was only ever cleared
+per-run.**
+
+1. **The deposit counters were never reset.** `dev_count_done` and
+   `dev_pack_done` are compared against `CkNodeSize()` to fire the next
+   round. `FoFPhase1Node::reset` cleared everything else and not these,
+   so on iteration 2 `fetch_add(1) + 1` never equals `CkNodeSize()`
+   again, the trigger never fires, and phase 1 hangs — with no error, no
+   abort, and nothing in the log. Fixed by `resetDevice()`, called from
+   `reset()`.
+
+2. **The device's top tree was cached on the wrong question.** It was
+   built `if (h_top.empty())` and cleared only by `finalize()`, so from
+   iteration 2 the walk descended a top tree whose boxes and piece links
+   described the PREVIOUS tree build — while `d_nodes` underneath it was
+   correctly re-uploaded. This is silent under-merging, not a crash. It
+   went unnoticed because the FoF harness does not move particles between
+   iterations, so every rebuild produces an identical tree: **the cache
+   was right for the wrong reason, and would have failed the moment
+   anything moved.** Fixed by clearing `h_top` in `uploadTree()` — the
+   only place that knows a new tree has arrived. Cost: an O(n_pieces)
+   host build (~1000 entries) and a ~40 KB upload, under the noise of the
+   node upload it rides along with.
+
+Neither would have been found by making the gate stricter. Both were
+found by asking what runs twice.
+
+### 18.4 Section 17.3 revisited: `hapiPollEvents` is not a candidate
+
+Section 17.3 left the ~3.0 s phase-3 + histogram regression with two
+unmeasured candidates: memory, and `hapiPollEvents` firing on every
+scheduler-loop iteration. **The second is eliminated by reading the code,
+not by measuring it.**
+
+`hapiPollEvents` is registered by `hapiInit` (`hapi_impl.cpp:219`,
+`CcdCallOnConditionKeep(CcdSCHEDLOOP, ...)`), on every PE, at Charm layer
+init, unconditionally — NOT by `hapiCreateStreams` as 17.3 assumed. It
+therefore fires identically in the `cpu_l12` arm, which was the same
+binary against the same charm with only `FOF_GPU_STAGE0` changed. And its
+body opens `if (CpvAccess(n_hapi_events) <= 0) return;`, with
+`n_hapi_events` identically zero in BOTH arms, because through stage 3
+FoF never called `hapiAddCallback` at all. A hook that is installed in
+both arms and returns on its first line in both arms cannot produce a
+delta between them.
+
+That leaves memory, and stage 4 sharpens it into something testable.
+`+1.41 GB` per process is not the whole statement: **~600 MB of it is
+PINNED** — the staged positions, orders and the concatenated node array —
+which is unpageable and registered with the driver, on nodes where 8
+processes each hold their share and where `FI_MR_CACHE_MONITOR=userfaultfd`
+has libfabric managing its own registration cache over the same address
+space. Phase 3 is the communication-heavy phase. That is a third
+candidate, and it is not distinguishable from plain RSS pressure by
+looking at RSS.
+
+`Device::releaseStaging()` frees all of it (and the device-side scratch)
+as soon as the last PE has read the labels; `FOF_GPU_RELEASE=0` keeps it
+resident. So the question is now a one-flag A/B on otherwise identical
+runs, which is what the stage-4 gate's last two 80M arms are.
+
+### 18.5 What Replace mode has to refuse
+
+The shadow gate made wrong answers loud: anything the device got wrong
+showed up as a per-particle mismatch against the CPU. Replace mode has no
+oracle, so three things that used to be visible have to become aborts.
+
+- **No flat tree.** Without `PARATREET_DEVICE_TREE=1` there are no
+  `DNode`s, `runPhase1` early-returns on `n_nodes == 0`, and
+  `hostLabels()` holds whatever was last written there. Under Verify that
+  is a wall of mismatches; under Replace it would be ADOPTED.
+  `deviceLaunch` now aborts. (`devicePlanTree` already printed a warning,
+  which is exactly the level of noise that gets scrolled past.)
+- **Periodic boundaries.** The device traversal has no periodic wrap
+  (section 8 defers PBC). Under Verify that shows up as mismatches on the
+  boundary particles; under Replace it would be a quietly wrong answer at
+  the box faces — the kind of result that looks plausible.
+  `runFoFPhase1` aborts if `-P` is set in Replace mode.
+- **A CPU-only binary.** `FOF_GPU_PHASE1=1` against a build without
+  `FOF_GPU` aborts rather than falling back. A silent fallback would
+  report the CPU path's timings as the device path's, which is the same
+  class of failure as trap 16's silently untraced traced run.
+
+### 18.6 The gate
+
+`fof/gpu/run_stage4.sbatch`. The verify arms are unchanged and still
+prove the device labels equal the CPU labels particle by particle. What
+is NEW is `deviceAdopt`, and the chain that gates it has four links:
+
+1. device labels == CPU labels — the verify arms (exact, aborting).
+2. `group_number` == device labels — by construction; `deviceAdopt`
+   assigns it and nothing else does.
+3. the representative structure reproduces the particle labels —
+   `FOF_COUNT_VERIFY=1`, which recomputes the per-label counts from the
+   particles and aborts on disagreement. This is the gate on the
+   run-length construction and it is machinery that already existed.
+4. end to end, the replace arm and the CPU arm agree — the FOF3
+   components line, which the harness documents as the cross-run
+   determinism observable.
+
+Plus `-c full` on the small inputs, which runs the serial O(n^2)
+reference on PE 0 — code shared with neither arm — and `-i 3` on
+everything, which is what keeps 18.3 fixed.
+
+### 18.7 Results
+
+Three jobs. `run_stage4.sbatch` (1 node, 80M, correctness + the release
+A/B), `run_stage4_iter.sbatch` (1 node, 80M/100k, multi-iteration),
+`run_stage4_scale_16.sbatch` (16 nodes, 2B, 128 processes, `-u dist`,
+UNTRACED — a claim about iteration time cannot be measured with
+per-event logging on the hot path).
+
+**Correctness.** Every arm of every job agrees, exactly:
+
+| scale | arms | result |
+|---|---|---|
+| 1k, 100k | cpu / replace / verify, p2 and p8, `-c full` | identical components; `-c full`'s O(n^2) PE-0 reference agrees with both |
+| 80M | cpu / replace(l12) / replace(l128) / verify / no-release, x3 iterations | **23,707,197 components, max 1,519,203** — every arm, every iteration, all 21 log2 bins |
+| 2B / 128 procs | cpu_l12 / replace_l128 / replace_l12 / verify_l12 / sync, 9 arm-iterations | **424,897,832 components, max 185,317,566** — identical to section 17, 0 label mismatches |
+
+`FOF_COUNT_VERIFY=1` was on throughout, so the run-length representative
+structure was checked against a recount from the particles on every PE of
+every run. Note the l128 arms: a DIFFERENT tree, different leaf sets,
+different kernel shape (section 16 auto-selection), same answer.
+
+**2B on 16 nodes, steady state (iteration 1; iteration 0 additionally
+pays the one-time device init, below).**
+
+| | cpu_l12 | replace_l128 | replace_l12 |
+|---|---|---|---|
+| tree build | 0.779 s | 0.738 s | 1.312 s |
+| **phase 1** | **5.269 s** | **0.657 s** | 0.820 s |
+| — device pass | — | 0.308 s | 0.372 s |
+| tip encode | 0.124 s | 0.141 s | 0.141 s |
+| upwardPass | 0.354 s | 0.393 s | 0.466 s |
+| phase-3 walk | 0.378 s | 0.774 s | 0.592 s |
+| **iteration** | **8.809 s** | **5.724 s** | 6.400 s |
+
+**Phase 1: 5.269 -> 0.657 s, 8.0x. The application: 8.809 -> 5.724 s,
+1.54x.** Section 17.3's "the application is 56% slower per iteration" is
+now "the application is 35% faster per iteration", and it is the same
+code, the same input, the same node count, with the shadow removed.
+
+For scale, the same comparison at 80M on ONE node (8 processes): phase 1
+1.190 -> 0.387 s (3.1x), iteration 2.87 -> 2.70 s (1.06x). The device
+path's advantage grows with process count exactly as section 17.2
+predicted, and for the same reason: what it deletes (phaseB) grows with
+concurrency while what it costs (staging) does not.
+
+**Iteration 0 is not the number.** At 80M, phase 1 was 0.983 s on
+iteration 0 and 0.374/0.399 s after; at 2B, 1.365 s then 0.657 s. The
+difference is one-time Kokkos/HIP init and the first pinned allocation,
+charged to the first phase-1 call. Every device measurement in sections
+11-17 was a single-iteration run, so all of them carry it.
+
+### 18.8 The async launch does not pay, and the reason is not the one 18.2 gave
+
+Section 18.2 argued the async form's throughput value would be about
+zero. It is about zero. But the prediction underneath it — that the
+synchronous part is just the leaf-count readback, leaving the walk,
+freeze and download to run with the scheduler free — is **wrong**, and
+that matters more than the null result.
+
+Measured at 2B, on every arm: `blocking` is 307.9 ms of a 308.2 ms round
+trip. **The enqueue itself does not return until the pass is essentially
+finished.** The tail is real — at 100k the fenced form reports walk 15.3
+ms + freeze 15.6 ms, and the async form finds the stream already drained
+when the callback is serviced — but at scale the async path defers 0.3 ms
+and charges a HAPI event, a callback dispatch and QD bookkeeping for it.
+The synchronous arm came out slightly faster end to end (5.620 vs 5.724 s
+per iteration), which is within noise, but there is no reading of these
+numbers in which async is ahead.
+
+**So the completion path now defaults to synchronous** and
+`FOF_GPU_ASYNC=1` opts in. Both are kept, because the interesting
+question is open: why does the enqueue block? The suspects are the
+per-call Kokkos `View` allocations in the prepare — `d_leaves`,
+`d_parent`, `d_node_rep`, `d_grid_root` are reallocated every pass, and
+`hipFree` is a synchronizing call — and the HIP launch queue backing up
+behind a long kernel. Hoisting those allocations to persist across
+iterations is worth doing on its own merits (it is per-iteration work
+that does not change size), and if it makes the enqueue return promptly
+then `FOF_GPU_ASYNC` becomes the default.
+
+What the user's observation DID buy, and what is kept in both forms, is
+launching from any PE: the pass is enqueued inline at the tail of
+`devicePack` by whichever PE finished packing last, with no hop to the
+home PE and no PE singled out.
+
+### 18.9 Section 17.3's regression is real, reproduced, and not memory
+
+With the shadow gone there is nothing left to blame for the phase-3
+regression, and it is still there. Apples to apples — same tree, same
+labels, same 491k edges:
+
+> **phase-3 walk: 0.378 s (cpu_l12) -> 0.592 s (replace_l12), 1.57x.**
+> upwardPass: 0.354 -> 0.466 s.
+
+About 330 ms of a 6.4 s iteration, against a 4.6 s saving in phase 1. It
+no longer threatens the result, but it is unexplained work in a phase
+that does provably identical work in both arms.
+
+Two of the three candidates are now eliminated:
+
+- **`hapiPollEvents`** — eliminated by reading (18.4): installed by
+  `hapiInit` on every PE in both arms, returns on its first line in both.
+- **Resident staging** — eliminated by measurement. `FOF_GPU_RELEASE=1`
+  frees the ~600 MB of pinned staging and the device scratch after the
+  scatter. Over three iterations at 80M it moved the phase-3 walk by 12
+  ms and **cost ~100 ms per iteration in phase 1** re-allocating pinned
+  memory (0.374/0.399 s -> 0.475/0.513 s). That is why the default is
+  OFF: a certain per-iteration cost is not worth paying for an uncertain
+  one, and the measurement agreed with the decision after the fact.
+
+What is left is the one thing common to both: a HIP context and a
+device-resident allocation existing in the process at all. That is
+testable — a run that initializes the device and never uses it would
+separate "having a GPU bound" from "having used it".
+
+**The 8-to-128-node sweep (design/fof3-2b-scaling.md, 2026-08-14)
+narrows it further and raises the stakes.** The regression is not
+confined to the phase-3 walk: `upwardPass`, `loadCache` and `uf2` all
+regress by 1.4-2.4x, at every node count, on identical trees and
+identical labels — and it GROWS with node count, from +0.93 s at 8 nodes
+to +1.75 s at 128, while phase 1's saving shrinks from 7.14 s to 2.41 s.
+At 128 nodes they cancel: the application speedup falls from 1.95x to
+0.99x. Every regressed phase is message-bound and the two that are not
+(`tip_encode`, the histogram) barely move, which is what a NETWORK effect
+looks like and not what a per-process memory effect looks like. The
+working hypothesis is now an interaction between the HIP context's
+device-memory registrations and libfabric's CXI registration cache
+(`FI_MR_CACHE_MONITOR=userfaultfd`) on nodes running 8 processes that
+each pin hundreds of megabytes. Projections traces of a matched
+CPU/device pair at 16 nodes were collected for exactly this
+(fof3-2b-scaling.md section 5).
+
+### 18.10 Traps
+
+19. **`PROJECTIONS=0` turned tracing ON.** `src/Makefile.common` tested
+    `ifneq ($(strip $(PROJECTIONS)),)` — defined, not truthy. Harmless
+    for as long as nobody passed 0, and then trap 16's fix taught
+    `rebuild_deps.sh` to pass `PROJECTIONS="${PROJECTIONS:-0}"` as its
+    default, and every build silently linked tracing in. **A fix that
+    makes a flag mandatory changes the meaning of its default value.**
+    Now tested with `filter-out 0 no off false`.
+
+20. **`-i N` was broken for every non-perturbing app, in the core.**
+    `TreePiece::reset()` cleared `particles` at the end of each
+    iteration, and `buildTree()` refills by swapping in
+    `incoming_particles` — which only `perturb`/`rebucket` ever writes,
+    and `Driver::run` skips that entire block when
+    `perturb_particles == false`. So from iteration 2 every TreePiece had
+    nothing. Under `-c full` it aborted ("final gathered 0 records");
+    **under `-c stats` it did not abort at all — it reported an empty
+    iteration and exited 0.** Fixed in `reset()`, which is the place that
+    knows whether anything will refill the buffer.
+
+    Worth the trap entry for how it was found: the first fix went into
+    `buildTree` (guard the swap), was verified in the source, was built,
+    and did not work — because by then `particles` was already empty. The
+    symptom said "buildTree gets nothing"; the cause was two functions
+    away. A fix that provably changes the code and provably does not
+    change the behaviour means the diagnosis was wrong, not the build.
+
+21. **An abort added for a hypothetical fired the same day.** The "no
+    flat device tree" abort (18.5) was written because Replace mode has
+    no oracle. The first configuration to reach it was the broken `-i 3`
+    run above: with zero particles there is no tree, and Replace mode
+    would have adopted a stale label buffer as the answer. The guard
+    turned a silent wrong result into a named abort on its first outing.

@@ -72,6 +72,10 @@ struct WalkStats {
   double t_walk = 0;      // the traversal itself
   double t_freeze = 0;    // find-all + label write
   double t_download = 0;
+  // Async form only (enqueuePhase1): walk + freeze + download are one
+  // unfenced sequence, so they are one number, measured in the completion
+  // callback. Zero on the synchronous path, where the three above are real.
+  double t_device_tail = 0;
   long stack_overflows = 0;   // must be 0; a nonzero count means LOST WORK
   long certificates = 0;      // positive certificates fired
   long leaf_pairs = 0;        // leaf-leaf pair tests performed
@@ -176,17 +180,52 @@ class Device {
   // Particle::group_number after phaseA+phaseB+merge+relabel.
   //
   // Synchronous, with a fence between kernels so the per-kernel walls are
-  // real. The async form (enqueue + hapiAddCallback) is proven in stage 0
-  // and is what production will use; measurement comes first.
+  // real. This is the MEASUREMENT form; production uses the
+  // enqueue/complete pair below.
   //
   // grid_thresh is the CPU's -G occupancy gate (expected particles per
   // cell of side b/sqrt(6)); <= 0 disables the stage-3 grid pre-pass and
   // leaves the traversal to solve dense nodes by descent.
   void runPhase1(float b2, float grid_thresh, WalkStats* out);
 
+  // Stage 4: the same pass, split so no scheduler thread waits on the GPU.
+  //
+  // enqueuePhase1() runs the prepare (which CANNOT be asynchronous — the
+  // leaf-list parallel_scan returns its count to the host, and both the
+  // walk's launch bounds and the shape choice depend on it) and then
+  // ENQUEUES the walk, the freeze and the download on the stream set by
+  // setStream(), returning with all of it in flight. The caller then arms
+  // hapiAddCallback() on that same stream; when the callback fires,
+  // completePhase1() fences, reads back the device counters and fills in
+  // the stats. hostLabels() is valid only after completePhase1().
+  //
+  // Either call may come from ANY PE of the owning process (HAPI binds
+  // every PE of the process to the same device at startup), but only one
+  // at a time: the pair shares Impl state, and the deposit chain that
+  // drives it already guarantees a single caller.
+  void enqueuePhase1(float b2, float grid_thresh);
+  void completePhase1(WalkStats* out);
+
+  // Release everything the pass no longer needs: the pinned host staging
+  // (positions, orders, the concatenated node array) and the device-side
+  // scratch (union-find parent, certificate memo, leaf list, grid roots).
+  // hostLabels() SURVIVES, because the scatter reads it after this.
+  //
+  // Phase 1 is a small slice of the iteration and everything above is dead
+  // for the rest of it, but it stays RESIDENT — ~600 MB per process of it
+  // pinned, which is not ordinary memory: it is unpageable and registered
+  // with the driver, on nodes where the phase-3 node cache and libfabric's
+  // MR cache are both competing for the same pages (design/phase1-gpu.md
+  // section 17.3). The next iteration's resize()/resizeTree() reallocate.
+  void releaseStaging();
+
   void fence();
 
  private:
+  // One body behind runPhase1() and enqueuePhase1(); `async` selects only
+  // whether the trailing fences are taken.
+  void runPhase1Impl(float b2, float grid_thresh, bool async);
+
   struct Impl;
   Impl* p_;
 };

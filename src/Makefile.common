@@ -23,11 +23,16 @@ LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet
 # (PROJECTIONS=) is off, matching the AGGREGATION convention above.
 # See the README ("Tracing with Projections") for output files and the
 # runtime +trace* flags.
+# The test is on the VALUE, not on whether the variable is defined:
+# `make PROJECTIONS=0` has to mean off. It used to mean ON (the test was
+# "non-empty"), which stays invisible for as long as nobody passes 0 — and
+# then fof/gpu/rebuild_deps.sh started passing PROJECTIONS=0 as its
+# default and every build silently linked tracing in.
 TRACE_MODES :=
-ifneq ($(strip $(PROJECTIONS)),)
+ifneq ($(filter-out 0 no off false,$(strip $(PROJECTIONS))),)
 	TRACE_MODES += projections
 endif
-ifneq ($(strip $(SUMMARY)),)
+ifneq ($(filter-out 0 no off false,$(strip $(SUMMARY))),)
 	TRACE_MODES += summary
 endif
 TRACE_FLAGS := $(foreach m,$(TRACE_MODES),-tracemode $(m))
