@@ -97,3 +97,32 @@ result unchanged. Anvil 7-arm validation job queued: calibration
 baseline x2, model-LB x2, old-inverse-volume-proxy LB (controls for
 "any LB" vs "this model"), and an LB-without-S3 / base-without-S3 pair
 (does a balanced map remove the NEED to steal?).
+
+## A/B design correction (2026-08-14, found while setting up job 19932506)
+
+The intended "did the COST MODEL matter, or would any LB have done?"
+control was `PARATREET_LB_MODEL=0` (the historical inverse-bounding-box
+proxy). It cannot serve that role in the pre-build window: that proxy
+reads `local_root`, which is NULL before the tree is built, so it
+assigns no load at all. The old proxy simply has no inputs this early —
+that is a fact about it, not a bug in the arm. Read arm 5 of job
+19932506 as "LB with an unset load vector", i.e. whether calling the
+balancer at all does anything, and nothing stronger.
+
+`PARATREET_LB_MODEL=2` (added at 667686a) is the control the question
+wants: uniform load, so the balancer equalises PIECE COUNT. A win for
+the model over uniform is then attributable to the model rather than to
+the mere fact that a balancer ran. Use it in the follow-up job in place
+of mode 0.
+
+Also fixed at 667686a: `printLoadModel` hardcoded the 1.2 exponent while
+`UserSetLBLoad` read `PARATREET_LB_SELF_EXP`, so a non-default exponent
+would have validated one formula while migrating by another. They agree
+at the default, which is what 19932506 runs.
+
+Laptop observation worth carrying into the reading of the results: the
+LB's decision is NOT perfectly reproducible run-to-run at 1M (the same
+model config gave 214/122 and later 171/165 pieces per process),
+presumably because the Charm++ balancer folds measured background load
+in with `setObjTime`. On a dedicated allocation this should be tighter,
+but it is a reason the job carries two reps of every LB arm.
