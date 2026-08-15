@@ -126,3 +126,80 @@ model config gave 214/122 and later 171/165 pieces per process),
 presumably because the Charm++ balancer folds measured background load
 in with `setObjTime`. On a dedicated allocation this should be tighter,
 but it is a reason the job carries two reps of every LB arm.
+
+## MEASURED: Anvil job 19932506 (2B/16, 7 arms, all exact) — mechanism
+## works, STRATEGY is catastrophic, and the model as shipped had no signal
+
+| arm | phaseA | phaseB | Iteration 0 | pieces/proc min/avg/max |
+|---|---|---|---|---|
+| baseline | 1.045 | 0.733 | 4.296 | 396/531/688 |
+| baseline-rep2 | 1.030 | 0.653 | 4.258 | 396/531/688 |
+| lb-self | 2.241 | 0.445 | **20.265** | **0**/531/1543 |
+| lb-self-rep2 | 2.503 | 0.722 | **22.241** | **0**/531/1893 |
+| lb-oldproxy | 2.566 | 0.475 | **30.283** | **0**/531/2012 |
+| lb-noS3 | 2.525 | 1.581 | **22.227** | **0**/531/1786 |
+| base-noS3 | 1.032 | 1.704 | 4.954 | 396/531/688 |
+
+1. **THE STRATEGY IS THE DISASTER, NOT THE MECHANISM.** Migration itself
+   is correct (7/7 exact, and the pre-build window held). But
+   GreedyRefineLB has no notion of locality, and phase 1 IS locality —
+   "the complete FoF restricted to a process" (FoFPhase3.h). It scattered
+   pieces from a 1.7x spread (396-688) to 0-2012 per process, leaving
+   processes with NO pieces at all, and Iteration 0 went 4.3 s -> 20-30 s
+   (5-7x). phaseA doubled; the rest of the damage is tree build + the
+   phase-3 walk paying for shattered locality. The LB call itself also
+   costs 2.4-2.9 s (68k chares with their particles).
+   CONCLUSION: a generic Charm++ strategy cannot be used here. The
+   assignment must preserve SFC contiguity by construction — which is
+   what design/simd-and-piece-mapping.md proposed and what this job's
+   convenience shortcut skipped.
+2. **THE MODEL AS SHIPPED WAS NEVER TESTED**, because with K=0 it carries
+   no signal: `self` (sum n^1.2) spreads only **1.06x** across the 128
+   processes while actual phaseA spreads 1.83x. Oct decomposition
+   equalises particle counts, so any near-linear function of n is
+   near-constant per process. The three LB arms are statistically
+   indistinguishable (phaseA 2.24/2.50/2.57, Iter0 20/22/30), including
+   the arm that sets NO load at all — direct confirmation that the
+   balancer was not acting on our model.
+3. **WHERE THE IMBALANCE ACTUALLY IS**: phaseA spreads 1.83x; phaseB
+   spreads **88.8x** (pb_sum_s 0.091-8.082 s). phaseB is the target, and
+   phaseB is exactly what the K=0 model ignored.
+4. **THE PAIR TERM IS A GOOD PREDICTOR ONCE COMPRESSED.** Against actual
+   per-process phaseB, over the 128 baseline processes:
+
+   | form | Pearson r | spread |
+   |---|---|---|
+   | pair (mean-field, as implemented) | +0.746 | 30208x |
+   | **sqrt(pair)** | **+0.872** | 174x |
+   | pair^0.25 | +0.862 | 13x |
+   | log(pair) | +0.760 | 1.2x |
+   | (actual pb) | — | 89x |
+
+   sqrt(pair) is both the best correlated AND the right magnitude
+   (174x predicted vs 89x actual, against the raw term's 30000x). The
+   mean-field form over-predicts the tail because it assumes every
+   neighbour is as dense as the piece itself; the square root is the
+   empirical correction. r=0.87 also matches the m2 heritage (R^2 0.87).
+5. **THE SELF TERM NEEDS THE GRID IN IT.** A uniform-piece proxy
+   P*(N/P)^e correlates with phaseA at r=+0.67 for ANY e>1.2 (with N
+   nearly fixed per process the ranking is set by P), and e~2.1
+   reproduces the observed 1.83x magnitude. But the EXACT sum
+   `sum n_i^1.2` correlates at only -0.187 — WORSE than the crude
+   uniform approximation. That gap is piece-size heterogeneity being
+   anti-correlated with time, which is the -G grid doing its job: a
+   process holding a few big dense pieces sends them down the O(n log n)
+   grid path instead of the walk. Any usable self term must branch on
+   the same occupancy gate the grid uses, not apply one exponent to
+   every piece.
+
+### Revised plan
+
+- DROP the generic-LB shortcut. Build the SFC-contiguous assignment:
+  order pieces by key (they already are), partition into 128 contiguous
+  runs balancing the calibrated weight, migrate only pieces whose run
+  changed. Contiguity bounds the locality damage by construction, and
+  the migration count is far below GreedyRefine's.
+- Weight for v2: `w = grid_aware_self(n, V) + K * sqrt(pair)`, with the
+  pair term dominant (it owns the 89x) and K calibrated from c/a on this
+  job's data.
+- Keep the instrument as is: it is what produced every number above.
