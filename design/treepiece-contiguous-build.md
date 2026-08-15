@@ -132,3 +132,48 @@ All three are complementary and touch different code:
 Sequence them so attribution stays clean: measure the compiler flags
 first (running now, zero code), then the layout (it enables SIMD), then
 SIMD, with shedding on its own track since it is orthogonal to all of it.
+
+## MEASURED PREMISE CHECK (2026-08-14): the layout is ALREADY preorder —
+## contiguous only in 27 KB runs, and the chunk size was never set
+
+Before building a per-piece arena, I checked what the current allocator
+actually produces. Two facts change the plan:
+
+1. **`buildTree` is one entry method with no yields.** `recursiveBuild`
+   is a plain recursion over `cm_local->makeNode`, so from the
+   scheduler's view a piece's whole tree is built atomically: nothing
+   from another piece, and nothing from the CacheManager, interleaves.
+   `FullNodePool::alloc` bump-allocates. Therefore a piece's nodes are
+   ALREADY laid out in creation order, which is depth-first PREORDER.
+   The interleaved-allocation scenario my microbench modelled (47.2 vs
+   13.0 ns/node) does NOT occur, so that 3.6x overstates the available
+   gain — an honest correction to this note's earlier motivation.
+2. **But contiguity stops at the chunk boundary, and the chunk is 128
+   nodes.** Each pool chunk is its own `new char[sizeof(FullNode) *
+   pool_elem_size]`, and `config.pool_elem_size` is never assigned by any
+   app and is not a registered config field, so
+   `std::max(config.pool_elem_size, 128)` has ALWAYS resolved to the 128
+   floor — 27 KB per chunk (confirmed at runtime). A 29k-particle piece
+   at 12 particles/leaf is ~5k nodes, i.e. ~40 separately-malloc'd
+   blocks with arbitrary addresses between them.
+
+So the real state is "preorder, contiguous in 27 KB runs, ~40 heap jumps
+per piece" — much better than assumed, but not contiguous.
+
+### Consequence: the first experiment is a knob, not an arena
+
+`PARATREET_POOL_ELEM_SIZE` (added same day) sets the chunk size. Sized to
+hold a whole piece it yields fully contiguous preorder local trees with
+NO structural change — no arena, no capacity bound, no destructor path,
+no fallback. Exactly parallel to the `-march` experiment: run the cheap
+version first, and let it decide whether the expensive one is worth
+building.
+- If a large chunk moves phaseA/phaseB: contiguity matters, and the
+  per-piece arena (which additionally guarantees exact bounds and enables
+  the packed-position array) becomes worth its complexity.
+- If it does not: the walk is latency-bound in a way layout cannot fix,
+  and option 3 closes cheaply — with the packed-SoA-positions idea for
+  SIMD still standing on its own, since that attacks the gather, not the
+  node layout.
+Cost of the knob: memory. A chunk is allocated whole, so oversized chunks
+waste up to one chunk per lane per piece-tail; report RSS in the A/B.
