@@ -287,3 +287,68 @@ c/a ratio in the same data.
 Note the model only has to RANK pieces and processes here, not predict
 seconds — a much weaker requirement than global rebalancing imposed, and
 one this model already meets.
+
+### v2 refinements (Kale, 2026-08-14 evening) — scope, conservatism, and
+### the shadow copy
+
+**1. DROP the physical-node restriction.** The v2 sketch above confined
+destinations to the S3 block. The bandwidth evidence does not justify it:
+relay1 item 12 measured LCI's intra-node path BEATING the shmem build
+over most of the range, and found a 4.1x cliff between 16 and 32 MB in
+BOTH builds — i.e. intra-node is not a specially fast path, and the sizes
+we move sit past the cliff either way. So choose destinations by the two
+things that actually matter — the m2 locality cost and the destination's
+own load — and let them fall on whatever node they fall on.
+
+**2. AIM AT THE PEAKS, NOT AT BALANCE.** Migration is not free: job
+19932506's global pass cost 2.4-2.9 s, and a piece is ~n *
+sizeof(Particle) ~ 2.9 MB at 29k particles. Moving 10-20 pieces is
+~30-60 MB and ~0.1-0.2 s from one sender; moving hundreds is not
+affordable. So the objective is explicitly PARTIAL: shave the top of the
+distribution, accept the rest.
+- Act only on the worst one or few processes (max/mean above a factor,
+  with an absolute floor so a fast phase never churns).
+- Cap BOTH the piece count and the bytes moved per process, and log both.
+- Target something like a 30-50% cut in the peak, not the mean. On
+  19932506's numbers that is 8.08 s -> ~4-5.5 s of phaseB on the
+  straggler for ~0.1-0.2 s of migration: a good trade that does NOT
+  require the model to be accurate, only to rank.
+- Concentration is on our side: the cost probe found the top 1% of pairs
+  hold 60-79.5% of the time, so a handful of well-chosen pieces should
+  carry a disproportionate share of the excess.
+
+**3. THE SHADOW COPY, and one correction to its premise.** Kale: since we
+do not modify the piece, leave an inactive copy behind rather than
+migrating it back.
+
+The premise needs one amendment: phase 1 DOES write to the particles —
+`group_number` (the tip/label) at three sites in FoFPhase1.h (2102, 2167,
+2407), which phase 3 then reads. The tree structure and every other
+particle field are untouched, and `vertex_id` is written only by the
+union-find setup in Node.h, not by FoF's phases.
+
+That makes the idea better rather than worse: the return trip is not
+free, but it is LABELS ONLY — 8 bytes/particle against ~100 for a full
+piece, so ~232 KB instead of ~2.9 MB per piece, a ~12x saving on the way
+back. Shape:
+- forward: full piece to the destination (unavoidable — it must be
+  walked there);
+- back: the group_number array, indexed by the piece's particle order;
+- the origin keeps its untouched copy, so the HOST's distribution is
+  never disturbed and no second migration is needed.
+
+Note what this becomes: S3 stealing at PIECE granularity, decided before
+phase 1 instead of during phaseB. That is a favourable trade on traffic —
+S3 ships ~73 KB per stolen UNIT and ~11 GB per run because the same
+subtree ships repeatedly across many units, whereas a piece ships once
+and serves all of its pairs. The open question this design must answer is
+the one m2 prices: the pairs the moved piece has with pieces left behind
+become phase-3 cache-walk work, so the saving is real only when the piece
+is chosen where that conversion is cheap.
+
+IMPLEMENTATION NOTE: a shadow copy is NOT chare migration — a chare array
+element lives in one place. So this is a data-plane change (ship the
+piece's particles + tree to a helper process, walk there, return labels),
+which reuses the S3 transport rather than the LB machinery. The
+PARATREET_PREBUILD_LB migration path stays useful as the simpler variant
+to measure first, since it needs no new protocol.
