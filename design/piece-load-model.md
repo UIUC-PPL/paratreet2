@@ -203,3 +203,87 @@ but it is a reason the job carries two reps of every LB arm.
   pair term dominant (it owns the 89x) and K calibrated from c/a on this
   job's data.
 - Keep the instrument as is: it is what produced every number above.
+
+## v2 DESIGN: targeted shedding, not global rebalance (Kale, 2026-08-14)
+
+Kale's correction after 19932506: do not rebalance globally. Identify the
+WORST-AFFECTED process from a rough cost model and move just a FEW pieces
+off it, each to a process that is spatially close (touching pieces /
+nearest centroid, preferably a combination of both).
+
+This repairs the exact defect the measurement exposed. GreedyRefineLB
+failed not because balancing is wrong but because a global strategy with
+no locality term reassigned everything (0-2012 pieces/process) and paid
+5-7x in wall clock. Targeted shedding bounds both quantities that went
+wrong: how many pieces move, and how far.
+
+### Why it should be enough
+
+phaseB per process spreads 88.8x (0.091-8.082 s) with a mean of 1.14 s.
+Shedding the straggler's excess (~6.9 s) across its 7 physical-node
+block-mates raises each by ~1 s and drops the max from 8.08 to ~2.1 —
+a ~3.8x cut in the term that sets the phase, without touching anyone
+outside the block. Work is also concentrated (the cost probe: top 1% of
+pairs hold 60-79.5% of the time), so a handful of pieces should carry
+most of the excess.
+
+Cost comparison, which is the argument for doing this at all: a piece is
+~n * sizeof(Particle) ~ 3 MB at 29k particles, so shedding tens of pieces
+moves ~100 MB ONCE. S3 ships ~11 GB per run, repeatedly, to chase the
+same imbalance. Same objective, ~100x less traffic, and the work follows
+the data instead of round-tripping.
+
+### The destination rule (quantifying "close")
+
+A piece P moved from process A to process B converts every pair
+(P, piece-on-A) from phase-1-local into phase-3 cache-walk work, and
+converts every (P, piece-on-B) the other way. Both are priced by the
+SAME m2 already used everywhere else. So:
+
+    net locality cost(P -> B) = sum_{q in A} m2(P,q) - sum_{q in B} m2(P,q)
+
+Choose B minimising that (equivalently: the process where most of P's
+interaction weight already lives). This is exactly "touching pieces and
+nearest centroid" made quantitative — m2 is nonzero only for pieces whose
+grown boxes overlap (touching), and falls off with separation (centroid
+distance). Restrict B to the physical-node block, the same scope S3
+already steals within: migration stays intra-node and the phase-3
+conversion stays small.
+
+Special case worth exploiting: pieces are SFC-ordered and processes hold
+contiguous runs, so a piece at either END of a run has most of its
+neighbours in the adjacent process already. Shedding from the ends is
+nearly locality-free and merely moves the run boundary. Prefer end pieces
+when their load is comparable; pay the m2 accounting only for hot pieces
+buried mid-run.
+
+### Algorithm sketch (per physical-node block, before the tree build)
+
+1. Every process computes its own predicted load from the calibrated
+   model (below) and posts it to the block coordinator — the S3
+   coordinator already exists and already polls exactly this kind of
+   quantity.
+2. Coordinator finds max vs block mean. If max < FACTOR * mean (2.0,
+   with an absolute floor so a near-idle block never churns), do nothing.
+3. Straggler ranks its pieces by predicted load, walks them heaviest
+   first, and for each computes the best destination and net locality
+   cost by the rule above; accepts the move if it sheds more load than
+   it adds phase-3 work (scaled by a measured phase3-per-m2 constant).
+4. Stop when the straggler is within FACTOR of the mean or no move
+   passes. Migrate with migrateMe in the pre-build window
+   (PARATREET_PREBUILD_LB machinery, but our assignment, no
+   Charm++ strategy involved).
+
+### Calibrated weight (from 19932506's 128 processes)
+
+    w(piece) = grid_aware_self(n, V) + K * sqrt(pair(n, V))
+
+sqrt(pair) is the empirical winner: r=+0.872 against actual phaseB and a
+174x spread against the actual 89x, versus the raw mean-field term's
++0.746 at 30208x. The self term must branch on the -G occupancy gate
+rather than use one exponent (see the measured section above). K from the
+c/a ratio in the same data.
+
+Note the model only has to RANK pieces and processes here, not predict
+seconds — a much weaker requirement than global rebalancing imposed, and
+one this model already meets.
