@@ -72,3 +72,63 @@ exact). So contiguity needs to cover ONLY the local piece build.
 - 2B A/B, one allocation, flag off/on x2: phaseA wall (locality
   effect either way), s3_time flatten ms/grant (the sized claim),
   phaseB_s max, RSS (slack).
+
+## UN-DEFERRED, and re-motivated (Kale, 2026-08-14)
+
+Kale restated this as the third standing option: give the LOCALLY OWNED
+TreePiece tree a contiguous allocation in PREORDER, built before phase 1
+(explicitly NOT the CacheManager's remote-node storage, which keeps its
+per-lane pool and its async arrivals).
+
+The deferral in section 34 was correct on its own terms and wrong as a
+verdict on the idea. What relay3 killed was the S3-FLATTEN motivation:
+per-grant donor cost does not bind, so speeding the flatten buys nothing.
+Three motivations survive, and two of them got STRONGER since:
+
+1. **WALK LOCALITY — now the dominant remaining cost.** Section 34 places
+   the residual straggler in phaseBChained on the hot process, i.e. its
+   own local walk, untouched by every S3 change. The walk descends
+   pointer-linked nodes allocated from a per-LANE pool, so sibling and
+   parent-child nodes of one piece are interleaved with other pieces'
+   nodes across the heap. Preorder-contiguous storage makes a descent a
+   forward scan and makes any subtree a contiguous range.
+   Microbench (design/flatten-bench.cpp, faithful 216 B node with vptr
+   and 8 atomic children, 113 MB working set): the same pointer-chasing
+   code runs 47.2 ns/node interleaved vs 13.0 ns/node contiguous — 3.6x
+   from the ALLOCATION CHANGE ALONE, no code change to the traversal. A
+   pure range sweep reaches 6.7 ns/node (7x) if the access is later
+   rewritten to exploit contiguity.
+2. **IT IS THE ENABLER FOR IDEA 1 (SIMD).** The distance-test loops are
+   gather-bound because positions live 12 bytes at a time inside ~100 B
+   AoS Particles. A contiguous per-piece build is the natural place to
+   also emit a packed SoA position array (x[], y[], z[], 12 B/particle),
+   after which the leaf-leaf loops are contiguous float loops the
+   compiler can vectorise. Neither idea reaches its ceiling without this.
+3. **The buffer-is-the-message endgame** (unchanged): once a subtree is a
+   contiguous range of POD-ish nodes, shipping one approaches a memcpy.
+   Lowest priority of the three now, but free once the layout exists.
+
+### Scope, unchanged from the original design
+
+Local piece builds only; CacheManager untouched. Capacity-bounded arena
+per piece sized from n_particles, single-threaded depth-first build
+(pieces are already the parallel grain, so preorder comes for free), and
+NEVER compact or move afterwards — registries, parked waiters and
+PoolUnit all hold raw Node*. Overflow falls back to the lane pool for
+that piece's tail (correct, loses contiguity, counted). Flag
+PARATREET_PIECE_ARENA, default off, 2B A/B reading phaseA wall, phaseB
+wall and phaseB_s max — with the honest possibility that the walk is
+latency-bound in a way contiguity does not fix, which the A/B settles
+either way.
+
+### Interaction with the other two ideas
+
+All three are complementary and touch different code:
+- contiguous+preorder layout: the tree BUILD (src/)
+- SIMD: the distance-test LOOPS (fof/), enabled by the layout's packed
+  positions
+- targeted shedding: WHICH PROCESS owns a piece (fof/ + the pre-build
+  migration window)
+Sequence them so attribution stays clean: measure the compiler flags
+first (running now, zero code), then the layout (it enables SIMD), then
+SIMD, with shedding on its own track since it is orthogonal to all of it.
