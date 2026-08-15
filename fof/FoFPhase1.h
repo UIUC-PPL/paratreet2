@@ -540,6 +540,35 @@ public:
     }();
     return v;
   }
+  // ---- Cross-node helpers (design/s3-cross-node.md). ADDITIVE: the block
+  // coordinator and all within-node stealing are untouched; this only adds
+  // a few helpers from OTHER blocks, because the straggler's own block is
+  // where the load already is (block 6 holds both the worst and 2nd-worst
+  // process) and a shipment's delay is transit, not scheduling (measured:
+  // s3Shipment ~1.1 GB/s, while s3ShipOrder waits 16 us at the median).
+  // FOF_S3_XNODE = how many remote helper PROCESSES to admit. 0 = off.
+  static int s3XNodeHelpers() {
+    static const int v = [] {
+      const char* e = std::getenv("FOF_S3_XNODE");
+      return e ? std::atoi(e) : 0;
+    }();
+    return v;
+  }
+  // A donor must be this many times the global mean backlog before remote
+  // help is offered — conservative, so ordinary imbalance stays local.
+  static double s3XNodeFactor() {
+    static const double v = [] {
+      const char* e = std::getenv("FOF_S3_XNODE_FACTOR");
+      return e ? std::atof(e) : 2.0;
+    }();
+    return v;
+  }
+  static int s3XCoord() { return 0; }   // global coordinator: node 0
+  std::map<int, double> s3x_total;      // node -> published pool m2
+  std::set<int> s3x_helpers;            // admitted remote helpers
+  long s3x_orders = 0;                  // remote orders issued (stat)
+  std::atomic<unsigned> s3_xnode_cursor{0};  // donor-side partition rotor
+
   static double s3GrantM2() {
     static const double v = [] {
       const char* e = std::getenv("FOF_S3_GRANT_M2");
@@ -819,6 +848,45 @@ public:
     }
     s3DecideLocked();
   }
+  // ---- Global coordinator (node 0), cross-node helpers only.
+  // Every member publishes its pool total here as well as to its block
+  // coordinator; every member reports here when it drains. Node 0 matches
+  // an idle process to the globally-worst donor IN A DIFFERENT BLOCK and
+  // issues an ordinary s3ShipOrder — the data plane is unchanged.
+  void s3XPublish(int fromNode, double total) {
+    std::lock_guard<std::mutex> g(s3_lock);
+    s3x_total[fromNode] = total;
+  }
+  void s3XDrained(int fromNode) {
+    if (s3XNodeHelpers() <= 0) return;
+    int donor = -1;
+    {
+      std::lock_guard<std::mutex> g(s3_lock);
+      // Admit at most N distinct remote helpers; an already-admitted one
+      // may take further grants as it drains.
+      if (!s3x_helpers.count(fromNode)) {
+        if ((int)s3x_helpers.size() >= s3XNodeHelpers()) return;
+      }
+      if (s3x_total.empty()) return;
+      const int P = probeProcsPerPnode();
+      double sum = 0;
+      for (auto& kv : s3x_total) sum += kv.second;
+      const double mean = sum / (double)s3x_total.size();
+      double best = mean * s3XNodeFactor();   // conservative trigger
+      for (auto& kv : s3x_total) {
+        if (kv.first / P == fromNode / P) continue;   // same block: local
+        if (kv.second > best) { best = kv.second; donor = kv.first; }
+      }
+      if (donor < 0) return;
+      s3x_helpers.insert(fromNode);
+      s3x_orders++;
+      s3x_total[donor] *= 0.5;  // crude debit so one donor is not swamped
+    }
+    // partIdx -1: the global coordinator does not track this donor's
+    // partition state, so the donor picks (see s3ShipOrder).
+    this->thisProxy[donor].s3ShipOrder(fromNode, -1);
+  }
+
   // Donor -> coordinator: the ordered partition had NOTHING unclaimed —
   // retire it permanently (an emptied partition never refills).
   void s3Declined(int donorNode, int helperNode, int partIdx) {
@@ -943,6 +1011,18 @@ public:
   // Coordinator -> donor: ship partition partIdx's still-unowned units to
   // helperNode. Ownership per unit via the same CAS the local drain uses.
   void s3ShipOrder(int helperNode, int partIdx) {
+    if (partIdx < 0) {
+      // Cross-node order: node 0 has no view of this donor's partition
+      // bookkeeping, so pick locally and rotate. Correctness does not
+      // depend on the choice — per-unit CAS means a partition already
+      // being shipped simply yields nothing and declines.
+      const int np = (int)pb_part_range.size();
+      if (np <= 0) {
+        this->thisProxy[s3Coord()].s3Declined(CkMyNode(), helperNode, -1);
+        return;
+      }
+      partIdx = (int)(s3_xnode_cursor.fetch_add(1) % (unsigned)np);
+    }
     paratreet::StealShipment<Data> ship;
     ship.origin_node = CkMyNode();
     ship.part_idx = partIdx;
@@ -1169,6 +1249,7 @@ public:
     }
     this->thisProxy[rec->origin].s3Return(CkMyNode(), flat);
     this->thisProxy[s3Coord()].s3Drained(CkMyNode()); // next grant, please
+    this->thisProxy[s3XCoord()].s3XDrained(CkMyNode());
   }
   // Helper -> donor: edges (deduped within the shipment) come home
   // through the ordinary submitEdges door; the final merge's union is
@@ -3024,6 +3105,7 @@ public:
           nb->s3_total_m2 = tot;
           CkPrintf("FOF3STAT s3_arm: node %d parts %zu units %zu m2 %.3g\n",
                    CkMyNode(), nb->pb_part_cost.size(), n, tot);
+          node_proxy[FoFPhase1Node<Data>::s3XCoord()].s3XPublish(CkMyNode(), tot);
           node_proxy[nb->s3Coord()].s3Publish(CkMyNode(), tot,
                                               nb->pb_part_cost);
         } else {
@@ -3068,6 +3150,7 @@ public:
     // last units may still be executing on sibling PEs; THIS PE is free).
     if (nb->s3_unit_taken && !nb->s3_drain_sent.exchange(1))
       node_proxy[nb->s3Coord()].s3Drained(CkMyNode());
+      node_proxy[FoFPhase1Node<Data>::s3XCoord()].s3XDrained(CkMyNode());
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
       if (nb->s3_unit_taken) {
