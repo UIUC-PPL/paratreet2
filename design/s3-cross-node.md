@@ -91,3 +91,55 @@ cross-node help for 55 alone leaves 54 setting the phase. Two helpers
 aimed at the two worst processes of block 6 is the configuration that
 actually moves the max, which is an argument for the "2 helpers" scope
 being about right for reasons beyond conservatism.
+
+## CLARIFICATIONS (Kale, 2026-08-15 evening)
+
+### Helpers are PROCESSES, not nodes
+
+An S3 helper is a process: `s3Shipment` lands on one of its PEs and
+`drainForeign` fans out across all of them (13.4 of 14 active, measured).
+So "2 helpers" = 2 remote processes ~ 28 additional worker PEs, against
+the 7 block-mate processes available today — roughly a 29% increase in
+helper capacity, not a tripling.
+
+That is deliberately small for a first arm. But the count is a bare
+integer with no protocol consequences, so the A/B should SWEEP it —
+0 (baseline) / 2 / 4 / 8 remote processes — in one job. Two alone
+answers "does anything happen"; the sweep answers "where does it stop
+helping", which is the number that matters, because helper count is only
+useful up to the rate at which the donor can produce grants.
+
+### CORRECTION: the donor's packing is ALREADY parallel across grants
+
+I claimed the donor's pack is serialized on one PE, and derived ~660 ms
+of packing for the straggler (13-14 grants x 49 ms). Kale, from the
+projections timeline (images/timelinesPodwire08-13.png): the orange
+`s3ShipOrder` blocks on proc 55 OVERLAP IN TIME across its PEs — several
+PEs pack concurrently. relay1 section 20 saw the same thing (six
+overlapping ~600 ms bars) and first read them as PEs blocked on sends;
+section 22 corrected that to packing, but nobody drew the consequence.
+
+So the aggregate pack rate is already ~6x my estimate and the serial-pack
+argument is wrong. What remains true, and is the real tension: **every PE
+that packs is a PE not walking.** Packing does not stall the donor by
+being serial; it costs the donor by consuming the very capacity that
+makes it the straggler.
+
+That reframes the lever. It is not "add parallelism to the pack" — the
+pack is parallel. It is:
+1. **Priority.** An order should be serviced promptly rather than after
+   the servicing PE finishes its current slice of local walk, because the
+   recipient is idle until the grant lands. Charm++ message priorities
+   are the mechanism (`CkEntryOptions::setPriority` on the s3ShipOrder
+   send); this is a small, contained change and it directly attacks the
+   recipient-visible latency Kale flags as mattering most in the tail.
+2. **Role separation.** A PE that has just packed should not immediately
+   re-enter the local drain if another order is pending — "PEs doing
+   orange work should skip looking at the node queue" (Kale). Harder,
+   because it needs a policy that adapts to how many orders are
+   outstanding, and it trades donor throughput for recipient latency.
+Both are about WHEN the donor packs, not how fast.
+
+Neither blocks the cross-node work: cross-node adds helpers, priority
+changes when they are fed. They compose, and the counters
+(`s3_time`, grant counts) already distinguish them.
