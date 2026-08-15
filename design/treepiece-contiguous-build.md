@@ -177,3 +177,31 @@ building.
   node layout.
 Cost of the knob: memory. A chunk is allocated whole, so oversized chunks
 waste up to one chunk per lane per piece-tail; report RSS in the A/B.
+
+## CLOSED — measured null (Frontier relay4, 2026-08-15)
+
+`PARATREET_POOL_ELEM_SIZE` default/4096/16384/65536 at 2B/16 nodes:
+phase1 spans 3.245-3.376 s while the two IDENTICAL default arms differ
+by 1.8%, and the drift control is the largest phaseB outlier of the
+five. No ordering by chunk size in phaseA, phaseB, Iter0 or RSS. Pool
+bytes rise +0.4/+1.6/+6.1%, so the knob demonstrably took effect — it
+simply bought nothing.
+
+Full contiguity within a piece therefore produces no measurable gain,
+and the per-piece ARENA cannot do better: it differs from the knob only
+in removing the same chunk boundaries more precisely. THIS IDEA IS
+CLOSED on measurement.
+
+Worth keeping from it: the reason it was cheap to close. The knob was
+~15 lines and one job; the arena would have been a capacity-bounded
+allocator, a destructor path, an overflow fallback and a week of
+gating, to reach the same answer. Also the premise check that preceded
+it (buildTree never yields, so pieces were ALREADY preorder) is what
+made the microbench's 3.6x recognisably an overstatement before anyone
+built on it.
+
+NOTE for the SIMD idea, which cited this note as its enabler: the
+packed-SoA-position array does NOT depend on this. It attacks the
+gather in the distance-test loops, not the node layout, and can be built
+independently if part 1 is ever revived — though relay4's measurement
+(phaseB unmoved by vectorisation) argues against that too.
