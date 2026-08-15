@@ -43,6 +43,11 @@ Read in this order:
 1. `~/software/BUILDS.md` — build state, charm trees, staged binaries.
    **Verify tracing with `nm -C <bin> | grep -ci TraceSummary`
    (0 = production, ~465-524 = traced); never trust a filename.**
+   Since 2026-08-15 that check is NECESSARY BUT NOT SUFFICIENT: the
+   compiler-flag binaries are all untraced yet several are NOT
+   bit-exact, so also check `objdump -d <bin> | grep -c vfmadd` —
+   nonzero means FMA contraction is on and the component count will be
+   424897833 (relay5 item 7c).
 2. `~/software/notes/frontier-corrections.md` — build recipe quirks
    (e.g. `module` is unavailable in non-interactive shells).
 3. This repo: `design/phaseab-balancing.md` is the campaign narrative,
@@ -124,6 +129,15 @@ CLOSED, on measurement, cheaply:
 THE STANDING FINDING (§34): what pays is removing SERIALIZATION — work
 stuck on one PE while thirteen idle — not reducing per-grant cost. Three
 independent measurements agree.
+
+ALSO MEASURED (2026-08-15): `-march=znver3 -ffp-contract=off
+-fno-signed-zeros -fno-trapping-math -fassociative-math` is worth -8.1%
+phaseA / -2.8% Iteration 0 and returned the exact count on 29/29 arms
+across 10k/80M/2B including the forced and loopback paths. Its exactness
+is EMPIRICAL (a granted permission gcc 13.3.1 happens not to use), not
+structural like -ffp-contract=off. Adoptable with that caveat stated;
+the mechanism is that std::round in periodicDistSq is a libm CALL and
+-fassociative-math is the only flag that escapes it.
 
 OPEN: targeted shedding — migrate a few pieces off the single
 worst-ranked process. The load model reproduces across machines
