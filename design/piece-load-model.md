@@ -434,3 +434,52 @@ element's current epoch, and the migration itself may already bump it
 (`recordEmigration` at cklocation.C:2382 updates the local entry). Read
 the element's entry after migrating and patch with epoch+1, rather than
 inventing a number.
+
+## Outlier structure, measured on BOTH machines (2026-08-15) — and a
+## correction to my own shedding estimate
+
+Kale asked whether shedding-from-the-worst is overfitted to 2B, and
+whether there is a BIMODALITY that would isolate true outliers. Answered
+from the two 128-process load_model datasets:
+
+| | Anvil | Frontier |
+|---|---|---|
+| max / median | 10.5x | 9.4x |
+| gap #1 -> #2 | **1.59x** | **1.57x** |
+| robust z of #1 ((x-med)/1.4826 MAD) | **10.4** | **10.0** |
+| robust z of #2 | 6.2 | 6.0 |
+| processes with z > 5 | 2 | 3 |
+
+The SHAPE reproduces across machines to two digits, so it is not a
+2B-on-one-machine artefact. But it is NOT bimodal: below the top two or
+three the tail decays smoothly (Frontier 9.63, 8.90, 7.08, 6.75, 6.25,
+5.16 ...). What exists is ONE clear outlier — z~10 with a ~1.58x gap
+below it on both machines — over a heavy tail.
+
+CRITERION, therefore: a robust-z (median/MAD) test, not a factor of the
+mean. z > ~8 selects exactly the one true outlier on both machines,
+adapts to whatever distribution appears, and needs no tuning constant
+carried between problem sizes. A "2x the mean" rule would have flagged
+12 processes on Frontier and is exactly the overfit to avoid.
+
+CORRECTION TO MY EARLIER ESTIMATE. The v2 section above claimed shedding
+the straggler's excess across its block-mates would take the max from
+8.08 s to ~2.1 s. That was WRONG: it implicitly assumed a uniform
+background, when #2 is already at 5.09 (Anvil) / 9.63 (Frontier). The
+max cannot fall below #2. The honest ceiling of levelling the top k:
+
+| level top k | Anvil | Frontier |
+|---|---|---|
+| 1 | -37% | -36% |
+| 2 | -56% | -41% |
+| 3 | -60% | -53% |
+| 5 | -61% | -59% |
+
+So shedding from the single worst process buys ~36-37% of the phaseB
+max — reproducibly on two machines. Real and bounded, and still larger
+than anything the compiler or layout experiments produced (both ~0 on
+phaseB). Going further needs BOTH more migrations and a better ranker,
+and relay4 showed the detector ranks #1 correctly but only 2/5 of the
+top five — so what is reliably actionable (level 1, maybe 2) matches
+what is reliably detectable. That alignment is the argument for the
+conservative design, not a limitation of it.
