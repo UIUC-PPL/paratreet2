@@ -1472,30 +1472,81 @@ public:
   // Fit sum(actual phaseA) ~ a*self and sum(actual phaseB) ~ c*pair across
   // processes: the R^2 of those two regressions is the go/no-go, and the
   // ratio c/a calibrates PARATREET_LB_K for the migration arm.
-  void printLoadModel() {
-    // Must track TreePiece::lbSelfExp — the instrument is only a check on
-    // the model we ACT on, so a divergent exponent would validate one
-    // formula and migrate by another.
+  // m2 between two pieces, the SAME expected-pairs estimate the pool uses
+  // per unit (FoFPhase1.h ~2489, validated R^2 0.87 at 2B), evaluated at
+  // piece-root granularity: rho_a * rho_b * V_int(a grown by b, b) * V_ball.
+  // With a == b it degenerates to the piece's own self-pair estimate, so
+  // ONE formula covers self work and pair work.
+  static double pieceM2(const TreePieceRef& a, const TreePieceRef& b,
+                        double b2) {
+    double va = (double)a.root->data.box.volume();
+    double vb = (double)b.root->data.box.volume();
+    if (va <= 0 || vb <= 0) return 0.0;
+    const double bb = std::sqrt(b2);
+    double vint = 1.0;
+    for (int ax = 0; ax < 3 && vint > 0; ax++) {
+      double lo = std::max((double)a.root->data.box.lesser_corner[ax] - bb,
+                           (double)b.root->data.box.lesser_corner[ax]);
+      double hi = std::min((double)a.root->data.box.greater_corner[ax] + bb,
+                           (double)b.root->data.box.greater_corner[ax]);
+      vint = hi > lo ? vint * (hi - lo) : 0.0;
+    }
+    if (vint <= 0) return 0.0;
+    const double vball = 4.18879 * bb * bb * bb;
+    return ((double)a.root->data.n_below / va) *
+           ((double)b.root->data.n_below / vb) * vint * vball;
+  }
+
+  // Predicted phase-1 work of THIS process UNDER THE CURRENT ASSIGNMENT
+  // (Kale, 2026-08-15). The point of the estimate is only to say what this
+  // process will do if nothing moves — it deliberately does NOT try to
+  // predict what shedding a piece would do to pair work, which is
+  // unknowable cheaply and unnecessary for choosing a victim.
+  //
+  // So it sums m2 over the pairs the assignment ACTUALLY schedules:
+  //   m2_self  = sum_i  m2(i,i)          -> the phaseA self-pair term
+  //   m2_intra = sum over pairs on the SAME PE   -> rest of phaseA
+  //   m2_cross = sum over pairs on DIFFERENT PEs -> phaseB (the pool)
+  // The earlier version summed a per-piece MEAN-FIELD proxy
+  // (n^1.2 and n^2/V^(4/3)) that never looked at a neighbour; it reached
+  // r=+0.871 against phaseB on both machines, but its self term was
+  // anti-correlated (-0.19 Anvil, -0.26 Frontier) and unusable. Both proxies
+  // are still printed so the two can be compared on one run.
+  // Cost: O(pieces^2) per process, ~141k evaluations at 531 pieces — but it
+  // runs once, off the critical path, at phase3Stats.
+  void printLoadModel(double b2) {
     static const double self_exp = [] {
       const char* e = std::getenv("PARATREET_LB_SELF_EXP");
       return e ? std::atof(e) : 1.2;
     }();
-    double self = 0, pair = 0, np = 0;
-    int pieces = 0;
+    std::vector<const TreePieceRef*> all;
+    std::vector<int> pe_of;
+    double self_proxy = 0, pair_proxy = 0, np = 0;
     for (auto& kv : pe_treepieces)
       for (auto& s : kv.second) {
         if (s.n <= 0 || s.root == nullptr) continue;
-        double n = (double)s.n;
-        double v = (double)s.root->data.box.volume();
-        self += std::pow(n, self_exp);
-        if (v > 0) pair += n * n / std::pow(v, 4.0 / 3.0);
+        all.push_back(&s);
+        pe_of.push_back(kv.first);
+        double n = (double)s.n, v = (double)s.root->data.box.volume();
+        self_proxy += std::pow(n, self_exp);
+        if (v > 0) pair_proxy += n * n / std::pow(v, 4.0 / 3.0);
         np += n;
-        pieces++;
       }
-    CkPrintf("FOF3STAT load_model: node %d pieces %d n %.0f self %.6g "
-             "pair %.6g pa_sum_s %.3f pa_max_s %.3f pb_sum_s %.3f "
-             "pb_max_s %.3f\n",
-             CkMyNode(), pieces, np, self, pair, a_time_sum, a_time_max,
+    double m2_self = 0, m2_intra = 0, m2_cross = 0;
+    for (size_t i = 0; i < all.size(); i++) {
+      m2_self += pieceM2(*all[i], *all[i], b2);
+      for (size_t j = i + 1; j < all.size(); j++) {
+        double m = pieceM2(*all[i], *all[j], b2);
+        if (m <= 0) continue;
+        if (pe_of[i] == pe_of[j]) m2_intra += m; else m2_cross += m;
+      }
+    }
+    CkPrintf("FOF3STAT load_model: node %d pieces %zu n %.0f "
+             "m2_self %.6g m2_intra %.6g m2_cross %.6g "
+             "self %.6g pair %.6g "
+             "pa_sum_s %.3f pa_max_s %.3f pb_sum_s %.3f pb_max_s %.3f\n",
+             CkMyNode(), all.size(), np, m2_self, m2_intra, m2_cross,
+             self_proxy, pair_proxy, a_time_sum, a_time_max,
              b_time_sum, b_time_max);
   }
 
@@ -3503,7 +3554,7 @@ public:
     // vs ACTUAL, per process, in one line. This is the gate on whether a
     // (n, volume) model is good enough to migrate pieces by, and it costs
     // one print per process — no algorithm change, so it can ride any run.
-    if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printLoadModel();
+    if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printLoadModel(b2_);
     // "edges sent" counts streamed batches plus what remains buffered (the
     // two are disjoint: flushUF2Batch clears the buffer as it submits).
     long sums[9] = {phase3_emitted,
