@@ -548,3 +548,53 @@ construction of the decomposition). **Any model that reduces to particle
 count cannot work here.** That is the structural reason the n^1.2 self
 proxy failed, and it is worth remembering before proposing any future
 "balance the counts" scheme.
+
+## IMPLEMENTATION ATTEMPT 1 (2026-08-15): forced shedding does NOT work by
+## direct migration, and the reason is specific
+
+Attempted the forced arm (`FOF_SHED_NODE` / `FOF_SHED_COUNT`): broadcast a
+decision to the TreePieces, have the chosen ones migrate in the pre-build
+window, quiesce, then build. Three variants, all reverted; the branch is
+back to a clean, working state (baseline re-verified exact at 1M).
+
+**What crashed, and where.** Calling `ckMigrate` from inside the decision
+broadcast segfaults on the SENDING process, with the stack in
+`CkArrayBroadcaster::attemptDelivery` — migrating an element while the same
+broadcast is still being delivered to the array corrupts the broadcaster's
+bookkeeping. Reproduced with **k=1**, so it is not a concurrency effect
+between simultaneous migrations.
+
+Two attempted fixes, neither sufficient:
+1. Bounce the migration through a point-to-point message to self
+   (`thisProxy[thisIndex].migrateTo(dest)`). Still crashes: the
+   point-to-point message can be delivered while the broadcast is STILL in
+   flight to other elements.
+2. Decide in the broadcast, contribute to a reduction (whose completion
+   proves the broadcast reached everyone), and migrate point-to-point from
+   the reduction target. The reduction target never fired; not diagnosed
+   before reverting.
+
+**What this does NOT cast doubt on.** Migration in this window is proven to
+work: the `PARATREET_PREBUILD_LB` path migrated pieces wholesale at 1M
+(167/169 -> 214/122 per process) and stayed exact, and Anvil job 19932506
+did it at 2B across 128 processes with all 7 arms exact. The difference is
+purely the mechanism — AtSync hands the array to the LB framework, which
+quiesces it, migrates, and resumes; app-directed `ckMigrate` has no such
+coordination.
+
+**Where to pick this up.** In order of likely success:
+1. Diagnose why the reduction target did not fire — the decide/reduce/
+   migrate shape is the right one and was closest to working. Suspect the
+   `CkCallback(CkIndex_Driver<Data>::shedPlan(nullptr), thisProxy)`
+   plumbing rather than the concept.
+2. Failing that, ride the LB framework, which is proven here: call
+   `AtSync` and perform the placement in the framework's migration phase
+   rather than issuing `ckMigrate` from application code.
+3. Only then consider the location-map patch
+   (`CkLocCache::updateLocation`, verified available) — it is a
+   PERFORMANCE refinement and irrelevant until migration works at all.
+
+The measurement this was meant to produce — does the -33% prize
+materialise, and what does the phase-1 -> phase-3 locality conversion cost
+— remains unmeasured, and is still the thing that decides whether
+model-driven shedding is worth building.
