@@ -1,0 +1,20 @@
+mainmodule mig {
+  readonly CProxy_Main mainProxy;
+  readonly int nElements;
+  readonly int gMode;
+  mainchare Main {
+    entry Main(CkArgMsg*);
+    entry void phaseDone();
+    entry void allAnswered(CkReductionMsg*);
+    entry void planReady(CkReductionMsg*);
+  };
+  array [1D] Mover {
+    entry Mover(void);
+    entry void p2pMigrate(int dest);     // mode 0: migrate in a point-to-point EP
+    entry void bcastMigrate();           // mode 1: migrate inside a BROADCAST
+    entry void bcastDefer();             // mode 2: broadcast decides, self-send migrates
+    entry void bcastPlan();              // mode 3: broadcast decides, reduction, then p2p
+    entry void doMigrate(int dest);
+    entry void checkAlive();             // broadcast: every element must answer
+  };
+};
