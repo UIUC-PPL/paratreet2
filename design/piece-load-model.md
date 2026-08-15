@@ -386,3 +386,51 @@ volume — small, and it does not scale with the walk's traffic. It also
 means job 19932506's 5-7x regression was NOT forwarding overhead: it was
 locality destruction (phase-1 pairs becoming phase-3 walks), the 2.4-2.9 s
 LB pass itself, and the phaseA imbalance from 0-2012 pieces/process.
+
+### The map-consistency mechanism (Kale, 2026-08-14) — option 2 is
+### directly supported, no charm change needed
+
+Kale: Charm++ supports a mode for applications that need a map with no
+lastKnown misses — centralized LB broadcasts the whole chare->PE map at
+the end, and PEs then refrain from migrating outside it. Two ways to fit
+targeted shedding into that: (1) write a centralized LB that performs
+only our few migrations but broadcasts the new map, or (2) do our own
+small round of migrations and then PATCH every local location map.
+
+Checked against this charm build (~/software/clusterFinding/charm) —
+option 2 has first-class support:
+
+- `CkLocCache` is a GROUP with an **entry method**, declared
+  `[expedited]` in `src/ck-core/CkLocation.ci`:
+      entry [expedited] void updateLocation(const CkLocEntry& newEntry);
+- `CkLocEntry` (cklocation.h:75) is `{CmiUInt8 id, int pe, int epoch}`,
+  16 bytes and `PUPbytes` — so a patch for one element is 16 bytes and a
+  whole shedding round is a few hundred.
+- The receiver already does the right thing (cklocation.C:2371):
+      if (newEntry.epoch > oldEntry.epoch) { oldEntry = newEntry;
+                                             notifyListeners(...); }
+  The EPOCH guard is what makes patching safe against races with the
+  ordinary home-based updates: a stale patch cannot overwrite a newer
+  entry, and listeners are notified on a real change.
+- Reaching it from the app: the array's location manager holds the group
+  id — `CkLocMgr::getLocationCache()` (cklocation.h:497), with the cache
+  created alongside the loc mgr in `ckarray.C:657`.
+
+So the plan is: perform the few chosen migrations, then broadcast one
+`updateLocation` per moved piece to the `CkLocCache` group with an epoch
+above the element's current one. Every PE's map is then correct without
+a single home lookup, which is exactly the no-miss mode, at a cost of
+~16 bytes x pieces-moved x PEs.
+
+Option 1 (a bespoke centralized LB) is heavier for this purpose: LB
+strategies live in charm's `src/ck-ldb`, so it means modifying and
+rebuilding charm — and this campaign's charm is PINNED (3d1fdd89f) as
+the provenance for every result. Worth revisiting only if we later want
+shedding to compose with a host application's real LB, where being a
+proper strategy is the honest integration point.
+
+CAVEAT to verify when implementing: the epoch to use. It must exceed the
+element's current epoch, and the migration itself may already bump it
+(`recordEmigration` at cklocation.C:2382 updates the local entry). Read
+the element's entry after migrating and patch with epoch+1, rather than
+inventing a number.
