@@ -156,3 +156,33 @@ Both are about WHEN the donor packs, not how fast.
 Neither blocks the cross-node work: cross-node adds helpers, priority
 changes when they are fed. They compose, and the counters
 (`s3_time`, grant counts) already distinguish them.
+
+## MEASURED (2026-08-15): orders are NOT queueing; shipments are TRANSIT-bound
+
+Kale: the send times are in the logs, so the answer is already there. It
+is — the projections traces are on the laptop
+(`traces/frontier/proj2b_parbuild5`), and CREATION (record type 1) pairs
+with BEGIN_PROCESSING (type 2) through `(event id, source PE)`. Measured
+over the whole run, wait = begin-execute minus create:
+
+| entry | msg size | n | p50 | p90 | p99 | max | >10 ms |
+|---|---|---|---|---|---|---|---|
+| `s3ShipOrder` | 96 B | 241 | **0.016 ms** | 5.9 ms | 70.8 ms | 185.8 ms | 9.5% |
+| `s3Shipment` | ~30 MB | 58 | 28.1 ms | 82.9 ms | 489 ms | 489 ms | 86% |
+
+**Kale's reading of the timeline was right: orders do not wait.** The
+median order is picked up 16 MICROSECONDS after it is created — there is
+no queue to jump. `[expedited]` is therefore NOT a lever, and the
+"role separation" idea (PEs that pack should skip the node queue) loses
+its motivation with it, since both aimed at the same latency. What
+remains is a tail: 9.5% of orders wait over 10 ms and the worst waits
+186 ms. Worth revisiting only if the tail is shown to land on the
+straggler; not worth building for now.
+
+**And the same measurement supports the cross-node case.** s3ShipOrder is
+96 bytes, so its wait is pure queueing. s3Shipment is ~30 MB, and its
+28 ms median works out to ~1.1 GB/s — consistent with the ~1.9 GB/s
+in-flight rate measured earlier. So a shipment's delay is TRANSIT, not
+scheduling: exactly Kale's framing that block-mates are limited by
+transfer delay rather than by being busy. More helpers drawing in
+parallel is then a bandwidth argument, which is what this design is for.
