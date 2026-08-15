@@ -186,3 +186,18 @@ in-flight rate measured earlier. So a shipment's delay is TRANSIT, not
 scheduling: exactly Kale's framing that block-mates are limited by
 transfer delay rather than by being busy. More helpers drawing in
 parallel is then a bandwidth argument, which is what this design is for.
+
+## Same-block donors: a restriction, not a requirement (Kale, 2026-08-15)
+
+The implementation skips a donor in the helper's OWN block
+(`kv.first / P == fromNode / P`). Kale's note: that is not necessary —
+the case in front of us has one truly large outlier, and a same-block
+helper could legitimately be matched globally too.
+
+The reason it is there: the block coordinator ALREADY matches within the
+block, so allowing node 0 to do it as well would duplicate orders for the
+same donor. That is safe (per-unit CAS means the second order finds
+nothing and declines) but wasteful, and it would blur the A/B — a
+cross-node arm should measure cross-node help, not extra local help.
+Accepted for this run; revisit if the global coordinator ever replaces
+the block one rather than supplementing it.
