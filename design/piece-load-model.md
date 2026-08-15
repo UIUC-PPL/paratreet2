@@ -352,3 +352,37 @@ piece's particles + tree to a helper process, walk there, return labels),
 which reuses the S3 transport rather than the LB machinery. The
 PARATREET_PREBUILD_LB migration path stays useful as the simpler variant
 to measure first, since it needs no new protocol.
+
+### Location management under migration — corrected (Kale, 2026-08-14)
+
+I had flagged migration + htram as a possible CORRECTNESS risk. Kale's
+correction, and it is right: Charm++ routes to a migrated array element
+through its HOME (a distributed hash of the index), which tracks the
+current location and forwards; the sender is then told the new location
+and installs it. So a PE sending many messages to one chare pays the
+extra hop only on the first few, until the correction arrives. The
+impact of migration on message delivery is PERFORMANCE, not correctness.
+
+Checked the one place that could still have held a private map —
+`UnionFindLib::boss_send` picking an htram destination PE
+(unionfind/unionFindLib.C:130):
+- it checks `ckLocal()` FIRST, with a comment that says explicitly this
+  "avoids using a stale lastKnown cache entry if the element has
+  migrated to this PE";
+- otherwise it asks `arr->lastKnown(idx)` — Charm++'s own location
+  manager — rather than computing a PE from a static map.
+So the aggregation path defers to the runtime's tracker and is already
+migration-aware. It is also a DIFFERENT chare array from TreePiece, so
+shedding TreePieces does not relocate union-find elements at all.
+
+Latent issue noted in passing, not triggered by this work: when
+`lastKnown` returns -1 that function calls `CkAbort("Location not
+found")`, and the recovery it clearly intended (`homePe` +
+`requestLocation`) sits AFTER the abort as dead code.
+
+Consequence for the design: the routing penalty of shedding a few pieces
+is bounded by the number of (sender, moved-piece) PAIRS, not by message
+volume — small, and it does not scale with the walk's traffic. It also
+means job 19932506's 5-7x regression was NOT forwarding overhead: it was
+locality destruction (phase-1 pairs becoming phase-3 walks), the 2.4-2.9 s
+LB pass itself, and the phaseA imbalance from 0-2012 pieces/process.
