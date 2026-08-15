@@ -127,12 +127,25 @@ makes it the straggler.
 
 That reframes the lever. It is not "add parallelism to the pack" — the
 pack is parallel. It is:
-1. **Priority.** An order should be serviced promptly rather than after
-   the servicing PE finishes its current slice of local walk, because the
-   recipient is idle until the grant lands. Charm++ message priorities
-   are the mechanism (`CkEntryOptions::setPriority` on the s3ShipOrder
-   send); this is a small, contained change and it directly attacks the
-   recipient-visible latency Kale flags as mattering most in the tail.
+1. **Order-servicing latency — MEASURE IT FIRST (Kale).** The timeline
+   does not actually show s3ShipOrder sitting in a queue; that was my
+   assumption, not an observation. And it is already measurable from
+   traces we have captured, with no new run: an order's queue wait is
+   `BEGIN_PROCESSING time on the receiver - CREATION time on the sender`,
+   and `projlog_tool.py` already parses both record types (CREATION is
+   what located the send at 99.2% through its block in relay1 section 22).
+   Do that before building anything.
+   IF it turns out to be significant, the mechanism is the **`[expedited]`
+   entry attribute**, not `CkEntryOptions::setPriority` (Kale). Expedited
+   skips the priority queue while still running in the normal scheduler,
+   which is exactly the semantics wanted. There is precedent in this very
+   runtime: `CkLocCache::updateLocation` is declared `[expedited]`.
+   NOT `[immediate]`: that runs outside the scheduler (comm thread, or
+   during polling where there is none — Kale is right that reconverse
+   changes WHERE it runs), and s3ShipOrder performs the ~30 MB pack. Heavy
+   work must not run in a polling context regardless of which thread is
+   doing the polling, so the objection to immediate survives the
+   comm-thread question.
 2. **Role separation.** A PE that has just packed should not immediately
    re-enter the local drain if another order is pending — "PEs doing
    orange work should skip looking at the node queue" (Kale). Harder,
