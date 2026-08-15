@@ -48,8 +48,29 @@ public:
   void initialize(const CkCallback& cb) {
     auto node_size = this->isNodeGroup() ? CmiNodeSize(CkMyNode()) : 1;
     auto& config = paratreet::getConfiguration();
+    // Node-pool chunk size, in nodes. This sets how far the LOCAL piece
+    // tree is contiguous: buildTree's recursive descent is one entry
+    // method with no yields, so a piece's nodes are bump-allocated in
+    // preorder with nothing interleaved — but only WITHIN a chunk. Each
+    // chunk is its own `new char[]`, so a piece bigger than the chunk is
+    // scattered across separately-malloc'd blocks (at 12 particles/leaf a
+    // 29k-particle piece is ~5k nodes = ~40 chunks at the historical 128).
+    // `config.pool_elem_size` is never assigned by any app or registered
+    // as a config field, so the effective value has always been the 128
+    // floor. PARATREET_POOL_ELEM_SIZE overrides it; large enough to hold a
+    // whole piece gives fully contiguous preorder trees, which is the
+    // cheap version of design/treepiece-contiguous-build.md.
+    static const int pool_elem = [&] {
+      const char* e = std::getenv("PARATREET_POOL_ELEM_SIZE");
+      int v = e ? std::atoi(e) : 0;
+      if (v <= 0) v = config.pool_elem_size;
+      return std::max(v, 128);
+    }();
+    if (CkMyPe() == 0)
+      CkPrintf("PARATREET pool_elem_size: %d nodes (%zu KB/chunk)\n",
+               pool_elem, (size_t)pool_elem * 216 / 1024);
     core.init(node_size, this->isNodeGroup(), config.branchFactor(),
-              std::max(config.pool_elem_size, 128));
+              pool_elem);
     this->contribute(cb);
   }
 
