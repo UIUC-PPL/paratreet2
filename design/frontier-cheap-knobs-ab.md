@@ -105,6 +105,19 @@ from `sacct` on a recent job, not a guess.
 per-arm tables, the objdump counts, and anything anomalous. Relay files
 have been `relay<N>.txt`; continue the numbering.
 
+
+## Anvil ran this first and it was destroyed by the machine, not the code
+
+Anvil job 19935188 (this exact A/B) launched at 23:30 local and ALL SIX
+arms were OOM-killed with the IBV `poll_comp_impl` assert cascade —
+including the control, which is byte-identical in flags to jobs that
+have run clean. This is Anvil's time-of-day fabric degradation
+(charm-notes machines/anvil.md, three-for-three now), not a compiler-flag
+effect. Resubmitted with `--begin=09:30` as job 19936288.
+Bearing on YOUR run: nothing about the flags is implicated, and there is
+no Anvil result to compare against yet. If Frontier shows a large
+compiler effect, it stands on its own; the Anvil point will follow.
+
 ## Do NOT
 
 - Do not run the piece-migration arms (`PARATREET_PREBUILD_LB`). That
