@@ -66,7 +66,18 @@ public:
       if (v <= 0) v = config.pool_elem_size;
       return std::max(v, 128);
     }();
-    if (CkMyPe() == 0)
+    // CacheManager is declared a NODEGROUP (paratreet.ci) unless GROUP_CACHE
+    // is defined, and a nodegroup branch entry method may be delivered on ANY
+    // PE of the process — so `CkMyPe() == 0` printed on nobody at 2B
+    // (Frontier relay4, 2026-08-15: the line was absent from every arm and
+    // read as "the knob did not take", when it had). Rank-relative is the
+    // correct guard for a nodegroup.
+    // (relay4 suggested CkMyNode()==0 && CkMyRank()==0; that has the SAME
+    // flaw — the branch may land on any rank, so it printed at ppn 2 and not
+    // at ppn 4 here. A nodegroup has exactly ONE branch per process, so
+    // CkMyNode()==0 alone is both necessary and sufficient; the rank test is
+    // only needed in the GROUP_CACHE build, where there is one branch per PE.)
+    if (CkMyNode() == 0 && (this->isNodeGroup() || CkMyRank() == 0))
       CkPrintf("PARATREET pool_elem_size: %d nodes (%zu KB/chunk)\n",
                pool_elem, (size_t)pool_elem * 216 / 1024);
     core.init(node_size, this->isNodeGroup(), config.branchFactor(),
