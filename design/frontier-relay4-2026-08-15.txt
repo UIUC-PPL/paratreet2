@@ -1,0 +1,177 @@
+relay4 -- Frontier 2026-08-15, cheap-knobs A/B
+INCONSISTENCIES between what the prompt/spec expected and what was found.
+Full data: ~/software/reports/cheap-knobs-ab.md
+Commit c302aaf. Jobs 5273921, 5273936, 5273967. All 2B/16 nodes.
+
+====================================================================
+1. THE SPEC ASKED FOR AN A/B WHOSE TREATMENT ARM CANNOT PASS ITS OWN GATE
+====================================================================
+   Expected: every arm returns components 424897832; a mismatch is a
+   stop-and-report event.
+   Found:    -march=znver3 returns 424897833 -- one component OVER gold --
+             reproducibly, 6 arms out of 6 across two jobs. -Ofast likewise,
+             0/6 exact, same +1.
+   Cause:    gcc defaults to -ffp-contract=fast. SSE2 has no FMA instruction,
+             so the base binary physically CANNOT fuse a*b+c; znver3 makes FMA
+             available and gcc starts using it, which changes the rounding of
+             the linking-length distance test. A pair on the boundary falls the
+             other way.
+   Fix:      -march=znver3 -ffp-contract=off is EXACT 6/6 and keeps 5479 of the
+             5540 vector references (all 69 FMAs go, nothing else does).
+   Note:     this is not a code bug. Both counts are defensible float answers.
+             But the gate as written is unsatisfiable by the experiment as
+             specified, so the spec needed the extra flag to be runnable at all.
+   Cost:     job 5273921 aborted 10 of its 12 arms on this, including the whole
+             pool sweep, which uses the BASE binary and could not have been
+             affected. Hence three jobs instead of the "one 2B/16-node job" the
+             prompt planned.
+
+====================================================================
+2. THE "PROOF THE KNOB TOOK" LINE DOES NOT EXIST
+====================================================================
+   Expected: 'The binary prints the effective value once at startup:
+             PARATREET pool_elem_size: N nodes (K KB/chunk) -- check it in
+             every arm's output, it is the proof the knob took.'
+   Found:    it prints on NO process, in any arm. The string is in the binary.
+             The guard is `if (CkMyPe() == 0)` inside CacheManager::initialize,
+             and src/paratreet.ci declares `nodegroup CacheManager` (GROUP_CACHE
+             is not defined in any makefile). A nodegroup branch entry method
+             can be delivered to any PE of the process, and on process 0 it did
+             not land on PE 0. Nothing appears between "* Initializing cache
+             managers." and "* Initialization".
+   Impact:   anyone following the spec literally would conclude the knob did
+             not take. It did.
+   Substitute used: `FOF3STAT cache: pool_MB` (= chunks x pool_elem_size x
+             sizeof(FullNode), i.e. allocated capacity). It moves monotonically
+             with the knob and the two default arms agree to 0.003%. It is a
+             better instrument than the intended print.
+   Fix:      guard on CkMyNode()==0 && CkMyRank()==0, or print from Driver.
+
+====================================================================
+3. THE SPEC'S RSS READOUT IS PRINTED TOO EARLY TO MEASURE THE KNOB
+====================================================================
+   Expected: 'REPORT RSS (the PARATREET vmhwm_mb line) per arm.'
+   Found:    that line is emitted from Driver.h AFTER DECOMPOSITION -- before
+             buildTree allocates a single pool chunk. It cannot move with
+             pool_elem_size, and it did not (8508-8553 MB across every arm).
+   Done instead: wrapped /usr/bin/time -f WRAPRSS=%M around every rank, gated
+             first by a 2-node 10k run (passed, 3549). Per-process peak RSS is
+             flat too: 10.1-10.4 GB max, 7.9-8.0 GB mean, no ordering by chunk
+             size.
+
+====================================================================
+4. THE CHUNK-WASTE MODEL IN THE SPEC IS OVER-STATED
+====================================================================
+   Expected: 'Chunks are allocated whole, so large values waste up to one chunk
+             per lane per piece-tail.'
+   Found:    FullNodePool (src/TreeCache.h) is a bump allocator over a LIST of
+             chunks, and the next piece continues in the current chunk. So the
+             waste is at most one partial chunk PER POOL, not per piece.
+   Measured: pool bytes +0.4% at 4096, +1.6% at 16384, +6.1% at 65536
+             (1890.5 -> 2004.9 MB/process). Not the multiple the per-piece
+             reading implies.
+   Bearing:  the same structure explains why the sweep is a null (item 7): a
+             piece's nodes were ALREADY bump-allocated in preorder within its
+             chunks; the knob only removes a boundary every 128 nodes.
+
+====================================================================
+5. ANVIL'S VECTOR-INSTRUCTION COUNT DOES NOT TRANSFER
+====================================================================
+   Expected: 'zero AVX/VEX in the control, 926 ymm refs with -march=znver3'.
+   Found:    control ZERO -- confirmed exactly, the Frontier binary is SSE2.
+             But -march=znver3 gives 5540 ymm/vex refs here, 6x Anvil's 926.
+             (-Ofast -march=znver3: 5709. -ffp-contract=off: 5479, vfmadd 0.)
+   Reading:  the qualitative claim holds and is the important one; the
+             magnitude is machine/compiler-specific (gcc 13.3.1 here). Do not
+             carry the 926 forward as a Frontier number.
+
+====================================================================
+6. charmc MIS-PARSES `-march=X -Ofast` IN THAT ORDER
+====================================================================
+   Not anticipated anywhere in the spec.
+     charmc ... -march=znver3 -Ofast -c x.C -o x.o
+       -> cc1plus: error: bad value 'znver3 -Ofast' for '-march=' switch
+   The two tokens reach cc1plus joined into the -march= value. Reversing them
+   (-Ofast -march=znver3) works and is how the fast binary was built. The error
+   names -march= and sends you hunting for an unsupported architecture, which
+   is not the problem. Worth a line in the build notes.
+   (znver3 itself IS accepted by the Cray wrapper -- gcc 13.3.1 -- so the
+   -march=native fallback the prompt offered was never needed.)
+
+====================================================================
+7. THE RESULT ITSELF: SIMD IS HALF THE WIN THE PROMPT HOPED FOR
+====================================================================
+   Expected: 'the hot phaseA/phaseB inner loops are float distance tests, so
+             this is potentially large, or potentially zero.'
+   Found (6 reps base/march3/fast, jobs 5273936+5273967, paired wins in
+   brackets):
+             -march=znver3 -ffp-contract=off  (EXACT 6/6)
+                phaseA    -3.5%  [6/6]   <- real, consistent
+                phaseB    +0.1%  [3/6]   <- nothing
+                phase1    -2.0%  [3/6]   <- inside base's own spread
+                Iter0     -0.9%  [3/6]   <- nothing
+             -Ofast -march=znver3  (NOT EXACT 0/6)
+                phaseA   -12.8%  [6/6]
+                phaseB    -3.0%  [5/6]
+                phase1    -8.1%  [6/6]
+                Iter0     -4.0%  [6/6]
+   So: the exact form of SIMD gives a genuine but SMALL phaseA win that does
+   not survive to Iteration 0. The large win is real and repeatable but it
+   belongs to -ffast-math, not to vectorisation, and it costs bit-exactness.
+   phaseB -- the straggler, the thing the campaign is chasing -- does not move
+   under either.
+   OPEN, and cheap: most of -Ofast's extra may come from -fno-math-errno
+   (semantically safe -- it only stops gcc preserving errno on sqrt) rather
+   than from reassociation. One more 12-arm job would separate them and could
+   plausibly recover much of the 4% Iter0 EXACTLY. Not run -- say the word.
+
+====================================================================
+8. THE STRAGGLER RATIO IN THE PROMPT DOES NOT REPRODUCE
+====================================================================
+   Expected: 'proc 55 at 14.9x the median process'.
+   Found:    node 55 IS the straggler -- confirmed, and independently, which is
+             good corroboration. But the ratio is 9.6x the median
+             (pb_sum_s 15.144 vs median 1.579). It is 7.5x the mean and 125x
+             the min. None of those is 14.9x, so the 14.9 came from a different
+             run or a different denominator.
+
+====================================================================
+9. WHAT MATCHED, INCLUDING ONE THAT MATCHED ALMOST TOO WELL
+====================================================================
+   - sqrt(pair) vs actual phaseB: Anvil +0.872, Frontier +0.871. 128 processes.
+     Two machines, three digits. This is now a real result, not an artefact.
+   - self (sum n^1.2) vs phaseA: Anvil -0.187, Frontier -0.263. Same sign, same
+     conclusion -- the self term is anti-correlated and unusable as shipped.
+   - NEW, and only visible on Frontier: sqrt(pair) ranks the actual worst
+     process #1 OF 128. Below that it degrades badly (top-5 overlap 2/5,
+     top-10 5/10). So it is a good DETECTOR of the extreme and a poor RANKER.
+     A v2 that sheds from the top one or two processes is supported by this
+     data; one that rebalances a top-N is not.
+   - Arm walltimes ~16-30 s, as the spec's sizing assumed.
+
+====================================================================
+10. SMALL THINGS
+====================================================================
+   - The spec says 'build-stack.sh takes extra charmc options'. There is no
+     build-stack.sh on Frontier -- that is an Anvil script. Used a new
+     ~/software/scripts/build-cheapknobs-ab.sh instead.
+   - The spec's step B says to run the pool sweep 'on whichever binary A shows
+     fastest'. Taken literally that puts the sweep on a NON-EXACT binary. Ran
+     it on base.
+   - CacheManager::cacheStats has no caller anywhere in src/, fof/ or
+     examples/ -- dead code. The FOF3STAT cache: line that does print comes
+     from examples/fof3/FoF3.C:761 by another path.
+   - The local paratreet2 tree was NOT clean before the pull: it carried an
+     uncommitted FLATSPLIT-timer + flatten-bulk-insert edit. Upstream had taken
+     the bulk insert and dropped the timers, so the local copy had to be
+     discarded to land on c302aaf. Preserved first as
+     patches/0007-s3-flatsplit-and-bulk-insert-SUPERSEDED.patch and
+     patches/wip/flatsplit.FoFPhase1.h. Nothing lost.
+   - One arm logged 127 WRAPRSS lines instead of 128 (a rank's line lost in
+     interleaved stdout). Cosmetic.
+   - '+traceoff' draws a "not parsed by the RTS" warning on every run. Harmless
+     on an untraced binary, but it is noise in the campaign's standard idiom.
+   - PARATREET_PREBUILD_LB was NOT run, per instruction.
+
+Nothing was pushed. Working tree left clean at c302aaf (only the utility
+submodule differs), rebuilt back to the base/no-march binary.

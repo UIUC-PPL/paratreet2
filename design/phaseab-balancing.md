@@ -1405,3 +1405,94 @@ frontier-s3-parallel-rebuild-results-2026-08-14.md. 21/21 2B exact.
    blocked) and whatever a fresh timeline of the hot process now
    shows. The next lever should be chosen from that timeline, not
    from the cost ledger.
+
+## 35. MEASURED (Frontier relay4, 2026-08-15): SIMD is small and phaseB
+## does not move; the pool knob is a clean null; and the load model
+## reproduces across two machines to three digits
+
+Full record: design/frontier-relay4-2026-08-15.txt (an inconsistency
+report against my spec — it found three of my own errors) and
+frontier-cheap-knobs-results-2026-08-15.md. Jobs 5273921/5273936/5273967,
+commit c302aaf.
+
+### 1. -march CHANGES THE ANSWER, and the mechanism is worth knowing
+`-march=znver3` returns 424897833 — ONE COMPONENT OVER GOLD —
+reproducibly, 6/6 arms across two jobs; `-Ofast` likewise 0/6 exact.
+Cause: gcc defaults to `-ffp-contract=fast`. SSE2 has NO FMA, so the
+base binary physically cannot fuse a*b+c; znver3 makes FMA available,
+gcc starts fusing, and the rounding of the linking-length distance test
+changes — a pair sitting exactly on b falls the other way. Both counts
+are defensible float answers; the FoF predicate is simply
+knife-edge-sensitive at 2e9 particles.
+`-march=znver3 -ffp-contract=off` is EXACT 6/6 and keeps 5479 of 5540
+vector references (only the 69 FMAs go). ANY future -march work must
+carry -ffp-contract=off, or the exactness gate is unsatisfiable.
+
+### 2. THE RESULT: vectorisation is real but small, and misses the target
+6 reps, paired-win counts in brackets:
+
+| arm | phaseA | phaseB | phase1 | Iter0 | exact |
+|---|---|---|---|---|---|
+| -march=znver3 -ffp-contract=off | **-3.5%** [6/6] | +0.1% [3/6] | -2.0% [3/6] | -0.9% [3/6] | 6/6 |
+| -Ofast -march=znver3 | -12.8% [6/6] | -3.0% [5/6] | -8.1% [6/6] | -4.0% [6/6] | **0/6** |
+
+So the EXACT form of SIMD gives a genuine, consistent phaseA win that
+does not survive to Iteration 0, and PHASEB — the straggler, the whole
+point — DOES NOT MOVE under either. The large win belongs to
+-ffast-math, not to vectorisation, and it costs bit-exactness.
+OPEN AND CHEAP: much of -Ofast's extra may be `-fno-math-errno`
+(semantically safe — it only stops gcc preserving errno on sqrt) rather
+than reassociation. One 12-arm job separates them and could plausibly
+recover much of the 4% Iter0 EXACTLY. Worth running.
+Bearing on the SIMD idea (design/simd-and-piece-mapping.md part 1): the
+autovectoriser reaching the loops buys ~3.5% of phaseA. Hand-SIMD with
+packed positions could do better, but the measured ceiling on the phase
+we care about is now ~0, so that work is NOT justified on this evidence.
+
+### 3. THE POOL KNOB IS A CLEAN NULL — option 3 closes
+PARATREET_POOL_ELEM_SIZE default/4096/16384/65536: phase1 spans
+3.245-3.376 s while the two IDENTICAL default arms differ by 1.8%, and
+the drift control is the largest phaseB outlier of the five. No ordering
+by chunk size in phaseA, phaseB, Iter0 or RSS. Cost is real though small
+(+6.1% pool bytes at 65536).
+Since full contiguity within a piece produced nothing, the per-piece
+ARENA (design/treepiece-contiguous-build.md) cannot produce anything
+either — it differs from the knob only in removing the same boundaries
+more precisely. THE CONTIGUOUS-LAYOUT IDEA IS CLOSED on measurement, and
+closed cheaply, which was the point of running the knob first.
+
+### 4. THE LOAD MODEL REPRODUCES ACROSS MACHINES
+| relation | Anvil (128 proc) | Frontier (128 proc) |
+|---|---|---|
+| sqrt(pair) vs actual phaseB | +0.872 | **+0.871** |
+| self (sum n^1.2) vs phaseA | -0.187 | -0.263 |
+Two machines, three digits on the first row. That is a real result, not
+an artefact — and the self term is confirmed unusable as shipped on both.
+NEW, only visible on Frontier: sqrt(pair) ranks the actual worst process
+**#1 of 128**, but degrades below that (top-5 overlap 2/5, top-10 5/10).
+So it is an excellent DETECTOR of the extreme and a poor RANKER —
+which is exactly the discrimination targeted shedding needs and
+global rebalancing does not. Kale's v2 (shed from the worst one or two
+processes) is SUPPORTED by this data; a top-N rebalance is not.
+Straggler ratio here: node 55 again (independent corroboration), at 9.6x
+the median (15.144 vs 1.579 pb_sum_s), not the 14.9x I quoted from the
+traced v3 run in section 31 — different generation and instrumentation,
+so both stand for their own run.
+
+### 5. THREE ERRORS IN MY SPEC, all found by the Frontier session
+- The `pool_elem_size` print never fired: CacheManager is a NODEGROUP
+  and I guarded on `CkMyPe()==0`. Fixed at 0b60ea9 (and relay4's
+  suggested fix had the same flaw — see the commit).
+- I told them to read `PARATREET vmhwm_mb` for the knob's memory cost;
+  that line is printed after DECOMPOSITION, before buildTree allocates a
+  single chunk, so it cannot move with the knob. They wrapped
+  /usr/bin/time per rank instead — the right instrument.
+- My chunk-waste model ("one chunk per lane per piece-tail") was
+  overstated: FullNodePool bump-allocates over a LIST and the next piece
+  continues in the current chunk, so waste is one partial chunk PER
+  POOL. Measured +0.4/+1.6/+6.1%.
+Also: `charmc` mis-parses `-march=X -Ofast` in that order (the tokens
+reach cc1plus joined into the -march= value, and the error names -march=,
+sending you hunting for a bad architecture); reverse to
+`-Ofast -march=X`. And there is no build-stack.sh on Frontier — that is
+an Anvil script.
