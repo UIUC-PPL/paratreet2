@@ -76,9 +76,13 @@ Use `~/software/scripts/build-*.sh`.
   and enabling FMA changes the rounding of the linking-length test —
   424897833, one component over, reproducibly. Any `-march` work must
   carry **`-ffp-contract=off`** (which keeps 5479 of 5540 vector refs).
-- **charmc mis-parses `-march=X -Ofast`** in that order (tokens reach
-  cc1plus joined into the -march= value; the error blames -march=).
-  Write `-Ofast -march=X`.
+- **Build flag lists under bash, not the login zsh.** zsh does not
+  word-split an unquoted `$var`, so a flag list expanded there reaches
+  charmc as ONE argument and cc1plus reports e.g. `bad value
+  'znver3 -Ofast' for '-march='` — the error points at the compiler when
+  the fault is the harness. (This is the corrected form of a claim that
+  briefly circulated as "charmc mis-parses -march=X -Ofast"; flag ORDER
+  is free, relay5 item 0a.)
 - **A nodegroup branch entry method runs on an arbitrary PE**, so
   `if (CkMyPe()==0) CkPrintf(...)` inside one prints on nobody.
   `CkMyNode()==0` is the correct once-per-job guard.

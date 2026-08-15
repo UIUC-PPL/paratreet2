@@ -230,3 +230,45 @@ closed as a lever, with one cheap loose end worth picking up:
 -Ofast's advantage may be mostly `-fno-math-errno` (semantically safe),
 which one 12-arm job would separate and which could plausibly recover
 much of the 4% Iteration 0 EXACTLY.
+
+## The -Ofast win explained, and a source fix I got WRONG (relay5, 2026-08-15)
+
+relay5 found the actual mechanism behind -Ofast's phaseA advantage, and
+it is not vectorisation. `periodicDistSq` (FoFPhase1.h:175) does, per
+axis per pair, `if (period.x > 0) dx -= period.x * std::round(dx/period.x)`.
+**std::round is a libm CALL** — 34 call sites, zero roundsd, in the
+shipped binary — and gcc escapes it ONLY under `-fassociative-math`,
+which collapses 34 calls to 1. None of -fno-math-errno (the flag I
+proposed), -freciprocal-math, -fno-signed-zeros, -fno-trapping-math or
+-ffinite-math-only changes that codegen alone.
+
+Measured: `-march=znver3 -ffp-contract=off -fno-signed-zeros
+-fno-trapping-math -fassociative-math` gives phaseA -8.1%, Iter0 -2.8%,
+and returned the EXACT component count on 4/4 then 29/29 arms across
+10k/80M/2B including the forced-shipment and loopback paths.
+The asymmetry relay5 states precisely, and it is the right way to hold
+this: one differing arm would have settled it AGAINST the flag; 29
+matching arms do not settle it in favour. `-ffp-contract=off` REMOVES a
+compiler permission and is exact by construction; `-fassociative-math`
+GRANTS one that gcc 13.3.1 happens not to use here.
+
+**A source-level fix I tried and REVERTED, with the reasoning, because
+the error is instructive.** The campaign runs are NON-PERIODIC (no -P),
+so those branches never execute — yet the call sites still block
+vectorisation. I replaced `std::round` with `std::nearbyint` (one
+instruction, vectorises, no libm) and argued it was exact BY
+CONSTRUCTION: round and nearbyint differ only at an exact half-integer
+quotient, where the two wrapped values are -p/2 and +p/2, and this
+function returns the SQUARE.
+**That proof is false, and a 20M-sample check caught it**: of 17
+constructed tie cases, 7 differed in the wrapped value and **5 differed
+in the SQUARE**. The flaw: `dx/p` landing exactly on k+0.5 does NOT mean
+`dx` is exactly `p*(k+0.5)` — the division rounds, so the two wrapped
+values are ∓p/2 + eps and their squares differ. Exactly the knife-edge
+class that produced 424897833 under FMA.
+Reverted rather than shipped. The correct source fix is to HOIST the
+periodicity test out of the hot leaf loops (a loop-invariant branch), so
+the non-periodic path contains no call on any path and the periodic path
+keeps `std::round` untouched — semantically inert on both. Not built:
+it targets phaseA, and relay5 confirms once more that **phaseB does not
+move under any flag tested** (-0.6% for assoc, losing 1 of 4 reps).

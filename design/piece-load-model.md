@@ -483,3 +483,68 @@ and relay4 showed the detector ranks #1 correctly but only 2/5 of the
 top five — so what is reliably actionable (level 1, maybe 2) matches
 what is reliably detectable. That alignment is the argument for the
 conservative design, not a limitation of it.
+
+## MEASURED v2 (Frontier relay5, 2026-08-15, 3 reps): the model works as a
+## DETECTOR, the trigger must be lower, and the ceiling is -33%
+
+Three repeats at 2B/16, commit abbd0d3, job 5274609. The actual-pairs
+model (m2_self / m2_intra / m2_cross) against measured per-process time:
+
+1. **It beats the mean-field proxy, but not on the comparison I posed.**
+   Raw m2_cross gives Pearson +0.718 against sqrt(pair)'s +0.866 — which
+   reads as WORSE and is not like-for-like, since sqrt(pair) is a tuned
+   compression of a raw term that itself only reaches +0.761. Like for
+   like: rank correlation (transform-free) m2_cross **+0.948** vs pair
+   +0.857; best transform each, m2_cross^0.25 +0.929 vs sqrt(pair)
+   +0.866. The +0.948 is the number to carry.
+2. **The phaseA sign is FIXED**: -0.260 -> +0.398 Pearson, +0.782
+   Spearman. Usable as an ordering, weak as a magnitude. Note m2_self
+   ALONE (+0.460) beats m2_self+m2_intra (+0.398) — adding the intra
+   term makes it slightly worse.
+3. **Ranking, which is what shedding actually needs**: true worst found
+   at #1 in 3/3 repeats (sqrt(pair) also managed this). The new model
+   wins on the rest of the tip — top-5 overlap 4/5 vs 2/5, Spearman over
+   the top 20 +0.59..+0.70 vs +0.42..+0.50, margin over #2 2.10x vs
+   1.74x. Input stability: piece->process assignment is identical across
+   all 3 repeats; 28 of 128 processes move >10% between repeats but ALL
+   of them rank 11th or lower, and node 55 moves 0.35%.
+4. **But it is a better DETECTOR, not a better MODEL.** Drop the single
+   worst process and refit over the other 127: m2_cross +0.718 -> +0.62,
+   sqrt(pair) +0.866 -> +0.80. Among ordinary processes the old proxy is
+   still the better linear predictor; m2_cross earns its edge by getting
+   the extreme right. Do not quietly reuse it as a general cost estimate.
+   It also MISRANKS THE ACTUAL #2 (node 54 is #2 measured, #5 by
+   m2_cross), so it cannot say who becomes the new worst after shedding —
+   that has to be MEASURED in the A/B, not predicted.
+
+### The trigger: z > 7, not z > 10
+
+My spec quoted z=10.0 and a 1.57x #1->#2 gap. Three repeats give robust
+z of 9.18/8.99/8.92 (mean 9.03) and gap 1.513/1.488/1.506 (mean 1.502) —
+both ~10% under, consistently, with a repeat spread (0.27 in z) far
+smaller than the gap to my quoted values. The earlier figure was a
+single draw. **A trigger written as z > 10 would NOT have fired on a run
+where the straggler is present, is the same process, and is 8.4x the
+median.**
+The robust discriminator is the SEPARATION, not the level: #1 at z~9.0
+and #2 at z~5.6 in every repeat, and the same separation holds in both
+earlier datasets. Any threshold in 6.5-8 separates them in all five
+measurements across both machines. **Use z > 7.**
+
+### Ceiling: -33.4%, not -36%
+
+Levelling #1 to #2 on pb_sum_s: -33.9 / -32.8 / -33.6%, mean -33.4%.
+(pb_max_s swings -32% to -45% because #2 is a different process in
+rep2, so pb_sum_s is the stabler basis.)
+
+### WHY node 55 is the straggler — and why every size-based proxy failed
+
+Node 55 holds **403 pieces against a median of 512**, with the SAME
+particle count as everyone else (1.55e7). It is not bigger; it has
+FEWER, LARGER pieces, so its pair work is higher. Consistent with
+particle count `n` having literally ZERO correlation with phaseA time
+(r=+0.000 — every process is within a hair of the same n, by
+construction of the decomposition). **Any model that reduces to particle
+count cannot work here.** That is the structural reason the n^1.2 self
+proxy failed, and it is worth remembering before proposing any future
+"balance the counts" scheme.

@@ -1491,8 +1491,11 @@ so both stand for their own run.
   overstated: FullNodePool bump-allocates over a LIST and the next piece
   continues in the current chunk, so waste is one partial chunk PER
   POOL. Measured +0.4/+1.6/+6.1%.
-Also: `charmc` mis-parses `-march=X -Ofast` in that order (the tokens
-reach cc1plus joined into the -march= value, and the error names -march=,
-sending you hunting for a bad architecture); reverse to
-`-Ofast -march=X`. And there is no build-stack.sh on Frontier — that is
+Also reported and LATER RETRACTED (relay5 item 0a, recorded here
+because this section is the archive): "charmc mis-parses
+`-march=X -Ofast`". It does not. The login shell is zsh, which does not
+word-split an unquoted `$var`, so the probe harness handed charmc both
+flags as ONE argument; from bash with separate arguments the same
+command succeeds and flag order is free. No build was ever affected.
+The lesson that survives is about the harness, not the compiler. And there is no build-stack.sh on Frontier — that is
 an Anvil script.
