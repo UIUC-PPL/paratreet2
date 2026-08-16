@@ -173,3 +173,41 @@ suspicion:
 Adding (1) to the test is the cheapest next step and would, if it
 reproduces, make this a fileable Charm++ issue rather than a paratreet2
 mystery.
+
+## CORRECTION (2026-08-16): the crashing PE IS the migration source
+
+I reported that the crashing PE "is not the one whose element moved",
+which made this look mysterious. That was my error — an over-generalised
+inference from one early SMP run, never checked. The logs say otherwise:
+
+    SHED piece 35 elt 0x12880aca0 pe 0 -> pe 4
+    ------------- Processor 0 Exiting: Caught Signal ------------
+
+PE 0 is both the source of the out-migration and the PE that segfaults.
+So the picture is ordinary, not mysterious: PE 0 is delivering a broadcast
+to its local elements, one of them migrates away cross-process and is
+DESTROYED on PE 0, and the broadcaster — still walking that same local
+list for that same broadcast — dereferences the freed element. That is
+exactly what a segfault inside
+`attemptDelivery(CkArrayMessage*, ArrayElement*, bool)` on the source PE
+means, and it is consistent with the intra-process case surviving (no
+destruction there, just a rebind).
+
+## Bound arrays (Kale's question): used in DUAL mode, NOT in ours
+
+`Driver.h:264`: `if (matching_decomps) treepiece_opts.bindTo(partitions);`
+— that is in the dual-distribution branch. fof3 runs
+`single_distribution`, which takes the branch at `Driver.h:150`, creates
+NO Partition array at all ("partitions stays a null proxy"), and gives
+TreePiece its own decomposition map with a group dependency. So no bound
+array is involved in the failing configuration, and bound-array location
+sharing is not the explanation.
+
+Worth knowing anyway, because it is a live hazard in the OTHER mode and
+already documented at Driver.h:200-227: `bindTo` + a fresh `setMap`
+reuses the bound-to array's location manager, skips the map dependency
+CkCreateArray would otherwise chain, and races the map-creation
+broadcast ("Local branch of array map is NULL!", seen at 32 processes on
+Anvil). paratreet2 works around it with `setGroupDepID`; the note there
+already flags "upstream charm candidate: bindTo + fresh setMap should
+declare this dependency itself."
