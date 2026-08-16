@@ -78,3 +78,41 @@ state (handled above) or app state that `buildTree` rebuilds from
 **So the crash points squarely at candidate 1: the custom `CkArrayMap`.**
 That is the one structural difference left between paratreet2 and the
 four-mode test, which uses the default map and passes all four modes.
+
+## Bisect log (2026-08-16) — what is RULED OUT
+
+Kale's correction retired my leading hypothesis before it cost a run:
+`procNum` is the STATIC answer, used to populate the array and to find an
+element's HOME (`CkArrayMap::homePe` defaults to it, cklocation.h:143/505;
+`CKARRAYMAP_POPULATE_INITIAL` at cklocation.C:277). The DYNAMIC location is
+always the location manager's. So a custom map cannot hand the broadcaster
+a stale local element, and swapping paratreet2 to the default map would
+have rearranged every piece — destroying locality and changing the whole
+run — while isolating nothing.
+
+Ruled out by direct experiment in this test (all four modes PASS in every
+configuration below):
+
+| difference from paratreet2 | tested | result |
+|---|---|---|
+| migration issued from inside a broadcast | modes 1-3 | PASS |
+| SMP (2 processes x 4 PEs, matching the failing run) | `+p8 ++ppn 4` | PASS |
+| element sets `usesAtSync` | `MIG_ATSYNC=1` | PASS |
+
+Ruled out by reading the runtime, not by experiment:
+- the `CkMigrateMessage` constructor not setting `usesAtSync` (recursive_pup
+  restores it — see the section above);
+- the partial `TreePiece::pup` (framework state is pupped by `parent_pup`;
+  the omitted app state is rebuilt by `buildTree`).
+
+STILL UNTESTED, and now the only structural difference left:
+1. a CUSTOM ARRAY MAP on the array being migrated — cheap to add to this
+   test, and the natural next step;
+2. paratreet2's other in-flight state at that moment: the TreeCanopy
+   registration each TreePiece performs in its constructor
+   (`buildCanopy` -> a `[createhere]` entry on another array), and the
+   Reader group's outstanding flush acks.
+
+The symptom to reproduce: segfault on a PE of the SOURCE process inside
+`CkArrayBroadcaster::attemptDelivery` <- `CkArray::recvBroadcast`, with
+k=1 (a single migration), on a PE OTHER than the one whose element moved.
