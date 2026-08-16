@@ -598,3 +598,41 @@ The measurement this was meant to produce — does the -33% prize
 materialise, and what does the phase-1 -> phase-3 locality conversion cost
 — remains unmeasured, and is still the thing that decides whether
 model-driven shedding is worth building.
+
+## RESOLVED (2026-08-16): shedding works — the barrier goes BEFORE the migration
+
+Attempt 1 failed because the migration happened inside the decision
+broadcast. The bisect that pinned it:
+
+| configuration | migration | result |
+|---|---|---|
+| 1 process x 4 PEs (PE 0 -> PE 2) | INTRA-process | exit 0, exact |
+| 2 proc x 1 PE / 2 x 2 / 2 x 4 | cross-process | segfault, every time |
+
+Cross-process migration DESTROYS the element on the source; intra-process
+is a rebind. And it reproduces single-threaded (2 processes x 1 PE), so it
+is a logical error, not a race: the source PE is still walking its local
+element list for that broadcast when one of them is freed. The crashing PE
+IS the migration source (an earlier note of mine said otherwise — wrong).
+
+Kale's fix, with the placement corrected: a barrier after migration cannot
+help — we already had CkWaitQD there and never reached it. It has to sit
+BETWEEN the broadcast and the migration:
+
+  1. `shedDecide` broadcast: every element only DECIDES a destination.
+  2. Concat reduction: completing PROVES the broadcast reached every
+     element, so the broadcaster has finished walking.
+  3. `Driver::shedPlan` migrates the chosen elements POINT-TO-POINT.
+  4. `CkWaitQD`, so every migration lands before buildTree.
+
+Landed at fb43f06 as the FORCED arm (`FOF_SHED_NODE`/`FOF_SHED_COUNT`,
+default off), which is what measures the prize and the phase-1 ->
+phase-3 locality conversion with no detection machinery. Classic gates
+all exact including loopback and a combined shed + cross-node run; the
+reconverse gate is INCONCLUSIVE (env never reached the ranks through
+lcrun, so the shed did not fire) and must be redone before a cluster run.
+
+NEXT: the 2B A/B. Shed k pieces off the measured worst process (node 55)
+and read phaseB_s max against the -33.4% ceiling, WITH phase3/merge/
+relabel, since that is where the locality conversion would show up. Only
+then is model-driven selection (z > 7 on m2_cross) worth wiring in.
