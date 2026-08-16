@@ -11,7 +11,7 @@ struct Main : CBase_Main {
     CkPrintf("MIGTEST mode %d, %d elements, %d PEs\n", gMode, nElements, CkNumPes());
     switch (gMode) {
       case 0: for (int i=0;i<nElements;i++) arr[i].p2pMigrate((CkMyPe()+1)%CkNumPes()); break;
-      case 1: arr.bcastMigrate(); break;
+      case 1: case 4: arr.bcastMigrate(); break;
       case 2: arr.bcastDefer(); break;
       case 3: arr.bcastPlan(); break;
     }
@@ -41,7 +41,10 @@ struct Mover : CBase_Mover {
   Mover(CkMigrateMessage* m) { delete m; }
   int dest_ = -1;
   void p2pMigrate(int d) { if (CkNumPes()>1) migrateMe((CkMyPe()+1)%CkNumPes()); }
-  void bcastMigrate()    { if (CkNumPes()>1) migrateMe((CkMyPe()+1)%CkNumPes()); }
+  void bcastMigrate()    { // mode 1: ALL migrate; mode 4: only element 0
+    if (CkNumPes()<2) return;
+    if (gMode==4 && thisIndex!=0) return;
+    migrateMe((CkMyPe()+1)%CkNumPes()); }
   void bcastDefer()      { if (CkNumPes()>1) thisProxy[thisIndex].doMigrate((CkMyPe()+1)%CkNumPes()); }
   void bcastPlan() {                       // decide, then reduce; migrate later
     dest_ = (CkNumPes()>1) ? (CkMyPe()+1)%CkNumPes() : -1;

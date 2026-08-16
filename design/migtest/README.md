@@ -116,3 +116,60 @@ STILL UNTESTED, and now the only structural difference left:
 The symptom to reproduce: segfault on a PE of the SOURCE process inside
 `CkArrayBroadcaster::attemptDelivery` <- `CkArray::recvBroadcast`, with
 k=1 (a single migration), on a PE OTHER than the one whose element moved.
+
+## THE DECISIVE BISECT (2026-08-16): intra-process migration WORKS,
+## cross-process migration CRASHES, and it is not a race
+
+Ran the forced shed as a single process by migrating to another PE of the
+SAME process (`FOF_SHED_PE`), then across processes at three SMP widths:
+
+| configuration | migration | result |
+|---|---|---|
+| 1 process x 4 PEs, PE 0 -> PE 2 | INTRA-process | **exit 0, components exact (333889)** |
+| 2 processes x 1 PE | cross-process | segfault |
+| 2 processes x 2 PEs | cross-process | segfault |
+| 2 processes x 4 PEs | cross-process | segfault |
+
+Two things follow.
+
+**It is the cross-process path, not migration.** Intra-process `ckMigrate`
+is a local rebind; cross-process pups the element, ships it, and DESTROYS
+it on the source. The crash needs that destruction.
+
+**It is not a race.** It reproduces at `+p2 ++ppn 1` — one PE per process,
+single-threaded, no concurrent scheduler activity. So the broadcaster is
+holding a reference to an element that has legitimately departed, which is
+a logical error in the bookkeeping rather than a timing window. Stack,
+identical in every configuration, on the SOURCE PE:
+
+    CkArray::recvBroadcast(CkMessage*)
+      -> CkArrayBroadcaster::attemptDelivery(CkArrayMessage*, ArrayElement*, bool)
+         -> segmentation violation
+
+## Why lldb did not add to this
+
+`charmrun ++local` spawns the FoF3 processes in a way lldb's
+follow-fork-mode does not track, and Charm++ installs its own SIGSEGV
+handler that prints the traceback and exits before a debugger sees the
+fault. Getting a raw faulting address needs either Charm's handler
+disabled or the two ranks launched by hand. Not pursued — the bisect above
+is more informative than the address would have been.
+
+## The standalone test STILL does not reproduce
+
+Now also ruled out, all PASS at 2 processes x 1 PE:
+- cross-process migration of ONE element among 16, and among 336
+  (matching paratreet2's element count) — mode 4.
+
+So paratreet2 has something this test does not. What is left, in order of
+suspicion:
+1. the broadcast is issued from a `[threaded]` entry method
+   (`Driver::run`) that then calls `CkWaitQD`; the test's Main is a plain
+   mainchare;
+2. the custom array map (still the only creation-time difference);
+3. the group dependency the array is created with (`sub_dep_opts`), and
+   the presence of a second array (TreeCanopy) the pieces registered with.
+
+Adding (1) to the test is the cheapest next step and would, if it
+reproduces, make this a fileable Charm++ issue rather than a paratreet2
+mystery.
