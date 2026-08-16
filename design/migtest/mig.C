@@ -37,7 +37,7 @@ struct Main : CBase_Main {
   }
 };
 struct Mover : CBase_Mover {
-  Mover() {} 
+  Mover() { if (getenv("MIG_ATSYNC")) usesAtSync = true; }
   Mover(CkMigrateMessage* m) { delete m; }
   int dest_ = -1;
   void p2pMigrate(int d) { if (CkNumPes()>1) migrateMe((CkMyPe()+1)%CkNumPes()); }
