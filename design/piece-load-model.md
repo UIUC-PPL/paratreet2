@@ -629,8 +629,11 @@ Landed at fb43f06 as the FORCED arm (`FOF_SHED_NODE`/`FOF_SHED_COUNT`,
 default off), which is what measures the prize and the phase-1 ->
 phase-3 locality conversion with no detection machinery. Classic gates
 all exact including loopback and a combined shed + cross-node run; the
-reconverse gate is INCONCLUSIVE (env never reached the ranks through
-lcrun, so the shed did not fire) and must be redone before a cluster run.
+reconverse gate is now CONCLUSIVE too: 4 of 330 pieces migrated, exact,
+no aborts. (It first read as a no-op because examples/fof3 was not
+`make clean`ed — paratreet2 has no header dependency tracking, so a
+changed Driver.h does not rebuild Main.o. The campaign's own build rule,
+caught the hard way again.)
 
 NEXT: the 2B A/B. Shed k pieces off the measured worst process (node 55)
 and read phaseB_s max against the -33.4% ceiling, WITH phase3/merge/
