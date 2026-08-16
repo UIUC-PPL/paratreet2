@@ -145,6 +145,8 @@ module paratreet {
     entry void perturb(Real, const CkCallback&);
     entry void rebucket(BoundingBox, bool);
     entry void pauseForLB();
+    entry void shedDecide(const CkCallback&);
+    entry void migrateTo(int destPe);
   }
 
   template <typename Data>
@@ -163,6 +165,7 @@ module paratreet {
     entry [threaded] void run(CkCallback cb);
     entry [reductiontarget] void countInts(unsigned long long intrn_counts [4]);
     entry [reductiontarget] void reportTime();
+    entry void shedPlan(CkReductionMsg*);
     entry void recvTC(std::pair<Key, SpatialNode<Data>>);
     entry void loadCache(CkCallback);
     entry void partitionLocation(int, int);

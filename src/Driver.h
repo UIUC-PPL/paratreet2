@@ -290,6 +290,19 @@ public:
     
   }
 
+  // Receives (index, destPE) from every TreePiece. Runs only after the
+  // decision broadcast has been delivered to all of them, so no array
+  // broadcast is in flight and migrating here is safe.
+  void shedPlan(CkReductionMsg* msg) {
+    const int n = msg->getSize() / (int)(2 * sizeof(int));
+    const int* p = (const int*)msg->getData();
+    int moved = 0;
+    for (int i = 0; i < n; i++)
+      if (p[2 * i + 1] >= 0) { treepieces[p[2 * i]].migrateTo(p[2 * i + 1]); moved++; }
+    CkPrintf("SHED plan: %d of %d elements migrating\n", moved, n);
+    delete msg;
+  }
+
   // Core iterative loop of the simulation
   void run(CkCallback cb) {
     auto& config = paratreet::getConfiguration();
@@ -321,6 +334,14 @@ public:
           CkPrintf("Pre-build load balancing: %.3lf ms\n",
                    (CkWallTimer() - start_time) * 1000);
         }
+      }
+      if (std::getenv("FOF_SHED_NODE")) {
+        start_time = CkWallTimer();
+        treepieces.shedDecide(
+            CkCallback(CkIndex_Driver<Data>::shedPlan(NULL), this->thisProxy));
+        CkWaitQD();
+        CkPrintf("Targeted shedding: %.3lf ms\n",
+                 (CkWallTimer() - start_time) * 1000);
       }
       // Start tree build in TreePieces
       start_time = CkWallTimer();

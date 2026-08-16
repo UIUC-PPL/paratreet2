@@ -95,6 +95,37 @@ public:
     //CkPrintf("[ST %d]  pause for LB on PE %d\n", this->thisIndex, CkMyPe());
     this->AtSync();
   }
+  // ---- Targeted shedding, decide/reduce/migrate (design/piece-load-model.md).
+  // The migration must NOT happen inside this broadcast: the source PE is
+  // still walking its local element list for this very broadcast, and
+  // destroying an element mid-walk segfaults in
+  // CkArrayBroadcaster::attemptDelivery (measured, reproducible at
+  // 2 processes x 1 PE, so not a race). Instead every element DECIDES here
+  // and contributes; the reduction completing proves the broadcast reached
+  // everyone and the walk is over, and only then does the Driver migrate
+  // the chosen elements point-to-point.
+  int shed_dest_ = -1;
+  void shedDecide(const CkCallback& cb) {
+    shed_dest_ = -1;
+    const char* vn = std::getenv("FOF_SHED_NODE");
+    const char* kc = std::getenv("FOF_SHED_COUNT");
+    const int victim = vn ? std::atoi(vn) : -1;
+    const int k = kc ? std::atoi(kc) : 0;
+    if (victim >= 0 && k > 0 && CkMyNode() == victim &&
+        !incoming_particles.empty() && CkNumNodes() > 1) {
+      static std::atomic<int> taken{0};
+      const int slot = taken.fetch_add(1);
+      if (slot < k) {
+        int dn = (victim + 1) % CkNumNodes();
+        if (dn != victim)
+          shed_dest_ = CkNodeFirst(dn) + (slot % CkNodeSize(dn));
+      }
+    }
+    int pair[2] = {this->thisIndex, shed_dest_};
+    this->contribute(sizeof(pair), pair, CkReduction::concat, cb);
+  }
+  void migrateTo(int destPe) { this->ckMigrate(destPe); }
+
   void ResumeFromSync(){
     //CkPrintf("[ST %d]  resume from sync for LB on PE %d\n", this->thisIndex, CkMyPe());
     return;
