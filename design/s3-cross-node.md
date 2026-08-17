@@ -201,3 +201,28 @@ nothing and declines) but wasteful, and it would blur the A/B — a
 cross-node arm should measure cross-node help, not extra local help.
 Accepted for this run; revisit if the global coordinator ever replaces
 the block one rather than supplementing it.
+
+## VERDICT (Kale, 2026-08-16): STEALING IS OUT OF CONSIDERATION ENTIRELY
+
+Kale's summary of the Frontier day: cross-node stealing was made to work
+after real effort, and it does not help. Combined with everything before
+it, stealing as a LEVER is finished — not just the cross-node extension.
+
+Recorded here as the headline only; the supporting detail is in the
+Frontier batch (relay6-9, s3-cross-node-protocol.md,
+s3-xnode-hang-diagnosis.md, patches 0008/0009) which has NOT yet been
+read into this repo. Do not write the full post-mortem from this note.
+
+Immediate consequences:
+- The laptop-side cross-node implementation (79514f1, FOF_S3_XNODE,
+  default OFF) is now dead code by decision, not by defect. It was gated
+  exact on both runtimes; leave it default-off pending a decision to
+  remove, and do NOT merge the Frontier protocol patches (0008/0009),
+  which are a different and more elaborate design for the same retired
+  idea.
+- What S3 already BOUGHT stays: the POD wire, the parallel helper
+  rebuild, and the grant-size correction took phaseB_s max from ~3.2 s
+  to ~1.23-1.32 s. Those live in the code and are not affected.
+- TARGETED SHEDDING is now the only remaining line on the straggler.
+  It works as of fb43f06 and its first 2B measurement is Anvil job
+  19979370 (queued for 2026-08-17 09:30).
