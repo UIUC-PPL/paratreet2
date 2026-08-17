@@ -1499,3 +1499,67 @@ flags as ONE argument; from bash with separate arguments the same
 command succeeds and flag order is free. No build was ever affected.
 The lesson that survives is about the harness, not the compiler. And there is no build-stack.sh on Frontier — that is
 an Anvil script.
+
+## 36. THE PE-SET SPLIT ENDS THE CAMPAIGN'S PREMISE (Frontier relay10,
+## 2026-08-16/17): phase 1 is no longer the bottleneck
+
+Full record in design/campaign-archive/ (relay10.txt items 0-54,
+pe-sets-*.md). Landed as 986dcab after laptop vetting on both runtimes.
+
+THE MECHANISM. Split each process's PEs into sets and OMIT cross-set
+piece pairs from the phaseB pool; the phase-3 walk merges them instead.
+No migration, no stealing, no victim list, no per-process cost.
+
+THE RESULT, with `-u dist`, FOF_PE_SETS=14 machine-wide, FOF_S3=0:
+
+| nodes | Iteration 0 vs serial baseline | phase 1 |
+|---|---|---|
+| 16 | 5379 vs 6409 ms (-16.2%) | -37.8% |
+| **64** | **2771 vs 4384 ms (-36.8%)** | -68.2% |
+| 128 | 3826 vs 5446 ms (-29.7%) | -77.5% |
+
+phaseB is ELIMINATED (1.343 -> 0.001 s). The benefit GROWS with scale.
+Best measured result of the campaign: 64 nodes at 2771 ms, against the
+6409 ms 16-node baseline this campaign started from.
+
+**Phase 1 is now 7% of Iteration 0 at 128 nodes.** The target this whole
+campaign was built around has been optimised out of relevance, and the
+next bottleneck is a different subsystem: Pre-traversal + Tree traversal,
+90% of Iteration 0 at 128 nodes and growing with process count.
+
+WHAT THIS RETIRES:
+- STEALING, entirely (Kale, 2026-08-16). S3 is a partial substitute for
+  the split and worth 560 ms on top of a victim-only split, but with the
+  machine-wide split phaseB is empty and FOF_S3=0 is a small WIN.
+  Everything S3 bought (POD wire, parallel rebuild, grant sizing:
+  3.2 s -> 1.23 s) stays in the code.
+- TARGETED SHEDDING, as a recommendation. It works (-49 ms on Iteration
+  0, 119 ms of migration) but the split does the same job ~8x better with
+  no migration. KEEP the cost model and the m2_cross ranker: they are
+  what proved the split's phase-3 budget.
+- CROSS-NODE STEALING, which was made to work and does not help.
+
+THE CORRECTNESS TRAP, which cost a failed gate and must not recur:
+FoFPhase3.h's 2026-07-18 invariant — "after phase 1, different-tip pairs
+within b are necessarily on different processes" — IS NOW DELIBERATELY
+FALSE. Traverser.h's SkipLocalSource ownership prune (2026-08-05)
+discards local-source pairs BEFORE open() runs, so it silently dropped
+exactly the pairs the split defers: 10k gate 3642 vs 3549, with
+leaf_visits IDENTICAL to the control (the signature of pairs never
+entering the traversal). The fix is a NARROW runtime veto keyed on the
+piece->set table, so only genuinely cross-set pairs escape the prune; a
+coarse veto was correct but cost up to 2.07 s. Both comments are
+rewritten in place — do not reintroduce an ownership test on the
+strength of the retired wording.
+
+TWO KNOBS, AND THEY ARE COUPLED. FOF_PE_SETS_MODE=1 (round-robin) is
+REQUIRED for s<14, worth up to 2.2 s (blocked keeps SFC-adjacent PEs
+together, so almost nothing crosses a boundary). s itself is noise
+(s=3..14 within 68 ms). FOF_S3=0 is only safe once phaseB is nearly
+gone: at s=2 it COSTS 190 ms.
+
+`-u dist` IS WHAT MAKES IT AFFORDABLE, isolated cleanly: two traced runs
+at the identical split differing only in -u gave phase 1 identical to
+2 ms but uf2 2.094 (serial) vs 0.692 (dist). Serial gathers every edge
+to the root and the split inflates edges 3.4x. At 128 nodes serial-s14
+takes 9831 ms — worse than doing nothing.

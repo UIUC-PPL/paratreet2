@@ -1,0 +1,491 @@
+relay10 -- targeted shedding measured at 2B / 16 nodes
+Frontier, 2026-08-16.  Job 5286357.  paratreet2 4f49227 (phaseab-campaign).
+Binary bin/FoF3.2b.shed, md5 e1310be9cf57b3d8739f444bd98d72d9, FULL clean
+rebuild.  Checks: TraceSummary 0, "Targeted shedding" 1, "SHED plan" 1,
+vfmadd 0.  Full report: reports/targeted-shedding-2b.md.  Nothing pushed.
+
+0. EXACTNESS.  424897832 on all 13 2B arms.  10k gate 3549 on both legs.
+   Zero mismatches.
+
+1. THE VICTIM IS NODE 55, MEASURED NOT ASSUMED.  A probe baseline arm ran
+   first and exported the largest-pb_sum_s process to the shed arms.
+   n55 pb_sum_s 14.61, #2 n54 9.56, gap 1.528x, median 1.57 (9.3x).
+   Ceiling of levelling #1 to #2 = -34.5%, a fourth independent draw within
+   a point of the design's -33.4%.  n55 again holds 403 pieces against a
+   median ~512 with the same particle count: fewer, larger pieces.
+
+2. THE PRIZE IS REAL.  phaseB_s max, 3 reps each:
+      base    1.242 1.177 1.346   mean 1.254 (n=4 with probe)
+      shed4   1.268 1.210 1.274   mean 1.251   -0.3%
+      shed12  1.166 1.215 1.110   mean 1.164   -7.2%
+      shed30  1.301 0.788 1.067   mean 1.052  -16.1%
+   shed30-r2 at 0.788 s is a NEW CAMPAIGN BEST (previous 1.23-1.32, floor
+   0.25) -- -37.2% vs base mean, slightly past the -34.5% ceiling because
+   S3 stealing composes with the migration.  phaseB_s AVG is flat at 0.148
+   on every arm: this is entirely a tail effect, as intended.
+   Both SHED lines present on all 9 shed arms; requested count moved every
+   time (n55 403 -> 399 -> 391 -> 373 pieces at k=4/12/30).
+
+3. PHASE 3 DOES NOT BILL FOR IT -- this is the answer to the open question.
+   shed30-r2 pushed 10.7% of the MACHINE-WIDE phase-1 pair work across the
+   process boundary into phase 3.  Its phase-3 total, 0.884 s, is INSIDE the
+   base range (0.873-0.892).  phase3_walk 0.278 -> 0.289: +0.011 s bought
+   -0.447 s of phaseB critical path.  Counter-check: the largest phase-3
+   reading in the job (shed12-r3, 0.975) came from an arm that converted
+   only 1.2% -- that is what phase-3 noise looks like.
+   So NO, this is not an arm that improves phaseB by inflating phase 3.
+   Mechanism: all k pieces go to ONE destination, so 48% of the work that
+   left n55 was re-created as phase-1 work on n56 instead of converting.
+   The crude single-destination rule is protective, not merely crude.
+
+4. THE SPREAD IN shed30 IS THE SELECTION, NOT NOISE -- the main finding.
+   TreePiece.h:114 takes the first k elements to run shedDecide
+   (static atomic taken.fetch_add), i.e. a RANDOM SAMPLE of 30 of 403, and
+   sends them all to (victim+1)%128 = process 56.  Three identical k=30 reps:
+      n55 m2_cross  -0.8%  -75.0%  -19.9%
+      phaseB max     1.301   0.788   1.067
+   The particle mass moved was near-identical in all three (1.34M/1.19M/
+   1.40M).  The outcome tracks the m2 moved, not the pieces or particles
+   moved -- the design's "any model that reduces to particle count cannot
+   work here", measured from the other side.  A random 7.4% of pieces
+   catching 75% of the work is exactly the cost probe's concentration
+   finding (top 1% of pairs hold 60-79.5% of the time).
+
+5. WHERE THE PHASE LANDS.  In all 13 arms the global phaseB max equals the
+   worst PE of n55 or n56.  n55 sets it in 12 of 13; in shed30-r2 n56
+   becomes the new worst at 9.04 s and sets it -- right next to base #2
+   (n54, 9.6 s).  Levelling #1 lands you at #2 and no further, as predicted.
+   One destination SATURATES at ~5 s of absorbed pb_sum; beyond that k
+   cannot help.
+
+6. IT DOES NOT REACH ITERATION 0, AND I WILL NOT DRESS THAT UP.
+   Iter0 means: base 6472.7, shed4 6433.9, shed12 6489.6, shed30 6621.3 ms
+   (+2.3%).  Two arithmetic reasons: phaseB max is only 19% of Iteration 0,
+   so a perfect fix caps the gain at ~7%; and the migration is charged to the
+   same iteration -- 274 ms mean at k=30 against a 202 ms mean phaseB saving.
+   Iter0 ranges 6344-6836 across the job (7.8%), so no arm is separable there.
+   DO NOT adopt shedding on these numbers as an end-to-end speedup.
+
+7. WHAT THIS LICENSES.  The measurement that was blocking model-driven
+   selection is done and it came out in favour of building it: the prize is
+   real, the locality conversion (the stated risk since v2) is below phase-3
+   noise, and the obstacle is SELECTION.  relay5 showed m2_cross ranks the
+   worst PROCESS #1 in 3/3; what is needed now is the same ranking one level
+   down, over the pieces WITHIN the victim.  Two small follow-ons the data
+   points at directly: split the destination (one saturates), and rank the
+   pieces -- getting 75% of the work into 8-10 pieces instead of 30 would cut
+   the 274 ms migration tax ~3x AND make the result deterministic.
+
+HOUSEKEEPING
+- Tree was carrying patches/0009 (cross-node protocol) uncommitted.  Reverted
+  it before building so these are pristine-branch numbers; the patch file is
+  untouched in patches/.  Tree now clean at 4f49227.
+- Queue was empty, so the pull was allowed.
+- No FOF_S3_XNODE arms, no PARATREET_PREBUILD_LB, nothing pushed.
+- The 10k gate was run with shed ON as well as off, specifically to prove
+  FOF_SHED_* reaches the ranks through srun -- the thing fb43f06's reconverse
+  gate could not establish.  It does: "SHED plan: 2 of 330 elements migrating".
+- 3 reps per arm rather than the 2 asked for: an arm costs ~17 s and relay8
+  established n=2 cannot clear the control spread.  Per-rep numbers are all in
+  the report, so the first two alone can be read.
+
+ADDENDUM (Kale's follow-up: read phase 1, not phaseB; price the migration;
+how to migrate less).  Full detail in reports/targeted-shedding-2b.md.
+
+8. ON A PHASE-1 BASIS THE k SWEEP INVERTS.  time_s: phase1, paired within
+   each rep:  shed4 -94 ms, shed12 -172 ms, shed30 -158 ms.  Migration price
+   41 / 141 / 274 ms.  Net Iteration 0: shed4 -53, shed12 -31, shed30 +116 ms
+   predicted, against -59 / -3 / +129 observed -- the budget closes to within
+   30 ms, so there is no missing term.  THE USEFUL k IS 4-12, NOT 30, which
+   is the opposite of what the phaseB-max column alone says.  274 ms is the
+   right price for k=30 and it is charged to Iteration 0, not to phase 1.
+
+9. THE PHASEB WIN IS DISCOUNTED ~2:1 REACHING THE PHASE-1 WALL, exactly as
+   Kale expected from there being no barrier between phaseA and phaseB.
+   shed30-r2 cut the phaseB stage 447 ms but the phase-1 wall only 233 ms:
+   half the freed tail was hiding under other processes' phaseA.  The -37.2%
+   headline is -6.8% on phase 1.  QUOTE FUTURE SHEDDING ON time_s: phase1.
+   Also: the price is one-off (the static `taken` never resets, so iterations
+   1+ migrate nothing) while the gain repeats, so shed30 would go net
+   positive from iteration 2 on a multi-iteration host run.
+
+10. CHEAPEST NEXT MEASUREMENT IS FREE AND NEEDS NO CODE.  FOF_SHED_COUNT=0
+    with FOF_SHED_NODE set runs the WHOLE machinery (broadcast to 63946
+    elements, concat reduction, shedPlan, CkWaitQD) and migrates nothing --
+    shedDecide gates on k>0 but Driver::run gates on getenv alone.  That
+    isolates the FIXED cost exactly.  Run it before tracing anything.
+    Evidence it matters: 2-3x spread at fixed k, and k=4 as low as 19 ms.
+
+11. IDEAS, in value/effort order.  (a) shed0 above.  (b) One line: non-movers
+    contribute 0 bytes to the concat -- today 500 KB is gathered to carry 240
+    useful bytes, and every element still contributes so the broadcast-
+    delivery proof fb43f06 relies on is untouched.  (c) RANK BY
+    m2_cross(piece)/n(piece) -- work moved per byte moved.  The two came
+    apart completely in this job (same particle mass moved, 0.8%/75%/20% of
+    the work), so a ranker reaching 75% with 8-10 pieces cuts the per-piece
+    price ~3x, lands k in the profitable 4-12 band, and kills the lottery.
+    (d) Split the destination -- only after (c).  (e) Overlap migration with
+    the tree build -- invasive, keep in reserve.  NOT the shadow copy: it
+    saves a return trip we are not paying.
+
+12. TRACING -- OPPOSITE VERDICTS FOR THE TWO QUESTIONS.
+    YES, cheaply, for the migration COST: +sumDetail full machine (257 MB,
+    3585 files), base vs shed30 (+shed4 for k-scaling), one batched --ep
+    invocation over shedDecide / migrateTo / shedPlan / reduction / element
+    pup.  Selection-independent, so the lottery does not invalidate it.  But
+    run shed0 first -- if the cost is mostly fixed, (b) is a one-liner.
+    NO, not yet, for the phaseB/phase-1 WIN, and this is stronger than the
+    usual perturbation caveat: THE SELECTION RULE *IS* THE DELIVERY ORDER
+    (taken.fetch_add, first-come across 14 PEs), so tracing changes WHICH
+    PIECES MOVE.  A traced shed30 run is a different experiment, not a
+    perturbed one -- a fresh draw from a 0.8%/75%/20% lottery.  Same failure
+    that wasted job 5282141, sharper.  Make selection deterministic first
+    (even "lowest k indices" as a stopgap), THEN trace -- and then a SUBSET
+    suffices: process 55 owns PEs 770-783, process 56 owns 784-797, so ~28
+    PEs + a control block is 75-150 MB against 2.6 GB all-PE.  All-PE is not
+    worth it here: the machine-wide thing it would show is phase 3, and
+    phase 3 is flat.
+
+ADDENDUM B -- job 5286540 (migration cost) and patches/0010 (ranking).
+
+13. WHY CONCAT.  Driver::shedPlan must issue the migrations (issuing them
+    inside the broadcast is the fb43f06 crash), so the plan has to reach the
+    Driver, and across a chare array the only gather is a reduction; concat
+    rather than sum/max because the payload is a variable-length LIST of
+    records.  The same reduction is also the barrier -- it completes only
+    after every element got the broadcast.  The mechanism was right; the
+    DENOMINATOR was wrong (non-candidates had no reason to send bytes).
+
+14. I WAS WRONG ABOUT THE PAYLOAD.  FOF_SHED_COUNT=0 runs the entire
+    machinery and migrates nothing: 1.323 / 1.325 / 1.246 ms.  Broadcast to
+    63946 elements + the 500 KB concat + shedPlan + CkWaitQD = 1.3 ms TOTAL.
+    Collapsing 500 KB to 6 KB, which I ranked second on the list, is worth
+    about one millisecond.  It is hygiene for larger machines, not a
+    speedup.  It rides along in patches/0010 because it falls out of moving
+    the choice to the Driver, not because it earns its place.
+
+15. AND THE PER-PIECE COST IS NOT DATA MOVEMENT EITHER.  Targeted shedding
+    ms by k (3 reps): 0->1.3, 1->21.9, 2->30.0, 4->63.7, 8->64.7,
+    16->212.2, 30->103.5.  k=16 REPRODUCIBLY COSTS ~2x k=30, all three
+    reps, one allocation, same binary.  Fewer pieces, more time.  Also the
+    same k=30 cost 147-353 ms in job 5286357 and 94-110 ms here, and the
+    spread at fixed k is 2-4x.  None of that is a bytes-moved cost, so the
+    "~11 ms per piece" law the low-k rows suggest is not the mechanism.
+    HYPOTHESIS (stated as one, not proved): the cost is CkWaitQD
+    convergence, not migration traffic -- quiescence has to see the whole
+    machine go quiet, which is neither monotonic in k nor reproducible
+    between allocations.  If so, migrating FEWER pieces will not help much
+    and the lever is a targeted completion test instead of global QD --
+    promoting item 5 from reserve to primary.
+
+16. THE DISCRIMINATOR IS ALREADY RUNNING.  Job 5286573 with ranked
+    selection moves very different particle masses at the SAME k depending
+    on mode.  If Targeted shedding tracks particles_moved it is data-bound;
+    if it is flat across modes at fixed k it is QD-bound.  Settles it with
+    no trace.
+
+17. RANKING IS IMPLEMENTED -- patches/0010, bin/FoF3.2b.shedrank,
+    md5 8f47b65b927b660bcf4f403b5819ed33, TraceSummary 0, vfmadd 0,
+    "SHED rank" string present.  The CHOICE moves from the element to the
+    Driver: each piece on the victim contributes (index, n, score) and
+    Driver::shedPlan sorts and takes the top k, ties broken by index so the
+    plan is reproducible.  FOF_SHED_RANK: 0 = -index (blind, deterministic,
+    = shed from the low end of the SFC run, THE CONTROL), 1 = n^2/V^(4/3)
+    (work per piece), 2 = n/V^(4/3) (work per PARTICLE, the cost/benefit
+    ratio), 3 = 1/V^(2/3) (per-particle with the sqrt-compressed term).
+    FOF_SHED_DESTS spreads over d destination processes, default 1 = the
+    old single destination, left at 1 so this job isolates ranking.
+    Same reduction, same barrier, every element still contributes.
+    Determinism is part of the readout: the new "SHED rank:" line prints
+    particles_moved and the top/cut scores, which must be IDENTICAL across
+    reps if ranking works -- and that is the property that makes a later
+    projections capture meaningful at all.
+    NIT to tighten before it lands: ShedCand is left default-initialised on
+    non-candidates and passed with length 0.  Safe (nothing reads it) but it
+    should be `ShedCand c{}`; not changed here because the binary that
+    produced the results was already built.
+
+18. TRACING, REVISED.  The sumDetail capture I proposed for "where does the
+    fixed cost go" is NOT needed -- there is no fixed cost to decompose,
+    it is 1.3 ms.  If the QD hypothesis survives job 5286573, the trace
+    worth taking is a different one: a projections capture of the migration
+    window itself, to see whether the machine is idle waiting for
+    quiescence.  Deterministic selection (patches/0010) is what makes that
+    capture legitimate, since with the old rule tracing changed which
+    pieces moved.
+
+ADDENDUM C -- job 5286573, ranked selection (patches/0010).  30/30 exact.
+
+19. DETERMINISM ACHIEVED.  particles_moved is IDENTICAL across all 3 reps of
+    all 9 ranked arms, and m2_cross agrees to 3 significant figures.  The
+    lottery is gone.  That is the property that makes a future trace legal.
+
+20. RANKING FINDS THE WORK.  At k=4: mode 1 and mode 2 both move 191533
+    particles (1.2% of the victim's 15.5M) and drop its cross-PE pair work
+    by 37.3%.  The blind control (mode 0, lowest index = low end of the SFC
+    run) moves 180517 particles for 0.0-0.4%.  Mode 3 (1/V^(2/3)) finds
+    almost nothing (-3.9%).  Mode 2 depth series: k=1 -16.2%, k=2 -23.2%,
+    k=4 -37.3%, k=8 -47.6%, k=12 -56.1%.  ONE piece moves 16% of the work.
+
+21. DESIGN-DOC CORRECTION.  The v2 sketch says to prefer pieces at the ENDS
+    of the SFC run "when their load is comparable".  Mode 0 IS that rule and
+    it moved 180517 particles for ZERO work.  Their load is NOT comparable:
+    end pieces are locality-cheap and load-empty, so the two criteria point
+    in opposite directions and locality must not be the tiebreak.
+
+22. COST MODEL, now that selection is deterministic (R^2 0.93 over 9 arms):
+       cost ~ 59 ms + 142 ms per MILLION PARTICLES moved   (if anything moves)
+       cost =  1.3 ms                                      (if nothing moves)
+    So B2's QD hypothesis was HALF right: there is a ~59 ms step the moment
+    any element migrates, independent of how much, plus a real data term
+    (~700 MB/s).  CONSEQUENCE: below ~400k particles the step dominates, so
+    shaving k is nearly pointless -- the lever is moving fewer PARTICLES for
+    the same work, which is exactly what mode 2 does (at k=12 it moves 42%
+    fewer particles than mode 1, 417k vs 721k, for 56% vs 64% of the work).
+
+23. FIRST NET-POSITIVE CONFIGURATION IN THE CAMPAIGN.
+    FOF_SHED_RANK=2 FOF_SHED_COUNT=12: phase1 3.062 vs base 3.249 (-187 ms),
+    migration 119 ms, Iteration 0 6292.2 vs 6341.3 = -49 ms.  Reproducible
+    over 3 reps, deterministic, exact.  Modest (0.8% of Iter0) but real.
+    Mode 2 beats mode 1 at k=12 on every axis: cost 119 vs 162 ms, phase1
+    3.062 vs 3.109, Iter0 6292 vs 6361.  The per-particle metric earns its
+    keep.  The budget (Iter0 delta = phase1 delta + migration) closes on all
+    10 arms, several to within 5 ms.
+
+24. AN ANOMALY I CANNOT EXPLAIN, AND IT IS SYSTEMATIC.  Phase-1 wall delta
+    vs base for mode 2: k=1 +252, k=2 +355, k=4 +201, k=8 0, k=12 -187 ms.
+    Consistent in sign across all 3 reps of every arm.  SMALL k WITH
+    CONCENTRATED WORK MAKES PHASE 1 WORSE.  What is strange is that every
+    counter moves the RIGHT way in those arms -- phaseA flat, phaseB stage
+    down, victim pb_sum down, destination still below the victim, phaseB max
+    down -- while the phase-1 WALL goes up.  So the cost is in the ALIGNMENT
+    between processes, which is exactly what none of these counters measure.
+    r0k4 (4 pieces migrated, no work moved) is only +38 ms, so it is not
+    "any migration hurts"; it is specific to relocating a small amount of
+    highly concentrated work.
+
+25. THIS IS FINALLY A JUSTIFIED TRACE, and the prerequisite is met.
+    Projections over phase 1 for base / r2k2 / r2k12, victim and destination
+    PEs 770-783 and 784-797 plus a control block (~28 PEs, 75-150 MB).
+    +sumDetail would NOT answer it: the question is ordering BETWEEN
+    processes, not where time goes inside an entry method.
+    Until it is explained: use k=12 mode 2, and treat small-k shedding as
+    MEASURED-HARMFUL rather than merely unhelpful.
+
+ADDENDUM D -- KALE'S PE-SET SPLIT.  Jobs 5287404 (failed gate) + 5287418.
+patches/0011.  bin/FoF3.2b.pesets2 md5 e2784b0b3112.  Full report:
+reports/pe-set-split-results.md.  ALL 13 2B ARMS EXACT.
+
+26. FIRST ATTEMPT FAILED THE 10k GATE: 3642 vs 3549, 93 merges lost.  The
+    diagnostic that pinned it in one step: leaf_visits 279 IDENTICAL to the
+    control while same_frag halved 74->38 -- same reach, fewer merges, so the
+    pairs never entered the traversal.  Cause: FoFPhase3.h:113
+    SkipLocalSource, Kale's own 2026-08-05 ownership prune, which discards
+    local-source pairs in Traverser.h BEFORE open() is called.  That is
+    exactly the assumption Kale suspected.  I MISSED IT in the analysis: I
+    checked the visitor predicate, the SEEN table and same_frag, found all
+    three safe, and stopped one layer too early.  My "same_frag 43353 proves
+    the walk visits these pairs" inference was wrong.
+
+27. FIX (patches/0011): runtime veto -- the prune is off on any process where
+    the split is active.  All four 10k set modes then exact.  The veto is
+    COARSE: it disables the prune for EVERY local source, not just cross-set
+    ones, restoring the whole local-vs-local certificate sweep.
+
+28. VICTIM-ONLY SPLIT IS THE BEST RESULT OF THE CAMPAIGN.
+       phase1     3.324 -> 2.934 s   -390 ms  (-11.7%)
+       Iter0      6421  -> 6015 ms   -406 ms  (-6.3%)
+       phaseB max 1.263 -> 0.768     -39%
+    AND THE PHASE-3 BILL IS NOTHING: phase3_walk 0.303 -> 0.285 (DOWN),
+    uf2 +9 ms, and unique edges rise by 377 (485013 -> 485390) while 74543
+    piece pairs were dropped from the pool.  The first-witness discount in
+    its purest form -- nearly every cross-set pair joins fragments already
+    connected another way, so SEEN suppresses it.
+    For scale: best shedding was -49 ms on Iter0 and cost 119 ms of
+    migration.  This is 8x better and costs nothing to set up.
+    Round-robin beats blocked at s=2 (0.745 vs 0.898), as predicted.
+    Benefit SATURATES at s=2 round-robin: s=7 and s=14 are no better,
+    because 0.768 is where process #2 sits -- the same level-to-#2 ceiling.
+    Going further needs more PROCESSES treated, not more sets.
+
+29. MACHINE-WIDE IS A 3.2 s NET LOSS, and it prices the sweep.
+    all-s14: phaseB GONE (1.322 -> 0.000), phase1 2.086 -- but phase3_walk
+    0.29 -> 2.36 (+2.07 s, this IS the local-vs-local sweep the prune was
+    added to remove, now measured) and uf2 0.44 -> 2.05 (+1.61 s) with the
+    relabel map 745540 -> 2449538 entries and edges 3.4x.  Iter0 9576.
+    The failure mode named in the analysis is real, and it is the COARSE
+    VETO plus fragment inflation -- not the idea.
+    Note all-s14 phase1 = 2.086 with phaseB at zero: that is phaseA alone,
+    confirming the 19-process phaseA plateau as the floor.
+
+30. STEALING: KEEP IT.  S3 is worth 1.82 s on the baseline (5.140 -> 3.324
+    phase1).  The victim split recovers most of that when stealing is off
+    (5.140 -> 3.494), so they are partial substitutes, but S3 is STILL worth
+    560 ms on top of the split (3.494 -> 2.934).  Use both.  Only in the
+    machine-wide variant is stealing free to remove (2.086 vs 2.083), and
+    only because phaseB is empty -- Kale's "turn off all phaseB steals"
+    endpoint is reachable but currently costs 3.2 s.
+
+31. ADOPT NOW: FOF_PE_SETS=2 FOF_PE_SETS_MODE=1 FOF_PE_SETS_NODE=<measured
+    worst>, S3 left on.  NEXT, in order: (a) NARROW THE VETO to "source and
+    target in different sets" -- section 29 prices what the coarse version
+    wastes at up to 2.07 s, and it is now the highest-value follow-up in the
+    campaign; (b) re-run machine-wide and top-N with the narrow veto, since
+    this mechanism has no per-process cost and the tail is broad;
+    (c) track fragment inflation (uf2, relabel_map) on every arm -- it is
+    the second cost and it bounds how far top-N can go.
+
+ADDENDUM E -- NARROW VETO + TOP-N.  Jobs 5287618 (failed gate), 5287653.
+patches/0012, bin/FoF3.2b.pesets4 md5 2bd50769105e.  ALL 18 ARMS EXACT.
+
+32. "MACHINE-WIDE" MEANT: FOF_PE_SETS_NODE unset, so the split applied on ALL
+    128 processes, each splitting its own PEs.  Victim-only = node 55 alone.
+    Part 2 adds FOF_PE_SETS_NODES (comma list) so the top N can be treated
+    together -- the point of a mechanism with no per-process cost.
+
+33. THE NARROW VETO FAILED ONCE FIRST (10k 3555/3562/3557 vs 3549).  My bug:
+    I took the TARGET's set from CkMyPe(), but under FOF_STEALA a piece's
+    phase-1 set is its CLAIMED PE, not the one it resides on.  Fixed by
+    looking BOTH sides up in the piece->set table.
+
+34. THE NARROW VETO REMOVES ~2.0 s OF WALK, exactly as predicted:
+    phase3_walk machine-wide s=14 went 2.357 (coarse) -> 0.389 (narrow).
+
+35. TOP-6 IS THE ANSWER.  Means of 2 reps, base = phase1 3.267, Iter0 6364:
+       victim s14   phase1 2.880  Iter0 6036.7   -327 ms
+       top2  s2rr   phase1 2.708  Iter0 5893.4   -471 ms
+       top6  s2rr   phase1 2.690  Iter0 5873.8   -490 ms
+       top6  s14    phase1 2.639  Iter0 5829.7   -534 ms  (-8.4%)
+    phase1 -628 ms = -19.2%.  Phase-3 bill: +53 ms walk, +28 ms uf2,
+    +5.7% edges.  Top-1 -> top-2 -> top-6 improves the result monotonically,
+    which confirms the broad-tail thesis operationally.  Shedding's best
+    was -49 ms; this is ~11x that.
+
+36. MACHINE-WIDE IS STILL A LOSS, AND NOW WE KNOW EXACTLY WHY: uf2.
+    all-s14 uf2 0.448 -> 2.025 (+1.58 s), edges 3.4x, turning a -1157 ms
+    phase-1 win into a +1249 ms Iter0 loss.  all-s2 uf2 +1.01 s, +700 ms.
+    THE COST SCALES WITH HOW MANY PROCESSES ARE SPLIT, NOT HOW FINELY:
+    top6 s14 splits 6 processes 14 ways for 28 ms; all-s2 splits 128
+    processes 2 ways for 1.01 s.  The union-find is now the binding cost.
+
+37. KALE'S PAYOFF ARM LANDS.  With the top-6 split, phaseB stealing is worth
+    THREE MILLISECONDS: phase1 2.687 (S3 off) vs 2.690 (S3 on), Iter0 5861
+    vs 5874, both inside the rep spread.  On the baseline S3 is worth 1.82 s
+    (5.087 vs 3.267).  So the split FULLY SUBSTITUTES for phaseB work
+    stealing, within and across physical nodes -- the whole S3 machinery can
+    be switched off in this configuration.  It is a substitution, not a
+    refutation: S3 still earns its 1.82 s when the split is absent.
+
+38. RECOMMENDED: FOF_PE_SETS=14 FOF_PE_SETS_MODE=0
+    FOF_PE_SETS_NODES=<top 6 by pb_sum_s> FOF_S3=0.
+    Iter0 -534 ms, phase1 -628 ms, exact, no migration, no stealing.
+    s=2 mode 1 on the same six is within noise and cheaper in edges.
+
+39. LEFT: (a) uf2 is now the binding cost -- Kale's note that phase-3 edges
+    go to the root in serial mode and that communication dominates in
+    parallel mode is the thread to pull; (b) the victim list is still
+    hand-supplied, and wiring in the m2_cross ranker (relay5: #1 in 3/3,
+    4 of top 5) is now worth it because the payoff is -534 ms not -49 ms;
+    (c) phaseA's 19-process plateau (0.87 s) is untouched and, with phaseB
+    down to 0.50 s, is now most of what remains in phase 1.
+
+ADDENDUM F -- `-u dist` UNBLOCKS THE MACHINE-WIDE SPLIT.  Jobs 5288750 (19
+arms) + 5288783 (5 traced).  ALL 24 ARMS EXACT.  reports/pe-sets-dist-results.md.
+
+40. RECOMMENDED CONFIG IS NOW:  -u dist, FOF_PE_SETS=14 MACHINE-WIDE, FOF_S3=0
+       Iteration 0  6480 -> 5379 ms   -1101 ms  (-17.0%)
+       phase 1      3.374 -> 2.092 s  -1282 ms  (-38.0%)
+       phaseB       1.343 -> 0.001 s  ELIMINATED
+    No migration, no stealing, no victim list (machine-wide needs none).
+
+41. WHAT DIST FIXED, ISOLATED CLEANLY.  Two traced runs at the IDENTICAL split
+    differing only in -u:  phase1 2.014 vs 2.012 (same to 2 ms), walk the same,
+    uf2 2.094 (serial) vs 0.692 (dist), Iter0 7552 vs 5374.  THE ENTIRE 2.2 s
+    IS THE UNION-FIND.  Serial gathers every edge to the root, so the split's
+    3.4x edge inflation lands on one process; dist absorbs it for +0.2 s over
+    its own baseline.  Open issue 1 is CLOSED BY MEASUREMENT.
+    Note dist alone is worth only -174 ms (6306 vs 6480) -- its value here is
+    almost entirely that it makes the split affordable.
+
+42. S3 OFF IS NOW A SMALL WIN, not merely free: -195 ms (dist top6), -218 ms
+    (serial top6), -34 ms (dist all14).  Single reps, so read the direction.
+    On the unsplit baseline S3 is still worth 1.82 s: substitution, not
+    refutation.
+
+43. TRACES OF THE RECOMMENDED CONFIG (job 5288783, 5/5 exact, and they
+    reproduce the untraced numbers -- traced Iter0 5373.7 vs 5379.4):
+      pesets-sumd-rec-frontier.tar.gz         THE RECOMMENDED CONFIG, sumDetail
+      pesets-sumd-base-frontier.tar.gz        serial/no-split comparison
+      pesets-sumd-rec-serial-frontier.tar.gz  ISOLATION CONTROL: same split,
+                                              -u serial.  uf2 2.094 vs 0.692
+      pesets-proj-rec / proj-base             projections, 182-PE subset
+    Against timeProfile-2b-proto3-sumd-08-16.png the ~2 s phaseB tail at
+    5-15% utilisation should be GONE.  What remains is phaseA.
+
+44. WHAT IS LEFT.  phase 1 is 2.092 s against a perfect-balance floor of
+    1.150 s, and ALL 0.94 s of the remainder is phaseA -- which this
+    mechanism cannot touch by construction (a set boundary is between PEs;
+    phaseA is same-PE work) and which is a 19-process PLATEAU, so no targeted
+    method applies either.  Open issue 3 is now the whole of what remains.
+    Open issue 2 (victim list) is MOOT for the recommended config: machine-
+    wide needs no list, and it beats top-6 by 236 ms at 16 nodes.
+
+45. PREDICTIONS FOR 64/128 NODES, written down before the data exists:
+    (a) serial-mode union-find should break down FURTHER -- 4x the processes
+        means 4x the fragment contributors gathering to one root, so the
+        2.2 s serial/dist gap should widen;
+    (b) dist should improve RELATIVE to serial, because "communication
+        dominates in dist mode" describes a regime with too little work to
+        amortise, and the split hands it 3.4x more edges;
+    (c) phaseA per process should FALL at fixed problem size, but whether the
+        PLATEAU SHAPE survives is the open question and decides whether
+        anything further on phase 1 is worth attempting.
+
+ADDENDUM G -- s SWEEP (job 5288941) and SCALING to 64/128 (job 5288946).
+ALL 48 ARMS EXACT.  reports/pe-sets-ssweep.md, reports/pe-sets-scaling.md.
+
+46. s SWEEP ANSWERS KALE'S QUESTION: no, 3-7 had never been run machine-wide.
+    Now they have.  s=3,4,7,10,14 with ROUND-ROBIN are 5420/5403/5366/5434/
+    5420 ms -- a 68 ms spread over five configurations, i.e. noise.  s=14 is
+    NOT special and the result does not depend on "one PE per set".
+47. MODE IS THE VARIABLE THAT MATTERS, NOT s.  Round-robin beats blocked by
+    2131 ms at s=2, 2198 at s=3, 1077 at s=4, 605 at s=7.  Blocked keeps
+    SFC-adjacent PEs together so almost no pair weight crosses a boundary:
+    at s=2 blocked, phaseB is 3.112 s against a 3.326 s baseline -- it barely
+    split anything.  FOF_PE_SETS_MODE=1 is REQUIRED for any s < 14, not a
+    preference.
+48. THE TWO KNOBS ARE COUPLED.  S3=0 is only safe once phaseB is nearly gone:
+    at s=2 turning stealing off COSTS 190 ms (0.88 s of phaseB remains); at
+    s=14 it is free or slightly better.  At s=3-4, keep FOF_S3=1.
+49. SCALING, 2B on 16/64/128 nodes, one allocation.  Iteration 0 for
+    dist-s14-S3off against the serial baseline at the same N:
+       16 nodes  5369 vs 6409   -16.2%
+       64 nodes  2771 vs 4384   -36.8%
+      128 nodes  3826 vs 5446   -29.7%
+    THE BENEFIT GROWS WITH SCALE.  On phase 1 alone: -37.8% / -68.2% /
+    -77.5%.  phase1 for the recommended config is 2.069 -> 0.557 -> 0.281 s,
+    i.e. 3.71x on 4x nodes then 1.98x on 2x -- near linear.
+50. ALL THREE PREDICTIONS CONFIRMED.
+    (a) serial uf2 2.062 -> 3.814 -> 5.068 while dist is 0.655 -> 0.723 ->
+        1.048; the gap nearly triples (1.41 -> 4.02 s).  serial-s14 at 128
+        nodes takes 9831 ms, WORSE than doing nothing.
+    (b) dist on the unsplit baseline is worth -2.3% at 16, -20.4% at 64,
+        -11.3% at 128.
+    (c) phaseA magnitude collapses 2.0 -> 0.27 s and scales near-perfectly,
+        but the PLATEAU SHAPE SURVIVES and the ratio even worsens slightly
+        (1.63x -> 1.96x max/median).  It no longer matters either way.
+51. THE MAIN CONCLUSION: PHASE 1 IS NO LONGER THE BOTTLENECK.  At 128 nodes
+    it is 0.281 s of a 3942 ms iteration -- 7%.  The campaign's target has
+    been optimised out of relevance at scale.
+52. 128 NODES IS WORSE THAN 64, AND NOT BECAUSE OF THE SPLIT.  Iter0 2713 ->
+    3942 while phase 1 keeps improving (0.557 -> 0.281).  The regression is
+    Pre-traversal (1023 -> 1574) and Tree traversal (1346 -> 1987) --
+    framework costs growing with process count -- and it hits the serial
+    baseline too (4384 -> 5446).  2B on 128 nodes is 15.6M particles/node;
+    this problem has STRONG-SCALED OUT at 64.
+53. BEST MEASURED RESULT: 64 nodes, -u dist, FOF_PE_SETS=14, FOF_S3=0 =
+    2771 ms, against 4384 ms serial at the same N and 6409 ms at the 16-node
+    baseline the campaign started from.
+54. NEXT BOTTLENECK, if one is wanted: Pre-traversal + Tree traversal, 90% of
+    Iteration 0 at 128 nodes and growing with process count.  A different
+    subsystem from anything this campaign has touched.
