@@ -1552,6 +1552,20 @@ coarse veto was correct but cost up to 2.07 s. Both comments are
 rewritten in place — do not reintroduce an ownership test on the
 strength of the retired wording.
 
+CORRECTION TO COMMIT 986dcab's MESSAGE (caught 2026-08-17 by the Anvil
+session before it could mislead a run): that message says
+"FOF_PE_SETS_MODE (0 round-robin, 1 blocked)". IT IS INVERTED.
+common.h:135 is
+    return peSetsMode() == 1 ? (lr % sets) : (lr * sets / n);
+so **MODE=1 is ROUND-ROBIN** (lr % sets) and MODE=0 is BLOCKED. The
+in-file comments, the Frontier reports and the prose below all have it
+right; only that commit message is wrong, and a commit message cannot be
+amended after pushing — this note is the correction of record.
+Note also that at s == CkNodeSize the two modes are nearly DEGENERATE
+(with 15 PEs and s=14: blocked {0,1},{2}..{14}; round-robin {0,14},
+{1}..{13}), so an s=14 mode comparison measures nothing — compare modes
+at s=4, where Frontier measured a 1077 ms gap.
+
 TWO KNOBS, AND THEY ARE COUPLED. FOF_PE_SETS_MODE=1 (round-robin) is
 REQUIRED for s<14, worth up to 2.2 s (blocked keeps SFC-adjacent PEs
 together, so almost nothing crosses a boundary). s itself is noise
