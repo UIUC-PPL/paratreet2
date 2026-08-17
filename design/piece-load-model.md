@@ -639,3 +639,19 @@ NEXT: the 2B A/B. Shed k pieces off the measured worst process (node 55)
 and read phaseB_s max against the -33.4% ceiling, WITH phase3/merge/
 relabel, since that is where the locality conversion would show up. Only
 then is model-driven selection (z > 7 on m2_cross) worth wiring in.
+
+## Anvil confirmation (job 19979370, 2026-08-17 morning window, 8/8 exact)
+
+Archival — shedding is superseded — but the independent check is clean:
+
+- **Victim measured, not assumed: node 55 on Anvil as well.** Same rank hot
+  on both machines (deterministic decomposition, same dataset).
+- Mechanism works at 2B on a second machine: 4/12/30 of 67,992 pieces
+  migrated per arm, every arm exact at 424897832.
+- **Phase-3 bill ≈ zero**, matching Frontier: phase3_walk 0.372 -> 0.382-0.407,
+  uf2 flat at 0.33-0.35 across all arms.
+- Effect size is small here: phaseB_s max 0.650/0.692 (base reps) ->
+  0.588/0.601 at k=30, about -10%, versus Frontier's -39%. Consistent with
+  Anvil's milder morning-window straggler (max 0.65 s vs Frontier's 1.26).
+  Both machines agree on the shape: prize real, cost nil, magnitude set by
+  how extreme the outlier is.
