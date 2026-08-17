@@ -2,22 +2,28 @@
 
 ## How much the codebase grew
 
-Reference point `4d23ce1` (2026-07-25, "fix warnings") to HEAD, counting
-only `src/`, `fof/`, `examples/`:
+Measured from **`f2d40c7` (2026-08-03, "extract FoF into its own fof/
+module")** — i.e. AFTER the framework separation, so the numbers are the
+campaign's own additions and not the extraction moving code between
+directories. (An earlier cut from 2026-07-25 made `src/` look like it
+SHRANK by 845 lines; that was the extraction carrying code out to `fof/`,
+not restraint. Kale caught it.)
 
-    78 files changed, 10,060 insertions(+), 3,220 deletions(-)
+    70 files changed, 7,337 insertions(+), 1,710 deletions(-)
 
-i.e. **net +6,840 lines**. Where it went:
-
-| area | 2026-07-25 | now | note |
+| area | 2026-08-03 | now | added |
 |---|---|---|---|
-| `src/` | 12,481 | 11,636 | **SHRANK** by 845 |
-| `fof/` | 0 | 6,504 | the FoF module was extracted after this date |
-| `examples/fof3` | 1,003 | 1,211 | +208 |
+| `src/` | 10,396 | 11,636 | **+1,240** |
+| `fof/` | 3,131 | 6,504 | **+3,373** |
+| `examples/fof3` | 1,099 | 1,211 | +112 |
 
-So essentially all of the growth is the `fof/` module itself, which did
-not exist at the reference point — not bloat added to the framework. The
-framework proper is smaller than it was.
+And the number that matters most:
+
+    fof/FoFPhase1.h    2,234 -> 5,075 lines    (+2,841, i.e. +127%)
+
+**One file more than doubled in two weeks**, and it is the file every
+retired mechanism lives in. That is the cleanup target, not the repo as a
+whole.
 
 ## What is debris, and how much
 
