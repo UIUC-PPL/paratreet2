@@ -2594,6 +2594,25 @@ public:
       // one to finish assembles the pool and starts phaseB.
       nb->pool_slices.assign(CkNodeSize(CkMyNode()), {});
       nb->slice_done.store(0);
+      // PE-SET SPLIT: publish TreePiece index -> set id for this process,
+      // HERE, on the single PE that is about to broadcast the slice build.
+      // Written once, read-only afterwards by every PE — including by the
+      // phase-3 ownership prune, which needs it to tell a cross-set local
+      // pair (must be walked) from a same-set one (already merged, prune it).
+      if (paratreet::peSetsHere() > 1) {
+        auto& tbl = paratreet::pieceSetTable();
+        int maxidx = -1;
+        for (auto& kv : nb->pe_treepieces)
+          for (auto& s : kv.second)
+            if (s.root) maxidx = std::max(maxidx, s.root->tp_index);
+        tbl.assign(maxidx + 1, (signed char)-1);
+        for (auto& kv : nb->pe_treepieces) {
+          const int set = paratreet::peSetOfPe(kv.first);
+          for (auto& s : kv.second)
+            if (s.root && s.root->tp_index >= 0)
+              tbl[s.root->tp_index] = (signed char)set;
+        }
+      }
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].buildPoolSlice();
@@ -2728,19 +2747,60 @@ public:
   // from the flattened (thread-pair, TreePiece-pair) space by stride, so
   // every thread walks a comparable share of the geometry without any
   // coordination. Writes only its own slice.
+  // ---- PE-SET SPLIT (Kale, 2026-08-16; design in
+  // reports/pe-set-split-analysis.md). Treat this process's PEs as s
+  // independent sets for phase 1: pairs that cross a set boundary are LEFT
+  // OUT of the phaseB pool, and phase 3 discovers them instead.
+  //
+  // Why that is safe, and it is not an assumption — it is three checked
+  // mechanisms:
+  //  1. Phase 3's edge predicate is "different tips within b", with NO
+  //     ownership test (FoFPhase3.h). Its comment justifies that by the
+  //     invariant "different tips within b implies different processes",
+  //     which THIS CHANGE FALSIFIES — but the code never tested ownership,
+  //     so the conclusion still holds. That comment is updated accordingly.
+  //  2. The phase-3 SEEN table is written only when an edge is EMITTED
+  //     (FoFPhase1Node::trySeenInsert), so suppression can never swallow a
+  //     pair phase 1 declined to do.
+  //  3. same_frag pruning fires only when both sides are already in one
+  //     fragment, which is exactly when no edge is needed.
+  // And the phase-3 walk already visits these pairs today: a baseline 2B run
+  // reports same_frag 43353 prunes, and pre-relabel tips are process-local,
+  // so those ARE same-process pairs the walk reaches and discards as merged.
+  //
+  // FOF_PE_SETS=s        number of sets (1 = off, the default)
+  // FOF_PE_SETS_NODE=n   apply only on process n (unset = EVERY process)
+  // FOF_PE_SETS_MODE=0|1 0 = blocked (SFC-adjacent PEs share a set, so the
+  //                      least weight lands in phase 3), 1 = round robin
+  //                      (the most). Which is better depends on how much
+  //                      cheaper a pair is in phase 3 than in phaseB, which
+  //                      is the open question, so both are measured.
   void buildPoolSlice() {
     auto* nb = node_proxy.ckLocalBranch();
     int rank = CkMyRank(), nranks = CkNodeSize(CkMyNode());
     auto& slice = nb->pool_slices[rank];
-    long idx = 0;
+    const int sets = paratreet::peSetsHere();
+    long idx = 0, dropped = 0;
     for (auto ita = nb->pe_treepieces.begin(); ita != nb->pe_treepieces.end();
          ++ita) {
       auto itb = ita;
-      for (++itb; itb != nb->pe_treepieces.end(); ++itb)
+      for (++itb; itb != nb->pe_treepieces.end(); ++itb) {
+        if (sets > 1) {
+          const int sa_set = paratreet::peSetOfPe(ita->first);
+          const int sb_set = paratreet::peSetOfPe(itb->first);
+          if (sa_set >= 0 && sb_set >= 0 && sa_set != sb_set) {
+            dropped += (long)ita->second.size() * (long)itb->second.size();
+            continue;   // phase 3 will find these
+          }
+        }
         for (auto& sa : ita->second)
           for (auto& sb : itb->second)
             if ((idx++ % nranks) == rank) poolPushInto(slice, sa.root, sb.root);
+      }
     }
+    if (sets > 1 && rank == 0)
+      CkPrintf("FOF3STAT pe_sets: node %d sets %d mode %d piece_pairs_dropped %ld\n",
+               CkMyNode(), sets, paratreet::peSetsMode(), dropped);
     // Sort this thread's own slice (in parallel with the others), so the
     // assembly below never runs a global comparison sort — that sort
     // would otherwise become the new serial bottleneck as unit counts

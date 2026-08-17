@@ -100,6 +100,27 @@ constexpr auto dualSkipLocalSource(int) -> decltype(V::SkipLocalSource) {
 template <typename V>
 constexpr bool dualSkipLocalSource(long) { return false; }
 
+// RUNTIME veto on the ownership prune above (Kale's PE-set split, 2026-08-16;
+// reports/pe-set-split-analysis.md).
+//
+// The prune's correctness argument is phase-1 completeness: "two particles
+// within the linking length holding different tips are necessarily on
+// different processes, so a local-source-versus-local-target pair can never
+// emit an edge." FOF_PE_SETS DELIBERATELY BREAKS THAT PREMISE — it omits
+// cross-set piece pairs from the phaseB pool precisely so that phase 3 will
+// merge them — so on a process where the split is active the prune would
+// discard exactly the pairs the split depends on, and components come out
+// high. Measured the hard way: 10k gate 3642 against a gold of 3549 (job
+// 5287404), with leaf_visits IDENTICAL to the control, which is the signature
+// of pairs never entering the traversal at all.
+//
+// The veto is NARROW: paratreet::peSetKeepLocalPair (common.h) consults the
+// per-process piece -> set table, so only pairs whose two sides sit in
+// DIFFERENT sets escape the prune. A first, coarse version that vetoed the
+// prune for every local source was correct but cost up to 2.07 s of extra walk
+// machine-wide (job 5287418) — it restored the entire local-versus-local
+// certificate sweep rather than the sliver the split actually needs.
+
 // Opt-in DualTraverser symmetry prune (same opt-in idiom): the dual walk
 // processes every tree-piece pair (A, B) twice — once with A as the
 // target on A's processor, once with B as the target on B's — so a
@@ -763,7 +784,16 @@ public:
       // Ownership prune (see dualSkipLocalSource above): a source node that
       // is this process's own live data cannot produce output for a visitor
       // that declared the trait; discard the pair before any descent.
+      // NARROWED 2026-08-16: with the PE-set split active, a local source is
+      // still pruned when it is in the SAME set as the running PE (phase 1
+      // merged that pair, exactly as the original argument says); it is walked
+      // only when the two sides are in DIFFERENT sets, which is precisely the
+      // pairs the split left for phase 3. The earlier coarse veto disabled the
+      // prune for every local source and cost up to 2.07 s of walk machine-wide
+      // (job 5287418), because it restored the whole local-versus-local
+      // certificate sweep instead of the sliver actually needed.
       if (dualSkipLocalSource<Visitor>(0) &&
+          !paratreet::peSetKeepLocalPair(node->tp_index, tp.thisIndex) &&
           (node->type == Node<Data>::Type::Leaf ||
            node->type == Node<Data>::Type::EmptyLeaf ||
            node->type == Node<Data>::Type::Internal)) {

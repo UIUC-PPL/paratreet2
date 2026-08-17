@@ -293,14 +293,66 @@ public:
   // Receives (index, destPE) from every TreePiece. Runs only after the
   // decision broadcast has been delivered to all of them, so no array
   // broadcast is in flight and migrating here is safe.
+  // Receives one ShedCand per piece ON THE VICTIM (everyone else contributed
+  // zero bytes). Runs only after the decision broadcast has been delivered to
+  // every element, so no array broadcast is in flight and migrating here is
+  // safe — that ordering is the fix from fb43f06 and must not be relaxed.
+  //
+  // The choice lives here rather than in the element because ranking needs to
+  // compare siblings, and the plan has to reach the Driver anyway.
   void shedPlan(CkReductionMsg* msg) {
-    const int n = msg->getSize() / (int)(2 * sizeof(int));
-    const int* p = (const int*)msg->getData();
+    const int n = msg->getSize() / (int)sizeof(paratreet::ShedCand);
+    const paratreet::ShedCand* c =
+        (const paratreet::ShedCand*)msg->getData();
+    const char* vn = std::getenv("FOF_SHED_NODE");
+    const char* kc = std::getenv("FOF_SHED_COUNT");
+    const char* dc = std::getenv("FOF_SHED_DESTS");
+    const int victim = vn ? std::atoi(vn) : -1;
+    const int k = kc ? std::atoi(kc) : 0;
+    const int ndest = dc ? std::max(1, std::atoi(dc)) : 1;
+
+    // Heaviest first by the element's own score; ties by index so the plan is
+    // reproducible run to run. Determinism is the point: the previous rule
+    // took the first k elements to be delivered the broadcast, which is a
+    // random sample and gave a 0.8% / 75% / 20% spread in work moved over
+    // three identical runs (job 5286357 section 5).
+    std::vector<int> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    std::sort(order.begin(), order.end(), [&](int a, int b) {
+      if (c[a].score != c[b].score) return c[a].score > c[b].score;
+      return c[a].index < c[b].index;
+    });
+
     int moved = 0;
-    for (int i = 0; i < n; i++)
-      if (p[2 * i + 1] >= 0) { treepieces[p[2 * i]].migrateTo(p[2 * i + 1]); moved++; }
+    long particles_moved = 0;
+    const int nmove = std::min(k, n);
+    for (int i = 0; i < nmove; i++) {
+      const paratreet::ShedCand& s = c[order[i]];
+      // Destinations are the ndest processes following the victim, round
+      // robin, spread over the PEs of each. ndest=1 (the default) is the
+      // original rule. Splitting matters because one destination saturates:
+      // at k=30 it became the new worst process (job 5286357 section 5).
+      const int dn = (victim + 1 + (i % ndest)) % CkNumNodes();
+      if (dn == victim) continue;
+      treepieces[s.index].migrateTo(CkNodeFirst(dn) +
+                                    ((i / ndest) % CkNodeSize(dn)));
+      moved++;
+      particles_moved += s.n;
+    }
+    // NOTE the denominator CHANGED at this commit: it used to be every
+    // element in the array (63946 at 2B/16), it is now the candidates on the
+    // victim (~403). Comparing this line across builds needs that in mind.
     CkPrintf("SHED plan: %d of %d elements migrating\n", moved, n);
+    CkPrintf("SHED rank: mode %d dests %d particles_moved %ld"
+             " score_top %.6g score_cut %.6g\n",
+             shedRankEnv(), ndest, particles_moved,
+             n > 0 ? c[order[0]].score : 0.0,
+             nmove > 0 ? c[order[nmove - 1]].score : 0.0);
     delete msg;
+  }
+  static int shedRankEnv() {
+    const char* e = std::getenv("FOF_SHED_RANK");
+    return e ? std::atoi(e) : 0;
   }
 
   // Core iterative loop of the simulation
