@@ -270,6 +270,104 @@ srun --mpi=cray_shasta --network=job_vni --unbuffered \
    it, and design/phase1-gpu.md section 12.1's "emit the device form at
    tree build" would remove most of the tree half.
 
+## 9. The reconverse node-queue change, measured on top of all of the above
+
+Everything above was built against reconverse before `gate-nodelock` was
+merged into `gpu-merge-candidate`. That branch carries `a85140f`, which
+stops every PE from doing a `CmiTryLock(CsdNodeQueueLock)` on every
+scheduler iteration when the node queue is empty: it tracks the queue
+length in a relaxed atomic maintained under the lock and reads it before
+reaching for the lock. It was measured on Anvil at 120 PEs, where the
+effect grows with PEs per process (4201 -> 88 ns idle iteration at 1
+process x 120 PEs). Frontier's 8 x 14 shape is the wide-process case it
+targets.
+
+**It did not build.** `converse.h` gained
+`CsvExtern(std::atomic<int>, CsdNodeQueueLen)`, and this header is
+included by C translation units — GKlib's `b64.c` and friends inside
+ck-libs/metis — where `std::` is a syntax error. The file says so at the
+top: *"note: this file is included by both C and C++ files, so it should
+always have valid C code"*, and it already includes `<stdatomic.h>` for
+exactly this reason. Fixed by declaring the variable `std::atomic<int>`
+to C++ and `_Atomic int` to C, with `CsdNodeQueueLenAdd/Get` macros
+hiding the one piece of syntax that differs, so `CsdNodeEnqueueGeneral`
+(also C++-only as merged, via `.fetch_add`) needs no `#ifdef` at its call
+sites. That is the same split `CmiChunkHeader` already uses in the same
+header for its refcount. Verified by compiling `converse.h` standalone as
+C (gnu11, gnu17, c11, and the compiler default) and as C++ before
+rebuilding.
+
+**Correctness is unaffected.** The full stage-4 gate re-ran on the
+rebuilt stack: 18 arms, 1k/100k/80M, `-c full` where it fits, `-i 3`,
+`FOF_COUNT_VERIFY=1`, all exit 0, all component counts identical, 21
+zero-mismatch reports. At 2B/16 nodes: 424,897,832 components in all nine
+arm-iterations and 0 label mismatches in the verify arm.
+
+### 9.1 At 16 nodes it is a clean win, in every arm
+
+Same script, same node count, same input — the only difference is the
+merge. Iteration 1, seconds:
+
+| | cpu_l12 | replace_l12 | replace_l128 |
+|---|---|---|---|
+| phase 1 | 5.342 -> 4.924 | 0.826 -> 0.804 | 0.669 -> 0.610 |
+| upwardPass | 0.353 -> 0.352 | 0.503 -> 0.463 | 0.375 -> 0.350 |
+| loadCache | 0.046 -> **0.020** | 0.096 -> **0.034** | 0.096 -> **0.041** |
+| phase-3 walk | 0.378 -> 0.355 | 0.569 -> 0.524 | 0.772 -> 0.859 |
+| uf2 | 0.542 -> 0.506 | 0.785 -> 0.674 | 0.784 -> 0.763 |
+| histogram | 0.336 -> 0.342 | 0.549 -> 0.454 | 0.546 -> 0.474 |
+| **iteration** | **8.268 -> 7.740** | **5.852 -> 5.168** | **4.984 -> 4.676** |
+
+**-6% to -12% on the whole iteration, and 17 of the 18 cells move the
+right way.** Two things stand out:
+
+- **`loadCache` falls 57-65% in every arm.** That is the largest relative
+  improvement anywhere in the table, and `loadCache` is the term section
+  4 flagged as anti-scaling worst — 1.18 s of a 5.8 s iteration at 128
+  nodes. A change that halves it at 16 nodes is pointed straight at the
+  biggest remaining term at scale.
+- **It helps the DEVICE arms more.** `uf2` improves 0.036 s on the CPU
+  arm and 0.111 s on `replace_l12`; the histogram is flat on the CPU arm
+  and -0.095 s on `replace_l12`. That fits what the change does: it cuts
+  the latency of an idle PE noticing work, and the device arms are the
+  ones with 13 PEs idling through the GPU pass.
+
+It does NOT change the GPU-vs-CPU ratio at 16 nodes (1.659x before,
+1.655x after) — both arms got faster by about the same factor — and it
+takes roughly a quarter out of section 4's downstream regression without
+closing it: the `cpu_l12 -> replace_l12` penalty over upwardPass +
+loadCache + phase-3 walk + uf2 goes from +0.634 s to +0.462 s.
+
+### 9.2 At 128 nodes the A/B is inconclusive, and that is the finding
+
+| iteration 1 | before | after |
+|---|---|---|
+| cpu_l12 | 5.849 | 5.772 |
+| replace_l12 | 6.483 | **8.160** |
+| replace_l128 | 5.883 | **5.234** |
+
+The two device arms move in opposite directions by large margins in the
+same job: `replace_l12`'s `loadCache` rises 50% (1.482 -> 2.225 s) while
+`replace_l128`'s `uf2` falls 38% (1.685 -> 1.052 s). This is not
+iteration-to-iteration noise — within every run the two iterations agree
+to a few percent (`replace_l12` loadCache is 2.157/2.225 in the after
+run, 1.481/1.482 in the before run) — it is a whole-run shift that
+differs per arm.
+
+**So the honest reading is that at 128 nodes, with n = 1 per
+configuration, the between-run scatter is larger than the effect and no
+conclusion can be drawn either way.** Quoting the +11% on `replace_l128`
+(0.994x -> 1.103x GPU/CPU speedup) as the result of this change would be
+picking the arm that happened to move the right way. The 16-node A/B,
+where all three arms and 17 of 18 cells moved together, is the one to
+believe; 128 nodes needs repeats before it says anything.
+
+Job IDs: 16n after=5265073, 128n after=5265322 (before: 5264095,
+5264075). Fresh Projections traces for the matched 16-node CPU/device
+pair on the post-merge runtime are at
+`/lustre/orion/csc710/scratch/rrao/fof3_traces/scale_gpu_5265073/`
+(2.7 GB and 2.5 GB, 1794 files each).
+
 ---
 
 # Appendix A. The 2026-08-10 CPU-only sweep (`uniform-annotation`, HEAD `16fd529`)

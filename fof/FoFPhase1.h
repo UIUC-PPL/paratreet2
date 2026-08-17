@@ -1889,11 +1889,6 @@ public:
 #endif
       nb->device.setStream(nb->dev_stream);
       nb->dev_inited = true;
-      fofgpu::DeviceInfo di = nb->device.info();
-      CkPrintf("[FOF3GPU] proc %d pe %d backend=%s device=%d gpu=\"%s\" "
-               "%.1f GB, staging %ld particles\n",
-               CkMyNode(), CkMyPe(), di.backend, di.device_id, di.name,
-               di.total_global_mem / 1073741824.0, (long)nb->dev_total);
     }
     nb->device.resize((size_t)nb->dev_total.load());
     devicePlanTree(nb);
@@ -1955,12 +1950,10 @@ public:
         at += s.n;
       }
     }
-    if (nodes == 0) {
-      CkPrintf("[FOF3GPU] proc %d: no flat trees registered "
-               "(PARATREET_DEVICE_TREE unset?) - no tree on the device\n",
-               CkMyNode());
-      return;
-    }
+    // No flat trees registered (PARATREET_DEVICE_TREE unset?) means no tree
+    // on the device. Left to the guard in deviceLaunch, which aborts: a
+    // warning is not enough once the device is the only arm.
+    if (nodes == 0) return;
     nb->dev_total_nodes = nodes;
     nb->dev_tree_pieces = (long)piece_root.size();
     nb->device.resizeTree(nodes, (int)piece_root.size());
@@ -1978,13 +1971,6 @@ public:
     nb->dev_t_tree_upload = ts.t_upload;
     nb->dev_t_tree_check = ts.t_check;
     const long staged = nb->dev_total.load();
-    CkPrintf("[FOF3GPU] proc %d tree: %ld nodes over %ld pieces (%.1f MB), "
-             "device copy %.1f ms, check %.1f ms, particles under roots "
-             "%ld/%ld, bad nodes %ld\n",
-             CkMyNode(), ts.n_nodes, ts.n_pieces,
-             ts.n_nodes * sizeof(fofgpu::DDNode) / 1048576.0,
-             ts.t_upload * 1e3, ts.t_check * 1e3, ts.particles_under_roots,
-             staged, ts.bad_nodes);
     // Both numbers were recomputed BY THE DEVICE from what actually
     // landed in its memory, so they check the copy and the rebase rather
     // than echoing the host.
@@ -2129,31 +2115,6 @@ public:
     // Synchronous path: the whole pass blocked, by definition.
     if (!gpuAsyncLaunch()) nb->dev_t_block = nb->dev_t_launch;
     const fofgpu::WalkStats& w = nb->dev_walk;
-    CkPrintf("[FOF3GPU] proc %d walk shape: %s\n", CkMyNode(),
-             w.walk_solo ? "solo (one thread per leaf)"
-                         : "team (one wavefront per leaf)");
-    CkPrintf("[FOF3GPU] proc %d leaf occupancy: %.1f particles/leaf\n",
-             CkMyNode(), w.leaf_occupancy);
-    CkPrintf("[FOF3GPU] proc %d walk: %ld leaves, %ld top nodes | prepare "
-             "%.1f ms | grid %.1f ms | walk %.1f ms | freeze %.1f ms | "
-             "download %.1f ms | async tail %.1f ms | certificates %ld | "
-             "leaf pairs %ld | suppressed %ld | stack overflows %ld\n",
-             CkMyNode(), w.n_leaves, w.n_top_nodes, w.t_prepare * 1e3,
-             w.t_grid * 1e3, w.t_walk * 1e3, w.t_freeze * 1e3,
-             w.t_download * 1e3, w.t_device_tail * 1e3, w.certificates,
-             w.leaf_pairs, w.suppressed, w.stack_overflows);
-    CkPrintf("[FOF3GPU] proc %d grid split: mark %.1f | bin %.1f | union "
-             "%.1f | stencil %.1f ms\n",
-             CkMyNode(), w.t_grid_mark * 1e3, w.t_grid_bin * 1e3,
-             w.t_grid_union * 1e3, w.t_grid_nbr * 1e3);
-    CkPrintf("[FOF3GPU] proc %d grid: thresh %.3g | %ld dense nodes | "
-             "%ld particles (%.1f%%) | %ld cells | %ld stencil probes\n",
-             CkMyNode(), gpuGridThresh(), w.grid_nodes, w.grid_particles,
-             nb->dev_total.load() > 0
-                 ? 100.0 * (double)w.grid_particles /
-                       (double)nb->dev_total.load()
-                 : 0.0,
-             w.grid_cells, w.grid_probes);
     // A stack overflow means the traversal DROPPED work, which shows up
     // as silently under-merged components. Never a warning.
     if (w.stack_overflows != 0)
@@ -2188,19 +2149,11 @@ public:
       long at = dev_base_;
       for (auto& s : treepieces)
         for (int i = 0; i < s.n; i++, at++)
-          if (label[at] != s.parts[i].group_number) {
-            if (bad == 0)
-              CkPrintf("[FOF3GPU] proc %d pe %d MISMATCH at flat %ld "
-                       "(order %ld): device %ld, cpu %ld\n",
-                       CkMyNode(), CkMyPe(), at, s.parts[i].order, label[at],
-                       s.parts[i].group_number);
-            bad++;
-          }
+          if (label[at] != s.parts[i].group_number) bad++;
     }
     dev_t_scatter_ = CkWallTimer() - t0;
-    if (bad)
-      CkPrintf("[FOF3GPU] proc %d pe %d: %ld of %d particles disagree with "
-               "the CPU labeling\n", CkMyNode(), CkMyPe(), bad, dev_n_);
+    // `bad` is max-reduced below and aborts the run in runFoFPhase1; it is
+    // the only report a mismatch gets.
     // Every PE has now read hostLabels(), so the staging can go. The last
     // depositor does it — on whatever PE that is, which is safe because
     // releaseStaging fences the stream first and nothing else in the
@@ -4409,13 +4362,8 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
     local.device_scatter = gv[2];
     local.device_tree = gv[4] + gv[5];
     local.device_block = gv[6];
-    CkPrintf("[FOF3GPU] %s wall %.3f s | particle pack(max PE) %.1f ms "
-             "| tree pack(max PE) %.1f ms | tree upload(max proc) %.1f ms "
-             "| device round trip(max proc) %.1f ms | of which BLOCKING "
-             "%.1f ms | scatter(max PE) %.1f ms | LABEL MISMATCHES %ld\n",
-             gpu_mode == FoFGpuMode::Replace ? "replace" : "verify",
-             local.device_wall, gv[0] * 1e3, gv[4] * 1e3, gv[5] * 1e3,
-             gv[1] * 1e3, gv[6] * 1e3, gv[2] * 1e3, (long)gv[3]);
+    // The timings above are what `-c stats` reports as the phase1_device
+    // line; gv[3] is the verify-mode mismatch count, and nonzero is fatal.
     if (gv[3] != 0)
       CkAbort("FoF GPU: the device labeling disagrees with the CPU "
               "labeling on %ld particles", (long)gv[3]);
