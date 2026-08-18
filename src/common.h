@@ -166,22 +166,6 @@ inline bool peSetKeepLocalPair(int src_piece, int tgt_piece) {
   return a != b;
 }
 
-// Targeted shedding (design/piece-load-model.md): one candidate piece on the
-// victim process, as gathered by the shedDecide reduction. POD and fixed size,
-// because it travels as raw bytes through CkReduction::concat.
-//
-// Why the DRIVER and not the element decides: the element cannot rank itself
-// against its siblings without a gather, and a gather to the Driver already
-// has to happen — the migration must be issued from OUTSIDE the array
-// traversal (issuing it from inside the decision broadcast is what crashed,
-// fb43f06), so the Driver needs the plan regardless. Scoring in the element
-// and choosing in the Driver therefore costs no extra communication.
-struct ShedCand {
-  int index;      // TreePiece array index
-  int n;          // particles, i.e. what the migration will cost to move
-  double score;   // rank key, higher = shed first (FOF_SHED_RANK)
-};
-
 }  // namespace paratreet
 
 #endif // PARATREET_COMMON_H_
