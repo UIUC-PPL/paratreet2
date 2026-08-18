@@ -189,3 +189,46 @@ the single-piece floor may bind at this process count; the sub-piece escape
 hatch (section 2 constraint 6) is the answer if it does. Same run:
 phaseB max/avg 21x (0.004/0.134/2.812) with ONE pair at 0.634 s = 23%
 of the stage wall — direct evidence for half 2's tail splitting.
+
+## MEASURED AND RESOLVED (2026-08-18, relay12, jobs 5301010/5301011):
+## the gating measurement exists, and it retires the barrier scheme
+
+Section 3's gating measurement (within-process phaseA skew, per stage)
+ran at 2B on 16 and 64 nodes. The stopping rule ("if within ~1, STOP")
+does NOT fire at the critical process (1.226/1.262) — but the scheme is
+retired anyway, for a better-diagnosed reason:
+
+1. **The work is self, the skew is cross.** phaseA is 92-95% self work
+   (self:cross 17.4:1 at 16 nodes, 11.3:1 at 64) — but the SELF stage's
+   within-skew is only 1.09-1.10 median, while the CROSS stage is skewed
+   2.65-2.78 (max 5.7-7.4). The stage any PE may take is already flat;
+   the owner-bound stage carries the skew. The reverse of the scheme's
+   premise.
+2. **Because the self stage is ALREADY balanced by S1**, which is on in
+   every run: 12.2-12.8% of claims are foreign, ~10.5 of 14 PEs per
+   process steal. The 1.09 is the residual AFTER stealing — there is no
+   untapped self imbalance for a new self-stealing scheme to harvest.
+3. **The barrier variant is worth -1.6% of Iteration 0 at 16 nodes and a
+   small LOSS at 64** (the barrier converts the cross stage's 2.7x skew
+   into an additive cross_max term).
+4. **A "no-barrier" model suggesting -7.1%/-3.5% was WRONG**, withdrawn
+   after Kale challenged it: self and cross are not independently
+   schedulable (a claimed piece carries both its self walk AND p-1 new
+   cross pairs), and cross is owner-bound by an ADDRESSING constraint
+   (certRep/connectedRep index the claimer's PE-local uf_parent), not by
+   synchronisation. What that number actually measures is the ceiling of
+   PERFECT PIECE-TO-PE ASSIGNMENT — a better claim policy.
+5. **Critical-path decomposition**: 57-58% of phaseA's excess over the
+   ideal floor is ACROSS processes (max/mean 1.43 at 16 nodes, 1.60 at
+   64, growing with scale) — untouchable by any within-process scheme.
+
+WHAT SURVIVES, in value order:
+(a) ACROSS-process placement — the 57-58% — which is the piece-load-model
+    territory again, now for phaseA self cost (recall: node 55 = fewer,
+    LARGER pieces; particle count has zero correlation).
+(b) A CLAIM PRIORITY that prices the marginal cross cost of taking a
+    piece (p-1 new pairs against p held) — small, local, headroom
+    -368 ms at 16 nodes / -98 ms at 64; and total cross work is CONVEX
+    in pieces-per-PE, so equalising counts REDUCES it, not just
+    redistributes. Missing input: a per-PE (pieces, self, cross) dump —
+    a few lines in the existing deposit.
