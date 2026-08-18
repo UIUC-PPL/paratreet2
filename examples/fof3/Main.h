@@ -78,8 +78,21 @@ class ExMain: public paratreet::Main<FragData> {
   // walk (design/walk-uf2-overlap.md step 1), overlapping the union
   // cascades with the walk under one QD. 0 = classic post-walk injection
   // (the A/B oracle). Ignored under AGGREGATION (tram buffers are
-  // invisible to the walk's QD). Default 4096.
-  long fof_uf2_stream_batch = 4096;
+  // invisible to the walk's QD).
+  //
+  // Default 16 (2026-08-17, Frontier jobs 5295956/5296408/5296573; was
+  // 4096). The old default was an OFF SWITCH in disguise: the batch is a
+  // per-PE flush threshold, and per-PE edge yield is only 266-924 across
+  // 16-128 nodes (peak 6453 on ONE PE at 16 nodes), so 4096 fired once
+  // per run at best and never at 64+ nodes — every earlier "overlap A/B"
+  // compared no-overlap against no-overlap. 16 fires at every measured
+  // scale and is the only value never worse: -208 ms Iteration 0 (-3.8%)
+  // at 16 nodes, neutral at 64 (the walk shrinks faster than the union
+  // work it must hide — the ceiling on overlap is the HIDING phase's
+  // idle, not the hidden cost's size). 512 matches 16 at 16 nodes but
+  // REGRESSES +104 ms at 64: a scale-dependent default is the exact trap
+  // this replaces.
+  long fof_uf2_stream_batch = 16;
   // -g: compute and print the phase-1 fragments histogram (FOF3STAT
   // fragments line). Off by default since sparse-uf2: the histogram was the
   // only surviving consumer of countFragments, which is otherwise off the

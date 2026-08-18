@@ -1386,8 +1386,8 @@ frontier-s3-parallel-rebuild-results-2026-08-14.md. 21/21 2B exact.
      target per-grant cost -> expect the null result, EXCEPT
      zero-copy's removal of the 27 ms serial unmarshal (that part is
      worth it; still blocked upstream — relay2, stored as
-     design/frontier-relay2-nocopy-bug-2026-08-14.txt, a filed-quality
-     reconverse bug: getRMR scales per LCI device at runtime while
+     design/frontier-relay2-nocopy-bug-2026-08-14.txt, filed upstream as
+     reconverse bug (charmplusplus/reconverse#203): getRMR scales per LCI device at runtime while
      CMK_NOCOPY_DIRECT_BYTES=32 is compile-time; 7 devices need 176).
    - THE CONTIGUOUS-BUILD DESIGN NOTE'S S3 MOTIVATION IS UNDERCUT:
      donor flatten is per-grant cost, and DENSITY's 5x cut of exactly
@@ -1577,3 +1577,40 @@ at the identical split differing only in -u gave phase 1 identical to
 2 ms but uf2 2.094 (serial) vs 0.692 (dist). Serial gathers every edge
 to the root and the split inflates edges 3.4x. At 128 nodes serial-s14
 takes 9831 ms — worse than doing nothing.
+
+## 37. STALL ATTRIBUTION CLOSED (Frontier relay13/relay14, 2026-08-18):
+## the LCI idle-stall is an InfiniBand-path bug; Frontier never had it
+
+The question "what made the post-phase-1 communication stalls disappear"
+had two candidate answers (keep-alive ring, poll-thread setting). Both
+are wrong, because there is nothing to suppress on Frontier:
+
+- The trigger is REAL and stronger than the bug needs (relay13 items
+  5-8, measured on the E16 trace): 2.4-2.8 s of per-PE application
+  silence three times per run, ending in two-way exchanges against
+  48-108 distinct peer processes — the microbenchmark stalled at K=31.
+- Ring off, twice: exact, and indistinguishable in every timing region
+  (Iter0 5155.5 off vs 5167.7 on, within a 32 ms spread). The uf2
+  bracket, where the stalls lived, is unchanged to the millisecond.
+- The pure-LCI reproducer, rebuilt and run on Frontier at the app's own
+  shape (relay14): 220,000 round trips, 0 over 1 ms, K up to 64,
+  silences up to 60 s, ring on or off. Anvil put 0.62% over TEN ms at
+  K=31 on the same harness shape. Every measurement of this bug was
+  made on Anvil over Mellanox InfiniBand; the bug lives below the
+  progress API in the libfabric/IBV provider. Frontier is
+  Slingshot/CXI.
+
+Consequences: the ring STAYS (load-bearing on Anvil, ~free elsewhere)
+but FoF.C's comment now scopes it to the fabric; the lci-handover
+report gets no live Frontier reproduction (the condition never
+occurred); `+backend_poll_thread` is not an on/off switch — values
+below 1 clamp to 1, progress() advances only the caller's device, and
+the invariant is backend_poll_thread x lci_ndevices = ppn (2 is the
+UNIQUE full-coverage value at ppn 14 / ndevices 7; 14 deadlocks at
+startup on device coverage).
+
+Also in relay13: the per-PE stage dump retires the item-26 claim
+priority — piece count correlates -0.084 with cross time and -0.237
+with TOTAL phaseA time (an outcome of speed, not a cause of load);
+what varies is per-piece cost (4.9x median-to-max). The -13.3% ceiling
+stands but has no reachable mechanism as specified.

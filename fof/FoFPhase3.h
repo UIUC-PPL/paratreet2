@@ -22,11 +22,24 @@
 // Driver::loadCache ships the starter pack (see examples/fof3); the
 // annotation-validity CkEnforce in the visitor trips otherwise.
 //
-// Correctness of the edge predicate (design discussion, 2026-07-18): after
-// phase 1, any two particles within b of each other that hold DIFFERENT tips
-// are necessarily owned by different processes (phase 1 is the complete FoF
-// restricted to a process), so no ownership test is needed: different-tip
-// pairs within b are exactly the merge edges. Same-tip pairs are skipped.
+// Correctness of the edge predicate (design discussion, 2026-07-18): no
+// ownership test is needed — DIFFERENT-TIP PAIRS WITHIN b ARE EXACTLY THE
+// MERGE EDGES, and same-tip pairs are skipped. That is the whole predicate.
+//
+// The 2026-07-18 discussion justified it by an additional invariant: after
+// phase 1, two particles within b holding different tips are necessarily on
+// different processes, because phase 1 is the complete FoF restricted to a
+// process. AS OF 2026-08-16 THAT INVARIANT NO LONGER HOLDS, by design: the
+// PE-set split (FOF_PE_SETS, FoFPhase1.h::buildPoolSlice) deliberately omits
+// pairs crossing a set boundary from the phaseB pool, so two particles within
+// b on the SAME process can now hold different tips, and this walk is what
+// merges them.
+//
+// The predicate above is unaffected — it never tested ownership. But do NOT
+// reintroduce an ownership test as an optimisation on the strength of the old
+// invariant: same-process different-tip pairs are now real, expected, and
+// load-bearing. The walk already visited them before this change (they showed
+// up as same_frag prunes); it now emits edges for them instead.
 // The same pair is discovered from both sides' walks; duplicates are
 // deduplicated per PE and again at the gather root.
 //

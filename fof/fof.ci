@@ -43,6 +43,14 @@ module fof {
     // at this point in the module).
     entry void applyGlobalMapSlice(const std::vector<std::pair<long, long> >&,
                                    const CkGroupID&, const CkCallback&);
+    // Responsiveness + transfer probe (campaign P0, FOF_PROBE=1;
+    // design/phaseab-balancing.md section 14).
+    entry void probeStart(const CkCallback&);
+    entry void probeReport(const CkCallback&);
+    entry void probePing(int from, double t0);
+    entry void probeAck(int target, double t0);
+    entry void probeXfer(int from, double t0, const std::vector<char>&);
+    entry void probeXferAck(double t0, long bytes);
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
@@ -62,6 +70,9 @@ module fof {
     entry void startPhase1Chain(double b2, double grid_thresh, const CkCallback&);
     entry void phaseBChained();
     entry void buildPoolSlice();
+    // Campaign S2b: mid-phase relabel/re-annotate between the B1 and B2
+    // rounds (FOF_PB_MERGE=1).
+    entry void phaseBMidRelabel();
     entry void relabelChained(double tA, double tB, double tM);
     entry void countFragments(const CkCallback&);
     entry void collect(const CkCallback&);

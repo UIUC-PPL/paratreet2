@@ -8,7 +8,7 @@ CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 all: FoF3
 # FragData/FoFPhase3 live in the fof module; track them explicitly since
 # Makefile.common only adds -I flags, not header dependencies.
-DATA = $(FOF_PATH)/FoFData.h $(FOF_PATH)/FoFPhase3.h
+DATA = $(FOF_PATH)/FoFData.h $(FOF_PATH)/FoFPhase3.h $(FOF_PATH)/FoFPhase1.h
 VISITORS = FragCheckVisitor.h
 
 Main.decl.h: Main.ci $(DATA)

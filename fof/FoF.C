@@ -19,6 +19,14 @@
 // messages per second job-wide — so this sends ONE tiny message per
 // process every 100 ms to the next process in a ring.
 //
+// FABRIC-SPECIFIC: this is an InfiniBand-path (libfabric/IBV provider)
+// behaviour, measured on Anvil (jobs 19608513-19661625). It does NOT
+// reproduce on Frontier's Slingshot/CXI as of 2026-08-18: 220k round
+// trips, 0 over 1 ms, at up to 64 peers and 60 s silences, ring on or
+// off (jobs 5303887/5303902), and FoF's timings there are unchanged
+// with the ring off (job 5302846). The ring stays on because it is
+// load-bearing on InfiniBand and costs nothing measurable elsewhere.
+//
 // It MUST be a raw Converse message: Charm-level sends are counted by
 // quiescence detection, so a continuous Charm-level heartbeat would keep
 // CkStartQD/CkWaitQD (which the FoF uf2 bracket depends on) from ever

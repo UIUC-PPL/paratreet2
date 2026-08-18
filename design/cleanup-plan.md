@@ -68,3 +68,47 @@ Ballpark: **900-1,100 lines of retired mechanism**, almost all of it in
 3. Keep `design/` prose, since the numbered sections are the record of WHY
    each was retired. Delete `design/campaign-archive/` separately when the
    campaign formally closes (its README says so).
+
+## Executed (2026-08-18)
+
+Done as planned: tag `campaign-2026-08-stealing` at `0957364`, then six
+commits (`2a84e7b` shedding, `df144b0` prebuild-LB + cost-model load,
+`c7113eb` pool knob, `1673f02` cross-node, `465b377` reservation,
+`1046c29` S3 proper). Net: **9 files, −1,789 lines / +23**;
+`fof/FoFPhase1.h` 5,075 → 3,789; `fof/FoFStealTypes.h` deleted. All
+keep-list items verified present after the series (cost model +
+`printLoadModel`, `phaseA_stages`/`stage_pe`, `pb_unit_hist`, PE-set
+split + narrow veto, S1 claim pool, S2 partitioning/slicing, keep-alive
+ring).
+
+Gates: every commit passed the classic 16-run `make test` matrix, 1m
+`-c full` (333889), and split-active 10k `-u dist FOF_PE_SETS=2`
+(3549); commits 4 and 5 additionally re-gated the still-live wire
+(forced FOF_S3_TEST 9-ships run and FOF_S3_LOOPBACK, both exact). The
+end state passed reconverse (recharm clone, clean rebuild): 10k single
+and lcrun -n 2 (3549), split-active 10k (3549, pairs dropped on both
+processes), 1m lcrun `-c full` (333889). Two incidental finds en route:
+the second `s3XDrained` call in phaseBChained was never under its `if`
+(harmless, XNODE defaulted 0), and the recharm clone's `inputs/` lacks
+`1m.tipsy` — reconverse 1M gates need an absolute path to the
+clusterFinding copy.
+
+One deviation from the letter of the plan: the both-runtimes gate ran
+per-commit on classic only, with one reconverse pass at the series end
+(the six commits landed in one sitting; any reconverse-only breakage
+would still bisect over six commits).
+
+## Validated at scale (Frontier relay15, job 5304461, 2026-08-18)
+
+2B/16 nodes, 3 reps at `8e08843`, full artifact-scrubbed rebuild: all
+reps exact (424,897,832), Iteration 0 within 0.03% of relay13's
+pre-cleanup arms, stall detector shows no dark time, and the binary
+carries zero strings from any removed subsystem (twelve-string check
+now aborts the job script before spending 2B time). One drift, not
+wall-clock: walk-work counters +0.1-0.3% with within-process phaseA
+skew 1.35 -> 1.25 — the whole vector moves as a block between jobs
+while near-constant within one, and skew now reads 1.23/1.35/1.25 on
+three jobs across three different trees, so it tracks node placement /
+the claim race, not code. STANDING RULE from that: these counters are a
+regression signal only WITHIN a job, never across jobs. The cleanup is
+closed; the branch is ready to merge to main.

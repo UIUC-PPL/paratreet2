@@ -414,6 +414,209 @@ public:
     a_time_sum += t;
     if (t > a_time_max) a_time_max = t;
   }
+  // Stage split (see FoFPhase1::t_pa_self): per-process sum and max of
+  // each stage, printed by printLoadModel's caller. max/(sum/nPEs) per
+  // stage is the stage's within-process skew.
+  double pa_self_sum = 0.0, pa_self_max = 0.0;
+  double pa_cross_sum = 0.0, pa_cross_max = 0.0;
+  void depositPhaseAStages(double self_t, double cross_t) {
+    std::lock_guard<std::mutex> g(lock);
+    pa_self_sum += self_t;
+    if (self_t > pa_self_max) pa_self_max = self_t;
+    pa_cross_sum += cross_t;
+    if (cross_t > pa_cross_max) pa_cross_max = cross_t;
+  }
+  void printPhaseAStages() {
+    CkPrintf("FOF3STAT phaseA_stages: node %d self_sum %.3f self_max %.3f "
+             "cross_sum %.3f cross_max %.3f\n",
+             CkMyNode(), pa_self_sum, pa_self_max, pa_cross_sum,
+             pa_cross_max);
+  }
+
+  // ---- phaseA claim pool (campaign S1, FOF_STEALA=1;
+  // design/phaseab-balancing.md section 14 and
+  // design/phasea-reassignment.md). The frozen registry flattened into a
+  // claimable list: any PE of the process may claim any piece (exclusive
+  // ownership by CAS), own pieces first, then unclaimed siblings' —
+  // nearest-centroid first when FOF_STEALA_GEO=1 (default; =0 is the
+  // scan-order comparison arm, Kale's 1b). Built once per iteration
+  // under the narrow lock by the first arriver (~hundreds of entries).
+  struct StealEntry {
+    Node<Data>* root;
+    Particle* parts;
+    int n;
+    int home_pe;
+    double c[3]; // box center, for the geometry claim priority
+  };
+  std::vector<StealEntry> steal_pool;
+  std::unique_ptr<std::atomic<int>[]> steal_claimed;
+  bool steal_built = false;
+  // Direct steal evidence (Kale, 2026-08-12): per-process counts of
+  // claims that landed on the piece's home PE vs a sibling ("foreign" =
+  // an actual steal). Printed once per process at a_done completion.
+  std::atomic<long> s1_own{0}, s1_foreign{0}, s1_pes_foreign{0};
+
+  // Per-unit walltime histogram (log2 buckets of microseconds; Frontier
+  // Opus ask 2026-08-12): with a ~1950x unit-cost spread, max and mean
+  // cannot distinguish "a few giants over dust" from a smooth heavy
+  // tail — and those imply different fixes. Accumulated per process,
+  // printed once at the merge.
+  static constexpr int kUnitHistBuckets = 28;
+  std::atomic<long> pb_unit_hist[kUnitHistBuckets] = {};
+  void printUnitHist() {
+    printOneHist("pb_unit_hist", pb_unit_hist, "log2us");
+  }
+  void printOneHist(const char* name, std::atomic<long>* hist,
+                    const char* unit) {
+    long total = 0;
+    for (int i = 0; i < kUnitHistBuckets; i++) total += hist[i].load();
+    if (total == 0) return;
+    char buf[512];
+    int off = snprintf(buf, sizeof(buf), "FOF3STAT %s: node %d %s",
+                       name, CkMyNode(), unit);
+    for (int i = 0; i < kUnitHistBuckets; i++) {
+      long c = hist[i].load();
+      if (c > 0 && off < (int)sizeof(buf) - 24)
+        off += snprintf(buf + off, sizeof(buf) - off, " %d:%ld", i, c);
+    }
+    CkPrintf("%s\n", buf);
+  }
+
+  void ensureStealPool() {
+    std::lock_guard<std::mutex> g(lock);
+    if (steal_built) return;
+    for (auto& kv : pe_treepieces)
+      for (auto& s : kv.second) {
+        StealEntry e;
+        e.root = s.root; e.parts = s.parts; e.n = s.n; e.home_pe = kv.first;
+        for (int ax = 0; ax < 3; ax++)
+          e.c[ax] = 0.5 * ((double)s.root->data.box.lesser_corner[ax] +
+                           (double)s.root->data.box.greater_corner[ax]);
+        steal_pool.push_back(e);
+      }
+    steal_claimed.reset(new std::atomic<int>[steal_pool.size()]);
+    for (size_t i = 0; i < steal_pool.size(); i++) steal_claimed[i] = 0;
+    steal_built = true;
+  }
+
+  // ---- Responsiveness + transfer probe (campaign P0, FOF_PROBE=1;
+  // design/phaseab-balancing.md section 14). The coordinator process of
+  // each physical-node domain (lowest process of a FOF_PROCS_PER_PNODE
+  // block, default 8) pings every domain sibling every FOF_PROBE_MS
+  // (default 25) while armed; RTTs answer the campaign's central
+  // question -- does a process attend to messages while its PEs are
+  // inside phaseA/B? At report time a one-shot transfer ladder to the
+  // next process prices shipment sizes on the real transport (reconverse
+  // has no cross-process shared memory, so this is NIC loopback by
+  // construction; the latency signature confirms it). Charm "node" =
+  // process; the physical-node domain comes from the env, not the
+  // runtime.
+  static int probeProcsPerPnode() {
+    static const int v = [] {
+      const char* e = std::getenv("FOF_PROCS_PER_PNODE");
+      return e ? std::max(1, std::atoi(e)) : 8;
+    }();
+    return v;
+  }
+  static int probePeriodMs() {
+    static const int v = [] {
+      const char* e = std::getenv("FOF_PROBE_MS");
+      return e ? std::max(1, std::atoi(e)) : 25;
+    }();
+    return v;
+  }
+  bool probe_armed = false;
+  std::map<int, std::vector<double>> probe_rtts; // target proc -> rtt seconds
+  CkCallback probe_report_cb;
+  size_t probe_xfer_idx = 0;
+  std::vector<std::pair<size_t, double>> probe_xfer_rtts;
+
+  static void probeTickThunk(void* branch, double) {
+    ((FoFPhase1Node<Data>*)branch)->probeTick();
+  }
+
+  void probeTick() {
+    if (!probe_armed) return;
+    int ppn = probeProcsPerPnode();
+    int base = (CkMyNode() / ppn) * ppn;
+    int hi = std::min(base + ppn, CkNumNodes());
+    double now = CkWallTimer();
+    for (int p = base; p < hi; p++)
+      if (p != CkMyNode()) this->thisProxy[p].probePing(CkMyNode(), now);
+    CcdCallFnAfter(probeTickThunk, this, probePeriodMs());
+  }
+
+  void probeStart(const CkCallback& cb) {
+    if (std::getenv("FOF_PROBE")) {
+      probe_rtts.clear();
+      int ppn = probeProcsPerPnode();
+      if (CkMyNode() % ppn == 0 && CkNumNodes() > 1) {
+        probe_armed = true;
+        CcdCallFnAfter(probeTickThunk, this, probePeriodMs());
+      }
+    }
+    this->contribute(cb);
+  }
+
+  void probePing(int from, double t0) {
+    this->thisProxy[from].probeAck(CkMyNode(), t0);
+  }
+
+  void probeAck(int target, double t0) {
+    std::lock_guard<std::mutex> g(lock);
+    probe_rtts[target].push_back(CkWallTimer() - t0);
+  }
+
+  // Transfer ladder: one size at a time to the next process; the ack
+  // carries no payload, so RTT ~ one-way transfer + small.
+  void probeXfer(int from, double t0, const std::vector<char>& payload) {
+    this->thisProxy[from].probeXferAck(t0, (long)payload.size());
+  }
+
+  void probeXferAck(double t0, long bytes) {
+    probe_xfer_rtts.emplace_back((size_t)bytes, CkWallTimer() - t0);
+    probeXferNext();
+  }
+
+  void probeXferNext() {
+    static const size_t sizes[] = {4096, 65536, 1048576, 8388608};
+    if (probe_xfer_idx < 4 && CkNumNodes() > 1) {
+      size_t sz = sizes[probe_xfer_idx++];
+      std::vector<char> payload(sz, 1);
+      this->thisProxy[CkMyNode() + 1].probeXfer(CkMyNode(), CkWallTimer(),
+                                                payload);
+      return;
+    }
+    // Ladder done: print everything and close the report reduction.
+    for (auto& kv : probe_rtts) {
+      auto v = kv.second;
+      if (v.empty()) continue;
+      std::sort(v.begin(), v.end());
+      size_t n = v.size();
+      CkPrintf("FOF3STAT probe: proc %d->%d rtt_us min %.0f med %.0f "
+               "p99 %.0f max %.0f n %zu\n",
+               CkMyNode(), kv.first, v[0] * 1e6, v[n / 2] * 1e6,
+               v[std::min(n - 1, n * 99 / 100)] * 1e6, v[n - 1] * 1e6, n);
+    }
+    for (auto& pr : probe_xfer_rtts)
+      CkPrintf("FOF3STAT probe_xfer: proc %d->%d bytes %zu rtt_us %.0f\n",
+               CkMyNode(), CkMyNode() + 1, pr.first, pr.second * 1e6);
+    probe_rtts.clear();
+    probe_xfer_rtts.clear();
+    this->contribute(probe_report_cb);
+  }
+
+  void probeReport(const CkCallback& cb) {
+    probe_report_cb = cb;
+    bool was_armed = probe_armed;
+    probe_armed = false; // stop the tick chain
+    if (std::getenv("FOF_PROBE") && was_armed) {
+      probe_xfer_idx = 0;
+      probeXferNext(); // ladder, then print + contribute
+    } else {
+      this->contribute(cb);
+    }
+  }
 
   // Per-PROCESS redundant-descent total (design/step3.md §6d): each of this
   // process's group branches deposits its per-PE p3_redundant_descents here
@@ -481,6 +684,103 @@ public:
     pe_treepieces[pe].push_back(TreePieceRef{root, parts, n});
   }
 
+  // Per-process phaseB wall deposit, the phaseA analogue above. Needed
+  // because the load model predicts a PROCESS's phase-1 cost, while the
+  // balance line only reports min/avg/max over PEs globally.
+  double b_time_sum = 0.0, b_time_max = 0.0;
+  void depositPhaseBTime(double t) {
+    std::lock_guard<std::mutex> g(lock);
+    b_time_sum += t;
+    if (t > b_time_max) b_time_max = t;
+  }
+
+  // PREDICTED vs ACTUAL, one line per process (design/piece-load-model.md;
+  // this is the cost model the campaign validated and kept — the migration
+  // mechanisms it once fed are retired, tag campaign-2026-08-stealing):
+  //   self = sum n^1.2 over this process's pieces          (phaseA model)
+  //   pair = sum n^2 / V^(4/3) over the same pieces        (phaseB model,
+  //          mean-field neighbours; the constant b^4 is absorbed)
+  // Fit sum(actual phaseA) ~ a*self and sum(actual phaseB) ~ c*pair across
+  // processes: the R^2 of those two regressions is the go/no-go for acting
+  // on the model, and the ratio c/a calibrates the two terms' weights.
+  // m2 between two pieces, the SAME expected-pairs estimate the pool uses
+  // per unit (FoFPhase1.h ~2489, validated R^2 0.87 at 2B), evaluated at
+  // piece-root granularity: rho_a * rho_b * V_int(a grown by b, b) * V_ball.
+  // With a == b it degenerates to the piece's own self-pair estimate, so
+  // ONE formula covers self work and pair work.
+  static double pieceM2(const TreePieceRef& a, const TreePieceRef& b,
+                        double b2) {
+    double va = (double)a.root->data.box.volume();
+    double vb = (double)b.root->data.box.volume();
+    if (va <= 0 || vb <= 0) return 0.0;
+    const double bb = std::sqrt(b2);
+    double vint = 1.0;
+    for (int ax = 0; ax < 3 && vint > 0; ax++) {
+      double lo = std::max((double)a.root->data.box.lesser_corner[ax] - bb,
+                           (double)b.root->data.box.lesser_corner[ax]);
+      double hi = std::min((double)a.root->data.box.greater_corner[ax] + bb,
+                           (double)b.root->data.box.greater_corner[ax]);
+      vint = hi > lo ? vint * (hi - lo) : 0.0;
+    }
+    if (vint <= 0) return 0.0;
+    const double vball = 4.18879 * bb * bb * bb;
+    return ((double)a.root->data.n_below / va) *
+           ((double)b.root->data.n_below / vb) * vint * vball;
+  }
+
+  // Predicted phase-1 work of THIS process UNDER THE CURRENT ASSIGNMENT
+  // (Kale, 2026-08-15). The point of the estimate is only to say what this
+  // process will do if nothing moves — it deliberately does NOT try to
+  // predict what shedding a piece would do to pair work, which is
+  // unknowable cheaply and unnecessary for choosing a victim.
+  //
+  // So it sums m2 over the pairs the assignment ACTUALLY schedules:
+  //   m2_self  = sum_i  m2(i,i)          -> the phaseA self-pair term
+  //   m2_intra = sum over pairs on the SAME PE   -> rest of phaseA
+  //   m2_cross = sum over pairs on DIFFERENT PEs -> phaseB (the pool)
+  // The earlier version summed a per-piece MEAN-FIELD proxy
+  // (n^1.2 and n^2/V^(4/3)) that never looked at a neighbour; it reached
+  // r=+0.871 against phaseB on both machines, but its self term was
+  // anti-correlated (-0.19 Anvil, -0.26 Frontier) and unusable. Both proxies
+  // are still printed so the two can be compared on one run.
+  // Cost: O(pieces^2) per process, ~141k evaluations at 531 pieces — but it
+  // runs once, off the critical path, at phase3Stats.
+  void printLoadModel(double b2) {
+    static const double self_exp = [] {
+      const char* e = std::getenv("PARATREET_LB_SELF_EXP");
+      return e ? std::atof(e) : 1.2;
+    }();
+    std::vector<const TreePieceRef*> all;
+    std::vector<int> pe_of;
+    double self_proxy = 0, pair_proxy = 0, np = 0;
+    for (auto& kv : pe_treepieces)
+      for (auto& s : kv.second) {
+        if (s.n <= 0 || s.root == nullptr) continue;
+        all.push_back(&s);
+        pe_of.push_back(kv.first);
+        double n = (double)s.n, v = (double)s.root->data.box.volume();
+        self_proxy += std::pow(n, self_exp);
+        if (v > 0) pair_proxy += n * n / std::pow(v, 4.0 / 3.0);
+        np += n;
+      }
+    double m2_self = 0, m2_intra = 0, m2_cross = 0;
+    for (size_t i = 0; i < all.size(); i++) {
+      m2_self += pieceM2(*all[i], *all[i], b2);
+      for (size_t j = i + 1; j < all.size(); j++) {
+        double m = pieceM2(*all[i], *all[j], b2);
+        if (m <= 0) continue;
+        if (pe_of[i] == pe_of[j]) m2_intra += m; else m2_cross += m;
+      }
+    }
+    CkPrintf("FOF3STAT load_model: node %d pieces %zu n %.0f "
+             "m2_self %.6g m2_intra %.6g m2_cross %.6g "
+             "self %.6g pair %.6g "
+             "pa_sum_s %.3f pa_max_s %.3f pb_sum_s %.3f pb_max_s %.3f\n",
+             CkMyNode(), all.size(), np, m2_self, m2_intra, m2_cross,
+             self_proxy, pair_proxy, a_time_sum, a_time_max,
+             b_time_sum, b_time_max);
+  }
+
   // Called synchronously by group branches at the end of phaseB.
   void submitEdges(std::vector<std::pair<long, long>>&& es) {
     std::lock_guard<std::mutex> g(lock);
@@ -516,9 +816,32 @@ public:
     double key; // LPT order: ascending = costliest-first (see poolPush)
     Node<Data>* a;
     Node<Data>* b;
+    double m2;  // expected-pairs cost estimate (campaign S2; 0.87 R2 at 2B)
   };
   std::vector<PoolUnit> phaseb_pool;
   std::atomic<size_t> phaseb_next{0};
+  // Campaign S2: KD partitioning of the pool (FOF_PB_PARTS > 0). The
+  // pool is reordered partition-contiguous; each partition has a range,
+  // an m2 cost, a claim flag (a PE claims a whole partition, costliest
+  // unclaimed first — optimistic pick + CAS, same shape as the S1 piece
+  // claims), and a unit cursor (fetch_add within the claimed partition).
+  std::vector<std::pair<uint32_t, uint32_t>> pb_part_range;
+  std::vector<double> pb_part_cost;
+  std::unique_ptr<std::atomic<int>[]> pb_part_claimed;
+  std::unique_ptr<std::atomic<uint32_t>[]> pb_part_next;
+  // Campaign S2b (FOF_PB_MERGE=1, requires FOF_PB_PARTS): piece-REGION
+  // formulation with a process-level barrier. Units are classified
+  // intra-region (B1, partitioned by region) vs cross-region (B2, flat
+  // tail from pb_b2_begin); after B1 drains, the last depositor runs the
+  // mid-phase union-find over the B1 edges (the L2 path compression),
+  // every PE relabels + re-annotates (three-part rule; B1 edges are
+  // RETAINED for the final merge), then B2 runs over compressed tips.
+  int pb_stage = 0;             // 0 flat/unit-KD; 1 = B1; 2 = B2
+  size_t pb_b2_begin = 0;
+  std::atomic<size_t> pb_b2_next{0};
+  std::atomic<int> b1_done{0};
+  std::atomic<int> mid_done{0};
+  double stage_tM1 = 0.0;       // mid-merge wall (diagnostic)
   // Parallel pool build (2026-08-07): each of the process's threads
   // enumerates a stripe of the TreePiece-pair space into its own slice —
   // no lock, no sharing — and the last one to finish concatenates and
@@ -546,8 +869,28 @@ public:
     uf2_vertices.clear();
     uf2_labels.clear();
     global_slice.clear();
+    steal_pool.clear();
+    steal_claimed.reset();
+    steal_built = false;
+    s1_own = 0;
+    s1_foreign = 0;
+    s1_pes_foreign = 0;
+    for (int i = 0; i < kUnitHistBuckets; i++) pb_unit_hist[i] = 0;
+    pb_part_range.clear();
+    pb_part_cost.clear();
+    pb_part_claimed.reset();
+    pb_part_next.reset();
+    pb_stage = 0;
+    pb_b2_begin = 0;
+    pb_b2_next = 0;
+    b1_done = 0;
+    mid_done = 0;
+    stage_tM1 = 0.0;
     a_time_sum = 0.0;
     a_time_max = 0.0;
+    pa_self_sum = pa_self_max = pa_cross_sum = pa_cross_max = 0.0;
+    b_time_sum = 0.0;
+    b_time_max = 0.0;
     clearSeen();
     this->contribute(cb);
   }
@@ -727,15 +1070,178 @@ public:
   // (a) Per-PE union-find via dual walks over all pairs of this PE's
   // TreePieces (self-pairs included), then full path compression and tip
   // assignment into Particle::group_number.
+  // Campaign S1 arms.
+  static bool stealA() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_STEALA");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+  static bool stealGeo() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_STEALA_GEO");
+      return !e || std::atoi(e) != 0; // geometry priority is the default arm
+    }();
+    return on;
+  }
+
+  // Accounting + flat-index bookkeeping for one piece entering this PE's
+  // phaseA work set (shared by the static and claim paths).
+  void phaseAAdmit(TreePieceRef& s) {
+    s.offset = (int)uf_parent.size();
+    uf_parent.resize(s.offset + s.n);
+    std::iota(uf_parent.begin() + s.offset, uf_parent.end(), s.offset);
+    flat_order.resize(s.offset + s.n);
+    for (int i = 0; i < s.n; i++) flat_order[s.offset + i] = s.parts[i].order;
+    double vol = (double)s.root->data.box.volume();
+    if (vol > 0) density_x += (double)s.n * (double)s.n / vol;
+    size_x += std::pow((double)s.n, 1.28);
+    if ((long)s.n > max_piece_n) max_piece_n = s.n;
+  }
+
+  // One SELF pair (grid gate + walk), shared by both paths.
+  void phaseASelfPair(const TreePieceRef& sa) {
+    if (grid_thresh_ > 0 && sa.n >= 64) {
+      double vol = (double)sa.root->data.box.volume();
+      double b = std::sqrt(b2_);
+      double c = b / std::sqrt(6.0);
+      if (vol > 0 && (double)sa.n * c * c * c / vol >= grid_thresh_ &&
+          gridSelfUnion(sa))
+        return;
+    }
+    grid_ctx_ = &sa;
+    phaseAWalkPair(sa, sa);
+    grid_ctx_ = nullptr;
+  }
+
+  // One pair walk with the standard phaseA callbacks (self or cross).
+  void phaseAWalkPair(const TreePieceRef& sa, const TreePieceRef& sb) {
+    walk(sa.root, sb.root,
+         [&](Node<Data>* a, Node<Data>* b) { leafLeafUnion(a, b, sa, sb); },
+         [&](Node<Data>* a, Node<Data>* b) {
+           int ra = certRep(a, sa);
+           if (a != b) unite(ra, certRep(b, sb));
+         },
+         [&](Node<Data>* a, Node<Data>* b) {
+           int ra = connectedRep(a, sa);
+           if (ra < 0) return false;
+           if (a == b) { p1_conn_suppressed++; return true; }
+           int rb = connectedRep(b, sb);
+           if (rb < 0) return false;
+           if (find(ra) == find(rb)) { p1_conn_suppressed++; return true; }
+           return false;
+         });
+  }
+
+  // The claim path (FOF_STEALA=1): rebuild this PE's work set by claiming
+  // pieces from the process-wide pool — own pieces first, then unclaimed
+  // siblings' (nearest-centroid first under FOF_STEALA_GEO=1). Self pair
+  // runs at claim time (self-first ordering preserved piece by piece);
+  // the cross pass runs over the realized set afterwards. Ends by
+  // RE-KEYING this PE's registry bucket to the realized assignment — the
+  // constraint that keeps buildPoolSlice enumerating cross-ASSIGNMENT
+  // pairs (the silent-under-merge trap; fof1 phase-1-exact is the guard).
+  void phaseAClaims() {
+    const double t_claims0 = CkWallTimer();
+    auto* nb = node_proxy.ckLocalBranch();
+    nb->ensureStealPool();
+    auto& pool = nb->steal_pool;
+    auto* claimed = nb->steal_claimed.get();
+    treepieces.clear();
+    uf_parent.clear();
+    flat_order.clear();
+    // My claim-priority reference point: the centroid of my HOME pieces.
+    double myc[3] = {0, 0, 0};
+    int nown = 0;
+    for (auto& e : pool)
+      if (e.home_pe == CkMyPe()) {
+        for (int ax = 0; ax < 3; ax++) myc[ax] += e.c[ax];
+        nown++;
+      }
+    if (nown > 0)
+      for (int ax = 0; ax < 3; ax++) myc[ax] /= nown;
+    long own_claims = 0, foreign_claims = 0;
+    auto claim = [&](size_t i) {
+      int expect = 0;
+      if (!claimed[i].compare_exchange_strong(expect, 1)) return false;
+      (pool[i].home_pe == CkMyPe()) ? own_claims++ : foreign_claims++;
+      TreePieceRef r{pool[i].root, pool[i].parts, pool[i].n, 0};
+      treepieces.push_back(r);
+      phaseAAdmit(treepieces.back());
+      phaseASelfPair(treepieces.back());
+      return true;
+    };
+    // Own pieces first (a faster sibling may already hold some — that IS
+    // the stealing).
+    for (size_t i = 0; i < pool.size(); i++)
+      if (pool[i].home_pe == CkMyPe()) claim(i);
+    // Then unclaimed work, geometry-preferring or scan-order.
+    for (;;) {
+      size_t pick = pool.size();
+      if (stealGeo()) {
+        double best = 0;
+        for (size_t i = 0; i < pool.size(); i++) {
+          if (claimed[i].load(std::memory_order_relaxed) != 0) continue;
+          double d = 0;
+          for (int ax = 0; ax < 3; ax++) {
+            double dx = pool[i].c[ax] - myc[ax];
+            d += dx * dx;
+          }
+          if (pick == pool.size() || d < best) { pick = i; best = d; }
+        }
+      } else {
+        for (size_t i = 0; i < pool.size(); i++)
+          if (claimed[i].load(std::memory_order_relaxed) == 0) { pick = i; break; }
+      }
+      if (pick == pool.size()) break; // pool drained
+      claim(pick); // CAS may lose a race; loop re-scans either way
+    }
+    t_pa_self = CkWallTimer() - t_claims0;
+    // Cross pairs over the realized set (self pairs already done).
+    const double t_cross0 = CkWallTimer();
+    for (size_t i = 0; i < treepieces.size(); i++)
+      for (size_t j = i + 1; j < treepieces.size(); j++)
+        phaseAWalkPair(treepieces[i], treepieces[j]);
+    t_pa_cross = CkWallTimer() - t_cross0;
+    // RE-KEY: my registry bucket = my realized assignment, before the
+    // a_done deposit publishes it to the pool build.
+    {
+      std::lock_guard<std::mutex> g(nb->lock);
+      auto& bucket = nb->pe_treepieces[CkMyPe()];
+      bucket.clear();
+      for (auto& s : treepieces)
+        bucket.push_back({s.root, s.parts, s.n});
+    }
+    nb->s1_own += own_claims;
+    nb->s1_foreign += foreign_claims;
+    if (foreign_claims > 0) nb->s1_pes_foreign++;
+  }
+
+  // Per-PE phaseA stage split (instrument only, 2026-08-17): how much of
+  // this PE's phaseA is the SELF-walk stage (stealable under Kale's
+  // barrier scheme — any PE can self-walk any piece) vs the
+  // cross-piece-within-PE stage (owner-bound there). The within-process
+  // skew of each stage, read across a process's PEs, is what decides
+  // whether the barrier scheme captures the 1.28 within-skew or only the
+  // self share of it. Set by BOTH the static and the claim paths.
+  double t_pa_self = 0.0, t_pa_cross = 0.0;
   void phaseABody(double b2) {
     double t0 = CkWallTimer();
     frozen_ = false;
     b2_ = b2;
-    // Offset table: flat index space over this PE's particle blocks.
-    int n_local = 0;
     density_x = 0.0;
     size_x = 0.0;
     max_piece_n = 0;
+    cert_rep.clear();
+    p1_conn_suppressed = 0;
+    if (stealA()) {
+      phaseAClaims();
+      phaseAFreeze(t0);
+      return;
+    }
+    // Static path (default): offset table over the registered pieces.
+    int n_local = 0;
     for (auto& s : treepieces) {
       s.offset = n_local;
       n_local += s.n;
@@ -750,7 +1256,6 @@ public:
     }
     uf_parent.resize(n_local);
     std::iota(uf_parent.begin(), uf_parent.end(), 0);
-    cert_rep.clear();
     flat_order.resize(n_local);
     for (auto& s : treepieces)
       for (int i = 0; i < s.n; i++) flat_order[s.offset + i] = s.parts[i].order;
@@ -759,7 +1264,12 @@ public:
     // assembly populates the connectivity memo, so the cross-pair walks see
     // maximal suppression (design/phase1-scaling.md, connectivity layer).
     p1_conn_suppressed = 0;
+    double t_pass0 = CkWallTimer();
     for (int pass = 0; pass < 2; pass++) {
+      if (pass == 1) {
+        t_pa_self = CkWallTimer() - t_pass0;
+        t_pass0 = CkWallTimer();   // reused as the cross-stage start
+      }
       for (size_t i = 0; i < treepieces.size(); i++) {
         for (size_t j = i; j < treepieces.size(); j++) {
           if ((pass == 0) != (i == j)) continue; // pass 0: self; pass 1: cross
@@ -808,7 +1318,13 @@ public:
       }
     }
     grid_ctx_ = nullptr;
+    t_pa_cross = CkWallTimer() - t_pass0;
+    phaseAFreeze(t0);
+  }
 
+  // Shared phaseA tail (static and claim paths): freeze + compress +
+  // annotate + representative structures + component counts.
+  void phaseAFreeze(double t0) {
     // Freeze + compress: write tip id (order of the component's min-order
     // root particle) into every particle. Component counting rides this
     // pass (Kale's design, 2026-08-06): one dense-array increment per
@@ -955,14 +1471,36 @@ public:
   // deduplicated (tip, tip) edges into this PE's buffer; hand the buffer to
   // the nodegroup. No-op when this process has a single PE (non-SMP or
   // one-PE-per-process runs).
-  void phaseBBody(double b2) {
+  // Sliced drain (campaign step P1, design/phaseab-balancing.md sections
+  // 9 and 14): with FOF_PHASEB_SLICE_MS > 0 the claim loop returns false
+  // at the deadline and the caller re-enters by SELF-SEND, so the
+  // scheduler runs between slices and this PE stays responsive to
+  // messages (probe pings, network progress). Nothing is
+  // stashed: all intermediates are per-PE members and the claim cursor
+  // is process-shared. Default 0 = drain in one call, byte-identical to
+  // the pre-campaign behavior.
+  static double sliceSeconds() {
+    static const double s = [] {
+      const char* e = std::getenv("FOF_PHASEB_SLICE_MS");
+      return e ? std::atof(e) / 1e3 : 0.0;
+    }();
+    return s;
+  }
+
+  bool phaseBBody(double b2) {
     double t0 = CkWallTimer();
-    b2_ = b2;
-    t_phaseB_maxpair = 0.0;
-    t_phaseB_units = 0;
-    edge_buf.clear();
-    seen.clear();
-    cert_tip.clear();
+    if (!pb_active_) {   // start of stage (not a slice re-entry)
+      pb_active_ = true;
+      pb_t_accum_ = 0.0;
+      pb_cur_part_ = -1;
+      b2_ = b2;
+      t_phaseB_maxpair = 0.0;
+      t_phaseB_units = 0;
+      edge_buf.clear();
+      seen.clear();
+      cert_tip.clear();
+    }
+    const double slice = sliceSeconds();
     auto* nb = node_proxy.ckLocalBranch();
     // Claim units from the process-wide pool until it drains (dynamic
     // self-scheduling; supersedes the static symmetric-hash assignment —
@@ -970,11 +1508,28 @@ public:
     // the pool is LPT-sorted, so consecutive units are the costliest —
     // chunked claims would stack them on one PE. Atomic traffic is one
     // fetch_add per unit, a few thousand per PE.
+    // Claim granularity is the UNIT everywhere (measured 2026-08-11:
+    // exclusive whole-partition claims regressed phaseB 0.031 -> 0.114 at
+    // 80M — one PE drained the giant partition alone, un-doing the flat
+    // pool's LPT balance). Partitions remain the natural GPU batch unit;
+    // intra-process draining uses global cursors over the
+    // partition-ordered pool: [0, pb_b2_begin) in the B1 stage,
+    // [pb_b2_begin, n) in B2, the whole pool otherwise.
+    const int stage = nb->pb_stage; // 0 flat/unit-KD, 1 = B1, 2 = B2
     const size_t CHUNK = 1;
     for (;;) {
-      size_t start = nb->phaseb_next.fetch_add(CHUNK);
-      if (start >= nb->phaseb_pool.size()) break;
-      size_t end = std::min(start + CHUNK, nb->phaseb_pool.size());
+      size_t start, end;
+      if (stage == 2) {
+        size_t u = nb->pb_b2_next.fetch_add(1);
+        if (u >= nb->phaseb_pool.size()) break;
+        start = u;
+        end = u + 1;
+      } else {
+        size_t limit = stage == 1 ? nb->pb_b2_begin : nb->phaseb_pool.size();
+        start = nb->phaseb_next.fetch_add(CHUNK);
+        if (start >= limit) break;
+        end = std::min(start + CHUNK, limit);
+      }
       for (size_t k = start; k < end; k++) {
           t_phaseB_units++;
           double tp0 = CkWallTimer();
@@ -1002,12 +1557,34 @@ public:
           // leveling is complete (design/phase1-scaling.md).
           double tp = CkWallTimer() - tp0;
           if (tp > t_phaseB_maxpair) t_phaseB_maxpair = tp;
+          {
+            long us = (long)(tp * 1e6);
+            int b = 0;
+            while (us > 1 && b < FoFPhase1Node<Data>::kUnitHistBuckets - 1) {
+              us >>= 1;
+              b++;
+            }
+            nb->pb_unit_hist[b].fetch_add(1, std::memory_order_relaxed);
+          }
+      }
+      if (slice > 0 && CkWallTimer() - t0 > slice) {
+        pb_t_accum_ += CkWallTimer() - t0;
+        return false;   // deadline: caller re-enters by self-send
       }
     }
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
     edge_buf.clear();
     seen.clear();
-    t_phaseB = CkWallTimer() - t0; // per-PE load signal, reduced by phase3Stats
+    if (stage == 1) {
+      // End of B1 only: edges are in; the mid-phase merge and the B2
+      // round follow (phaseBChained routes on the stage). Stay active so
+      // B2 keeps accumulating into the same t_phaseB.
+      pb_t_accum_ += CkWallTimer() - t0;
+      return true;
+    }
+    pb_active_ = false;
+    t_phaseB = pb_t_accum_ + (CkWallTimer() - t0); // summed over slices
+    return true;
   }
 
   // (d) Rewrite this PE's labels through the merge map (identity if
@@ -1057,8 +1634,26 @@ public:
     // Skew-split instrument (design/phasea-reassignment.md section 3):
     // per-process sum/max of the phaseA walls, read back by phase3Stats.
     nb->depositPhaseATime(t_phaseA);
+    nb->depositPhaseAStages(t_pa_self, t_pa_cross);
+    // Per-PE dump (FOF_STAGE_DUMP=1; relay12 item 26): pieces held, self
+    // and cross seconds, one line per PE. The input the claim-priority
+    // design needs — cross work is convex in pieces-per-PE, so the
+    // correlation between piece count and cross time decides whether
+    // pricing the marginal cross cost at claim time is worth building.
+    static const bool stage_dump = [] {
+      const char* e = std::getenv("FOF_STAGE_DUMP");
+      return e && std::atoi(e) != 0;
+    }();
+    if (stage_dump)
+      CkPrintf("FOF3STAT stage_pe: pe %d pieces %zu self %.4f cross %.4f\n",
+               CkMyPe(), treepieces.size(), t_pa_self, t_pa_cross);
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
+      if (stealA())
+        CkPrintf("FOF3STAT s1_claims: node %d own %ld foreign %ld "
+                 "pes_with_foreign %ld of %d\n",
+                 CkMyNode(), nb->s1_own.load(), nb->s1_foreign.load(),
+                 nb->s1_pes_foreign.load(), CkNodeSize(CkMyNode()));
       // Enumerate the process's phaseB pool before releasing the PEs
       // (parallel across the process's threads (buildPoolSlice); pe_treepieces frozen since registration;
       // visibility: built before the trigger messages are sent).
@@ -1081,6 +1676,25 @@ public:
       // one to finish assembles the pool and starts phaseB.
       nb->pool_slices.assign(CkNodeSize(CkMyNode()), {});
       nb->slice_done.store(0);
+      // PE-SET SPLIT: publish TreePiece index -> set id for this process,
+      // HERE, on the single PE that is about to broadcast the slice build.
+      // Written once, read-only afterwards by every PE — including by the
+      // phase-3 ownership prune, which needs it to tell a cross-set local
+      // pair (must be walked) from a same-set one (already merged, prune it).
+      if (paratreet::peSetsHere() > 1) {
+        auto& tbl = paratreet::pieceSetTable();
+        int maxidx = -1;
+        for (auto& kv : nb->pe_treepieces)
+          for (auto& s : kv.second)
+            if (s.root) maxidx = std::max(maxidx, s.root->tp_index);
+        tbl.assign(maxidx + 1, (signed char)-1);
+        for (auto& kv : nb->pe_treepieces) {
+          const int set = paratreet::peSetOfPe(kv.first);
+          for (auto& s : kv.second)
+            if (s.root && s.root->tp_index >= 0)
+              tbl[s.root->tp_index] = (signed char)set;
+        }
+      }
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].buildPoolSlice();
@@ -1147,6 +1761,39 @@ public:
         // overlap volume; separated pairs follow by ascending gap.
         // Ascending sort then claims costliest-first, so the pool's
         // tail is cheap units and the last claim cannot be a giant.
+        // m2 = rho_a * rho_b * V_int(a grown by b, b) * V_ball: the
+        // expected-pairs estimate the cost probe validated (0.87 alone at
+        // 2B against 0.04 for the particle-count product). Computed for
+        // every unit (drives the adaptive tail split and the KD
+        // partition costs); FOF_PB_M2KEY=1 (default) also makes it the
+        // LPT key, -m2 so ascending sort = costliest first.
+        double m2v = 0.0;
+        {
+          double va = (double)a->data.box.volume();
+          double vb = (double)b->data.box.volume();
+          if (va > 0 && vb > 0) {
+            double bb2 = std::sqrt(b2_);
+            double vint = 1.0;
+            for (int ax = 0; ax < 3 && vint > 0; ax++) {
+              double lo = std::max((double)a->data.box.lesser_corner[ax] - bb2,
+                                   (double)b->data.box.lesser_corner[ax]);
+              double hi = std::min((double)a->data.box.greater_corner[ax] + bb2,
+                                   (double)b->data.box.greater_corner[ax]);
+              vint = hi > lo ? vint * (hi - lo) : 0.0;
+            }
+            double vball = 4.18879 * bb2 * bb2 * bb2;
+            m2v = ((double)a->data.n_below / va) *
+                  ((double)b->data.n_below / vb) * vint * vball;
+          }
+        }
+        static const bool m2key = [] {
+          const char* e = std::getenv("FOF_PB_M2KEY");
+          return !e || std::atoi(e) != 0;
+        }();
+        if (m2key && m2v > 0) {
+          out.push_back({-m2v, a, b, m2v});
+          return;
+        }
         double key;
         if (d2 > 0) {
           key = d2;
@@ -1165,7 +1812,7 @@ public:
               (double)std::max(ba.lesser_corner.z, bb.lesser_corner.z));
           key = -ov;
         }
-        out.push_back({key, a, b});
+        out.push_back({key, a, b, m2v});
         return;
       }
       for (int ci = 0; ci < a->n_children; ci++) {
@@ -1182,19 +1829,60 @@ public:
   // from the flattened (thread-pair, TreePiece-pair) space by stride, so
   // every thread walks a comparable share of the geometry without any
   // coordination. Writes only its own slice.
+  // ---- PE-SET SPLIT (Kale, 2026-08-16; design in
+  // reports/pe-set-split-analysis.md). Treat this process's PEs as s
+  // independent sets for phase 1: pairs that cross a set boundary are LEFT
+  // OUT of the phaseB pool, and phase 3 discovers them instead.
+  //
+  // Why that is safe, and it is not an assumption — it is three checked
+  // mechanisms:
+  //  1. Phase 3's edge predicate is "different tips within b", with NO
+  //     ownership test (FoFPhase3.h). Its comment justifies that by the
+  //     invariant "different tips within b implies different processes",
+  //     which THIS CHANGE FALSIFIES — but the code never tested ownership,
+  //     so the conclusion still holds. That comment is updated accordingly.
+  //  2. The phase-3 SEEN table is written only when an edge is EMITTED
+  //     (FoFPhase1Node::trySeenInsert), so suppression can never swallow a
+  //     pair phase 1 declined to do.
+  //  3. same_frag pruning fires only when both sides are already in one
+  //     fragment, which is exactly when no edge is needed.
+  // And the phase-3 walk already visits these pairs today: a baseline 2B run
+  // reports same_frag 43353 prunes, and pre-relabel tips are process-local,
+  // so those ARE same-process pairs the walk reaches and discards as merged.
+  //
+  // FOF_PE_SETS=s        number of sets (1 = off, the default)
+  // FOF_PE_SETS_NODE=n   apply only on process n (unset = EVERY process)
+  // FOF_PE_SETS_MODE=0|1 0 = blocked (SFC-adjacent PEs share a set, so the
+  //                      least weight lands in phase 3), 1 = round robin
+  //                      (the most). Which is better depends on how much
+  //                      cheaper a pair is in phase 3 than in phaseB, which
+  //                      is the open question, so both are measured.
   void buildPoolSlice() {
     auto* nb = node_proxy.ckLocalBranch();
     int rank = CkMyRank(), nranks = CkNodeSize(CkMyNode());
     auto& slice = nb->pool_slices[rank];
-    long idx = 0;
+    const int sets = paratreet::peSetsHere();
+    long idx = 0, dropped = 0;
     for (auto ita = nb->pe_treepieces.begin(); ita != nb->pe_treepieces.end();
          ++ita) {
       auto itb = ita;
-      for (++itb; itb != nb->pe_treepieces.end(); ++itb)
+      for (++itb; itb != nb->pe_treepieces.end(); ++itb) {
+        if (sets > 1) {
+          const int sa_set = paratreet::peSetOfPe(ita->first);
+          const int sb_set = paratreet::peSetOfPe(itb->first);
+          if (sa_set >= 0 && sb_set >= 0 && sa_set != sb_set) {
+            dropped += (long)ita->second.size() * (long)itb->second.size();
+            continue;   // phase 3 will find these
+          }
+        }
         for (auto& sa : ita->second)
           for (auto& sb : itb->second)
             if ((idx++ % nranks) == rank) poolPushInto(slice, sa.root, sb.root);
+      }
     }
+    if (sets > 1 && rank == 0)
+      CkPrintf("FOF3STAT pe_sets: node %d sets %d mode %d piece_pairs_dropped %ld\n",
+               CkMyNode(), sets, paratreet::peSetsMode(), dropped);
     // Sort this thread's own slice (in parallel with the others), so the
     // assembly below never runs a global comparison sort — that sort
     // would otherwise become the new serial bottleneck as unit counts
@@ -1223,6 +1911,325 @@ public:
           if (i < sl.size()) nb->phaseb_pool.push_back(sl[i]);
       for (auto& sl : nb->pool_slices)
         std::vector<typename FoFPhase1Node<Data>::PoolUnit>().swap(sl);
+      // Campaign S2a: adaptive m2 tail split (FOF_PB_SPLIT x mean,
+      // default 8; 0 disables). Split only units whose m2 exceeds the
+      // threshold — the measured rule (~1% of units hold 48-63% of
+      // time); children re-estimated by their own geometry, so the
+      // recursion terminates on the estimate itself. The 24x-units
+      // geometric rule this replaces split everything; this splits
+      // exactly the dense-core tail.
+      static const double split_fac = [] {
+        const char* e = std::getenv("FOF_PB_SPLIT");
+        return e ? std::atof(e) : 8.0;
+      }();
+      if (split_fac > 0 && !nb->phaseb_pool.empty()) {
+        double mean = 0;
+        for (auto& u : nb->phaseb_pool) mean += u.m2;
+        mean /= nb->phaseb_pool.size();
+        double thresh = split_fac * mean;
+        if (thresh > 0) {
+          std::vector<typename FoFPhase1Node<Data>::PoolUnit> out;
+          out.reserve(nb->phaseb_pool.size());
+          // Iterative worklist; split the larger side, gate children on
+          // mindist; cap the extra depth so a pathological estimate
+          // cannot run away.
+          std::vector<std::pair<typename FoFPhase1Node<Data>::PoolUnit, int>>
+              work;
+          for (auto& u : nb->phaseb_pool) work.push_back({u, 0});
+          while (!work.empty()) {
+            auto pr = work.back();
+            work.pop_back();
+            auto& u = pr.first;
+            bool splittable = pr.second < 4 && u.m2 > thresh &&
+                              !(u.a->isLeaf() && u.b->isLeaf());
+            if (!splittable) {
+              out.push_back(u);
+              continue;
+            }
+            Node<Data>* open_n = (!u.a->isLeaf() &&
+                                  (u.b->isLeaf() ||
+                                   boxMeasure(u.a) >= boxMeasure(u.b)))
+                                     ? u.a
+                                     : u.b;
+            Node<Data>* other = open_n == u.a ? u.b : u.a;
+            for (int ci = 0; ci < open_n->n_children; ci++) {
+              Node<Data>* c = open_n->getChild(ci);
+              if (c == nullptr || c->n_particles == 0) continue;
+              if (paratreet::mindist2(c->data.box, other->data.box, period_) >
+                  b2_)
+                continue;
+              typename FoFPhase1Node<Data>::PoolUnit cu;
+              cu.a = c;
+              cu.b = other;
+              // Re-estimate the child pair by its own geometry.
+              double m2v = 0.0;
+              double va = (double)c->data.box.volume();
+              double vb = (double)other->data.box.volume();
+              if (va > 0 && vb > 0) {
+                double bb2 = std::sqrt(b2_);
+                double vint = 1.0;
+                for (int ax = 0; ax < 3 && vint > 0; ax++) {
+                  double lo =
+                      std::max((double)c->data.box.lesser_corner[ax] - bb2,
+                               (double)other->data.box.lesser_corner[ax]);
+                  double hi =
+                      std::min((double)c->data.box.greater_corner[ax] + bb2,
+                               (double)other->data.box.greater_corner[ax]);
+                  vint = hi > lo ? vint * (hi - lo) : 0.0;
+                }
+                m2v = ((double)c->data.n_below / va) *
+                      ((double)other->data.n_below / vb) * vint *
+                      (4.18879 * bb2 * bb2 * bb2);
+              }
+              cu.m2 = m2v;
+              cu.key = m2v > 0 ? -m2v : 0.0;
+              work.push_back({cu, pr.second + 1});
+            }
+          }
+          nb->phaseb_pool.swap(out);
+        }
+      }
+      // Campaign S2: KD partitioning (FOF_PB_PARTS, default 0 = off =
+      // today's flat pool). m2-weighted median splits on unit centroids
+      // (spatially coherent AND cost-balanced); the pool is reordered
+      // partition-contiguous, each partition LPT-sorted internally, with
+      // a cost, a claim flag, and a unit cursor.
+      static const int kparts = [] {
+        const char* e = std::getenv("FOF_PB_PARTS");
+        return e ? std::atoi(e) : 0;
+      }();
+      static const bool pbmerge = [] {
+        const char* e = std::getenv("FOF_PB_MERGE");
+        return e && std::atoi(e) != 0;
+      }();
+      if (kparts > 1 && pbmerge && !nb->phaseb_pool.empty()) {
+        // S2b region mode: KD over the PIECES (realized assignment,
+        // n_below-weighted), then classify units by their two endpoints'
+        // regions. Intra-region units become the region's B1 partition;
+        // cross-region units form the flat B2 tail.
+        auto& pool = nb->phaseb_pool;
+        size_t n = pool.size();
+        int depth = 0;
+        while ((1 << depth) < kparts) depth++;
+        int nleaf = 1 << depth;
+        // Piece list from the realized registry.
+        std::vector<double> px, py, pz, pw;
+        for (auto& kv : nb->pe_treepieces)
+          for (auto& sp : kv.second) {
+            px.push_back(0.5 * ((double)sp.root->data.box.lesser_corner.x +
+                                (double)sp.root->data.box.greater_corner.x));
+            py.push_back(0.5 * ((double)sp.root->data.box.lesser_corner.y +
+                                (double)sp.root->data.box.greater_corner.y));
+            pz.push_back(0.5 * ((double)sp.root->data.box.lesser_corner.z +
+                                (double)sp.root->data.box.greater_corner.z));
+            pw.push_back((double)sp.root->data.n_below);
+          }
+        size_t np = px.size();
+        const double* pc[3] = {px.data(), py.data(), pz.data()};
+        struct Plane { int axis; double at; };
+        std::vector<Plane> planes(2 * nleaf, {0, 0.0});
+        std::vector<int> pidx(np);
+        for (size_t i = 0; i < np; i++) pidx[i] = (int)i;
+        struct Span { int lo, hi, d, node; };
+        std::vector<Span> stack{{0, (int)np, depth, 0}};
+        while (!stack.empty()) {
+          Span sp = stack.back();
+          stack.pop_back();
+          if (sp.d == 0 || sp.hi - sp.lo <= 1) continue;
+          double mn[3] = {1e300, 1e300, 1e300},
+                 mx[3] = {-1e300, -1e300, -1e300};
+          for (int i = sp.lo; i < sp.hi; i++)
+            for (int ax = 0; ax < 3; ax++) {
+              double c = pc[ax][pidx[i]];
+              if (c < mn[ax]) mn[ax] = c;
+              if (c > mx[ax]) mx[ax] = c;
+            }
+          int axis = 0;
+          for (int ax = 1; ax < 3; ax++)
+            if (mx[ax] - mn[ax] > mx[axis] - mn[axis]) axis = ax;
+          std::sort(pidx.begin() + sp.lo, pidx.begin() + sp.hi,
+                    [&](int x, int y) { return pc[axis][x] < pc[axis][y]; });
+          double total = 0;
+          for (int i = sp.lo; i < sp.hi; i++) total += pw[pidx[i]];
+          double acc = 0;
+          int split = sp.lo + 1;
+          for (int i = sp.lo; i < sp.hi - 1; i++) {
+            acc += pw[pidx[i]];
+            if (acc >= total / 2) { split = i + 1; break; }
+          }
+          planes[sp.node] = {axis, pc[axis][pidx[split - 1]]};
+          stack.push_back({sp.lo, split, sp.d - 1, 2 * sp.node + 1});
+          stack.push_back({split, sp.hi, sp.d - 1, 2 * sp.node + 2});
+        }
+        auto locate = [&](Node<Data>* nd) {
+          double c[3];
+          c[0] = 0.5 * ((double)nd->data.box.lesser_corner.x +
+                        (double)nd->data.box.greater_corner.x);
+          c[1] = 0.5 * ((double)nd->data.box.lesser_corner.y +
+                        (double)nd->data.box.greater_corner.y);
+          c[2] = 0.5 * ((double)nd->data.box.lesser_corner.z +
+                        (double)nd->data.box.greater_corner.z);
+          int node = 0, leaf = 0;
+          for (int d = depth; d > 0; d--) {
+            bool right = c[planes[node].axis] > planes[node].at;
+            if (right) leaf += (1 << (d - 1));
+            node = 2 * node + (right ? 2 : 1);
+          }
+          return leaf;
+        };
+        // Classify; reorder [B1 by region | B2 tail].
+        std::vector<int> region_of(n);
+        std::vector<char> is_b1(n);
+        for (size_t i = 0; i < n; i++) {
+          int ra = locate(pool[i].a), rb = locate(pool[i].b);
+          is_b1[i] = (ra == rb);
+          region_of[i] = ra;
+        }
+        std::vector<typename FoFPhase1Node<Data>::PoolUnit> reordered;
+        reordered.reserve(n);
+        nb->pb_part_range.assign(nleaf, {0, 0});
+        nb->pb_part_cost.assign(nleaf, 0.0);
+        for (size_t i = 0; i < n; i++)
+          if (is_b1[i]) nb->pb_part_cost[region_of[i]] += pool[i].m2;
+        // Concatenate partitions COSTLIEST-FIRST so the global unit
+        // cursor preserves the flat pool's LPT property across
+        // partitions (index-order concatenation measured +60% phaseB:
+        // the giant's units were claimed last).
+        std::vector<int> order(nleaf);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int x, int y) {
+          return nb->pb_part_cost[x] > nb->pb_part_cost[y];
+        });
+        for (int pnum : order) {
+          uint32_t begin = (uint32_t)reordered.size();
+          for (size_t i = 0; i < n; i++)
+            if (is_b1[i] && region_of[i] == pnum) reordered.push_back(pool[i]);
+          uint32_t end = (uint32_t)reordered.size();
+          std::sort(reordered.begin() + begin, reordered.begin() + end,
+                    [](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                       const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                      return x.key < y.key;
+                    });
+          nb->pb_part_range[pnum] = {begin, end};
+        }
+        nb->pb_b2_begin = reordered.size();
+        double b2cost = 0;
+        for (size_t i = 0; i < n; i++)
+          if (!is_b1[i]) {
+            reordered.push_back(pool[i]);
+            b2cost += pool[i].m2;
+          }
+        std::sort(reordered.begin() + nb->pb_b2_begin, reordered.end(),
+                  [](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                     const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                    return x.key < y.key;
+                  });
+        pool.swap(reordered);
+        nb->pb_part_claimed.reset(new std::atomic<int>[nleaf]);
+        nb->pb_part_next.reset(new std::atomic<uint32_t>[nleaf]);
+        for (int pnum = 0; pnum < nleaf; pnum++) {
+          nb->pb_part_claimed[pnum] = 0;
+          nb->pb_part_next[pnum] = nb->pb_part_range[pnum].first;
+        }
+        nb->pb_b2_next = nb->pb_b2_begin;
+        nb->pb_stage = 1;
+        double m2tot = b2cost;
+        for (int pnum = 0; pnum < nleaf; pnum++) m2tot += nb->pb_part_cost[pnum];
+        CkPrintf("FOF3STAT pb_regions: node %d k %d b1_units %zu b2_units %zu "
+                 "b2_m2 %.1f%%\n",
+                 CkMyNode(), nleaf, nb->pb_b2_begin, n - nb->pb_b2_begin,
+                 m2tot > 0 ? 100.0 * b2cost / m2tot : 0.0);
+      } else if (kparts > 1 && !nb->phaseb_pool.empty()) {
+        auto& pool = nb->phaseb_pool;
+        size_t n = pool.size();
+        int depth = 0;
+        while ((1 << depth) < kparts) depth++;
+        int nleaf = 1 << depth;
+        std::vector<double> cx(n), cy(n), cz(n);
+        for (size_t i = 0; i < n; i++) {
+          cx[i] = 0.25 * ((double)pool[i].a->data.box.lesser_corner.x +
+                          (double)pool[i].a->data.box.greater_corner.x +
+                          (double)pool[i].b->data.box.lesser_corner.x +
+                          (double)pool[i].b->data.box.greater_corner.x);
+          cy[i] = 0.25 * ((double)pool[i].a->data.box.lesser_corner.y +
+                          (double)pool[i].a->data.box.greater_corner.y +
+                          (double)pool[i].b->data.box.lesser_corner.y +
+                          (double)pool[i].b->data.box.greater_corner.y);
+          cz[i] = 0.25 * ((double)pool[i].a->data.box.lesser_corner.z +
+                          (double)pool[i].a->data.box.greater_corner.z +
+                          (double)pool[i].b->data.box.lesser_corner.z +
+                          (double)pool[i].b->data.box.greater_corner.z);
+        }
+        const double* coords[3] = {cx.data(), cy.data(), cz.data()};
+        std::vector<int> idx(n), leaf_of(n, 0);
+        for (size_t i = 0; i < n; i++) idx[i] = (int)i;
+        // Weighted median KD split, iterative over (lo, hi, depth, base).
+        struct Span { int lo, hi, d, base; };
+        std::vector<Span> stack{{0, (int)n, depth, 0}};
+        while (!stack.empty()) {
+          Span sp = stack.back();
+          stack.pop_back();
+          if (sp.d == 0 || sp.hi - sp.lo <= 1) {
+            for (int i = sp.lo; i < sp.hi; i++) leaf_of[idx[i]] = sp.base;
+            continue;
+          }
+          double mn[3] = {1e300, 1e300, 1e300},
+                 mx[3] = {-1e300, -1e300, -1e300};
+          for (int i = sp.lo; i < sp.hi; i++)
+            for (int ax = 0; ax < 3; ax++) {
+              double c = coords[ax][idx[i]];
+              if (c < mn[ax]) mn[ax] = c;
+              if (c > mx[ax]) mx[ax] = c;
+            }
+          int axis = 0;
+          for (int ax = 1; ax < 3; ax++)
+            if (mx[ax] - mn[ax] > mx[axis] - mn[axis]) axis = ax;
+          std::sort(idx.begin() + sp.lo, idx.begin() + sp.hi,
+                    [&](int x, int y) { return coords[axis][x] < coords[axis][y]; });
+          double total = 0;
+          for (int i = sp.lo; i < sp.hi; i++) total += pool[idx[i]].m2;
+          double acc = 0;
+          int split = sp.lo + 1;
+          for (int i = sp.lo; i < sp.hi - 1; i++) {
+            acc += pool[idx[i]].m2;
+            if (acc >= total / 2) { split = i + 1; break; }
+          }
+          stack.push_back({sp.lo, split, sp.d - 1, sp.base});
+          stack.push_back({split, sp.hi, sp.d - 1,
+                           sp.base + (1 << (sp.d - 1))});
+        }
+        // Reorder partition-contiguous; LPT order within each partition.
+        std::vector<typename FoFPhase1Node<Data>::PoolUnit> reordered;
+        reordered.reserve(n);
+        nb->pb_part_range.assign(nleaf, {0, 0});
+        nb->pb_part_cost.assign(nleaf, 0.0);
+        for (size_t i = 0; i < n; i++) nb->pb_part_cost[leaf_of[i]] += pool[i].m2;
+        // Costliest-first concatenation (see the region-mode comment).
+        std::vector<int> order(nleaf);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(), [&](int x, int y) {
+          return nb->pb_part_cost[x] > nb->pb_part_cost[y];
+        });
+        for (int pnum : order) {
+          uint32_t begin = (uint32_t)reordered.size();
+          for (size_t i = 0; i < n; i++)
+            if (leaf_of[i] == pnum) reordered.push_back(pool[i]);
+          uint32_t end = (uint32_t)reordered.size();
+          std::sort(reordered.begin() + begin, reordered.begin() + end,
+                    [](const typename FoFPhase1Node<Data>::PoolUnit& x,
+                       const typename FoFPhase1Node<Data>::PoolUnit& y) {
+                      return x.key < y.key;
+                    });
+          nb->pb_part_range[pnum] = {begin, end};
+        }
+        pool.swap(reordered);
+        nb->pb_part_claimed.reset(new std::atomic<int>[nleaf]);
+        nb->pb_part_next.reset(new std::atomic<uint32_t>[nleaf]);
+        for (int pnum = 0; pnum < nleaf; pnum++) {
+          nb->pb_part_claimed[pnum] = 0;
+          nb->pb_part_next[pnum] = nb->pb_part_range[pnum].first;
+        }
+      }
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].phaseBChained();
@@ -1231,16 +2238,59 @@ public:
 
   void phaseBChained() {
     auto* nb = node_proxy.ckLocalBranch();
-    phaseBBody(b2_); // b2_ set by phaseABody on this PE
+    if (!phaseBBody(b2_)) { // slice deadline: yield, re-enter by self-send
+      this->thisProxy[CkMyPe()].phaseBChained();
+      return;
+    }
+    // S2b B1 completion: last depositor runs the mid-phase union-find
+    // over the B1 edges (RETAINED afterwards — the final merge needs
+    // them for collapsed-name consistency) and fans out the
+    // relabel+re-annotate stage; B2 starts when that stage's last
+    // depositor flips pb_stage and re-broadcasts phaseBChained.
+    if (nb->pb_stage == 1) {
+      if (nb->b1_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+        double tm0 = CkWallTimer();
+        nb->mergeBody();
+        nb->stage_tM1 = CkWallTimer() - tm0;
+        CkPrintf("FOF3STAT pb_merge: node %d t %.3f map %zu\n", CkMyNode(),
+                 nb->stage_tM1, nb->tip_map.size());
+        int first = CkNodeFirst(CkMyNode());
+        for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+          this->thisProxy[pe].phaseBMidRelabel();
+      }
+      return;
+    }
     if (nb->b_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tB = CkWallTimer() - nb->chain_t0 - nb->stage_tA;
       double tm0 = CkWallTimer();
       nb->mergeBody();
       nb->stage_tM = CkWallTimer() - tm0;
+      nb->printUnitHist();
       int first = CkNodeFirst(CkMyNode());
       for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
         this->thisProxy[pe].relabelChained(nb->stage_tA, nb->stage_tB,
                                            nb->stage_tM);
+    }
+  }
+
+
+  // S2b mid-phase stage, once per PE: apply the B1 merge map at
+  // representative granularity, materialize, re-annotate the frozen-tip
+  // node fields (the three-part atomicity rule), clear the tip-keyed
+  // per-PE state that the relabel staled (SEEN keys and cert_tip memos
+  // name old tips; clearing only re-emits idempotent duplicates), and
+  // barrier into B2.
+  void phaseBMidRelabel() {
+    relabelBody();
+    for (auto& sp : treepieces) annotateFrozenTips(sp.root);
+    seen.clear();
+    cert_tip.clear();
+    auto* nb = node_proxy.ckLocalBranch();
+    if (nb->mid_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
+      nb->pb_stage = 2;
+      int first = CkNodeFirst(CkMyNode());
+      for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+        this->thisProxy[pe].phaseBChained();
     }
   }
 
@@ -1583,6 +2633,12 @@ public:
   //     with element 4's X and phaseA sums these give the Pearson r of
   //     predicted density work vs measured phaseA time across PEs.
   void phase3Stats(const CkCallback& cb) {
+    // Piece-load model validation (design/piece-load-model.md): predicted
+    // vs ACTUAL, per process, in one line. This is the gate on whether a
+    // (n, volume) model is good enough to migrate pieces by, and it costs
+    // one print per process — no algorithm change, so it can ride any run.
+    if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printLoadModel(b2_);
+    if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printPhaseAStages();
     // "edges sent" counts streamed batches plus what remains buffered (the
     // two are disjoint: flushUF2Batch clears the buffer as it submits).
     long sums[9] = {phase3_emitted,
@@ -1644,6 +2700,10 @@ public:
   // over the process's PEs.
   void depositNodeRedundant(const CkCallback& cb) {
     node_proxy.ckLocalBranch()->addNodeRedundant(p3_redundant_descents);
+    // Same barrier, same reason: this PE's phaseB wall is final here (the
+    // walk's QD is behind us), and it must be deposited before phase3Stats
+    // prints the per-process load-model line.
+    node_proxy.ckLocalBranch()->depositPhaseBTime(t_phaseB);
     this->contribute(cb);
   }
 
@@ -2348,6 +3408,8 @@ private:
     }
   }
 
+
+ private:
   int find(int x) {
     int root = x;
     while (uf_parent[root] != root) root = uf_parent[root];
@@ -2416,6 +3478,14 @@ private:
     }();
     return on;
   }
+  // Sliced-drain state (campaign P1): stage-active flag guards the
+  // start-of-stage initialization across slice re-entries; accumulated
+  // wall over completed slices.
+  bool pb_active_ = false;
+  double pb_t_accum_ = 0.0;
+  // Campaign S2: the partition this PE currently holds (-1 = none);
+  // persists across P1 slice re-entries.
+  int pb_cur_part_ = -1;
   // Final-reduction callback of the within-process chain (startPhase1Chain).
   CkCallback done_cb_;
   // Touched-component (negative-label) per-process totals held between
