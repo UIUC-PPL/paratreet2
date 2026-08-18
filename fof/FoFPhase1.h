@@ -417,6 +417,24 @@ public:
     a_time_sum += t;
     if (t > a_time_max) a_time_max = t;
   }
+  // Stage split (see FoFPhase1::t_pa_self): per-process sum and max of
+  // each stage, printed by printLoadModel's caller. max/(sum/nPEs) per
+  // stage is the stage's within-process skew.
+  double pa_self_sum = 0.0, pa_self_max = 0.0;
+  double pa_cross_sum = 0.0, pa_cross_max = 0.0;
+  void depositPhaseAStages(double self_t, double cross_t) {
+    std::lock_guard<std::mutex> g(lock);
+    pa_self_sum += self_t;
+    if (self_t > pa_self_max) pa_self_max = self_t;
+    pa_cross_sum += cross_t;
+    if (cross_t > pa_cross_max) pa_cross_max = cross_t;
+  }
+  void printPhaseAStages() {
+    CkPrintf("FOF3STAT phaseA_stages: node %d self_sum %.3f self_max %.3f "
+             "cross_sum %.3f cross_max %.3f\n",
+             CkMyNode(), pa_self_sum, pa_self_max, pa_cross_sum,
+             pa_cross_max);
+  }
 
   // ---- phaseA claim pool (campaign S1, FOF_STEALA=1;
   // design/phaseab-balancing.md section 14 and
@@ -1783,6 +1801,7 @@ public:
     stage_tM1 = 0.0;
     a_time_sum = 0.0;
     a_time_max = 0.0;
+    pa_self_sum = pa_self_max = pa_cross_sum = pa_cross_max = 0.0;
     b_time_sum = 0.0;
     b_time_max = 0.0;
     clearSeen();
@@ -2037,6 +2056,7 @@ public:
   // constraint that keeps buildPoolSlice enumerating cross-ASSIGNMENT
   // pairs (the silent-under-merge trap; fof1 phase-1-exact is the guard).
   void phaseAClaims() {
+    const double t_claims0 = CkWallTimer();
     auto* nb = node_proxy.ckLocalBranch();
     nb->ensureStealPool();
     auto& pool = nb->steal_pool;
@@ -2090,10 +2110,13 @@ public:
       if (pick == pool.size()) break; // pool drained
       claim(pick); // CAS may lose a race; loop re-scans either way
     }
+    t_pa_self = CkWallTimer() - t_claims0;
     // Cross pairs over the realized set (self pairs already done).
+    const double t_cross0 = CkWallTimer();
     for (size_t i = 0; i < treepieces.size(); i++)
       for (size_t j = i + 1; j < treepieces.size(); j++)
         phaseAWalkPair(treepieces[i], treepieces[j]);
+    t_pa_cross = CkWallTimer() - t_cross0;
     // RE-KEY: my registry bucket = my realized assignment, before the
     // a_done deposit publishes it to the pool build.
     {
@@ -2108,6 +2131,14 @@ public:
     if (foreign_claims > 0) nb->s1_pes_foreign++;
   }
 
+  // Per-PE phaseA stage split (instrument only, 2026-08-17): how much of
+  // this PE's phaseA is the SELF-walk stage (stealable under Kale's
+  // barrier scheme — any PE can self-walk any piece) vs the
+  // cross-piece-within-PE stage (owner-bound there). The within-process
+  // skew of each stage, read across a process's PEs, is what decides
+  // whether the barrier scheme captures the 1.28 within-skew or only the
+  // self share of it. Set by BOTH the static and the claim paths.
+  double t_pa_self = 0.0, t_pa_cross = 0.0;
   void phaseABody(double b2) {
     double t0 = CkWallTimer();
     frozen_ = false;
@@ -2146,7 +2177,12 @@ public:
     // assembly populates the connectivity memo, so the cross-pair walks see
     // maximal suppression (design/phase1-scaling.md, connectivity layer).
     p1_conn_suppressed = 0;
+    double t_pass0 = CkWallTimer();
     for (int pass = 0; pass < 2; pass++) {
+      if (pass == 1) {
+        t_pa_self = CkWallTimer() - t_pass0;
+        t_pass0 = CkWallTimer();   // reused as the cross-stage start
+      }
       for (size_t i = 0; i < treepieces.size(); i++) {
         for (size_t j = i; j < treepieces.size(); j++) {
           if ((pass == 0) != (i == j)) continue; // pass 0: self; pass 1: cross
@@ -2195,6 +2231,7 @@ public:
       }
     }
     grid_ctx_ = nullptr;
+    t_pa_cross = CkWallTimer() - t_pass0;
     phaseAFreeze(t0);
   }
 
@@ -2565,6 +2602,7 @@ public:
     // Skew-split instrument (design/phasea-reassignment.md section 3):
     // per-process sum/max of the phaseA walls, read back by phase3Stats.
     nb->depositPhaseATime(t_phaseA);
+    nb->depositPhaseAStages(t_pa_self, t_pa_cross);
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
       if (stealA())
@@ -3698,6 +3736,7 @@ public:
     // (n, volume) model is good enough to migrate pieces by, and it costs
     // one print per process — no algorithm change, so it can ride any run.
     if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printLoadModel(b2_);
+    if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printPhaseAStages();
     // "edges sent" counts streamed batches plus what remains buffered (the
     // two are disjoint: flushUF2Batch clears the buffer as it submits).
     long sums[9] = {phase3_emitted,
