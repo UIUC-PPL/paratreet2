@@ -99,90 +99,17 @@ public:
     //CkPrintf("[ST %d]  resume from sync for LB on PE %d\n", this->thisIndex, CkMyPe());
     return;
   };
-  // Predicted FoF phase-1 cost of this piece, from particle count and
-  // occupied volume alone (design/piece-load-model.md):
-  //
-  //   self / phaseA  ~ n^SELF_P     SELF_P ~ 1.2 measured, R^2 0.85-0.90
-  //                                 (design/cost-model-probe.md). The
-  //                                 exponent is sub-quadratic because the
-  //                                 -G cell grid short-circuits dense self
-  //                                 pairs into ~n log n.
-  //   pair / phaseB  ~ n^2/V^(4/3)  the expected-pairs estimate m2 (R^2 0.87
-  //                                 at 2B) summed over a piece's neighbours
-  //                                 in a MEAN-FIELD approximation: neighbours
-  //                                 of similar density contribute
-  //                                 rho^2 * A * b * V_ball, and A ~ V^(2/3).
-  //                                 The b^4 that falls out is the same for
-  //                                 every piece, so it is absorbed into K.
-  //
-  // Only the RATIO of the two terms is a free parameter, hence one knob
-  // (PARATREET_LB_K). Both inputs are available BEFORE the tree is built,
-  // which matters: pup() ships incoming_particles and nothing else, so the
-  // window between flush/rebucket and buildTree is the only one in which a
-  // TreePiece may legally migrate.
-  static double lbK() {
-    static const double v = [] {
-      const char* e = std::getenv("PARATREET_LB_K");
-      return e ? std::atof(e) : 0.0;   // 0 = self term only (calibrate first)
-    }();
-    return v;
-  }
-  static double lbSelfExp() {
-    static const double v = [] {
-      const char* e = std::getenv("PARATREET_LB_SELF_EXP");
-      return e ? std::atof(e) : 1.2;
-    }();
-    return v;
-  }
-  // n and the occupied volume, taken from whichever representation is live:
-  // incoming_particles pre-build (the migration window), the built tree
-  // after. Returns false when neither is available.
-  bool lbExtent(double& n_out, double& vol_out) const {
-    if (!incoming_particles.empty()) {
-      OrientedBox<Real> box;
-      for (const auto& p : incoming_particles) box.grow(p.position);
-      n_out = (double)incoming_particles.size();
-      vol_out = (double)box.volume();
-      return true;
-    }
-    if (local_root) {
-      n_out = (double)local_root->data.n_below;
-      vol_out = (double)local_root->data.box.volume();
-      return n_out > 0;
-    }
-    return false;
-  }
   void UserSetLBLoad()
   {
-    // PARATREET_LB_MODEL: 1 (default) = the cost model below; 0 = the
-    // historical inverse-bounding-box-volume proxy; 2 = uniform load.
-    //
-    // Read 0 carefully as an A/B arm: that proxy reads local_root, which is
-    // NULL in the pre-build migration window, so at iteration 0 it assigns
-    // no load at all — arm "LB with an unset load vector", not "LB with the
-    // old model". The old proxy simply has no inputs before the tree
-    // exists. Mode 2 is the control that question actually wants: uniform
-    // load makes the balancer equalise PIECE COUNT, so a win for mode 1
-    // over mode 2 is attributable to the cost model rather than to the fact
-    // that any LB ran at all.
-    static const int model = [] {
-      const char* e = std::getenv("PARATREET_LB_MODEL");
-      return e ? std::atoi(e) : 1;
-    }();
-    double n = 0, vol = 0;
-    if (model == 2) {
-      this->load = 1.0;
-    } else if (model == 0) {
-      if (local_root) {
-        Real volume = local_root->data.box.volume();
-        this->load = volume > 0.0 ? 1.0 / volume : 0.0;
-      }
-    } else if (lbExtent(n, vol)) {
-      double w = std::pow(n, lbSelfExp());
-      if (lbK() > 0 && vol > 0) w += lbK() * n * n / std::pow(vol, 4.0 / 3.0);
-      this->load = w;
-    } else {
-      this->load = 0.0;
+    //calculate load as inverse of volume of bounding box
+    if (local_root)
+    {
+      OrientedBox<Real> box = local_root->data.box;
+      Real volume = box.volume();
+      if (volume > 0.0)
+        this->load = 1.0 / volume;
+      else
+        this->load = 0.0;
     }
     //CkPrintf("[ST %d] LB load set to %f on PE %d\n", this->thisIndex, this->load, CkMyPe());
     this->setObjTime(this->load);

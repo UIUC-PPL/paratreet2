@@ -1562,15 +1562,15 @@ public:
     if (t > b_time_max) b_time_max = t;
   }
 
-  // PREDICTED vs ACTUAL, one line per process (design/piece-load-model.md).
-  // The predictor is the same one TreePiece::UserSetLBLoad migrates by, so
-  // this line is the direct check on the thing we would act on:
+  // PREDICTED vs ACTUAL, one line per process (design/piece-load-model.md;
+  // this is the cost model the campaign validated and kept — the migration
+  // mechanisms it once fed are retired, tag campaign-2026-08-stealing):
   //   self = sum n^1.2 over this process's pieces          (phaseA model)
   //   pair = sum n^2 / V^(4/3) over the same pieces        (phaseB model,
   //          mean-field neighbours; the constant b^4 is absorbed)
   // Fit sum(actual phaseA) ~ a*self and sum(actual phaseB) ~ c*pair across
-  // processes: the R^2 of those two regressions is the go/no-go, and the
-  // ratio c/a calibrates PARATREET_LB_K for the migration arm.
+  // processes: the R^2 of those two regressions is the go/no-go for acting
+  // on the model, and the ratio c/a calibrates the two terms' weights.
   // m2 between two pieces, the SAME expected-pairs estimate the pool uses
   // per unit (FoFPhase1.h ~2489, validated R^2 0.87 at 2B), evaluated at
   // piece-root granularity: rho_a * rho_b * V_int(a grown by b, b) * V_ball.

@@ -297,31 +297,6 @@ public:
     for (int iter = 0; iter < config.num_iterations; iter++) {
       CkPrintf("\n* Iteration %d\n", iter);
       double iter_start_time = CkWallTimer();
-      // PRE-BUILD load balance (PARATREET_PREBUILD_LB=1, single mode only).
-      // The stock LB block at the bottom of this loop runs AFTER an
-      // iteration, which never helps a run whose interesting phase is
-      // iteration 0 — and for a guest phase like FoF, whose cost model is
-      // known from (n, volume) before any tree exists, the useful moment is
-      // HERE: after the flush/rebucket has filled incoming_particles (the
-      // only state pup ships) and before buildTree consumes it. Same safe
-      // migration window the bottom block relies on, one step earlier.
-      // Intended for a host application (e.g. ChaNGa) whose TreePiece
-      // distribution is balanced for ITS phases: this migrates for the guest
-      // phase without disturbing how the host decomposed.
-      {
-        static const bool prebuild_lb = [] {
-          const char* e = std::getenv("PARATREET_PREBUILD_LB");
-          return e && std::atoi(e) != 0;
-        }();
-        if (prebuild_lb && config.single_distribution) {
-          start_time = CkWallTimer();
-          CkPrintf("Pre-build load balancing (iteration %d)...\n", iter);
-          treepieces.pauseForLB();
-          CkWaitQD();
-          CkPrintf("Pre-build load balancing: %.3lf ms\n",
-                   (CkWallTimer() - start_time) * 1000);
-        }
-      }
       // Start tree build in TreePieces
       start_time = CkWallTimer();
       CkCallback timeCb (CkReductionTarget(Driver<Data>, reportTime), this->thisProxy);
