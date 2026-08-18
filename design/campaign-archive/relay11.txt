@@ -1,0 +1,292 @@
+relay11 -- walk/union-find OVERLAP measured via the -E edge-stream batch
+size, 2B / 16 nodes.  Job 5295956.  Full report: reports/e-stream-batch.md
+Written 2026-08-17 17:52 EDT.  Everything below is new since relay10.
+
+*** READ TO THE END.  Two addenda were appended at 18:50 EDT, AFTER the
+    FILES section: 64-NODE RESULTS (items 17-21, which CHANGE the
+    recommendation in item 14 -- the default should be 16, not 512) and
+    FULL-MACHINE PROJECTIONS (items 22-24). ***
+
+
+SETUP AND PROVENANCE
+
+ 1. Queue was empty, so I pulled paratreet2 to ac600f0 as instructed.
+    Before resetting my working tree I verified the live `git diff` was
+    BYTE-IDENTICAL to patches/0012.  The only code commit between my
+    4f49227 and ac600f0 is 986dcab -- that IS patch 0012, landed by the
+    laptop.  So ac600f0 is code-identical to what I had applied, and the
+    "src/ and fof/ have changed" in the task spec means "changed relative
+    to the committed tree", not relative to what I built and measured.
+    Consequence worth having: the -E 4096 arm should reproduce yesterday's
+    16-node numbers, and it does (see item 6).
+
+ 2. FULL clean rebuild against production charm, per scripts/rebuild-prod.sh.
+    Verified: TraceSummary 0, vfmadd 0, `pe_sets` string 1.
+    AGGREGATION= is empty in BOTH unionfind steps and is never defined in
+    any paratreet2 makefile -- zero compile lines carry -DAGGREGATION -- so
+    the `#ifdef AGGREGATION` that would zero uf2_stream_batch is not
+    compiled and -E is genuinely live.  Staged bin/FoF3.2b.estream,
+    md5 b820ba7efcc670022168ea80011ff00b.  Tree left CLEAN, nothing pushed,
+    no new patch (there is no code change in this work).
+
+ 3. Job 5295956: 10k gate at -E 0/16/4096 all exact (3549), then 2B arms
+    E0 E4096 E512 E64 E16, two interleaved reps.  ALL 10 ARMS EXACT
+    (424,897,832).  128 pe_sets lines on every arm.  Empty stderr.
+    Ran 17:46:30-17:49:28, under 3 minutes for the whole sweep.
+
+
+THE RESULT
+
+ 4. YOUR PREDICTION IS CORRECT AND THE MECHANISM WAS NEVER SWITCHED ON.
+    -E 4096 is indistinguishable from -E 0:
+       walk+uf2   1.038 vs 1.034 s
+       Iteration0 5452.5 vs 5433.9 ms
+    Both inside the rep spread.  Every 2B number this campaign has ever
+    produced was effectively an overlap-OFF number.
+
+ 5. THE MISSING NUMBER, now measured.  With -E 0 the edge buffer is never
+    cleared, so peak_edge_buf reports the TRUE maximum per-PE edge count:
+    6453.  Mean is 1,655,535 / 1792 PEs = 924 per PE.  So at -E 4096 the
+    single busiest PE in the machine fills exactly one batch and every
+    other PE fires post-walk.  That is why 4096 does nothing.  Your
+    estimate of 500-1000 per PE was right; the tail reaches 6.4k.
+
+ 6. TURNING IT ON IS WORTH -208 ms ON ITERATION 0 (-3.8%).
+    Means of two reps, seconds except Iter0 in ms:
+
+       -E      walk    uf2   walk+uf2   Tree_trav   Iter0     d(Iter0)
+        0     0.352  0.681     1.034      1659.4   5433.9        --
+        4096  0.388  0.651     1.038      1669.4   5452.5     +18.7
+        512   0.611  0.215     0.827      1458.2   5225.3    -208.6
+        64    0.775  0.099     0.874      1507.7   5301.7    -132.2
+        16    0.752  0.071     0.823      1451.3   5227.4    -206.5
+
+ 7. IT APPEARS IN EXACTLY THE SHAPE YOU SAID IT HAD TO.  Not a lower walk.
+    From -E 0 to -E 16 the walk RISES 0.352 -> 0.752 s (+0.40) while uf2
+    FALLS 0.681 -> 0.071 s (-0.61).  The union work moved into the walk;
+    0.21 s of it overlapped there.  walk+uf2 combined is the only honest
+    column and it drops 20%.
+
+ 8. NOTHING ELSE MOVED, which is the control.  Across all ten runs:
+    phase1 2.112-2.148 s, phaseA 2.054-2.090, Pre-traversal 2497.7-2533.8
+    ms, edge_gather 0.004-0.005, relabel 0.127-0.128.  The whole Iter0
+    saving is carried by the Tree traversal row (1659.4 -> 1451.3 ms,
+    -208 ms), which is where phase 3 lives.  No phase1_stages drift.
+
+ 9. SEPARABLE, not a noise reading.  Worst within-arm rep spread on Iter0
+    is 1.1% (E4096: 5421.6 / 5483.5); the other four arms are 0.09-0.72%.
+    Controls span 5421.6-5483.5 ms, treated span 5216.9-5233.7 ms.  NO
+    control rep overlaps any treated rep.  Gap 3.8%.
+
+10. NO PER-MESSAGE OVERHEAD FLOOR DOWN TO 16.  -E 16 (0.823) matches
+    -E 512 (0.827).  At 16 edges/message that is ~103k messages machine
+    wide, still small against the walk's own traffic.  The floor the
+    design doc predicted is below 16, or below the point where it matters.
+    -E 64 sits 50-75 ms worse than both neighbours, which does not fit a
+    monotone story -- it also has the widest rep spread in the job
+    (5320.9 / 5282.5).  Both its reps still beat every control rep, so
+    the direction is not in doubt; I am reading the 64-vs-512/16 ranking
+    as one noisy point, not structure.
+
+
+WHAT THIS RETRACTS -- and it is a real retraction, not a footnote
+
+11. design/walk-uf2-overlap.md step (1) recorded a 2B A/B of -E 0 vs
+    -E 4096 (job 19582087, Anvil, pre-split), found walk+uf2 4.65/4.52 vs
+    4.67/4.67, and concluded "performance-neutral".  THAT A/B DID NOT RUN
+    THE EXPERIMENT.  At ~970k edges over ~1920 PEs the per-PE yield was
+    ~505, so -E 4096 never flushed mid-walk either -- it compared
+    no-overlap against no-overlap.  The null is an artifact of the batch
+    size, not a property of the mechanism.
+
+12. THE DIAGNOSIS BUILT ON THAT NULL IS ALSO WRONG at these edge volumes.
+    The doc concluded the uf2 wall "sits in what runs AFTER all unions --
+    find_components' own serial latency structure ... which no amount of
+    union overlap can touch by design".  Now measured directly: at -E 16
+    the uf2 bracket (remainder flush + QD + find_components) is 0.071 s.
+    So find_components' serial structure is ~0.07 s, not 0.65 s.  The
+    other 0.6 s was union injection and its cascades, and it overlaps.
+    The "sparse-message-latency disease, not an application-schedulable
+    cost" reading does not survive.
+
+13. The doc's verdict line "KEPT with default -E 4096: zero measured cost"
+    is literally true and badly misleading.  4096 is not a conservative
+    default, it is an off switch.
+
+
+RECOMMENDATION AND THE GAP
+
+14. *** SUPERSEDED BY ITEM 20 BELOW -- 512 IS REFUTED AT 64 NODES.
+        The original text is kept so the wrong reasoning is visible. ***
+    RECOMMEND changing the default from 4096 to 512.  512 and 16 measure
+    the same; 512 is the conservative end of the tie -- 32x fewer messages
+    than 16, a useful peak_edge_buf bound, and margin before an overhead
+    floor this sweep did not find.  The default lives in
+    examples/fof3/Main.h:82.  No code change needed to USE it, and I have
+    not made one.
+
+15. *** CLOSED -- the 64-node job ran, see items 17-21. ***
+    THE GAP, and I did not close it because the task said 16 nodes:
+    this is 16-node data only.  The campaign's operating point is 64 nodes
+    (2771 ms, the best absolute result), and that is where it matters most
+    in relative terms -- at 64 nodes uf2 is 0.723 s of a 2771 ms iteration
+    = 26%, against 12% here.  If the same ~0.6 s of the bracket is
+    injection rather than find_components at that scale, the effect on the
+    headline is several times the 3.8% measured here.  Nothing in the
+    mechanism says it should fail at 64 nodes and nothing measured says it
+    holds.  I would not land a default change on 16-node data.
+    ONE SHORT JOB CLOSES IT: 64 nodes, arms -E 0 / 4096 / 512 / 16, two
+    reps, ~3 minutes of allocation.  Say the word and I will run it.
+
+16. Second, smaller caveat: 924 edges/PE is a POST-SPLIT number (the split
+    inflates edges 3.4x; the unsplit run is 491,173 = 274/PE).  So any -E
+    default has to be stated as a default FOR THE SPLIT CONFIGURATION.  On
+    an unsplit run the batch would have to be smaller still to trigger at
+    all -- which also means the old pre-split A/Bs in the design doc could
+    not have shown anything even at -E 512.
+
+
+FILES
+
+  reports/e-stream-batch.md                        the full report
+  sbatch/e-stream-2b-16n.sbatch                    the job
+  scripts/etable.sh                                table extractor
+  bin/FoF3.2b.estream                              the binary (md5 above)
+  /lustre/orion/csc710/scratch/lvkale/s3ab/5295956/          per-arm logs
+  /lustre/orion/csc710/scratch/lvkale/s3ab/e-stream-2b-16n-5295956.out
+
+Tree state: paratreet2 at ac600f0, CLEAN, production charm.  Nothing
+pushed.  No patch generated -- this work changed no code.
+
+
+================================================================
+ADDENDUM -- 64 NODES.  Job 5296408, 8/8 exact, 512 pe_sets lines per arm.
+Written 18:50 EDT.  THIS CHANGES THE RECOMMENDATION IN ITEM 14.
+================================================================
+
+17. YOUR PREMISE IS CONFIRMED, AND JOB 5288946 ALREADY HELD THE PROOF.
+    peak_edge_buf on the default -E 4096, read out of the scaling job:
+
+       nodes   PEs     edges      per PE   max per PE   does 4096 fire?
+        16    1792   1,655,535     924       6453       once, one PE
+        64    7168   2,903,750     405       3465       NEVER
+       128   14336   3,815,309     266       2307       NEVER
+
+    Total edges rise with node count, per-PE yield FALLS -- exactly as you
+    said.  The default has never fired at 64 or 128 nodes in ANY run this
+    campaign has made.  512 is also above the per-PE mean at 64 and 128, so
+    512 is not scale-safe either.
+
+18. THE 16-NODE WIN DOES NOT SCALE.  Means of two reps at 64 nodes:
+
+       -E      walk    uf2   walk+uf2   Iter0      d(Iter0)
+        0     0.235  0.734     0.969   2759.7        --
+        4096  0.251  0.708     0.959   2763.8      +4.1  (+0.1%)
+        512   0.508  0.559     1.067   2864.2    +104.5  (+3.8%)  WORSE
+        16    0.868  0.076     0.945   2736.7     -23.1  (-0.8%)  noise
+
+    -E 512 is WORSE THAN DOING NOTHING at 64 nodes: both its reps are
+    slower than every other rep in the job, against a ~60 ms within-arm
+    spread.  -E 16 moves the work exactly as at 16 nodes (walk +0.633,
+    uf2 -0.658) but the two now CANCEL: -23 ms is inside the rep spread.
+
+19. WHY, and it is not a failure of the mechanism.  What disappeared is the
+    slack it was hiding in.  At 16 nodes the walk is 0.352 s and can absorb
+    0.21 s of union work for free.  At 64 nodes the walk is 0.235 s -- it
+    shrank with the node count -- while total edges GREW 1.66M -> 2.90M.
+    More union work, less walk to hide it under, so moving it in is close
+    to a pure transfer.
+    The corrected rule for anything else in this campaign that proposes to
+    overlap X with Y: THE CEILING IS Y's IDLE TIME, NOT X's COST.  My
+    section-8 worry had this backwards -- I argued the prize would be
+    BIGGER at 64 nodes because uf2's share of the iteration is 26% there
+    against 12% at 16.  uf2's share did grow; the walk's slack shrank more.
+
+20. RECOMMENDATION, CORRECTED: DEFAULT 16, which is what you said.
+    You were right, though for a reason neither of us had: not only does
+    512 fail to fire at scale, it is an active REGRESSION where it does
+    fire.  16 is the only value measured never worse:
+
+                        16 nodes            64 nodes
+       -E 4096 (today)  baseline            baseline
+       -E 512           -208 ms (-3.8%)     +104 ms (+3.8%)
+       -E 16            -208 ms (-3.8%)     -23 ms (-0.8%, noise)
+
+    16 is also the only value whose behaviour does not depend on scale:
+    per-PE yield is 266-924 across 16-128 nodes, so a 16-edge batch fires
+    everywhere at every size.  A default that quietly turns itself off as
+    the machine grows is the exact trap this investigation uncovered, and
+    512 repeats it one scale later.
+    Change examples/fof3/Main.h:82 from 4096 to 16.  Still not landed here
+    -- Frontier does not push, and this needs no patch from me if you make
+    the one-line change on the laptop.
+
+21. STATE IT HONESTLY WHEN YOU LAND IT: this is a 16-node win that is FREE
+    at the operating point, not a win at the operating point.  128 nodes is
+    untested for -E; per-PE yield there is 266 so 16 still fires
+    everywhere, but whether the transfer stays neutral as the walk shrinks
+    further is unknown.  Low priority -- 128 nodes already regresses for
+    unrelated reasons (relay10 item 52).
+
+
+================================================================
+ADDENDUM -- FULL-MACHINE PROJECTIONS, as you asked for.  Job 5296573.
+================================================================
+
+22. Built bin/FoF3.2b.estream.proj from the CLEAN ac600f0 tree against
+    tracedcharm: TraceProjections 475, TraceSummary 0, pe_sets 1,
+    vfmadd 0, md5 99061e4861b4401ed74c4707d3b7df9e.  The tree was relinked
+    back to PRODUCTION charm afterwards and bin/FoF3.2b.estream.restored
+    verifies all-zero -- the tree is NOT left traced.
+    Script: scripts/build-estream-proj.sh.
+
+23. TWO ARMS, all 1792 PEs, no +traceprocessors, plus untraced controls in
+    the same job so the traced timings can be checked:
+      proj-E4096  the recommended config exactly as this campaign has
+                  measured it all along.  Since 4096 never fires, this is
+                  ALSO the overlap-OFF picture: uf2 should read as a
+                  serialized block after the walk.
+      proj-E16    same config with the edge stream actually on.  uf2
+                  collapses 0.65 -> 0.07 s and the union work should
+                  appear inside the walk.
+    Either alone is a valid record of the final configuration; together
+    they are the overlap mechanism in one viewer.  Sizes and paths are in
+    the next section of this file once the job reports.
+
+24. PROJECTIONS RESULTS AND WHERE THEY ARE.  4/4 exact.
+
+    run           walk    uf2   walk+uf2   peak   TreeTrav    Iter0
+    ctrl-E4096   0.363  0.697     1.060    4096     1695.2   5437.2   untraced
+    ctrl-E16     0.782  0.071     0.853      16     1483.6   5240.2   untraced
+    proj-E4096   0.379  0.732     1.111    4096     1739.7   5476.7   TRACED
+    proj-E16     0.882  0.080     0.962      16     1591.9   5317.9   TRACED
+
+    (a) The untraced controls reproduce the 16-node result a THIRD time,
+        independently of job 5295956: -197 ms, uf2 0.697 -> 0.071.  Three
+        separate jobs now agree.
+    (b) TRACING COSTS MORE ON THE E16 ARM (+1.5% on Iter0) THAN ON E4096
+        (+0.7%), which is expected -- streaming creates ~103k extra
+        messages to record.  So the traced pair shows -159 ms where the
+        untraced pair shows -197 ms.  READ THE TRACES FOR THE SHAPE OF THE
+        OVERLAP AND TAKE THE MAGNITUDE FROM THE UNTRACED RUNS.
+
+    Each set: 1794 files, 2.7 GB raw, .sts included.  Packed to
+
+      /lustre/orion/csc710/proj-shared/lvkale-traces/
+        estream-proj-E16-frontier.tar.gz     1.6 GB   overlap ON  (-E 16)
+        estream-proj-E4096-frontier.tar.gz   1.5 GB   overlap OFF (-E 4096,
+                                                      = the campaign default)
+
+    NOT staged into uploads/ -- 1.5 GB each is not an scp-from-a-dumb-
+    terminal proposition and uploads/ is 25 MB today.  Say which one you
+    want and I will move it, or pull them straight from proj-shared.
+    If you only want ONE: take estream-proj-E16-frontier.tar.gz.  It is the
+    final configuration, and the E4096 set is only interesting as the
+    side-by-side.
+
+25. TREE STATE AT SESSION END.  paratreet2 at ac600f0, CLEAN, linked against
+    PRODUCTION charm (bin/FoF3.2b.estream.restored verifies TraceSummary 0,
+    TraceProjections 0).  Nothing pushed.  No patch -- none of this work
+    changed any code.  Queue empty.
+    The ONE change to land, on the laptop: examples/fof3/Main.h:82,
+    fof_uf2_stream_batch default 4096 -> 16.

@@ -249,3 +249,36 @@ Sum-detail traces of the -G 4 configuration at 2B (10 ms bins) are on
 the laptop: traces/2b-sumdetail-G4 (46 MB, alongside -D3 = grid-off
 baseline and -D4 = overfetch case). All three sets are at commit
 b84ddaf, so cross-set comparisons are apples-to-apples.
+
+## RETRACTION AND RESOLUTION (2026-08-17, Frontier relay11 — jobs
+## 5295956, 5296408, 5296573)
+
+Step (1)'s conclusion above — "performance-neutral, KEPT with default
+-E 4096: zero measured cost" — is RETRACTED. That A/B never ran the
+experiment: the batch is a per-PE flush threshold, per-PE edge yield was
+~505 in that job, so -E 4096 never flushed mid-walk and the comparison
+was no-overlap vs no-overlap. The null was an artifact of the batch
+size. The diagnosis built on it — that the uf2 wall is find_components'
+serial latency which "no amount of union overlap can touch" — is also
+wrong at these volumes: find_components measures 0.07 s; the other
+~0.6 s was union injection and its cascades, and IT OVERLAPS.
+
+Measured with batches that actually fire (post-split, 2B):
+- 16 nodes: walk 0.352 -> 0.752 s, uf2 0.681 -> 0.071, combined -20%,
+  Iteration 0 -208 ms (-3.8%). Reproduced by three independent jobs.
+- 64 nodes: the SAME transfer happens (walk +0.63, uf2 -0.66) and
+  CANCELS — the walk shrank with node count while edges grew, so there
+  is no slack left to hide in. -E 512 actively regresses (+104 ms).
+- No per-message overhead floor found down to -E 16 (~103k messages).
+
+THE CORRECTED RULE, for anything else that proposes to overlap X with
+Y: the ceiling is Y's IDLE TIME, not X's cost. uf2's share of the
+iteration GROWS with scale (12% -> 26%) while the prize SHRINKS,
+because the walk's slack shrinks faster.
+
+Default changed 4096 -> 16 (the only value that fires at every measured
+scale and is never worse). Full record:
+design/campaign-archive/{relay11.txt,e-stream-batch.md}. Full-machine
+projections of both arms exist at
+/lustre/orion/csc710/proj-shared/lvkale-traces/estream-proj-{E16,E4096}-
+frontier.tar.gz (1.5-1.6 GB each, on request).
