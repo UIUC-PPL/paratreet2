@@ -453,6 +453,28 @@ public:
   std::map<int, std::vector<int> > dev_piece_node_off;
   long dev_total_nodes = 0;
   double dev_t_tree_upload = 0, dev_t_tree_check = 0;
+  // The three components of deviceInitOnHome, which is a SERIAL step on
+  // the home PE that every other PE in the process waits through. Split
+  // because the fixes differ: dev_t_kokkos_init is a fixed per-process
+  // cost (HIP context + code-object load) that is hoistable off the
+  // critical path, dev_t_alloc scales with bytes (~440 MB of pinned host
+  // memory per process at 2B/128 procs) and wants fewer/smaller pinned
+  // buffers, and dev_t_plan is the only part with a genuine dependency on
+  // the tree build. Only the first two are paid once per run.
+  double dev_t_kokkos_init = 0;  // device.init + checkMapping + streams
+  double dev_t_alloc = 0;        // device.resize: pinned host + device
+  double dev_t_plan = 0;         // devicePlanTree
+  // The whole prologue on one PE. This is the quantity to subtract the
+  // three parts above from: they are all measured on the SAME home PE, so
+  // the remainder is meaningful. Subtracting them from device_wall is not
+  // -- device_wall is one driving thread's wall while pack/pass/scatter
+  // are maxima over all PEs that never occur on the same PE, so that
+  // difference is routinely negative and means nothing.
+  double dev_t_prologue = 0;
+  // Device::init when it happens OFF the critical path, in deviceWarmup.
+  // Kept separate from dev_t_kokkos_init so the two are never confused:
+  // whichever one is nonzero tells you where the context creation landed.
+  double dev_t_warmup = 0;
   long dev_tree_pieces = 0;
   // Per-iteration deposit counters. resetDevice() below MUST clear them:
   // they are compared against CkNodeSize(), so a counter left at its
@@ -478,6 +500,9 @@ public:
     dev_pack_done.store(0);
     dev_scatter_done.store(0);
     dev_t_launch = dev_t_block = 0;
+    // dev_t_kokkos_init / dev_t_alloc are deliberately NOT reset: they are
+    // paid once per run and the point of measuring them is to see that.
+    dev_t_plan = 0;
     dev_launch_pe = -1;
     dev_walk = fofgpu::WalkStats();
   }
@@ -1283,33 +1308,85 @@ public:
       this->thisProxy[CkNodeFirst(CkMyNode())].deviceInitOnHome();
   }
 
-  // Round 2 (home PE only): bind the device and size the staging buffers.
-  void deviceInitOnHome() {
+  // Kokkos/HIP context creation, hoisted OFF the phase-1 critical path.
+  //
+  // Broadcast from ExMain::main, which runs BEFORE Driver::initialize calls
+  // readers.load -- so the 0.38 s (warm) to 0.84 s (cold) this costs
+  // overlaps a multi-second Tipsy read instead of stalling deviceInitOnHome,
+  // where one PE pays it while the other CkNodeSize()-1 PEs of the process
+  // sit idle. Measured at 2B/16 nodes it was 0.844 s of a 0.924 s prologue.
+  //
+  // Home PE only. This is deliberately an entry method on the GROUP and not
+  // the nodegroup: a nodegroup broadcast can be picked up by any PE in the
+  // process, and Kokkos::initialize binds to whatever hapiGetDevice()
+  // returned on the calling thread. Pinning it to CkNodeFirst makes that
+  // identical to the PE deviceInitOnHome will later run on.
+  //
+  // ONLY Device::init moves. hapiCreateStreams/hapiGetStream are per-PE HAPI
+  // state and checkMapping's abort belongs where the mapping is used, so
+  // both stay in deviceInitOnHome -- they cost ~0 next to the context.
+  void deviceWarmup() {
+    if (paratreet::fofGpuMode() == paratreet::FoFGpuMode::Off) return;
+    if (CkMyPe() != CkNodeFirst(CkMyNode())) return;
     auto* nb = node_proxy.ckLocalBranch();
+    if (nb->dev_inited) return;
+    double t0 = CkWallTimer();
+    deviceBind(nb);
+    nb->dev_t_warmup = CkWallTimer() - t0;
+  }
+
+  // The once-per-process device bind. Factored out because it runs from
+  // either deviceWarmup (overlapped with the input read, the fast path) or
+  // deviceInitOnHome (if the warmup never ran). Both callers are on
+  // CkNodeFirst(CkMyNode()), which is what makes it safe to create the HAPI
+  // streams here: hapiGetStream() is per-PE state and this is the PE that
+  // will use it.
+  void deviceBind(FoFPhase1Node<Data>* nb) {
+    if (nb->dev_inited) return;
     int device_id = -1;
 #ifdef FOF_GPU_HAS_HAPI
     hapiCheck(hapiGetDevice(&device_id));
 #endif
-    if (!nb->dev_inited) {
-      nb->device.init(device_id);
-      const int procs_per_node = CmiNumNodes() / CmiNumPhysicalNodes();
-      // One process per GPU is an invariant, not a preference
-      // (design/phase1-gpu.md section 2): sharing a GCD silently halves
-      // every later measurement, so refuse rather than run.
-      if (!nb->device.checkMapping(procs_per_node))
-        CkAbort("FoF GPU: processes would SHARE a GPU (%d processes on "
-                "this physical node, only %d devices visible). Launch at "
-                "most one process per GCD.",
-                procs_per_node, nb->device.info().n_visible);
+    nb->device.init(device_id);
+    const int procs_per_node = CmiNumNodes() / CmiNumPhysicalNodes();
+    // One process per GPU is an invariant, not a preference
+    // (design/phase1-gpu.md section 2): sharing a GCD silently halves every
+    // later measurement, so refuse rather than run. Checking it here rather
+    // than in phase 1 means it now fails BEFORE the input read, not after.
+    if (!nb->device.checkMapping(procs_per_node))
+      CkAbort("FoF GPU: processes would SHARE a GPU (%d processes on "
+              "this physical node, only %d devices visible). Launch at "
+              "most one process per GCD.",
+              procs_per_node, nb->device.info().n_visible);
 #ifdef FOF_GPU_HAS_HAPI
-      hapiCreateStreams();
-      nb->dev_stream = (void*)hapiGetStream();
+    hapiCreateStreams();
+    nb->dev_stream = (void*)hapiGetStream();
 #endif
-      nb->device.setStream(nb->dev_stream);
-      nb->dev_inited = true;
+    nb->device.setStream(nb->dev_stream);
+    nb->dev_inited = true;
+  }
+
+  // Round 2 (home PE only): bind the device and size the staging buffers.
+  void deviceInitOnHome() {
+    auto* nb = node_proxy.ckLocalBranch();
+    const double t_pro0 = CkWallTimer();
+    // Normally a no-op: deviceWarmup did this during the input read. Left
+    // here so the device arm still works if the warmup never ran, in which
+    // case dev_t_kokkos_init is nonzero and warmup_offpath is 0.
+    if (!nb->dev_inited) {
+      deviceBind(nb);
+      nb->dev_t_kokkos_init = CkWallTimer() - t_pro0;
     }
+    double t_a0 = CkWallTimer();
     nb->device.resize((size_t)nb->dev_total.load());
+    // resize() early-returns when the size is unchanged, so on any
+    // iteration after the first this is ~0 -- which is the reading, not a
+    // missing measurement.
+    nb->dev_t_alloc = CkWallTimer() - t_a0;
+    double t_p0 = CkWallTimer();
     devicePlanTree(nb);
+    nb->dev_t_plan = CkWallTimer() - t_p0;
+    nb->dev_t_prologue = CkWallTimer() - t_pro0;
     const int first = CkNodeFirst(CkMyNode());
     for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
       this->thisProxy[pe].devicePack();
@@ -1583,10 +1660,16 @@ public:
     // scatter (per PE), failures (summed in as a max so any nonzero
     // survives to the driver), tree pack (per PE), tree upload (per
     // process), and the scheduler-visible GPU wait (per process).
-    double vals[7] = {dev_t_pack_,  nb->dev_t_launch,     dev_t_scatter_,
-                      (double)bad,  dev_t_tree_pack_,
-                      nb->dev_t_tree_upload, nb->dev_t_block};
-    this->contribute(7 * sizeof(double), vals, CkReduction::max_double,
+    double vals[12] = {dev_t_pack_,  nb->dev_t_launch,     dev_t_scatter_,
+                       (double)bad,  dev_t_tree_pack_,
+                       nb->dev_t_tree_upload, nb->dev_t_block,
+                       // deviceInitOnHome's three parts. Nonzero on the
+                       // home PE only, so max_double reports the worst
+                       // process rather than an average that would hide it.
+                       nb->dev_t_kokkos_init, nb->dev_t_alloc,
+                       nb->dev_t_plan, nb->dev_t_prologue,
+                       nb->dev_t_warmup};
+    this->contribute(12 * sizeof(double), vals, CkReduction::max_double,
                      dev_done_cb_);
   }
 
@@ -1689,6 +1772,7 @@ public:
     this->contribute(7 * sizeof(double), vals, CkReduction::max_double, cb);
   }
   void deviceInitOnHome() {}
+  void deviceWarmup() {}
   void devicePack() {}
   void deviceComplete() {}
   void deviceScatter() {}
@@ -3188,6 +3272,11 @@ struct FoFPhase1Stages {
   // compare against phaseA+phaseB+merge+relabel.
   double device_wall = 0, device_pack = 0, device_tree = 0, device_pass = 0,
          device_scatter = 0, device_block = 0;
+  // The serial home-PE prologue inside device_wall, broken out. These are
+  // NOT part of device_pass and do not overlap the stages above; they are
+  // the reason iteration 0's device_wall exceeds the sum of its stages.
+  double device_init = 0, device_alloc = 0, device_plan = 0,
+         device_prologue = 0, device_warmup = 0;
 };
 
 // Convenience driver for the full phase-1 sequence. Must be called from a
@@ -3286,6 +3375,11 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
     local.device_scatter = gv[2];
     local.device_tree = gv[4] + gv[5];
     local.device_block = gv[6];
+    local.device_init = gv[7];
+    local.device_alloc = gv[8];
+    local.device_plan = gv[9];
+    local.device_prologue = gv[10];
+    local.device_warmup = gv[11];
     // The timings above are what `-c stats` reports as the phase1_device
     // line; gv[3] is the verify-mode mismatch count, and nonzero is fatal.
     if (gv[3] != 0)

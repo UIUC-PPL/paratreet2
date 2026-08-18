@@ -239,6 +239,12 @@ PARATREET_REGISTER_MAIN(ExMain);
 
     fof_node = CProxy_FoFPhase1Node<FragData>::ckNew();
     fof = CProxy_FoFPhase1<FragData>::ckNew(fof_node);
+    // Start Kokkos/HIP context creation NOW, so it overlaps the Tipsy read
+    // in Driver::initialize instead of being paid inside deviceInitOnHome
+    // with the rest of the process idle behind it. No-op unless a device
+    // arm is selected, and the phase-1 path does not depend on it having
+    // finished -- Device::init early-returns if it already ran.
+    fof.deviceWarmup();
   }
 
   void ExMain::run() {
