@@ -1,0 +1,265 @@
+relay13 -- STALL ATTRIBUTION.  Job 5302846, 16 nodes, 2B, 2026-08-18.
+Full report: reports/stall-attrib.md.  Written 2026-08-18 15:55 EDT.
+Everything below is new since relay12.
+
+*** HEADLINE: the keep-alive ring is NOT what is holding the stall off.
+    Switched OFF, twice, the run is exact and indistinguishable in every
+    timing region (Iteration 0 mean 5155.5 ms ring-off against 5167.7 ms
+    ring-on -- ring-off is 12 ms FASTER, against a 32 ms within-arm
+    spread).  And the trigger has NOT gone away: the E16 trace shows 2.4 s
+    of application silence per process, 2.6-2.8 s per thread, three times
+    per run, each ending in a two-way exchange against 48-108 distinct
+    peer processes per thread.  Both preconditions of the LCI idle-stall
+    are met, by a wider margin than the microbenchmark that found the bug,
+    and the stall does not fire with or without the ring.  Credit belongs
+    to something neither arm removed.  See items 5-9 and 16. ***
+
+
+SETUP AND PROVENANCE
+
+ 1. Pulled paratreet2 61685b7 -> 0957364 on phaseab-campaign (queue empty).
+    The only code change is the FOF_STAGE_DUMP per-PE instrument from item
+    26; verified live (1792 stage_pe lines with the dump on, 0 with it off).
+
+ 2. FULL clean rebuild against PRODUCTION charm.  bin/FoF3.2b.stagedump,
+    md5 1b5e13a67bee1defe92eb4687d5d805f.  Gates: TraceSummary 0,
+    TraceProjections 0, vfmadd 0, pe_sets 1, phaseA_stages 1, stage_pe 1,
+    keep-alive 3.  Tree CLEAN, nothing pushed, NO PATCH -- no code changed.
+
+ 3. Both 10k gates EXACT (3549).  All six completed 2B arms EXACT
+    (424,897,832).  stderr empty.  128/128 pe_sets and phaseA_stages lines
+    on every completed arm.
+
+ 4. ONE JOB as asked, arms interleaved, srun -t 8:00 per arm, plus a warmup
+    run that absorbs the cold read (relay12 item 8 lost a rep to it) and is
+    excluded from the readout.  Config identical everywhere and equal to
+    the standing recommendation.
+
+
+THE TRIGGER IS REAL -- MEASURED, NOT MODELLED (no new job needed)
+
+ 5. Projections records the SOURCE PE on BEGIN_PROCESSING, so inter-process
+    arrivals can be separated from intra-process ones in job 5296573's E16
+    full-machine trace, which was already on disk.  Four processes:
+
+       process   inter-proc arrivals    rate     100ms buckets EMPTY
+          0        166,050 (85.5%)    13,868/s      60 of 120
+          5        196,493 (80.7%)    16,404/s      81 of 120
+         40        288,137 (89.6%)    24,059/s      66 of 120
+        100        240,832 (84.3%)    20,112/s      60 of 120
+
+    Half the run's 100 ms buckets carry NO inter-process message at all.
+
+ 6. The silences are the phases.  Process 5 against the run's own printed
+    timeline (phaseA 2.009 s inside Pre-traversal 2.459 s ending at
+    "Starting tree traversal at time 10.815"):
+
+       2387 ms   8.359 -> 10.747 s   PRE-TRAVERSAL: phaseA + upwardPass
+       1447 ms   6.759 ->  8.206 s   tree build
+       2763 ms   0.695 ->  3.458 s   decomposition
+        627 ms  11.154 -> 11.781 s   inside the phase-3 walk
+        592 ms  11.816 -> 12.408 s   inside the phase-3 walk
+
+    Per PE -- the level the bug lives at, since it is thread-local -- the
+    longest silence is 2.4-2.8 s on essentially every PE sampled.
+    YOUR ~2 s FIGURE IS RIGHT, and it is not the only one in the run.
+
+ 7. The SECOND precondition is met too, and by more than the bug needs.
+    In the first 200 ms after its longest silence, each PE of process 5
+    exchanges with 139-302 distinct peer PEs = 48-108 distinct peer
+    PROCESSES.  The resumption point is the start of the phase-3 walk,
+    whose remote fetches are request/response -- two-way.  The LCI
+    microbenchmark stalled at K=31 two-way peers.  This is K=48-108,
+    immediately after 2.6 s of silence, on every thread at once.
+
+ 8. So the configuration is a STRONGER trigger than the one the bug was
+    characterised with, and it fires three times per run.  Whatever is
+    suppressing the stall is doing real work.  That is what made arm 2 the
+    decisive experiment rather than a formality.
+
+
+THE ANSWER
+
+ 9. RING OFF CHANGES NOTHING.  FOF_KEEPALIVE=0, both reps, banner
+    confirmed absent:
+
+       arm       Iter0      Pre-trav   Tree-trav   phaseA
+       asis-r1   5183.9 ms   2408.6     1497.7     1.966 s
+       asis-r2   5151.5 ms   2414.4     1476.0     1.971 s
+       ka0-r1    5192.4 ms   2422.9     1501.5     1.979 s
+       ka0-r2    5118.6 ms   2415.7     1440.7     1.972 s
+
+    The uf2 bracket -- where the old stalls lived -- is unchanged to the
+    millisecond: uf2_setup 24/25/25/25, uf2 69/69/71/72, edge_gather
+    5/5/5/21, relabel 128/127/128/128, comp_hist 413/413/416/399.
+
+10. A STALL DETECTOR THAT NEEDS NO TRACE.  Tree traversal's wall minus its
+    own instrumented parts is 0.7 / 2.0 / -0.5 / 0.7 ms on those four arms
+    (and 0.0-0.8 on the others).  There is no dark time anywhere, with or
+    without the ring.  Pre-traversal's residual is a constant 231-235 ms
+    of uninstrumented canopy/cache setup on EVERY arm -- flat, so not a
+    stall.  I recommend this subtraction as the standing cheap check.
+
+11. NO PROJECTIONS RUN WAS CAPTURED, because the condition you set did not
+    occur: neither arm 2 nor arm 3 stalled, and the arm that hung did not
+    hang on a stall (item 13).  The lci-handover bug report does not get a
+    live reproduction from this stack.
+
+
++backend_poll_thread: THE FLAG DOES NOT DO WHAT ITS NAME SUGGESTS
+
+12. Read the source before running arm 3, so the arm plan could be fixed
+    rather than the result explained afterwards.  Three facts settle every
+    poll arm:
+      - scheduler.cpp:182 -- progress() is called INLINE at the bottom of
+        the scheduler loop by ranks with rank % backend_poll_thread == 0,
+        including while idle.  There is NO separate progress thread.
+      - convcore.cpp:351 -- values below 1 are clamped UP to 1, so
+        `+backend_poll_thread 0` means EVERY rank polls, i.e. MORE
+        progress than the recommended 2, not none.
+      - comm_backend_lci2.cpp:225 -- device_id = thread_id /
+        ceil(nthreads/ndevices), and progress() advances ONLY the caller's
+        own device.
+    With +ppn 14 +lci_ndevices 7 that is device_id = rank/2:
+
+       setting   pollers            device coverage          measured
+         2       ranks 0,2,...,12   ALL 7, one poller each   baseline
+         0 -> 1  all 14 ranks       each device twice        +1.3% Iter0,
+                                                             uf2_setup
+                                                             24 -> 34 ms
+        14       rank 0 only        device 0 ONLY            HANGS
+
+13. So arm 3 as specified could not resurrect anything, which is why I
+    added arm 4 (+backend_poll_thread 14, one poller per process -- the
+    least this flag can express).  It HANGS, twice, at 497 s and 501 s,
+    both killed by the 8:00 guard.  But it dies in "* Initializing cache
+    managers", before the input is read and before any quiet window
+    exists: devices 1-6 are never progressed, so it is a DEVICE-COVERAGE
+    DEADLOCK AT STARTUP, not a resurrected stall.  The 8:00 guard did
+    exactly its job -- two hangs cost 17 minutes of a 40-minute
+    allocation and the other six arms still ran.
+
+14. THE RULE, and it generalises: backend_poll_thread x lci_ndevices = ppn.
+    The recommended 2 is not a tuning preference -- with ndevices 7 and
+    ppn 14 it is the UNIQUE value that covers every device exactly once.
+    This is the same invariant as the old "+lci_ndevices must track +ppn"
+    note in BUILDS.md/relay3, seen from the other side.
+
+15. CONSEQUENCE: the progress-starvation direction CANNOT be tested with
+    this flag.  Anything below one poller per device breaks startup.  The
+    only reachable states are "every device covered once" and "twice".
+
+
+WHAT I WOULD DO NEXT
+
+16. Two candidates survive for what is actually suppressing the stall,
+    neither measured, both testable in ONE cheap microbenchmark job:
+      (a) WARM CONNECTIONS.  The bug's rate decays ~35x over a run and
+          "touch 31 peers once" leaves no residue.  FoF pushes 13-24k
+          inter-process messages/s/process through decomposition before
+          the first silence opens, so every peer pair is hot by then.
+      (b) WITHDRAWN 2026-08-18 18:00 -- WRONG, and the note said so.  Job
+          19624352 ran the reproducer at BOTH 1 and 15 devices per rank and
+          BOTH stalled (K=8: 0.070%/0.210% over 10 ms; K=31: 0.620%/0.430%),
+          with the explicit conclusion "per-thread devices are not a
+          workaround".  Device fan-out is dead as a candidate.
+          WHAT REPLACES IT IS BIGGER: every measurement of this bug (jobs
+          19608513-19661625) was made on ANVIL over MELLANOX INFINIBAND.
+          Frontier is Slingshot/CXI.  FoF.C's own comment opens with "on
+          reconverse/LCI over InfiniBand", and the bug was localised below
+          the progress API, in the libfabric/IBV provider.  So the prior
+          question is whether the bug exists on THIS fabric at all.  See
+          relay14.
+    Re-running the pure-LCI reproducer (jobs 19644929 / 19661625) on the
+    CURRENT stack, with and without warm-up and at 1 vs 7 devices,
+    separates them.  If it no longer stalls at all, the app-side question
+    closes and the ring can be retired outright.  Not run -- you asked for
+    one job, and this is a different one.  Say the word.
+
+17. RECOMMENDATION MEANWHILE: keep the ring.  It costs nothing measurable
+    (160 msg/s job-wide; -12 ms, inside noise).  But stop describing it as
+    the thing that fixed the stalls: on this stack they are absent without
+    it, and WORKAROUND-lci-idle-stall.md's claim about FoF's uf2-bracket
+    stalls is not supported here.
+
+
+THE PER-PE DUMP (free on asis-r2) -- IT RETIRES ITEM 26
+
+18. Item 26 proposed a claim priority that charges the MARGINAL CROSS COST
+    of taking one more piece, on the argument that cross work is convex in
+    pieces-per-PE.  The arithmetic is right and the premise is false:
+
+       pieces vs cross seconds          -0.084
+       pieces vs self seconds           -0.246
+       pieces vs TOTAL phaseA seconds   -0.237
+       self vs cross seconds            +0.318
+
+    Piece count does not predict cross cost and predicts total cost WITH
+    THE WRONG SIGN.  PEs holding more pieces finish sooner -- the claim
+    pool already works this way, so piece count is an OUTCOME of speed,
+    not a cause of load.
+
+19. The PE that sets each process's phaseA wall holds FEWER pieces than
+    its peers (33.9 vs 35.8) while taking 16.7% longer.  Piece counts are
+    far more skewed than time (within-process max/mean 1.490 for pieces
+    against 1.145 for time) and the two skews barely correlate (+0.189).
+    Equalising piece counts would make the imbalance WORSE even though it
+    would genuinely cut sum p(p-1)/2 by 7.2%.
+
+20. WHAT VARIES IS THE COST OF A PIECE: per-piece phaseA cost runs
+    11.7 / 28.6 / 138.9 ms (min/median/max) -- 4.9x from median to worst.
+    That is what a claim priority would have to charge, and the count is
+    not a proxy for it.
+
+21. Ceiling recomputed from PER-PE data (was process sum/max in item 23):
+    sum over processes of max(self+cross) 154.12 s against 133.63 s for a
+    perfect within-process split, -13.3%.  The number is unchanged; the
+    reachable MECHANISM is not.  VERDICT: do not build item 26 as
+    specified.  If the line is worth pursuing, the next instrument is a
+    per-PIECE (cost proxy, realized time) dump to see whether the existing
+    m2_* load-model terms predict that 4.9x spread.
+
+22. Cross share cross-checks relay12 exactly: 5.47% here from per-PE sums
+    against 5.4% there from process sums.
+
+
+CAVEATS
+
+23. The silence measurement counts CHARM-level arrivals.  Raw Converse
+    traffic is invisible to Projections -- including the ring itself -- so
+    "quiet" means quiet at the application level.  That is the level your
+    trigger model is stated at, but it is not proof of zero packets.
+
+24. Two reps per arm.  A 0.05-0.7 s stall would be blatant against a 32 ms
+    spread, but four ring-off minutes would not catch a rare intermittent.
+
+25. phaseA_skew:within reads 1.35-1.37 on all seven arms here against 1.23
+    on both arms of job 5301010 -- same config, code-identical binary,
+    consistent within each job.  It tracks the allocation or the claim
+    race, not the code.  Know that before quoting it across jobs.
+
+26. Job housekeeping: 5302769 was the first submission at -t 60:00 and sat
+    PENDING with a 17:42 start estimate, so I cancelled it and resubmitted
+    the same arms at -t 40:00 as 5302846, which started in 9 minutes.  The
+    deadline check inside the script now reads SLURM's own EndTime instead
+    of a hard-coded copy of the limit.
+
+
+FILES TO PULL  (uploads/ on Frontier)
+
+    reports/stall-attrib.md            the full report
+    reports/relay13.txt                this file
+    sbatch/stall-attrib-2b-16n.sbatch
+    scripts/stall-attrib-analyze.py    arm table + the wall-minus-parts detector
+    scripts/stage-pe-analyze.py        the per-PE dump analysis (items 18-21)
+    scripts/proj-quiet-scan.py         silences from a projections trace (items 5-6)
+    scripts/proj-resume-fanin.py       resumption peer count (item 7)
+
+STATE ON FRONTIER
+
+    paratreet2 at 0957364 on phaseab-campaign, CLEAN, production charm.
+    Queue empty.  Nothing pushed.  No patch -- no code changed.
+    Raw logs: /lustre/orion/csc710/scratch/lvkale/s3ab/5302846.
+    estream-proj-E16-frontier.tar.gz (1.6 GB) is STILL in uploads/ from
+    relay11 and still unpulled; its extracted copy in scratch/5296573 is
+    what sections 1/items 5-7 were measured from.

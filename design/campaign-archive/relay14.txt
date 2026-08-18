@@ -1,0 +1,186 @@
+relay14 -- THE PURE-LCI REPRODUCER, RUN ON FRONTIER.  Jobs 5303876 (smoke),
+5303887 (16-arm sweep), 5303902 (long silences), 2026-08-18.
+Full report: reports/lci-repro-frontier.md.  Written 2026-08-18 18:20 EDT.
+
+*** HEADLINE: the LCI idle-stall DOES NOT EXIST on this fabric.  220,000
+    round trips, 0 samples over 1 ms, at K = 1/8/16/31/64 peers and
+    silences of 5/15/30/60 s, with and without the keep-alive ring.  Anvil
+    put 0.070% (K=8) and 0.620% (K=31) over TEN ms on the same harness
+    shape.  So the relay13 question resolves outside both candidates I
+    offered: neither the ring nor the polling configuration deserves the
+    credit, because there is nothing to suppress.  The credit belongs to
+    the fabric and provider.  See items 4-8. ***
+
+*** AND A CORRECTION TO RELAY13, which is what led here: candidate (b),
+    "device fan-out", was already dead in our own notes -- job 19624352
+    ran 1 AND 15 devices per rank and both stalled.  I offered it without
+    reading that table.  Withdrawn in place in relay13.txt and
+    stall-attrib.md.  Item 2. ***
+
+
+WHY THIS RUN HAPPENED
+
+ 1. Relay13 left two candidates for what suppresses the stall in FoF.  In
+    building the job to test them I read the source notes again and found
+    the reframing: EVERY measurement of this bug -- Anvil jobs 19608513
+    through 19661625 -- was made over MELLANOX INFINIBAND HDR
+    (charm-notes/machines/anvil.md).  fof/FoF.C:13 opens the workaround
+    comment with "On reconverse/LCI over InfiniBand".  The bug was
+    localised BELOW the progress API, in the libfabric/IBV provider.
+    Frontier is Slingshot/CXI through libfabric's cxi provider.  So the
+    prior question is not which remedy holds the stall off here.  It is
+    whether the bug is on this fabric at all.
+
+ 2. CORRECTION TO RELAY13 ITEM 16(b).  Job 19624352 ran the reproducer at
+    BOTH 1 device/rank and 15 devices/rank: K=1 immune in both, K=8 at
+    0.070%/0.210% over 10 ms, K=31 at 0.620%/0.430%, with the explicit
+    conclusion "per-thread devices are not a workaround".  Device fan-out
+    was never a live candidate.  My error was offering a hypothesis the
+    notes had already killed; the fix is in place in both files.
+
+
+THE HARNESS
+
+ 3. lci_multipeer.cpp DID NOT EXIST on Frontier -- it was written on Anvil
+    and never copied.  Rebuilt from the description in
+    charm_best_practices.md, matching it point by point:
+      - PURE LCI: nm reports 0 converse/Cmi symbols; links the SAME
+        liblci.so the production FoF binary links (LCI 8.0.1).
+      - THE APP'S SHAPE: 128 ranks x 14 threads x 7 devices, with
+        reconverse's exact mapping device_id = thread_id /
+        ceil(nthreads/ndevices), so 2 threads share a device just as
+        +ppn 14 +lci_ndevices 7 produces.
+      - Rank 0 thread 0 pings round-robin over K distinct remote ranks,
+        ONE message outstanding, 8-byte AMs; every other thread on every
+        rank spins on lci::progress() for the whole run.
+      - Silence before measuring, and NO barrier after it -- a barrier is
+        itself traffic and would destroy the condition under test.
+      - Each arm is a SEPARATE srun, so no arm warms the connections for
+        the next one.  That is the variable under test.
+    Two arms Anvil never ran: a heavy all-to-all traffic warm-up before
+    the silence (relay13's warm-connections candidate), and a 100 ms
+    keep-alive ring (the FOF_KEEPALIVE analogue, as workaround control).
+
+
+THE RESULT
+
+ 4. JOB 5303887, 10,000 round trips per arm, 2 reps, 16 arms:
+
+       K     mean us   p99 us   max us  <=8us    >1ms   >10ms   ANVIL >10ms
+        1    6.55-6.58  34.8     78-294  94.6-95.1%  0    0      0.000%
+        8    6.46-6.53  34.6     97-287  96.7%       0    0      0.070%
+       16    6.67-6.77  33.0     80-260  93.6-95.6%  0    0      --
+       31    7.05-7.08  32.6-35.1 81-276 93.4-93.8%  0    0      0.620%
+       64    7.30-7.51  34.8-35.7 80-84  89.1-90.5%  0    0      not run
+
+    NOT ONE SAMPLE OVER 1 ms IN 160,000.  Worst round trip in the whole
+    job: 580 us.  On Anvil, K=31 put 62 samples per 10,000 over TEN ms.
+
+ 5. HOW STRONG THE NULL IS.  0 events in 20,000 trials gives a 95% upper
+    bound of 3/20,000 = 0.015%:
+       K=8   Anvil 0.070%  ->  at least  4.7x below here
+       K=31  Anvil 0.620%  ->  at least 41x   below here
+    The healthy statistics differ too: Anvil's degraded K=16 control had
+    an 89.1 us mean and its recovered state 24-27 us; Frontier's mean is
+    6.5-7.5 us with 86-97% of samples in the 2-8 us mode at every K.
+    There is no degraded regime here to recover from.
+
+ 6. LONG SILENCES (job 5303902).  Anvil's onset needed ~1 s and the sweep
+    used Anvil's 5 s, so a slower-onset version on cxi would have been
+    missed.  It does not exist:
+       K=16 at 15/30/60 s: mean 6.94 / 6.96 / 6.93 us, 0 over 1 ms
+       K=64 at 15/30/60 s: mean 7.39 / 7.41 / 7.41 us, 0 over 1 ms
+    The mean is FLAT TO TWO DECIMALS across a 12x range of idle time.  The
+    variable the entire trigger model rests on does nothing on this stack.
+    Running total across both jobs: 220,000 round trips, 0 over 1 ms.
+
+ 7. THE PEER-COUNT AXIS DOES EXIST HERE, and it is tiny: mean 6.58 us at
+    K=1 rising monotonically to 7.51 us at K=64, fast-mode fraction 95.1%
+    falling to 89.1%.  That is +14% of mean across a 64x peer count,
+    entirely inside the microsecond band.  On Anvil the same axis moved
+    the mean 3.5x and pushed 0.6% of samples past 10 ms.  So the harness
+    is sensitive to the right variable; the fabric just does not break.
+
+ 8. THE TWO NEW ARMS.
+    (a) WARM CONNECTIONS is not the mechanism, and the question has
+        dissolved.  Heavy traffic before the silence makes the mean WORSE
+        (8.5-10.5 us against 6.7-7.5 us at the same K; max 520-580 us
+        against 80-280) -- residual traffic still draining.  Since neither
+        arm stalls there is nothing for it to suppress.
+    (b) THE RING DOES SOMETHING MEASURABLE, AND IT IS NOT WHAT IT WAS
+        BUILT FOR.  With the 100 ms ring on, p99 falls from 32.95/34.63 us
+        to 23.09/23.27 us, consistently in both reps -- about 12 us off
+        the tail.  The mean does not move (6.62 vs 6.67).  Twelve
+        microseconds of p99 on a microsecond-scale operation is not the
+        removal of 10-25 ms stalls.
+
+
+WHAT THIS SETTLES, AND WHAT I RECOMMEND
+
+ 9. The relay13 question is answered, outside both candidates: neither the
+    keep-alive ring nor the polling configuration is holding the stall off
+    on Frontier.  There is no stall on Frontier.  The credit belongs to
+    the fabric and provider -- Slingshot/CXI, libfabric, LCI 8.0.1 -- and
+    the bug is an InfiniBand-path behaviour this machine's path does not
+    have.
+
+10. THE RING IS DEAD WEIGHT ON FRONTIER.  160 msg/s job-wide, invisible in
+    FoF's timings (relay13: -12 ms, inside noise), and 12 us of p99 in a
+    microbenchmark.  KEEP IT anyway: it is free, and it is load-bearing on
+    Anvil, where jobs 19624352/19661625 are not in question.  What should
+    change is the DESCRIPTION, not the code.
+
+11. ONE COMMENT IS WORTH EDITING, and I have not edited it because no code
+    change was asked for.  fof/FoF.C:13-33 presents the ring as the fix
+    for FoF's uf2-bracket stalls without naming the fabric it was measured
+    on.  One sentence -- InfiniBand-path behaviour, not reproducible on
+    Slingshot/CXI as of 2026-08-18, jobs 5303887/5303902 -- would stop the
+    next person inheriting the wrong model.  Say the word and it is a
+    three-line patch.
+
+12. BUILDS.md IS STALE ON ONE POINT.  It records the charm build against
+    libfabric 1.20.1; the stack now resolves 2.3.1 at run time
+    (/opt/cray/libfabric/2.3.1/lib64/libfabric.so.1), with 1.15.0.0,
+    1.15.2.0 and 1.20.1 also installed.  Both the FoF binary and this
+    reproducer load 2.3.1.  Nothing in this relay depends on it, but a
+    provider-level behaviour is exactly what a provider upgrade changes.
+
+
+CAVEATS
+
+13. THIS IS A REWRITTEN HARNESS, not the Anvil binary, so a null could in
+    principle be a harness that fails to exercise the bug.  Three things
+    argue it is faithful: it matches the documented structure point by
+    point; it reproduces the healthy behaviour the notes describe (a
+    2-8 us mode holding 86-97% of samples); and it shows the same
+    qualitative K dependence, three orders of magnitude smaller.  WHAT
+    WOULD SETTLE IT BEYOND ARGUMENT: run this same file on Anvil and
+    recover the 0.62% at K=31.  One small job, on a machine I do not have
+    in this session.
+
+14. Scale differs from Anvil (32 ranks x 15 threads there; 128 x 14 x 7
+    here, chosen to mirror FoF).  Anvil stalled at both 1 and 15 devices
+    per rank, so 7 is not a special case, and 128 ranks is a LARGER
+    fan-out than the 32 that stalled.
+
+15. This says nothing about Anvil.  The ring remains load-bearing there.
+
+
+FILES TO PULL  (uploads/ on Frontier)
+
+    reports/lci-repro-frontier.md        the full report
+    reports/relay14.txt                  this file
+    lci-repro/lci_multipeer.cpp          the reproducer
+    lci-repro/build.sh                   builds it against production charm's LCI
+    sbatch/lci-repro-sweep-16n.sbatch
+    sbatch/lci-repro-longquiet-16n.sbatch
+    sbatch/lci-repro-smoke.sbatch
+
+STATE ON FRONTIER
+
+    paratreet2 at 0957364 on phaseab-campaign, CLEAN, production charm.
+    Queue empty.  Nothing pushed.  No patch -- no application code changed;
+    the reproducer is a new standalone file in ~/software/lci-repro/, not
+    in any git tree.
+    Raw logs: /lustre/orion/csc710/scratch/lvkale/s3ab/5303887, /5303902,
+    /5303876.
