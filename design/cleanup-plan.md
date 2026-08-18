@@ -97,3 +97,18 @@ One deviation from the letter of the plan: the both-runtimes gate ran
 per-commit on classic only, with one reconverse pass at the series end
 (the six commits landed in one sitting; any reconverse-only breakage
 would still bisect over six commits).
+
+## Validated at scale (Frontier relay15, job 5304461, 2026-08-18)
+
+2B/16 nodes, 3 reps at `8e08843`, full artifact-scrubbed rebuild: all
+reps exact (424,897,832), Iteration 0 within 0.03% of relay13's
+pre-cleanup arms, stall detector shows no dark time, and the binary
+carries zero strings from any removed subsystem (twelve-string check
+now aborts the job script before spending 2B time). One drift, not
+wall-clock: walk-work counters +0.1-0.3% with within-process phaseA
+skew 1.35 -> 1.25 — the whole vector moves as a block between jobs
+while near-constant within one, and skew now reads 1.23/1.35/1.25 on
+three jobs across three different trees, so it tracks node placement /
+the claim race, not code. STANDING RULE from that: these counters are a
+regression signal only WITHIN a job, never across jobs. The cleanup is
+closed; the branch is ready to merge to main.
