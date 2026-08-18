@@ -1,0 +1,256 @@
+relay12 -- phaseA SELF/CROSS stage split, and the -E 16 default confirmed
+as shipped.  Jobs 5301010 (16 nodes) and 5301011 (64 nodes), 2026-08-18.
+Full report: reports/stage-split.md.  Written 2026-08-18 11:30 EDT.
+Everything below is new since relay11.
+
+*** READ TO THE END.  Items 13-16 were CORRECTED at 11:45 EDT after Kale
+    challenged the "no barrier" model.  He was right.  The correction is
+    items 20-26, appended after the FILES section, and it WITHDRAWS the
+    "build it barrier-free" recommendation in item 16. ***
+
+*** HEADLINE (corrected): the self/cross stage split is worth -1.6% of
+    Iteration 0 at 16 nodes and a small LOSS at 64.  Removing its barrier
+    does NOT rescue it -- self and cross move together, because a piece
+    carries both.  The self stage is ALREADY balanced by the live claim
+    pool.  The -7.1% figure is real but it measures perfect ASSIGNMENT,
+    not stage separation.  See items 9-12, then 20-26. ***
+
+
+SETUP AND PROVENANCE
+
+ 1. Pulled paratreet2 to 61685b7 on phaseab-campaign as instructed (queue was
+    empty).  Two changes since ac600f0, both present and both verified live:
+    f5ac39f (-E default 4096 -> 16) and the new unconditional FOF3STAT
+    phaseA_stages line.
+
+ 2. FULL clean rebuild against PRODUCTION charm.  Gates: TraceProjections 0,
+    TraceSummary 0, vfmadd 0, `pe_sets` 1, `phaseA_stages` 1.  Staged
+    bin/FoF3.2b.stagesplit, md5 dbad388ed959e475e285ca4e67baf298.  Tree left
+    CLEAN, nothing pushed, NO PATCH -- no code changed in this work.
+
+ 3. All 8 2B arms EXACT (424,897,832).  Both 10k gates EXACT (3549).  stderr
+    empty on both jobs.  phaseA_stages lines: 128 of 128 processes at 16
+    nodes, 512 of 512 at 64.  The instrument is not stale anywhere.
+
+ 4. Each job ran the shipped default (BARE, no -E flag) against -E 0, two
+    interleaved reps, config -u dist / FOF_PE_SETS=14 MODE=1 / FOF_S3=0.
+
+
+PART (a) -- THE -E DEFAULT IS CORRECT AND IS FIRING
+
+ 5. peak_edge_buf on the bare default arms is exactly 16 -- the batch cap --
+    at both scales.  With -E 0 it is 6452 (16 nodes) and 3465 (64 nodes).
+    The old 4096 default sat above both, which is why it never fired.  The
+    shipped default is doing what it was changed to do.
+
+ 6. 16 nodes: Iteration 0 default 5159.2 ms vs -E 0 5387.1 / 5337.4 ms.
+    -203 ms against the -E 0 mean, a FOURTH independent reproduction of the
+    relay11 magnitude (-197, -208 ms).  walk 0.739 / uf2 0.070 with overlap
+    on, against walk ~0.350 / uf2 ~0.64 with it off.
+
+ 7. 64 nodes: default 2758.2 / 2786.1 vs -E 0 2691.7 / 3010.0.  Means 2772.1
+    vs 2850.9, but the -E 0 reps span 318 ms by themselves.  Inside the
+    noise, consistent with relay11's -0.8%.  The overlap win remains a
+    16-node phenomenon.  Nothing here changes the recommendation.
+
+ 8. CAVEAT, stated plainly: default-r1 at 16 nodes was a cold-cache outlier
+    (Iteration 0 7084.2 ms, Pre-traversal 4290 ms against ~2450 ms on every
+    later arm, upwardPass 2.187 s against 0.353 s).  I excluded it, which
+    leaves the 16-node comparison at ONE clean default rep against two -E 0
+    reps.  The walk/uf2 signature is unambiguous and three prior jobs already
+    carry the magnitude, so I did not re-run -- but the rep count is thin and
+    you should know that.
+
+
+PART (b) -- THE STAGE SPLIT.  THIS IS THE DELIVERABLE.
+
+ 9. SELF:CROSS WORK RATIO.  phaseA is overwhelmingly self work:
+       16 nodes: self 94.6%, cross 5.4%  -> 17.4 : 1  (median proc 19.1)
+       64 nodes: self 91.9%, cross 8.1%  -> 11.3 : 1  (median proc 12.5)
+    The laptop 1M figure of ~10:1 is NOT what 2B shows at 16 nodes.  The
+    cross share GROWS with node count, so the laptop number is closer to the
+    64-node behaviour.  Reps agree to three digits.
+
+10. BUT THE SKEW IS IN THE CROSS STAGE.  Within-process skew, max/(sum/14):
+       SELF  stage: median 1.101 (16n) / 1.086 (64n)   -- nearly flat
+       CROSS stage: median 2.776 (16n) / 2.646 (64n), max 5.7 / 7.4
+    The part any PE may take is already balanced.  The owner-bound part is
+    skewed ~2.7x.  That is the reverse of what the scheme wants.
+
+11. THE 1.28 IS CONFIRMED, BUT IT IS THE CRITICAL PROCESS, NOT A TYPICAL ONE.
+    Within-process phaseA skew at the process whose pa_max_s EQUALS the
+    phaseA wall time: 1.226 (16 nodes, proc 57) and 1.262 (64 nodes, proc
+    164).  The MEDIAN process is only 1.086 / 1.101.  Both numbers are real
+    and they are different; quoting the median would understate the target
+    and quoting 1.28 as typical would overstate it.
+    This is the gating measurement design/phasea-reassignment.md section 3
+    asked for and said did not exist.  Its stopping rule ("if within ~1,
+    STOP") does NOT fire.
+
+12. DECOMPOSITION OF THE phaseA CRITICAL PATH.  Splitting the critical
+    process's excess over a perfectly-balanced machine:
+                              16 nodes        64 nodes
+       phaseA wall            2.004 s         0.522 s
+       ideal (mean floor)     1.147 s         0.265 s
+       ACROSS-process excess  0.486 s (57%)   0.149 s (58%)
+       WITHIN-process excess  0.370 s (43%)   0.108 s (42%)
+       across max/mean        1.426           1.602
+    57-58% of the excess is ACROSS processes and no within-process scheme
+    can touch it.  That caps this whole item at -7.1% of Iteration 0 at 16
+    nodes and -3.5% at 64, even executed perfectly.
+
+13. [SUPERSEDED by items 20-26 -- the no-barrier row does NOT describe a
+    stage-splitting scheme.  Kept for the arithmetic.]
+    *** THE BARRIER IS THE PROBLEM. ***  Model: spread the self stage (and
+    the ~10% of phaseA outside both stages) perfectly over the 14 PEs, then
+    each PE does its own owner-bound cross work.  New phaseA wall:
+                                     16 nodes            64 nodes
+       today                         2.004 s             0.522 s
+       WITH a barrier between stages 1.922 s (-82 ms,    0.536 s (+14 ms,
+                                     -1.6% of Iter0)     +0.5% -- A LOSS)
+       NO barrier (cross overlaps)   1.636 s (-368 ms,   0.424 s (-98 ms,
+                                     -7.1% of Iter0)     -3.5% of Iter0)
+       perfect everywhere            1.147 s (-857 ms)   0.265 s (-257 ms)
+
+14. WHY.  Algebraically  after/floor = 1 + (cross_sum/pa_sum) x (cross_skew - 1).
+    With cross at 5-8% of phaseA and skew ~2.7 that is +9% to +12% -- the
+    same size as the 1.09-1.10 self skew being removed.  A barrier turns the
+    cross stage's skew into an ADDITIVE cross_max term.  At 64 nodes it adds
+    back slightly more than the rebalance saves.
+
+15. WITHOUT the barrier the scheme reaches the within-process floor EXACTLY,
+    at every process, at both scales.  cross_max never exceeds a process's
+    own floor anywhere: median 0.117x the floor at 16 nodes (max 0.334x),
+    median 0.169x at 64 nodes (max 0.724x).  0 of 128 and 0 of 512 processes
+    have cross_max above their floor.  There is always room to hide the
+    cross work behind the self tail.
+
+16. [WITHDRAWN -- see item 25.]  RECOMMENDATION: if the scheme is built, self and cross must NOT be
+    separated by a barrier -- cross work has to be allowed to run against
+    the tail of the self stage.  That is the difference between -7.1% and
+    -1.6% at 16 nodes, and between -3.5% and a regression at 64.
+
+17. WHERE THE PLATEAU'S EXCESS SITS (relay10 item 50c, top 19 by pa_max_s).
+    Excess of the plateau over the rest, split by stage:
+       16 nodes: self +5.57 s (88.9% of excess, +43% relative)
+                 cross +0.70 s (11.1% of excess, +102% relative)
+                 proportional would be self 95.0% / cross 5.0%
+       64 nodes: self +1.56 s (83.6%, +52% relative)
+                 cross +0.31 s (16.4%, +118% relative)
+                 proportional would be self 92.1% / cross 7.9%
+    Two readings, both true.  In ABSOLUTE seconds the plateau's excess is
+    mostly self work (84-89%), so a self-rebalancing scheme does address the
+    bulk of it.  But cross is OVER-REPRESENTED in the excess by about 2x
+    (11.1% against a 5.0% work share; 16.4% against 7.9%): plateau processes
+    carry roughly DOUBLE the cross work of the rest while having only 40-50%
+    more self work.  Cross volume is the sharper identifier of a plateau
+    process even though it is not the bulk of its excess.
+
+18. ACCOUNTING.  (self_sum + cross_sum) / pa_sum_s = 0.90 median at both
+    scales, so ~10% of phaseA is outside the two instrumented stages.  I
+    assumed it spreads evenly in every model above.  If that assumption is
+    wrong the barrier/no-barrier GAP is unaffected (the term cancels), but
+    the absolute ceilings move.
+
+19. WHAT I WOULD DO NEXT, if you want a view: the bigger remaining lever is
+    ACROSS-process placement -- the other 57-58%, with max/mean 1.43 at 16
+    nodes rising to 1.60 at 64 and still growing with scale.  The
+    within-process item is real but bounded at -7.1% / -3.5% and only if
+    built barrier-free.
+
+
+FILES TO PULL  (uploads/ on Frontier)
+
+    reports/stage-split.md          the full report, all tables
+    reports/relay12.txt             this file
+    sbatch/stage-split-2b-16n.sbatch
+    sbatch/stage-split-2b-64n.sbatch
+    scripts/stage-split-analyze.py  the analysis; run it on any arm's log
+
+    NOTE on the script: its section 3 uses "self_max + cross_max" as today's
+    cost, which assumes the SAME PE is max in both stages.  That overstates
+    today and flatters the scheme (it reports an 8% gain).  I added section
+    3b, anchored on the measured load_model pa_max_s, and every number in
+    this relay and in stage-split.md comes from 3b.  READ 3b, NOT 3.
+
+STATE ON FRONTIER
+
+    paratreet2 at 61685b7 on phaseab-campaign, CLEAN, production charm.
+    Queue empty.  Nothing pushed.  No patch -- no code changed.
+    estream-proj-E16-frontier.tar.gz (1.6 GB) is STILL in uploads/ from
+    relay11; you have not pulled it yet.  Its E4096 companion remains in
+    proj-shared/lvkale-traces/ and can be staged on request.
+    Raw logs: /lustre/orion/csc710/scratch/lvkale/s3ab/5301010 and /5301011.
+
+
+=====================================================================
+CORRECTION, appended 2026-08-18 11:45 EDT.  Kale asked how "without a
+barrier" could work, since the cross pass needs the self work done --
+or whether the intent was that pairs become available as their pieces
+complete.  He was right to push.  Items 13-16 above are superseded.
+=====================================================================
+
+20. YOUR SECOND READING IS THE RIGHT ONE, AND IT DOES WORK.  Cross pair
+    (i,j) becomes available the moment the LATER of i,j finishes its self
+    walk; each pair is then enumerated exactly once, when its second
+    endpoint lands.  Suppression survives, because the memo that makes
+    cross(i,j) cheap is built by self(i) and self(j) -- both done by
+    construction.  So no barrier is structurally required.  That much of
+    what I said stands.
+
+21. BUT CROSS IS OWNER-BOUND FOR A DIFFERENT REASON THAN I IMPLIED, AND IT
+    IS NOT A BARRIER.  phaseAAdmit (fof/FoFPhase1.h:2004) appends each
+    claimed piece to a PE-LOCAL flat uf_parent array at its own offset;
+    certRep(a,sa) and connectedRep(a,sa) index into that array.  A cross
+    pair can only be walked by a PE holding BOTH pieces in its own
+    uf_parent.  That is an ADDRESSING constraint, not a synchronisation
+    one.  Removing a barrier does not remove it.
+
+22. THE REAL ERROR: SELF AND CROSS ARE NOT INDEPENDENTLY SCHEDULABLE.
+    Claiming a piece BOTH assigns it AND self-walks it.  A PE holding p
+    pieces owes p(p-1)/2 cross pairs, so taking one more piece to fill
+    idle time adds one self walk AND p-1 cross pairs.  The unit of
+    movement is a piece and it carries both stages.  My no-barrier model,
+    max(pa_sum/14, cross_max), assumed you could move self without moving
+    cross.  You cannot.  It therefore does not describe any self/cross
+    stage-splitting scheme, with or without a barrier.
+
+23. WHAT THE -7.1% / -3.5% ACTUALLY IS.  max(pa_sum/14, cross_max) with
+    cross_max never binding (0 of 128 and 0 of 512 processes have
+    cross_max above their own floor) is just the PER-PROCESS FLOOR.  So it
+    is the ceiling of PERFECT ASSIGNMENT of pieces to PEs within a
+    process -- the ceiling of a better CLAIM POLICY.  Same number,
+    different mechanism, and the mechanism is what tells you what to build.
+
+24. AND THE SELF STAGE IS ALREADY BALANCED, BY MACHINERY ALREADY ON.  Both
+    jobs ran FOF_STEALA=1 / FOF_STEALA_GEO=1, and the pool is working:
+       16 nodes: 56,125 own claims, 7,821 foreign = 12.2% foreign,
+                 mean 10.7 of 14 PEs per process stealing (range 6-13)
+       64 nodes: 212,578 own, 31,268 foreign = 12.8% foreign,
+                 mean 10.5 of 14 (range 5-13)
+    The 1.09-1.10 self skew is the RESIDUAL AFTER STEALING.  There is no
+    large untapped self imbalance for a self-stealing scheme to harvest.
+    THAT, not the barrier, is why the stage split is worth so little.
+
+25. WITHDRAWN: item 16's "build it barrier-free".  The barrier is not the
+    binding constraint and removing it buys nothing on its own.  What
+    survives from the measurement: the stage split WITH a barrier is worth
+    -1.6% at 16 nodes and a small loss at 64 (item 13's first row is still
+    right), the cross stage really is skewed 2.7x and really is
+    owner-bound, and 57-58% of the excess really is across-process.
+
+26. WHAT I WOULD BUILD INSTEAD, if anything within-process.  The claim pool
+    takes own pieces first, then nearest-centroid among unclaimed
+    (fof/FoFPhase1.h:2089).  It balances pieces TAKEN; it never prices the
+    MARGINAL CROSS COST of taking one (p-1 new pairs against the p already
+    held).  A claim priority that charges that cost is small, local and
+    testable, and item 23 says the headroom is -368 ms at 16 nodes,
+    -98 ms at 64.
+    Unmeasured upside: total cross work is CONVEX in pieces-per-PE
+    (sum p_i(p_i-1)/2), so equalising piece counts should REDUCE total
+    cross work, not merely redistribute it.
+    THE ONE THING MISSING to settle this: the instrument reports
+    per-process sums and maxima only.  A per-PE (pieces, self, cross) dump
+    would let me correlate them directly.  Say the word and I will add it
+    -- it is a few lines in the same deposit -- but it needs a rebuild and
+    a job, so I have not done it unasked.
