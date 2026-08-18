@@ -48,40 +48,8 @@ public:
   void initialize(const CkCallback& cb) {
     auto node_size = this->isNodeGroup() ? CmiNodeSize(CkMyNode()) : 1;
     auto& config = paratreet::getConfiguration();
-    // Node-pool chunk size, in nodes. This sets how far the LOCAL piece
-    // tree is contiguous: buildTree's recursive descent is one entry
-    // method with no yields, so a piece's nodes are bump-allocated in
-    // preorder with nothing interleaved — but only WITHIN a chunk. Each
-    // chunk is its own `new char[]`, so a piece bigger than the chunk is
-    // scattered across separately-malloc'd blocks (at 12 particles/leaf a
-    // 29k-particle piece is ~5k nodes = ~40 chunks at the historical 128).
-    // `config.pool_elem_size` is never assigned by any app or registered
-    // as a config field, so the effective value has always been the 128
-    // floor. PARATREET_POOL_ELEM_SIZE overrides it; large enough to hold a
-    // whole piece gives fully contiguous preorder trees, which is the
-    // cheap version of design/treepiece-contiguous-build.md.
-    static const int pool_elem = [&] {
-      const char* e = std::getenv("PARATREET_POOL_ELEM_SIZE");
-      int v = e ? std::atoi(e) : 0;
-      if (v <= 0) v = config.pool_elem_size;
-      return std::max(v, 128);
-    }();
-    // CacheManager is declared a NODEGROUP (paratreet.ci) unless GROUP_CACHE
-    // is defined, and a nodegroup branch entry method may be delivered on ANY
-    // PE of the process — so `CkMyPe() == 0` printed on nobody at 2B
-    // (Frontier relay4, 2026-08-15: the line was absent from every arm and
-    // read as "the knob did not take", when it had). Rank-relative is the
-    // correct guard for a nodegroup.
-    // (relay4 suggested CkMyNode()==0 && CkMyRank()==0; that has the SAME
-    // flaw — the branch may land on any rank, so it printed at ppn 2 and not
-    // at ppn 4 here. A nodegroup has exactly ONE branch per process, so
-    // CkMyNode()==0 alone is both necessary and sufficient; the rank test is
-    // only needed in the GROUP_CACHE build, where there is one branch per PE.)
-    if (CkMyNode() == 0 && (this->isNodeGroup() || CkMyRank() == 0))
-      CkPrintf("PARATREET pool_elem_size: %d nodes (%zu KB/chunk)\n",
-               pool_elem, (size_t)pool_elem * 216 / 1024);
     core.init(node_size, this->isNodeGroup(), config.branchFactor(),
-              pool_elem);
+              std::max(config.pool_elem_size, 128));
     this->contribute(cb);
   }
 
