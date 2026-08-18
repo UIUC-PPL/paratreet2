@@ -2603,6 +2603,18 @@ public:
     // per-process sum/max of the phaseA walls, read back by phase3Stats.
     nb->depositPhaseATime(t_phaseA);
     nb->depositPhaseAStages(t_pa_self, t_pa_cross);
+    // Per-PE dump (FOF_STAGE_DUMP=1; relay12 item 26): pieces held, self
+    // and cross seconds, one line per PE. The input the claim-priority
+    // design needs — cross work is convex in pieces-per-PE, so the
+    // correlation between piece count and cross time decides whether
+    // pricing the marginal cross cost at claim time is worth building.
+    static const bool stage_dump = [] {
+      const char* e = std::getenv("FOF_STAGE_DUMP");
+      return e && std::atoi(e) != 0;
+    }();
+    if (stage_dump)
+      CkPrintf("FOF3STAT stage_pe: pe %d pieces %zu self %.4f cross %.4f\n",
+               CkMyPe(), treepieces.size(), t_pa_self, t_pa_cross);
     if (nb->a_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode())) {
       nb->stage_tA = CkWallTimer() - nb->chain_t0;
       if (stealA())
