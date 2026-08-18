@@ -501,34 +501,6 @@ public:
   // m2 budget stops a grant that scoops giants, the count cap stops a
   // grant that is all dust. First unit always ships (budget checked
   // before collecting), so the v1 giant-collapse cannot recur.
-  // Section 27 reservation knobs. Reservation defaults OFF pending
-  // redesign (section 30): at 2B with properly sized grants it moved
-  // LESS work in LARGER grants — draining the cursor window BEFORE the
-  // ordered range swaps giant units for average ones (Frontier job
-  // 5253475: phaseB +84%, work moved 38%->22%). FOF_S3_RESERVE=1
-  // re-enables; FACTOR=0 then forces every member to reserve — the
-  // correctness-gate configuration.
-  static bool s3ReserveOn() {
-    static const bool on = [] {
-      const char* e = std::getenv("FOF_S3_RESERVE");
-      return e && std::atoi(e) != 0;
-    }();
-    return on;
-  }
-  static double s3ReserveFactor() {
-    static const double v = [] {
-      const char* e = std::getenv("FOF_S3_RESERVE_FACTOR");
-      return e ? std::atof(e) : 2.0;
-    }();
-    return v;
-  }
-  static double s3ReserveFrac() { // fraction of remaining m2 to reserve
-    static const double v = [] {
-      const char* e = std::getenv("FOF_S3_RESERVE_FRAC");
-      return e ? std::atof(e) : 0.5;
-    }();
-    return v;
-  }
   // Marginal-density packing. A unit's byte cost is NOT a property of the
   // unit: place() dedups subtrees, so a unit reusing trees already in the
   // shipment costs ~nothing extra. Bytes-added is therefore submodular in
@@ -648,7 +620,6 @@ public:
     double remaining = -1;         // latest polled remaining m2 (<0: none)
     bool drained = false; // pool cursor exhausted: can help
     bool busy = false;    // an order/shipment is in flight for this helper
-    bool reserved = false; // section 27: RESERVE sent to this member
     int assigned_donor = -1, assigned_part = -1; // helper's current grant
   };
   std::map<int, S3Member> s3_members; // coordinator-side status table
@@ -689,32 +660,6 @@ public:
   };
   std::atomic<S3ForeignShip*> s3_active_ship{nullptr};
   std::vector<S3ForeignShip*> s3_ship_graveyard; // under s3_lock
-  // Section 27 donor-side reservation: [reserve_lo, reserve_hi) of the
-  // costliest-first pool is ship-preferred. Local claims skip it while
-  // other work remains (cheap skips — the cursor races through), then
-  // reclaim leftovers at pool end (the starvation valve; grants that
-  // collected first won their CASes). Coordinator-side reserved flag
-  // lives in S3Member.
-  std::atomic<uint32_t> s3_reserve_lo{0}, s3_reserve_hi{0};
-  std::atomic<long> s3_reserved_shipped{0};
-  // Coordinator -> donor: reserve a high-m2 window ahead of your cursor.
-  void s3Reserve() {
-    uint32_t lo = (uint32_t)std::min(phaseb_next.load(), phaseb_pool.size());
-    double budget = s3ReserveFrac() * (double)s3_remaining_m2.load();
-    double acc = 0;
-    uint32_t hi = lo;
-    const long ucap = 4 * s3GrantUnits(); // never reserve more than ~4 grants
-    while (hi < phaseb_pool.size() && acc < budget &&
-           (long)(hi - lo) < ucap) {
-      if (s3_unit_taken && s3_unit_taken[hi].load(std::memory_order_relaxed) == 0)
-        acc += phaseb_pool[hi].m2;
-      hi++;
-    }
-    s3_reserve_lo.store(lo);
-    s3_reserve_hi.store(hi);
-    CkPrintf("FOF3STAT s3_reserve: node %d lo %u hi %u m2 %.3g\n",
-             CkMyNode(), lo, hi, acc);
-  }
   // Per-unit walltime histogram (log2 buckets of microseconds; Frontier
   // Opus ask 2026-08-12): with a ~1950x unit-cost spread, max and mean
   // cannot distinguish "a few giants over dust" from a smooth heavy
@@ -891,22 +836,6 @@ public:
     auto m = s3_members.find(fromNode);
     if (m == s3_members.end()) return;
     m->second.remaining = remaining;
-    // Section 27 trigger: remaining > FACTOR x block mean EXCLUDING SELF
-    // (self-inclusive mean with one 12x straggler turns a nominal 2x
-    // into ~4.75x and misses second-tier hotspots — Frontier review).
-    if (s3ReserveOn() && !m->second.reserved && s3_members.size() > 1) {
-      double sum = 0;
-      int cnt = 0;
-      for (auto& kv : s3_members)
-        if (kv.second.remaining >= 0) { sum += kv.second.remaining; cnt++; }
-      if (cnt > 1) {
-        double mean_excl = (sum - remaining) / (cnt - 1);
-        if (remaining > s3ReserveFactor() * mean_excl && remaining > 0) {
-          m->second.reserved = true;
-          this->thisProxy[fromNode].s3Reserve();
-        }
-      }
-    }
     s3DecideLocked();
   }
   // One decision pass (coordinator only, s3_lock held): match each free
@@ -1000,28 +929,6 @@ public:
     const double dens_frac = s3DensityFrac();
     double m2 = 0;
     const long cap = s3GrantUnits();
-    // Section 27: serve grants from the reserved high-m2 window first —
-    // these are the units the composition finding shows never travel
-    // under pure tail-collection.
-    uint32_t rlo = s3_reserve_lo.load(), rhi = s3_reserve_hi.load();
-    for (uint32_t k = rlo; k < rhi; k++) {
-      if ((long)ship.unit_pairs.size() >= cap) break;
-      if (m2 >= s3GrantM2()) break;
-      int expect = 0;
-      if (!s3_unit_taken[k].compare_exchange_strong(expect, 2)) continue;
-      s3_units_owned.fetch_add(1);
-      s3_remaining_m2.fetch_sub((long)phaseb_pool[k].m2);
-      s3_reserved_shipped.fetch_add(1);
-      {
-        long v = (long)phaseb_pool[k].m2;
-        int b = 0;
-        while (v > 1 && b < kUnitHistBuckets - 1) { v >>= 1; b++; }
-        s3_ship_hist[b].fetch_add(1, std::memory_order_relaxed);
-      }
-      ship.unit_pairs.emplace_back(place(phaseb_pool[k].a),
-                                   place(phaseb_pool[k].b));
-      m2 += phaseb_pool[k].m2;
-    }
     // One range's worth of collection. Returns true if it took anything.
     // Factored out so a grant can SPAN partitions: job 5257769 showed the
     // density filter shrinks a grant (it skips units but the partition then
@@ -1225,12 +1132,11 @@ public:
       // from phase3Stats, instead.
       CkPrintf("FOF3STAT s3: node %d out_ships %ld out_units %ld out_m2 "
                "%.3g in_ships %ld in_units %ld ret_edges %ld declines %ld "
-               "rem_m2 %ld tot_m2 %.4g resv_shipped %ld\n",
+               "rem_m2 %ld tot_m2 %.4g\n",
                CkMyNode(), s3_out_ships.load(), s3_out_units.load(),
                s3_out_m2, s3_in_ships.load(), s3_in_units.load(),
                s3_ret_edges.load(), s3_declines.load(),
-               s3_remaining_m2.load(), s3_total_m2,
-               s3_reserved_shipped.load());
+               s3_remaining_m2.load(), s3_total_m2);
     if (s3On() && s3_out_ships.load() > 0) {
       const long b = s3_out_bytes.load(), s = s3_out_ships.load();
       CkPrintf("FOF3STAT s3_bytes: node %d out_bytes %ld bytes_per_ship %ld "
@@ -1690,9 +1596,6 @@ public:
     s3_remaining_m2 = 0;
     s3_total_m2 = 0;
     s3_poll_armed = 0;
-    s3_reserve_lo = 0;
-    s3_reserve_hi = 0;
-    s3_reserved_shipped = 0;
     for (int i = 0; i < kUnitHistBuckets; i++) {
       pb_unit_hist[i] = 0;
       s3_ship_hist[i] = 0;
@@ -2370,12 +2273,6 @@ public:
           if (nb->s3_unit_taken) {
             if (s3Test() && CkMyNode() % 2 == 0)
               continue; // refuse: leave the unit for a shipment
-            // Section 27: reserved window is ship-preferred; skip it
-            // (cheap — the cursor races through). Leftovers are
-            // reclaimed by the valve after the main drain.
-            if (k >= nb->s3_reserve_lo.load(std::memory_order_relaxed) &&
-                k < nb->s3_reserve_hi.load(std::memory_order_relaxed))
-              continue;
             int expect = 0;
             if (!nb->s3_unit_taken[k].compare_exchange_strong(expect, 1))
               continue;
@@ -2427,33 +2324,6 @@ public:
       if (slice > 0 && CkWallTimer() - t0 > slice) {
         pb_t_accum_ += CkWallTimer() - t0;
         return false;   // deadline: caller re-enters by self-send
-      }
-    }
-    // Section 27 starvation valve: the main drain is done; reclaim any
-    // reserved units no grant collected (reservation is advisory —
-    // termination must never depend on helpers showing up). CAS races
-    // with in-flight grant collection resolve either way.
-    if (nb->s3_unit_taken) {
-      uint32_t rlo = nb->s3_reserve_lo.load(), rhi = nb->s3_reserve_hi.load();
-      for (uint32_t k = rlo; k < rhi; k++) {
-        if (s3Test() && CkMyNode() % 2 == 0) break; // forced mode: still refuse
-        int expect = 0;
-        if (!nb->s3_unit_taken[k].compare_exchange_strong(expect, 1)) continue;
-        nb->s3_units_owned.fetch_add(1);
-        nb->s3_remaining_m2.fetch_sub((long)nb->phaseb_pool[k].m2);
-        t_phaseB_units++;
-        walk(nb->phaseb_pool[k].a, nb->phaseb_pool[k].b,
-             [&](Node<Data>* a, Node<Data>* b) { leafLeafEmit(a, b); },
-             [&](Node<Data>* a, Node<Data>* b) {
-               long ta = certTipRep(a);
-               long tb = certTipRep(b);
-               if (ta != tb) {
-                 long lo2 = std::min(ta, tb), hi2 = std::max(ta, tb);
-                 if (seen.insert(paratreet::packTipPair(lo2, hi2)).second)
-                   edge_buf.emplace_back(lo2, hi2);
-               }
-             },
-             [](Node<Data>*, Node<Data>*) { return false; });
       }
     }
     if (!edge_buf.empty()) nb->submitEdges(std::move(edge_buf));
