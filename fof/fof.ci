@@ -82,6 +82,7 @@ module fof {
     // is the whole point of stage 4 (no hop, no blocked scheduler thread).
     entry void deviceStage0(double b2, const CkCallback&);
     entry void deviceInitOnHome();
+    entry void deviceWarmup();
     entry void devicePack();
     entry void deviceComplete();
     entry void deviceScatter();
