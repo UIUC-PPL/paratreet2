@@ -58,8 +58,6 @@ module fof {
     entry void s3Publish(int fromNode, double total,
                          const std::vector<double>&);
     entry void s3Drained(int fromNode);
-    entry void s3XPublish(int fromNode, double total);
-    entry void s3XDrained(int fromNode);
     entry void s3Declined(int donorNode, int helperNode, int partIdx);
     entry void s3ShipOrder(int helperNode, int partIdx);
     entry void s3Shipment(const paratreet::StealShipment<Data>&);
