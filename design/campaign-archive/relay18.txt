@@ -1,0 +1,185 @@
+relay18 -- RITVIK'S STALL TRACE, READ (Part A, no job), AND THE POLLER SWEEP
+ON THE GO-FORWARD BUILD (Part B, job 5310158, 16 nodes, 2B, GPU replace arm,
+ALL 896 PEs TRACED), 2026-08-19.
+Full report: reports/gpu-stalls-relay18.md.
+
+*** HEADLINE 1 (Part A, from his .sts before any analysis): HIS TRACED RUN
+    5307458 IS ppn 7 / ndevices 4 / +backend_poll_thread 2 / -i 1 -- THE
+    RUNBOOK SHAPE, NOT HIS ppn-14 SWEEP SHAPE.  896 PEs, charm 9af1de4b6,
+    timestamp 2026-08-19T15:36:40Z (11:36 EDT the same day), +logsize
+    20000000 so no mid-run buffer flush.  His stalls happen at ppn 7.
+    Items 1-2. ***
+
+*** HEADLINE 2 (Part A): THE 10-60 ms GAPS ARE REAL, SMALL, AND ON THE
+    POLLING THREADS.  317 OVERHEAD intervals in the band on 193 of 896 PEs
+    = 7.11 s = 0.076% of PE-time; 310 of 317 on pollers, a 44:1 split over
+    their co-tenants; 97.8% end on a message arrival, 96.1% of those
+    inter-process; 261 of 317 sit in the PARTICLE EXCHANGE at t = 3-7 s,
+    only 10 in the uf2 bracket.  Items 3-5. ***
+
+*** HEADLINE 3 (Part A control): THE RECONVERSE-LOCK HYPOTHESIS IS DEAD.
+    Production traces on charm 90f05d8cb + reconverse main -- which set
+    NEITHER ofi_lock_mode NOR m_progress_locks, the +67 message-path lines
+    relay17 identified -- give 0.0312 band intervals per PE-second against
+    his 0.0330, with the same poller concentration and a HIGHER overhead
+    fraction (1.06% vs 0.58%).  A defect that exists only in his reconverse
+    cannot produce a rate the runtime without it matches to 6%.  Item 6. ***
+
+*** HEADLINE 4 (Part B, measured, job 5310158): THE GAP RATE PER POLLING
+    THREAD IS A CONSTANT.  Three shapes at ppn 7 spanning 1, 2 and 7 threads
+    per libfabric domain give 0.0499-0.0743 band intervals per POLLING
+    PE-second, and Ritvik's own run sits at 0.0565 inside that range.  The
+    total band count tracks only HOW MANY PEs POLL: 1 poller/proc -> 161,
+    4 -> 396, 7 -> 539.  Items 8-14. ***
+
+*** HEADLINE 5 (Part B): IT IS NOT DEVICE SHARING, AND THE PREDICTION WAS
+    BACKWARDS.  The script predicted L < M < H if sharing caused the gaps.
+    Measured order is H < M < L: the arm where every thread owns a private
+    device has the MOST gaps and the arm with seven threads on one device
+    has the FEWEST, by 3x.  Items 11-12. ***
+
+*** HEADLINE 6 (Part B): THE POSITIVE TEST PASSES ON THE GO-FORWARD BUILD.
+    His symptom reproduces at his own shape on FoF3.up -- upstream LCI, no
+    fork -- at his own rate, with the same poller concentration and the same
+    closers.  Nothing about the gaps is specific to his LCI fork, which
+    relay17 had already exonerated twice.  Item 13. ***
+
+
+PART A -- HIS TRACE, READ ON THE LOGIN NODE
+
+ 1. PROVENANCE FIRST.  Reading the .sts header was worth more than any of
+    the analysis.  /lustre/orion/csc710/proj-shared/16node_gpu_proj_5307458,
+    job 5307458: PROCESSORS 896, SMPMODE "7 128", COMMANDLINE "-i 1
+    +pemap 1-7,9-15,... +lci_ndevices 4 +backend_poll_thread 2 +logsize
+    20000000", CHARMVERSION v8.0.1-devel-175-g9af1de4b6, run 10.709 s.
+ 2. CONSEQUENCE.  The relay18 working hypothesis assumed the ppn-14 sweep
+    shape and put the stalls in the QD-heavy uf2 bracket.  Both halves were
+    wrong before a single record was parsed.
+ 3. THE RUN IS NOT PATHOLOGICAL.  busy 5029.9 s, idle 4280.6 s, OVERHEAD
+    54.0 s = 0.58% of PE-time; per wall second the overhead never exceeds
+    1.6%.
+ 4. THE GAPS.  326 OVERHEAD intervals >= 10 ms, 317 of them in the 10-60 ms
+    band = 7.11 s = 0.076% of all PE-time, on 193 of 896 PEs.  A faithful
+    match to the reported symptom -- a few PEs in overhead, everyone else
+    idle -- and small.
+ 5. WHERE AND ON WHOM.  310 of 317 on POLLING threads (ranks 0,2,4,6 at
+    poll 2), 44:1 over their co-tenants; the poller that owns its device
+    alone (rank 6) carries about a third of what the sharing pollers do.
+    Bounded by receive(ParticleMsg) 65.6% opening and 72.2% closing; 97.8%
+    end on an arrival, 96.1% of those inter-process; resumption fan-in p50
+    8 distinct peer processes, p90 19.  261 of 317 in the particle exchange
+    at t = 3-7 s; 10 in the uf2 bracket.
+ 6. THE CONTROL THAT KILLED THE LOCK HYPOTHESIS -- see HEADLINE 3.  Stated
+    caveat: the baseline is NOT a matched A/B (different paratreet version,
+    CPU not GPU, -u serial not -u dist, ppn 14 not 7, 183 of 1792 PEs traced
+    rather than all 896).  It controls the runtime's polling structure,
+    which is what the hypothesis was about, and nothing more.
+ 7. TWO ANALYSIS ERRORS I MADE AND CAUGHT BEFORE REPORTING.  (a) Sorting
+    events by (time, kind) inverts the same-microsecond END_IDLE/BEGIN_IDLE
+    pairs reconverse emits and turns genuine idle into phantom overhead --
+    this invented a "41x worse on his runtime" result that was pure
+    artifact.  (b) Treating END_PACK/END_UNPACK as a return to overhead
+    reclassified ordinary execution.  One validated state machine,
+    scripts/relay18_state.py, hand-checked against a raw record dump,
+    replaced both; every number in this relay comes from it.
+
+
+PART B -- THE POLLER SWEEP, JOB 5310158
+
+ 8. WHAT RAN.  16 nodes, 2B, GPU replace arm, 17:45:02 to 17:46:56 -- one
+    minute 54 seconds of compute for all six arms.  Every arm on FoF3.up
+    (his charm 9af1de4b6 / reconverse 397864f + UPSTREAM LCI b8069dd), ppn 7
+    with his byte-identical +pemap, -i 1 -c stats -l 128, ALL 896 PEs traced,
+    +logsize 20000000, +traceroot per arm on scratch, FOF_KEEPALIVE_MS=10.
+    Two reps each, interleaved.  Script sbatch/relay18-pollersweep-16n.sbatch.
+      M  ndev 4 / poll 2  4 pollers/proc  2 threads/device  MIMIC of 5307458
+      L  ndev 7 / poll 1  7 pollers/proc  1 thread/device   minimum sharing
+      H  ndev 1 / poll 7  1 poller/proc   7 threads/device  maximum sharing
+    poll x ndev = ppn = 7 on all three; domains/node 32 / 56 / 8, all well
+    under the 112 that failed memory registration in relay17 arm D.
+ 9. ALL SIX ARMS EXACT (424,897,832 components / 185,317,566 max_size),
+    896 log.gz + 1 .sts each, ~1.2 GB per arm, 7 GB total.
+10. THE THREE SHAPES ARE THE SAME SPEED.  Iteration 0: M 4.867 / 5.014 s,
+    L 4.883 / 4.799 s, H 4.966 / 4.762 s; UNACCOUNTED 22.3-23.3% on all six;
+    phase timers agree to a few ms.  The spread across all six runs is
+    smaller than the spread between the two reps of one arm.  Going from
+    seven threads on one domain to a private domain each costs nothing and
+    saves nothing.
+11. AN ARTIFACT HAD TO BE REMOVED FIRST, AND IT WOULD HAVE INVERTED THE
+    READING.  Every PE's trace opens with one OVERHEAD interval from its
+    first record to its first BEGIN_IDLE -- trace startup, not a stall.  In
+    five of six arms it lands inside the 10-60 ms band and contributes
+    EXACTLY 896 intervals (one per PE, all at t = 0-1 s, all opened by
+    "start of trace" and closed by "the PE went IDLE"), 62-85% of the raw
+    band population.  It is absent from arm M rep 1 and from his own 5307458
+    only because in those runs the input read was cold and that interval ran
+    past 60 ms.  open_entry == -1 identifies it; every number below excludes
+    it.
+12. THE MEASURED ORDER IS THE REVERSE OF THE PREDICTION.  Band intervals,
+    artifact excluded:
+      M-p7d4-poll2  r1 485 (9130 ms)   r2 396 (7688 ms)   91% / 88% on pollers
+      L-p7d7-poll1  r1 525 (11731 ms)  r2 539 (12078 ms)  100% on pollers
+      H-p7d1-poll7  r1 179 (2696 ms)   r2 161 (2380 ms)   63% / 52% on pollers
+    The script predicted L < M < H if device SHARING caused the gaps.  It is
+    H < M < L.  Private-device-per-thread is the WORST arm.
+13. WHAT THE COUNT ACTUALLY TRACKS IS THE NUMBER OF POLLERS, AND THE RATE
+    PER POLLER IS FLAT:
+      pollers/proc   1 (H)    4 (M)    7 (L)
+      band, rep 2      161      396      539
+      per POLLING PE-second:  H 0.0743 / 0.0573   M 0.0363* / 0.0592
+                              L 0.0499 / 0.0515   HIS 5307458  0.0565
+    (* M r1's span is 23.75 s because its input read was cold and ~13 s of
+    that carries no traffic; over its active window it is ~0.078.)  A
+    non-polling PE runs at roughly a sixth of the polling rate (M 0.011,
+    H 0.009 per co-tenant PE-second).  His run sits inside our range, on
+    upstream LCI, so the positive test passes on the go-forward build.
+14. IT COSTS NOTHING MEASURABLE.  2.4-12.1 s of PE-time out of ~10,100 s,
+    and the three shapes finish within 5% of each other.  This is a
+    REPORTING problem -- it makes a few PEs look stalled in projections --
+    far more than a performance problem.
+
+
+WHAT TO CHANGE
+
+15. IF THE GOAL IS TO STOP SEEING THE SYMPTOM IN PROJECTIONS, run
+    +lci_ndevices 1 +backend_poll_thread 7 at ppn 7.  It cuts the band
+    population by 3.4x and confines it to one PE per process at no cost in
+    wall time.  That is a COSMETIC fix and should be described as one.
+16. DO NOT chase device counts for performance.  M, L and H are the same
+    speed to within run-to-run noise.
+17. THE REAL QUESTION FOR THE CHARM TEAM: why does the PE that calls
+    progress() sit 10-60 ms inside the runtime without entering the idle
+    state?  It happens on his branch and on main, at 1, 2 and 7 threads per
+    domain, at the same per-poller rate.  That is reconverse scheduler
+    behaviour, not an application question and not an LCI question.
+
+
+WHAT I DID NOT DO
+
+18. NO CPU DISCRIMINATOR ARM.  The relay18 brief's third arm (mainline CPU
+    FoF3 at 241ddb4 on his charm/reconverse + upstream LCI) was dropped by
+    decision in favour of spending the allocation on the poller sweep; the
+    binary does not exist.  Part A's production comparison stands as the
+    runtime control, with the caveat in item 6.
+19. NO ppn-14 ARM.  Part A showed his stalls are at ppn 7, and relay17
+    item 9 already covers the ppn-14 uf2 penalty.
+20. NO NEW CODE.  The only change anywhere is main's 241ddb4 carried as an
+    uncommitted working-tree edit in gpu-stalls/paratreet2, which is a
+    cherry-pick of an already-pushed commit.  NO PATCH IS DUE.
+21. NOTHING PUSHED.  No file in any of Ritvik's repositories changed.
+
+
+STATE ON FRONTIER
+
+    job 5310158 output : /lustre/orion/csc710/scratch/lvkale/s3ab/relay18-pollersweep-16n-5310158.out
+    per-arm logs       : /lustre/orion/csc710/scratch/lvkale/s3ab/5310158/*.log
+    traces (7 GB)      : /lustre/orion/csc710/scratch/lvkale/s3ab/5310158/traces/<arm>/
+    his trace          : /lustre/orion/csc710/proj-shared/16node_gpu_proj_5307458
+    script             : ~/software/sbatch/relay18-pollersweep-16n.sbatch
+    state machine      : ~/software/scripts/relay18_state.py  (the only validated one)
+    Part A drivers     : ~/software/scripts/relay18-analyse.py, relay18-gap-attrib.py,
+                         relay18-pe-totals.py, relay18-quiet-scan.py
+    Part B band counts : ~/software/scripts/relay18-band.py  (excludes the
+                         start-of-trace artifact of item 11; relay18-analyse.py
+                         does NOT, so its raw band numbers are inflated)
+    binary             : ~/software/gpu-stalls/FoF3.up  md5 35af28c2f3fe42d9642ae5c644a1f844
