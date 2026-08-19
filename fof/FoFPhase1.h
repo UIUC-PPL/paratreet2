@@ -119,6 +119,11 @@ inline std::pair<int, uint64_t> uf2LocationFromID(uint64_t vid) {
   return { int(vid >> kUF2IdxBits), vid & kUF2IdxMask };
 }
 
+// Defined in FoF.C next to the keep-alive ring: one line per process of
+// ring-message gap counters (the no-tracing stall monitor). Called from
+// phase3Stats, once per process.
+void fofKeepAliveGapsPrint(void);
+
 // Fair phaseB work division (design/phase1-scaling.md, 2026-07-25): each
 // unordered TreePiece pair spanning two PEs of a process is walked by
 // exactly one of the two, chosen by one bit of a symmetric mix of the two
@@ -2639,6 +2644,7 @@ public:
     // one print per process — no algorithm change, so it can ride any run.
     if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printLoadModel(b2_);
     if (CkMyRank() == 0) node_proxy.ckLocalBranch()->printPhaseAStages();
+    if (CkMyRank() == 0) paratreet::fofKeepAliveGapsPrint();
     // "edges sent" counts streamed batches plus what remains buffered (the
     // two are disjoint: flushUF2Batch clears the buffer as it submits).
     long sums[9] = {phase3_emitted,

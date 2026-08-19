@@ -7,6 +7,7 @@
 #include "FoFPhase3.h"
 
 #include <cstdlib>
+#include <mutex>
 
 // ---- Keep-alive ring for the LCI idle-stall (WORKAROUND-lci-idle-stall.md,
 // 2026-08-04) ----
@@ -43,10 +44,82 @@ static int fof_keepalive_handler_id;
 static long fof_keepalive_ticks = 0;
 static double fof_keepalive_t0 = 0;
 static bool fof_keepalive_verbose = false;
+// Ring period, ms (FOF_KEEPALIVE_MS, default 100). Three useful settings:
+//   100   the validated workaround (suppression measured total at every
+//         period from 200 us to 200 ms, job 19661625) — and, with the gap
+//         monitor below, a tripwire that it KEEPS working.
+//   10    finer monitor sampling (per-process episode counts undercount
+//         ~3-10x at 100 ms; machine-wide detection is fine either way).
+//   1000+ PROBE mode: the ring's own traffic suppresses the Anvil stall,
+//         so a sparse ring deliberately leaves quiet windows longer than
+//         the ~1 s onset and each message then samples delivery exactly
+//         at the trigger. Use to MEASURE the raw bug without projections;
+//         it stops being a workaround at these settings.
+static double fof_keepalive_period_ms = 100.0;
 
-static void fofKeepAliveHandler(void* msg) { CmiFree(msg); }
+// ---- Ring-gap monitor (Kale, 2026-08-19): the ring doubles as a
+// delivery-delay instrument that needs no tracing. Each process receives
+// one ring message per 100 ms from its predecessor; the deviation of the
+// inter-ARRIVAL gap from that cadence is (predecessor's send stretch) +
+// (delivery delay) + (handler scheduling). The inter-SEND gaps are
+// recorded too, so a stretched sender (a busy rank slows its periodic
+// ladder to ~4/s legitimately — the rank-probe finding above) is
+// distinguishable from a delivery stall: arrival jitter WITHOUT matching
+// send jitter anywhere is the LCI idle-stall signature (10-25 ms tails,
+// WORKAROUND-lci-idle-stall.md). Counters only, one print per process at
+// phase3Stats (fofKeepAliveGapsPrint) — watch over10/over25 on machines
+// where the stall is live (Anvil/InfiniBand; absent on Frontier CXI as
+// of 2026-08-18, jobs 5303887/5303902).
+static std::mutex fof_ka_gap_mtx;
+struct FofKaGaps {
+  long n = 0, over5 = 0, over10 = 0, over25 = 0, over100 = 0;
+  double last = -1, max_ms = 0, max_at = 0;
+  void record(double now) {
+    if (last >= 0) {
+      // deviation from the configured cadence, ms
+      double d = (now - last) * 1e3 - fof_keepalive_period_ms;
+      n++;
+      if (d > 5) over5++;
+      if (d > 10) over10++;
+      if (d > 25) over25++;
+      if (d > 100) over100++;
+      if (d > max_ms) { max_ms = d; max_at = now; }
+    }
+    last = now;
+  }
+};
+static FofKaGaps fof_ka_arrival, fof_ka_send;
+
+static void fofKeepAliveHandler(void* msg) {
+  {
+    std::lock_guard<std::mutex> g(fof_ka_gap_mtx);
+    fof_ka_arrival.record(CmiWallTimer());
+  }
+  CmiFree(msg);
+}
+
+namespace paratreet {
+void fofKeepAliveGapsPrint(void) {
+  std::lock_guard<std::mutex> g(fof_ka_gap_mtx);
+  if (fof_ka_arrival.n == 0 && fof_ka_send.n == 0) return;
+  CmiPrintf("FOF3STAT keepalive_gaps: node %d arr_n %ld over5 %ld "
+            "over10 %ld over25 %ld over100 %ld max_ms %.1f at_s %.2f | "
+            "send_n %ld over5 %ld over10 %ld over25 %ld over100 %ld "
+            "max_ms %.1f\n",
+            CmiMyNode(), fof_ka_arrival.n, fof_ka_arrival.over5,
+            fof_ka_arrival.over10, fof_ka_arrival.over25,
+            fof_ka_arrival.over100, fof_ka_arrival.max_ms,
+            fof_ka_arrival.max_at, fof_ka_send.n, fof_ka_send.over5,
+            fof_ka_send.over10, fof_ka_send.over25, fof_ka_send.over100,
+            fof_ka_send.max_ms);
+}
+}  // namespace paratreet
 
 static void fofKeepAliveTick(void*) {
+  {
+    std::lock_guard<std::mutex> g(fof_ka_gap_mtx);
+    fof_ka_send.record(CmiWallTimer());
+  }
   void* msg = CmiAlloc(CmiMsgHeaderSizeBytes);
   CmiSetHandler(msg, fof_keepalive_handler_id);
   CmiSyncNodeSendAndFree((CmiMyNode() + 1) % CmiNumNodes(),
@@ -71,6 +144,14 @@ static void fofKeepAliveTick(void*) {
                 dt > 0 ? (fof_keepalive_ticks - 1) / dt : 0.0, CmiMyNode());
     }
   }
+}
+
+// Non-default periods (FOF_KEEPALIVE_MS != 100) run on a self-rearming
+// CcdCallFnAfter chain instead of the fixed 100 ms condition rung — the
+// same idiom the S3 poll loop used on both runtimes.
+static void fofKeepAliveChain(void* a, double) {
+  fofKeepAliveTick(a);
+  CcdCallFnAfter(fofKeepAliveChain, a, fof_keepalive_period_ms);
 }
 
 // Diagnosis probe (temporary): counts the 100 ms periodic condition on
@@ -118,6 +199,8 @@ void fofKeepAliveInit(void) {
   bool enabled = !(env && std::atoi(env) == 0);
   const char* venv = std::getenv("FOF_KEEPALIVE_VERBOSE");
   fof_keepalive_verbose = (venv && std::atoi(venv) != 0);
+  const char* penv = std::getenv("FOF_KEEPALIVE_MS");
+  if (penv && std::atof(penv) > 0) fof_keepalive_period_ms = std::atof(penv);
   if (!enabled || CmiNumNodes() < 2) return;
   // Diagnosis (temporary): with verbose on, count the periodic condition
   // on every rank so starved ranks identify themselves.
@@ -138,13 +221,17 @@ void fofKeepAliveInit(void) {
   // conditions "go silent" was wrong — an artifact of sparse print
   // points and block-buffered multi-process output.)
   if (CmiMyRank() == CmiMyNodeSize() - 1) {
-    CcdCallOnConditionKeep(CcdPERIODIC_100ms, fofKeepAliveTick, nullptr);
+    if (fof_keepalive_period_ms == 100.0)
+      CcdCallOnConditionKeep(CcdPERIODIC_100ms, fofKeepAliveTick, nullptr);
+    else
+      CcdCallFnAfter(fofKeepAliveChain, nullptr, fof_keepalive_period_ms);
     if (fof_keepalive_verbose)
       CcdCallOnConditionKeep(CcdPROCESSOR_STILL_IDLE, fofStillIdleProbe, nullptr);
     if (CmiMyNode() == 0) {
-      CmiPrintf("FoF keep-alive: 100 ms raw-Converse ring across %d "
-                "processes (FOF_KEEPALIVE=0 disables)\n",
-                CmiNumNodes());
+      CmiPrintf("FoF keep-alive: %.0f ms raw-Converse ring across %d "
+                "processes (FOF_KEEPALIVE=0 disables; FOF_KEEPALIVE_MS "
+                "sets the period — 1000+ is probe mode, not a workaround)\n",
+                fof_keepalive_period_ms, CmiNumNodes());
     }
   }
 }
