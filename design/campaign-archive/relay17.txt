@@ -1,0 +1,185 @@
+relay17 -- THE LCI-LAYER SWAP ON RITVIK'S STACK.  Job 5307495 (16 nodes, 2B,
+GPU replace arm, upstream LCI vs the fork), 2026-08-19.
+Full report: reports/gpu-stalls-relay17.md.
+
+*** HEADLINE 1 (login node, no job): RELAY16'S OPEN GAP IS CLOSED, AND THE
+    ANSWER IS NOT IN THE LCI FORK.  His reconverse sets
+        g_attr.ofi_lock_mode = TRYLOCK_SEND | TRYLOCK_RECV | TRYLOCK_POLL
+    (comm_backend_lci2.cpp:196, HIS commit 7737b74, 2026-05-05) before
+    runtime init, so LCI takes a per-device spinlock around every send,
+    recv and poll.  LCI's own default is 0 -- NO LOCK.  The relay14/16
+    reproducer never set it.  So the reproducer ran UNLOCKED and the
+    application did not: that is the whole difference between "dies 8 of 8"
+    and "clean 23 of 23" on the same library in the same shape.  Items 1-3. ***
+
+*** HEADLINE 2 (measured): UPSTREAM LCI RUNS THE APPLICATION CORRECTLY ON
+    FRONTIER.  Five arms on upstream b8069dd, all exact.  The fork commit
+    that is titled "changes to work on frontier" is not needed by the
+    application.  Fork and upstream are indistinguishable in his own sweep
+    shape -- no stall, no hang, no timing difference worth the name.
+    Items 4-7. ***
+
+
+THE THING THAT EXPLAINS RELAY16
+
+ 1. LCI default: lci-up-src/src/global/global.cpp:104 sets
+    g_default_attr.ofi_lock_mode = 0.  Enforcement is
+    backend_ofi.hpp:37 -- `if (ofi_lock_mode & mode && !lock.try_lock())
+    return ret;` -- one spinlock per ofi device, taken for whichever of
+    send/recv/poll the mask selects.
+ 2. reconverse gpu-merge-candidate sets all three bits.  It also adds
+    m_progress_locks (one atomic per device, so at most one thread polls a
+    CQ) and a g_in_progress_callback reentrancy guard that makes a send
+    issued inside a completion callback push to LCI's backlog instead of
+    spinning under the progress lock.  Commits 7737b74 and cdec537.
+ 3. CONSEQUENCE FOR RELAY16.  Its item 13 ("run with +lci_ndevices 7
+    +backend_poll_thread 1") is belt-and-braces, not a fix for a live
+    application bug -- the serialisation the FI_THREAD_DOMAIN contract
+    demands is already there, from a different repository.  The fork's
+    downgrade is still a real contract violation and still worth removing.
+    THIS IS CODE READING.  The control that measures it is written and its
+    binaries are built (item 16); it is the next job.
+
+
+THE SWAP, MEASURED -- JOB 5307495
+
+ 4. One layer swapped, everything else identical: same paratreet2 working
+    tree, same charm 9af1de4b6, same reconverse 397864f, same Kokkos.
+    `git diff b8069dd 4ee0d15` is 3 files, +103 -20.  Gated in the job on
+    CONTENT, not path: `strings liblci.so | grep -c FI_THREAD_DOMAIN` is
+    2 for the fork and 0 for upstream.
+
+ 5. RESULTS.  424,897,832 / 185,317,566 on every completed arm.
+
+      A  fork      ppn 14 / ndev 7  / poll 2   3 of 3 EXACT   <- his sweep shape
+      B  upstream  ppn 14 / ndev 7  / poll 2   3 of 3 EXACT   <- the swap
+      C  upstream  ppn  7 / ndev 4  / poll 2   2 of 2 EXACT   <- runbook shape
+      D  fork      ppn 14 / ndev 14 / poll 1   0 of 2         <- see item 8
+
+ 6. THE QD-STALL METER SAYS BUSY SENDER, NOT DELAYED DELIVERY.  The
+    keepalive_gaps arrival tail and send tail track each other in every arm
+    and every rep -- arrival over100 is 7-10% above send over100, and the
+    process with the worst arrival gap always carries a send gap of the
+    same order.  Every worst gap lands at 3-6 s, i.e. inside load and tree
+    build, not in the sparse QD brackets.  Identical on both libraries and
+    in both shapes.  (Aggregate over the LAST print per process: -i 2
+    prints the cumulative counters twice, so a naive sum double-counts.)
+
+ 7. TIMING.  Iteration 1 mean: upstream 5334 ms, fork 5167 ms -- upstream
+    1.4% (iter 0) to 3.2% (iter 1) higher, same direction in every phase.
+    I am NOT calling that a regression: the ranges overlap, three reps is
+    three reps, and B ran immediately before A in every rep, so the
+    ordering confound I built in favours A.  warmup_offpath is identical
+    to 5 ms across the arms.
+
+ 8. ARM D FAILED, AND THE FAILURE IS WORTH MORE THAN THE ARM WAS.  Both
+    reps died ~150 s in with
+      backend_ofi.cpp:register_memory_impl:458 err : No space left on device
+    14 devices x 8 processes = 112 libfabric domains per node, double his
+    56.  Memory registration runs out first.  I predicted this before the
+    run and said the failure would not be a delivery finding; it is not.
+    *** THIS RETIRES RELAY16 ITEM 13 AT ppn 14.  "One thread per domain"
+    means ndevices == ppn, and at his sweep's +ppn 14 that shape DOES NOT
+    EXIST on Frontier.  It is available at ppn 7 (56 domains/node, which
+    relay16 measured clean) and nowhere above it. ***
+
+ 9. UNASKED-FOR RESULT: HIS SWEEP'S ppn 14 IS 13% SLOWER THAN THE
+    RUNBOOK'S ppn 7.  Arms B and C are the same binary, same library, same
+    job; only the shape differs.  Iteration 1: 5.334 s at ppn 14 against
+    4.650 s at ppn 7, -12.8%, and almost all of it is uf2 (1.518 -> 0.910,
+    -40%) plus phase3_walk (0.845 -> 0.680).  Phase 1 goes the other way
+    (0.599 -> 0.653), which fits: one GPU per process either way, fewer
+    host PEs staging it.
+    CAVEAT: 2 reps against 3, one node count, and 896 against 1792 PEs is a
+    different decomposition, not only a different mapping.  An observation
+    to check, not a recommendation -- but his whole 08-14 node sweep
+    (jobs 5264070-5264135) ran +ppn 14, so if it holds the sweep is
+    measuring a shape that is not his best one.
+
+
+HOW MUCH OF RELAY13/14 TRANSFERS TO HIS RUNTIME (login node)
+
+10. charm: production 3d1fdd89f is an ANCESTOR of his 9af1de4b6, so the
+    comparison is exact -- 53 commits, +9664 -1789 over 153 files.
+    NO LINE TOUCHES THE LCI MESSAGE PATH.  Buckets: examples/tests/docs
+    +2609; load balancing +2606 (framework live, no strategy on the FoF3
+    line); HAPI/GPU device layer +1512 (live, it is the GPU arm); other
+    machine layers +979 (NOT COMPILED -- verified, the built tree has no
+    libconverse*); checkpoint/elastic/CCS +795; device-RDMA + PUP +588
+    (the app never calls charm's device-RDMA API); build machinery +234;
+    src/ck-core remainder +341 (GPU-LB instrumentation in cklocation.C,
+    CMK_CUDA -> CMK_CUDA||CMK_HIP guards, an _inrestart -> get_in_restart()
+    rename, commented-out debug prints).
+
+11. reconverse: his branch is main (a1207a8) + 22 commits, +543 -38 over 20
+    files, and is a strict superset of main.  EXACTLY +67 LINES ARE THE LCI
+    MESSAGE PATH, and they are the three things in item 2.  The rest is
+    tests +322, device-RDMA +94 (deviceRdmaOpInfo, a GPU-pointer-aware
+    loopback memcpy), build machinery +32, and +28 of debug prints, a
+    thread-listener leak fix, two converse.h defines, and an issueRget
+    signature refactor that is behaviour-preserving for host buffers.
+
+12. VERDICT.  Relay13/14 transfer, with exactly one caveat, and it is in
+    the progress path: PRODUCTION RECONVERSE TAKES NO LOCK THERE, HIS TAKES
+    TWO.  On production every thread polls its device freely; on his, a
+    send contends with the device's poller for one spinlock and a second
+    thread wanting to poll the same device is turned away.  Everything else
+    that differs is either not compiled into FoF3, not called by it, or on
+    the GPU side rather than the network side.
+
+
+WHAT TO CHANGE
+
+13. Ask Ritvik the relay16 question anyway: does his real (untracked) batch
+    script set LCI_OFI_THREADING_HINT?  Relay17 removes the LCI fork as a
+    candidate in his own shape, which makes his remaining differences from
+    what I ran MORE important, not less.
+14. Brace the dangling else in 4ee0d15 (unchanged from relay16 item 15).
+15. Fix the fork's threading contract or retire the fork: upstream ran the
+    application correctly 5 of 5 on CXI, so the three fork commits are
+    currently buying a contract violation that a lock in another repository
+    happens to mask.
+16. Do NOT repeat relay16 item 13 at ppn 14 -- item 8.  Extend the
+    section-8 rule with an upper bound: ndevices x processes_per_node must
+    stay near 56; 112 fails memory registration.
+17. Check item 9 at more than one node count; if it holds, rerun the 08-14
+    sweep at ppn 7.
+18. Commit run_fof3_scale_gpu.sbatch.  design/fof3-2b-scaling.md section 1
+    names it as the script that drove the whole 08-14 sweep and it is not
+    in the repository; I recreated the command from section 7.  Same defect
+    as run_fof3_nosmt_8p.sbatch in relay16 item 17.
+
+
+WHAT I DID NOT DO, AND WHY
+
+19. THE CAUSAL CONTROL FOR HEADLINE 1 HAS NOT BEEN RUN.  It is written
+    (sbatch/relay17-ofilock-control-16n.sbatch), its binaries are built and
+    gated (gpu-stalls/lci_multipeer_fork17 and _up17, both with RPATH so
+    LD_LIBRARY_PATH cannot override them), and its prediction is written
+    into the script: fork t7d4 --ofi-lock off FAILS, --ofi-lock on CLEAN.
+    Held back by the one-job-at-a-time rule.  THIS IS THE NEXT JOB.
+20. No traced arm -- no arm hung, so there is no stall to classify.
+21. The 10k preflight failed on BOTH binaries with "Reader failed to open
+    tipsy file": 1792 readers opening one small file on the home
+    filesystem.  My error, not a result; it discriminated nothing and the
+    arms below it were unaffected because it was written as advisory.  A
+    future preflight needs a Lustre-resident input.
+22. Nothing pushed.  No file in any of Ritvik's repositories changed.  The
+    only code change anywhere is main's 241ddb4 applied as an uncommitted
+    working-tree edit to gpu-stalls/paratreet2 -- a cherry-pick of an
+    already-pushed commit, not new work.  NO PATCH IS DUE.
+
+
+STATE ON FRONTIER
+
+    ~/software/gpu-stalls/
+      FoF3.fork  md5 8c3698af97bb299adab8a65148dd6689  -> charm/ + charm/lci (fork 4ee0d15)
+      FoF3.up    md5 35af28c2f3fe42d9642ae5c644a1f844  -> charm-up/ + lci-up (upstream b8069dd)
+      paratreet2 a491d27 gpu-phase1 + 241ddb4 UNCOMMITTED (fof/FoF.C, fof/FoFPhase1.h)
+      charm and charm-up both 9af1de4b6 + reconverse 397864f -- identical commits
+      lci-src 4ee0d15 / lci-up-src b8069dd (a worktree of the same clone)
+      lci_multipeer_fork17, lci_multipeer_up17 (built, not yet run)
+    ~/software/paratreet2 (the CPU tree) untouched at 8e08843, CLEAN.
+    Raw logs: /lustre/orion/csc710/scratch/lvkale/s3ab/5307495/
+    Readout:  ~/software/scripts/relay17-read.sh 5307495
+    Resume:   ~/software/relay17-RESUME.md
