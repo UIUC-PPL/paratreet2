@@ -1,0 +1,218 @@
+relay16 -- RITVIK'S GPU STALLS.  Jobs 5304940/5305170 (pure-LCI reproducer,
+fork vs production), 5305230 (his reference run reproduced + the fix),
+5305278 (intermittency, 20 vs 20).  2026-08-18.
+Full report: reports/gpu-stalls-relay16.md.
+
+*** READ ITEM 12a BEFORE ACTING ON THIS HEADLINE.  The fork defect below is
+    real and reproduces 8/8 in a microbenchmark, but his APPLICATION ran 23
+    consecutive clean runs in the very configuration that kills the
+    reproducer -- so I have NOT earned the claim that this is the cause of
+    HIS stalls.  Item 12a says what to ask him. ***
+
+*** HEADLINE: there is a real defect in his LCI FORK, of exactly his symptom
+    class.  The fork
+    downgrades libfabric's threading contract from FI_THREAD_SAFE to
+    FI_THREAD_DOMAIN for cxi (commit 05ee2d8), and reconverse's
+    thread-to-device mapping then puts TWO threads in one domain at his
+    +ppn 7 +lci_ndevices 4.  The relay14 reproducer, relinked against his
+    liblci, FAILS 8 of 8 in that shape and is CLEAN 4 of 4 with one thread
+    per domain; production LCI is clean 8 of 8 in both shapes.  The failure
+    presents as segfault, as "double free", OR AS A SILENT HANG WITH NO
+    ERROR -- and the third is his symptom.  FIX, no code change:
+    +lci_ndevices 7 +backend_poll_thread 1.  Items 4-8. ***
+
+
+THE TWO FREE CHECKS (cover-note step 2) -- BOTH PASS, so neither is it
+
+ 1. pemap: 56 entries, no duplicates, no multiples of 8, range 1-63 =
+    procs_per_node x ppn = 8 x 7.  The phantom-stall trap is not firing.
+
+ 2. Device coverage at ppn 7 / ndevices 4 / stride 2: threads {0,1}->d0,
+    {2,3}->d1, {4,5}->d2, {6}->d3; pollers 0,2,4,6 -> devices 0,1,2,3.
+    Every device has a poller.  I also reproduced his ndevices-7
+    counter-example (devices 1,3,5 unpolled), so the rule itself is right.
+    *** BUT THE RULE IS INCOMPLETE.  It guarantees every device a POLLER.
+    It does not guarantee every domain a single USER.  That gap is the bug. ***
+
+ 3. His scratch is not readable, so his stalling run (5302111, CANCELLED at
+    8:06 with no output) could not be inspected.  His history is
+    intermittent: 5302545 and 5303289 COMPLETED in 47-48 s.
+
+
+WHAT THE FORK CHANGES (read before building it -- this is where it was found)
+
+ 4. ritvikrao/lci frontier-changes @ 4ee0d15, three commits on upstream
+    b8069dd.  Both it and production LCI are 2.0.0, so the diff is real and
+    not a generation gap.
+      production:  domain_attr->threading = FI_THREAD_SAFE, unconditional
+      fork:        FI_THREAD_DOMAIN whenever multiprocess && provider is
+                   cxi or unset -- which on Frontier is ALWAYS
+    FI_THREAD_DOMAIN is libfabric's contract that the CALLER serialises
+    access to a domain and everything under it.  The fork's OWN next commit
+    (19fe6b8) adds a mutex around fi_mr_regattr/bind/enable/close with the
+    comment: "FI_THREAD_DOMAIN requires caller serialisation; concurrent
+    fi_mr_enable calls corrupt CXI's internal LE-append queue and cause
+    cxip_mr_wait_append to spin forever."  That serialises ONE path.  Every
+    send and every progress call on a shared domain is still unserialised.
+    The third commit's `if (!internal_ctx) return;` guard in progress_read
+    is the same story from the other end: a null completion context is what
+    you get after the provider's event queue is corrupted.
+
+ 5. SEPARATE LANDMINE, same fork.  4ee0d15 adds LCI_OFI_THREADING_HINT with
+    a DANGLING ELSE:  `} else` with no braces swallows the next statement,
+    so setting that variable to ANY value (even an unrecognised one) also
+    stops control_progress being set to FI_PROGRESS_MANUAL.  It is exactly
+    the knob someone debugging stalls would reach for.  One pair of braces.
+
+
+THE DECISIVE EXPERIMENT
+
+ 6. TWO TRAPS FIRST, both caught, both worth knowing:
+    (a) The first link of the reproducer against the fork SILENTLY RESOLVED
+        TO THE PRODUCTION liblci -- the linker emits RUNPATH, which loses to
+        LD_LIBRARY_PATH, and production charm's lib dir is on it.  That would
+        have reproduced relay14's null and "cleared" the fork.  Relinked with
+        --disable-new-dtags (readelf now shows RPATH); the job gates on ldd.
+    (b) MY OWN HARNESS was wrong in job 5304940: main() called barrier_x on
+        device 0 while a worker progressed device 0 on every non-zero rank --
+        two threads in one domain in EVERY arm, so the "one thread per
+        device" control was not one.  Production's FI_THREAD_SAFE tolerates
+        it; the fork does not.  Fixed (main is thread 0 on all ranks, worker
+        count unchanged) and rerun as 5305170.  I am reporting the corrected
+        job, not the first one.
+
+ 7. JOB 5305170, 10,000 round trips per arm, 2 reps x 2 peer counts:
+
+       LCI    shape         threads/domain   K=16 r1/r2      K=64 r1/r2
+       fork   7t/7d               1          7.30 / 7.31 us  8.67 / 9.07 us
+       fork   7t/4d  (HIS)        2          FAIL / FAIL     FAIL / FAIL
+       fork   14t/7d              2          FAIL / FAIL     FAIL / FAIL
+       prod   7t/7d               1          7.26 / 7.77     8.58 / 8.65
+       prod   7t/4d               2          13.90 / 19.77   10.90 / 10.49
+
+    Every clean arm: 0 samples over 1 ms.  THE FORK SURVIVES IF AND ONLY IF
+    EACH DOMAIN HAS EXACTLY ONE THREAD.  Production tolerates both shapes.
+
+ 8. THE FAILURE IS THREE SYMPTOMS, ONE CAUSE:
+      - cxip_evtq_event_req(): "Invalid event type: 19" from the CXI
+        provider, then LCI's "Assert failed: is_packet ... Not a packet"
+      - "free(): double free detected in tcache 2", segfaults, bus errors
+      - AND A PURE HANG WITH NO ERROR (f-k64-t7d4-r2), killed by the guard
+        at 177 s with zero diagnostic output
+    The third is his symptom, and it is why this has been hard to catch.
+
+
+HIS REFERENCE RUN, REPRODUCED (job 5305230)
+
+ 9. Stack per the runbook: paratreet2 a491d27 gpu-phase1, charm 9af1de4b6 +
+    reconverse 397864f (gpu-merge-candidate), LCI fork 4ee0d15, Kokkos
+    4.7.04.  Binary verified with nm: 300 fofgpu:: symbols, 38 LogPool, 4
+    deviceWarmup, and ldd confirming the FORK's liblci.
+
+10. All 7 arms EXACT on both gates (424,897,832 / max_size 185,317,566):
+
+       arm        device wall   init    warmup_offpath   Iter0
+       his ref    0.584/0.582   0.000   0.461/0.379      4275/4339 ms
+       asis-r1/2/3 0.584/0.571/0.573  0.000  0.465/0.420/0.418  4722/4615/4714
+       traced     0.583         0.000   0.448            5000
+       fix-r1/2/3 0.586/0.585/0.582  0.000  0.362/0.365/0.366  4748/4566/4719
+
+    init is 0.000 everywhere, so the device-init hoist the run exists to
+    measure IS firing, and device wall reproduces his 0.584/0.582 within 2%.
+    Iteration 0 sits ~10% above his reference; that is a different
+    allocation on a different night and I would not call it a regression
+    without an interleaved comparison (relay15 item 10).
+
+11. THE FIX COSTS NOTHING.  +lci_ndevices 7 +backend_poll_thread 1 gives
+    device wall 0.582-0.586 against 0.571-0.584 and Iter0 4566-4748 against
+    4615-4722 -- indistinguishable.  warmup_offpath is if anything lower.
+
+12. HIS CONFIG DID NOT STALL IN 3 REPS, which settles nothing about an
+    intermittent failure.  Job 5305278 asked the application the same
+    question, 20 reps of each config, interleaved, counting failures.
+
+12a. *** THE APPLICATION DID NOT REPRODUCE IT.  0 failures in 20 for his
+     config; 0 in 20 for the fix; all 40 exact, 13-16 s.  With 5305230 that
+     is 23 CONSECUTIVE CLEAN RUNS of the configuration the reproducer kills
+     8 times out of 8. ***
+     Both results are solid, so the gap is the finding.  Either the app's
+     per-thread traffic is too sparse for two threads to collide inside one
+     domain (fatal under the reproducer's tight loop, rare in FoF), or his
+     hang has another cause.
+     THE ARITHMETIC SAYS SOMETHING DIFFERS BETWEEN MY REBUILD AND HIS HUNG
+     RUN.  One hang (5302111) in three real attempts is 1-in-3; 23 clean
+     runs at that rate has probability 9e-5, and 1.5% even at 1-in-6.
+     I did not get lucky 23 times.
+
+12b. THE ONE QUESTION TO ASK RITVIK: DOES HIS REAL BATCH SCRIPT SET
+     LCI_OFI_THREADING_HINT?  His script is UNTRACKED (his runbook says so;
+     section 6 recreates it from memory, and that is what I ran).  He added
+     that knob himself in May, it is NOT in the runbook's env list, and the
+     dangling else in 4ee0d15 means setting it to ANY value also stops
+     control_progress being set to FI_PROGRESS_MANUAL.  A job whose control
+     progress is left to the provider default is a strong candidate for
+     "hangs for the whole walltime with no error".  That one line would
+     explain his hang, my null, and the difference between the real script
+     and the recreated one.
+     Also worth ruling out: 5302111 ran at 13:04, BEFORE both reference
+     runs (5302545 at 15:16, 5303289 at 16:28), so it was a different build
+     than either arm the runbook documents.
+
+
+WHAT TO CHANGE
+
+13. Run with +lci_ndevices 7 +backend_poll_thread 1 at ppn 7.  It is the
+    only mapping satisfying BOTH his section-8 poller rule AND the
+    FI_THREAD_DOMAIN contract his fork imposes, and it is free.
+14. Or fix the fork, which is better if the GPU work wants fewer devices:
+    keep FI_THREAD_SAFE (production's choice, and it handles this fine), or
+    serialise per-domain inside LCI rather than only around the MR calls.
+15. Brace the dangling else in 4ee0d15 before anyone debugs with that knob.
+16. Extend the section-8 rule: every device needs a poller AND no device may
+    have more than one user thread.  With this fork, ndevices must equal ppn.
+17. Commit run_fof3_nosmt_8p.sbatch to gpu-phase1 -- the runbook flags it
+    untracked, and its section 6 exists only to recreate it by hand.
+
+
+FIVE RUNBOOK DEFECTS, FOUND BY FOLLOWING IT.  Each stops a second person.
+
+18. KOKKOS_DIR defaults to /ccs/home/rrao/kokkos in BOTH fof/gpu/Makefile:14
+    and src/Makefile.common:95, and his home is not readable by anyone else.
+    The runbook says it defaults to $HOME/kokkos.
+19. `module load rocm/6.2.4` is a SILENT NO-OP non-interactively: no
+    ROCM_PATH, absent from module list.  Kokkos AND
+    reconverse/CMakeLists.txt:126 find_package(hip REQUIRED CONFIG) both
+    fail.  Both need -DCMAKE_PREFIX_PATH=/opt/rocm-6.2.4.
+20. charm's `amd` target builds reconverse-linux-x86_64-AMD, not
+    reconverse-linux-x86_64.  hapi.h is only in the former, and the
+    runbook's "set CHARM_HOME to that build directory" reads as the latter.
+21. `git clone kokkos` now gives master, whose Kokkos_BitManipulation.hpp
+    needs C++20 while fof/gpu/Makefile:25 compiles -std=c++17 (20 errors).
+    Pin a 4.x release; 4.7.04 works.
+22. Section 1's clone list is incomplete: the build also needs
+    N-BodyShop/utility (as paratreet2/utility) and the sibling unionfind and
+    htram checkouts.  Without them src does not build at all.
+
+
+WHAT I DID NOT DO, AND WHY
+
+23. Cover-note step 4 (CPU-only control on his runtime) was NOT run, by the
+    cover note's own branching: it is conditional on step 3 coming back
+    clean.  Step 3 did not come back clean, so the bug is located.
+24. Step 5 (classify the stall on the traced arm) is not possible from my
+    traces: the traced arm ran clean, so there is no stall in it to classify
+    as idle-gap vs busy-opaque vs QD-settle.  If 5305278 catches a hang,
+    that arm is the one to trace.
+25. No comparison against relay13/15 numbers, per the cover note.
+26. Nothing pushed.  No file in any of his repositories changed.  The whole
+    stack lives in ~/software/gpu-stalls/.
+
+
+STATE ON FRONTIER
+
+    ~/software/gpu-stalls/  paratreet2 a491d27 (gpu-phase1), charm 9af1de4b6
+      + reconverse 397864f, lci-src 4ee0d15, kokkos 4.7.04, all CLEAN.
+    ~/software/paratreet2 (the CPU tree) untouched at 8e08843, production
+      charm, CLEAN -- this work did not disturb it.
+    Raw logs: /lustre/orion/csc710/scratch/lvkale/s3ab/{5304940,5305170,
+      5305230,5305278}.
