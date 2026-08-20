@@ -582,6 +582,13 @@ public:
     int n;
     int home_pe;
     double c[3]; // box center, for the geometry claim priority
+    // Carried so a claim does not DROP the flat device tree: the claim
+    // path rewrites both this PE's treepieces and its registry bucket, and
+    // the registry bucket is what devicePlanTree reads to find the trees.
+    // Without these two fields FOF_STEALA=1 plus a device arm ends in
+    // deviceLaunch's "no flat device tree" abort.
+    const paratreet::DNode* dnodes = nullptr;
+    int n_dnodes = 0;
   };
   std::vector<StealEntry> steal_pool;
   std::unique_ptr<std::atomic<int>[]> steal_claimed;
@@ -624,6 +631,7 @@ public:
       for (auto& s : kv.second) {
         StealEntry e;
         e.root = s.root; e.parts = s.parts; e.n = s.n; e.home_pe = kv.first;
+        e.dnodes = s.dnodes; e.n_dnodes = s.n_dnodes;
         for (int ax = 0; ax < 3; ax++)
           e.c[ax] = 0.5 * ((double)s.root->data.box.lesser_corner[ax] +
                            (double)s.root->data.box.greater_corner[ax]);
@@ -1323,7 +1331,13 @@ public:
       int expect = 0;
       if (!claimed[i].compare_exchange_strong(expect, 1)) return false;
       (pool[i].home_pe == CkMyPe()) ? own_claims++ : foreign_claims++;
-      TreePieceRef r{pool[i].root, pool[i].parts, pool[i].n, 0};
+      // Field-by-field, not a braced aggregate: TreePieceRef's device
+      // members carry default member initializers, which under C++11
+      // (charmc compiles -std=gnu++11) makes the type a non-aggregate.
+      TreePieceRef r;
+      r.root = pool[i].root; r.parts = pool[i].parts; r.n = pool[i].n;
+      r.offset = 0;
+      r.dnodes = pool[i].dnodes; r.n_dnodes = pool[i].n_dnodes;
       treepieces.push_back(r);
       phaseAAdmit(treepieces.back());
       phaseASelfPair(treepieces.back());
@@ -1367,8 +1381,12 @@ public:
       std::lock_guard<std::mutex> g(nb->lock);
       auto& bucket = nb->pe_treepieces[CkMyPe()];
       bucket.clear();
-      for (auto& s : treepieces)
-        bucket.push_back({s.root, s.parts, s.n});
+      for (auto& s : treepieces) {
+        typename FoFPhase1Node<Data>::TreePieceRef ref;
+        ref.root = s.root; ref.parts = s.parts; ref.n = s.n;
+        ref.dnodes = s.dnodes; ref.n_dnodes = s.n_dnodes;
+        bucket.push_back(ref);
+      }
     }
     nb->s1_own += own_claims;
     nb->s1_foreign += foreign_claims;
