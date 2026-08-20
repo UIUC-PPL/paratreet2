@@ -137,18 +137,30 @@ install, and `GPU=1` on the FoF makefiles.
 
 **Extra prerequisites.**
 
-- A **HIP-enabled Charm++**, i.e. a build made with the `amd` option word
-  (`reconverse-linux-x86_64-amd`, or the `cuda` equivalent on NVIDIA). Point
-  `CHARM_HOME` at it. The GPU arm needs HAPI for the PE→GPU mapping and the
+- A **HIP-enabled Charm++**, i.e. a build made with the `amd` option word.
+  The option word is part of the BUILD DIRECTORY NAME —
+  `reconverse-linux-x86_64-amd`, not `reconverse-linux-x86_64` (the `cuda`
+  equivalent on NVIDIA) — and `hapi.h` exists only in the suffixed one, so
+  `CHARM_HOME` must carry the suffix too. The GPU arm needs HAPI for the PE→GPU mapping and the
   stream; `Makefile.common` detects such a build by the presence of
   `$(CHARM_HOME)/include/hapi.h`.
-- **ROCm** (developed against 6.2.4) for `hipcc`.
-- **Kokkos**, built with the HIP backend for the target arch. What the
-  Frontier install was configured with:
+- **ROCm** (developed against 6.2.4) for `hipcc`. On Frontier `module load
+  rocm/6.2.4` is a SILENT NO-OP in a non-interactive shell — it sets no
+  `ROCM_PATH` and does not show up in `module list`, and the CMake builds
+  below (and reconverse's own `find_package(hip REQUIRED CONFIG)`) then fail
+  looking for HIP. Pass the path explicitly instead:
+  `-DCMAKE_PREFIX_PATH=/opt/rocm-6.2.4`.
+- **Kokkos**, built with the HIP backend for the target arch. **Check out a
+  4.x release, not `master`**: master's `Kokkos_BitManipulation.hpp` needs
+  C++20 while `fof/gpu/Makefile` compiles `-std=c++17`, which is ~20 errors
+  that never mention the standard. 4.7.04 is what this was built against.
+  What the Frontier install was configured with:
 
   ```sh
+  git clone --branch 4.7.04 --depth 1 https://github.com/kokkos/kokkos.git
   cd kokkos && cmake -B build-hip \
     -DCMAKE_CXX_COMPILER=/opt/rocm-6.2.4/bin/hipcc \
+    -DCMAKE_PREFIX_PATH=/opt/rocm-6.2.4 \
     -DCMAKE_BUILD_TYPE=Release \
     -DKokkos_ENABLE_HIP=ON -DKokkos_ENABLE_SERIAL=ON \
     -DKokkos_ARCH_AMD_GFX90A=ON \

@@ -92,7 +92,11 @@ AGGREGATION ?= -DUNIONFIND
 # Requires a HIP-enabled charm (CHARM_HOME=.../reconverse-linux-x86_64-amd);
 # -D__HIP_PLATFORM_AMD__ is what makes hapi.h's hipStream_t prototypes
 # declare under g++ (design/phase1-gpu.md section 11.3 trap 4).
-KOKKOS_DIR ?= /ccs/home/rrao/kokkos
+# $(HOME)/kokkos, NOT a hardcoded home: the earlier default named one
+# user's Frontier home, which nobody else can read, and the failure is a
+# missing-header wall rather than anything that names KOKKOS_DIR
+# (relay16 defect 1). Override on the make line if yours lives elsewhere.
+KOKKOS_DIR ?= $(HOME)/kokkos
 FOF_GPU_PATH = $(FOF_PATH)/gpu
 
 # A HIP-ENABLED charm makes charm++.h pull in <hip/hip_runtime.h>

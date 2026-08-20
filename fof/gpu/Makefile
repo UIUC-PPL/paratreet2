@@ -11,7 +11,9 @@
 #
 # NVIDIA: make HIPCC=$(KOKKOS_DIR)/bin/nvcc_wrapper ARCH_FLAG="-arch=sm_80"
 
-KOKKOS_DIR ?= /ccs/home/rrao/kokkos
+# Must match src/Makefile.common's default (relay16 defect 1: both used to
+# name one user's home).
+KOKKOS_DIR ?= $(HOME)/kokkos
 ROCM_DIR   ?= /opt/rocm-6.2.4
 HIPCC      ?= $(ROCM_DIR)/bin/hipcc
 ARCH       ?= gfx90a
