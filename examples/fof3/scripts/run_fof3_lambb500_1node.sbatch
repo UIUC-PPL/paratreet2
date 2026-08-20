@@ -18,7 +18,7 @@ module load craype-x86-trento libfabric/2.3.1 craype-network-ofi perftools-base/
   cray-dsmml/0.3.0 cray-mpich/8.1.31 cray-libsci/24.11.0 PrgEnv-gnu/8.6.0 \
   darshan-runtime/3.4.6-mpi
 
-export LD_LIBRARY_PATH=/ccs/home/rrao/charm_reconverse/lib:/ccs/home/rrao/charm_reconverse/lci/lib64:/sw/frontier/spack-envs/cpe24.11-cpu/opt/gcc-13.2/darshan-runtime-3.4.6-evo63a663bvwadj3dgv5vwqgwupxnh43/lib:/sw/frontier/spack-envs/core-25.03/opt/gcc-13.2/hwloc-2.11.1-daogniiyv5buyimip5lfgv6i6zawodef/lib:/opt/cray/pe/papi/7.1.0.4/lib64:/opt/cray/libfabric/2.3.1/lib64
+export LD_LIBRARY_PATH=/ccs/home/rrao/charm_reconverse/lib:/sw/frontier/spack-envs/cpe24.11-cpu/opt/gcc-13.2/darshan-runtime-3.4.6-evo63a663bvwadj3dgv5vwqgwupxnh43/lib:/sw/frontier/spack-envs/core-25.03/opt/gcc-13.2/hwloc-2.11.1-daogniiyv5buyimip5lfgv6i6zawodef/lib:/opt/cray/pe/papi/7.1.0.4/lib64:/opt/cray/libfabric/2.3.1/lib64
 
 # Single-node run: single_node_vni (not job_vni, which is multi-node only). Same
 # CXI/LCI fixes as the multi-node sweep otherwise (see run_fof3_2B.sbatch for detail).
