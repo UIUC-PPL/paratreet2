@@ -379,6 +379,112 @@ Specifically:
    memory permits; otherwise rely on stats mode plus the cross-config
    determinism check.
 
+## Runtime options reference (fof3)
+
+Everything tunable at run time, in one place. Two kinds: **command-line
+flags** (parsed by fof3's getopt; `-h`/any bad flag prints the same
+list) and **environment knobs** (read once at first use; `FOF_*` are
+FoF-specific, `PARATREET_*` are framework-level). Defaults are the
+shipped, measured-best values — a plain
+`./FoF3 -f <input> -d oct -u dist` is a correct, near-optimal CPU run;
+the knobs exist for scale tuning, A/B oracles, and diagnostics.
+
+### Command-line flags
+
+| flag | default | meaning |
+|---|---|---|
+| `-b` | 0.2 | linking-length factor; b = factor·(V/N)^(1/3) |
+| `-c` | auto | correctness check: `full` (O(N²) serial oracle), `stats`, `auto` (full below a size gate) |
+| `-u` | dist | UF_2 backend: `dist` (distributed UnionFindLib) or `serial` (gather to PE 0). **`dist` is required whenever the PE-set split is on** — serial's root gather cannot absorb the split's edge inflation (+28% net at 2B, design/phaseab-balancing.md §38) |
+| `-E` | 16 | mid-walk edge-batch size streamed to UF_2 (overlaps phase-3 walk with union-find); `0` = classic post-walk injection (the no-overlap A/B oracle); large values silently never fire (per-PE yield is 266–924 at 2B scales) |
+| `-G` | 4 | phaseA grid occupancy threshold (particles per b/√6 cell) above which a chare is solved by the cell grid instead of the tree walk; `0` = walk-only oracle |
+| `-w` | dual | phase-3 walk: `dual` (requires `-u dist`) or `transposed` (original walk, A/B oracle) |
+| `-m` | 0 | min component size for REPORTING only |
+| `-P` | 0 | periodic box period L (cubic); 0 = open boundaries; requires b < L/2 |
+| `-D` | — | cache share depth override (larger replies, fewer node requests) |
+| `-S` | off | single-distribution mode (no Partition array; requires dual walk) |
+| `-C` | off | skip the post-run cache memory accounting (use in traced runs) |
+| `-g` | off | phase-1 fragments histogram (diagnostic pass over all particles) |
+
+Framework flags (`-f -n -p -l -d -t -i -s`) are listed by the usage
+text; `-d oct` is the FoF configuration.
+
+### Environment knobs — production tuning
+
+| knob | default | meaning |
+|---|---|---|
+| `FOF_PE_SETS` | 1 (off) | PE-set split (§36/§38): sets per process; phaseB pairs crossing a set boundary are deferred to the phase-3 walk. 14 is the measured optimum at 2B on Frontier and Anvil (−15 to −16% Iter0 at 16 nodes, more at 64/128). Requires `-u dist`. Clamped to PEs/process |
+| `FOF_PE_SETS_MODE` | 1 | rank→set mapping: 1 = round-robin (correct: scatters SFC-near pieces across sets, dropping the m2-heavy pairs, −96% phaseB), 0 = blocked (comparison arm; −3% phaseB only — §38 mechanism) |
+| `FOF_PE_SETS_NODES` | all | comma-separated process list to split on (singular `_NODE` also accepted). **Mixed CPU/GPU jobs: list only the CPU processes** — a Replace-mode GPU process with the split active aborts by design (engine contract §3) |
+| `FOF_STEALA` | off | phaseA claim pool: any PE claims any piece by CAS, own-first then nearest-centroid; flattens within-process phaseA skew (1.15–1.5 → ~1.05). Part of the standing recommended config |
+| `FOF_STEALA_GEO` | 1 | claim priority: 1 = nearest-centroid, 0 = scan-order (comparison arm) |
+| `FOF_PB_PARTS` | 0 (off) | KD partitioning of the phaseB pool into N spatial partitions (partition = natural GPU/shipping batch; 16 was the best 2B value) |
+| `FOF_PB_M2KEY` | 1 | LPT-sort the phaseB pool by the m2 expected-pairs estimate |
+| `FOF_PB_SPLIT` | 8 | adaptive tail split: split units costlier than N× the mean |
+| `FOF_PB_MERGE` | off | two-round phaseB (B1/mid-merge/B2 over compressed tips) |
+| `FOF_PHASEB_SLICE_MS` | 0 (off) | phaseB drain slice deadline; the claim loop yields by self-send so the PE stays responsive. 2 ms in the standing config |
+| `FOF_KEEPALIVE` | 1 | keep-alive ring: one raw-Converse message per process per period to its ring successor. Suppresses the LCI idle-stall on InfiniBand (Anvil); fabric-scoped comment in fof/FoF.C. `0` = off (reproduces the raw bug for LCI debugging) |
+| `FOF_KEEPALIVE_MS` | 100 | ring period. 100 = workaround + gap-monitor tripwire; 10 = finer monitor sampling; 1000+ = probe mode (deliberately leaves quiet windows past the ~1 s stall onset — a measurement, no longer a workaround) |
+| `FOF_PROCS_PER_PNODE` | 8 | processes per physical node (block structure for the probe and coordinator layouts) |
+
+### Environment knobs — instruments (all report-only)
+
+| knob | default | meaning |
+|---|---|---|
+| — | always on | `FOF3STAT keepalive_gaps`: per-process ring-message inter-arrival vs inter-send gap deviations (over 5/10/25/100 ms + max). Arrival jitter WITHOUT matching send jitter = delivery delay, no tracing needed. Compare within a job only |
+| `FOF_STAGE_DUMP` | off | per-PE phaseA line: pieces held, self and cross seconds |
+| `FOF_PROBE` / `FOF_PROBE_MS` | off / 25 | responsiveness probe: block coordinator pings every sibling; RTTs measure whether busy processes attend to messages |
+| `PARATREET_LB_SELF_EXP` | 1.2 | self-term exponent of the printLoadModel proxy (`FOF3STAT load_model`) |
+
+Walk-work counters (edges, leaf visits, prunes) are placement- and
+race-dependent: they drift 0.1–0.3% between jobs at identical code —
+regression signals **within** a job only (relay15).
+
+### Environment knobs — A/B oracles and debug
+
+`FOF_TIP_ANNOTATE=0` (disable frozen-tip uniformity shortcuts),
+`FOF_GRID_ROOT_ONLY=1`, `FOF_POOL_DEPTH` (default 2),
+`FOF_POOL_SPLIT_SIZE`, `FOF_SLICE_MIN_BYTES` (1 MB),
+`FOF_EDGE_CHECK` / `FOF_EDGE_DUMP`, `FOF_WALK_QD`,
+`PARATREET_FLUSH_WINDOW` (reader flush windowing),
+`FOF_KEEPALIVE_VERBOSE=1` (ring tick diagnostics). Each is documented
+at its `getenv` site; none belongs in a production run.
+
+### Environment knobs — GPU arm (needs a `GPU=1` build; see above)
+
+| knob | default | meaning |
+|---|---|---|
+| `PARATREET_DEVICE_TREE` | off | emit the flat device tree at tree build — **required** for any GPU mode (`_VERIFY=1` adds the device-side check) |
+| `FOF_GPU_PHASE1` | off | Replace mode: phase 1 entirely on the device. A CPU-only binary refuses it (no silent fallback); a split-configured process refuses it (engine contract §3) |
+| `FOF_GPU_VERIFY` | off | Verify mode: device runs alongside the CPU chain and mismatches abort (`FOF_GPU_STAGE0` is the historical spelling) |
+| `FOF_GPU_ASYNC`, `FOF_GPU_GRID`, `FOF_GPU_WALK` | off/0 | launch and walk-shape controls (design/phase1-gpu.md) |
+| `FOF_GPU_RELEASE`, `FOF_COUNT_VERIFY` | off | measurement-mode changers — do not enable in timed runs |
+
+### Recommended configurations (2026-08)
+
+CPU cluster run (the §36/§38-validated config; −15 to −30% Iter0
+depending on scale):
+
+```sh
+FOF_PE_SETS=14 FOF_STEALA=1 FOF_PB_PARTS=16 FOF_PHASEB_SLICE_MS=2 \
+  ./FoF3 -f <input> -d oct -u dist -c stats -l 128
+# Frontier: +ppn 14 +lci_ndevices 7 +backend_poll_thread 2
+```
+
+GPU run (Frontier, device phase 1):
+
+```sh
+PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1 \
+  ./FoF3 -f <input> -d oct -u dist -c stats -l 128
+# +ppn 7 +lci_ndevices 7 +backend_poll_thread 1 (one thread per domain;
+#  ndevices x processes/node must stay near 56 — 112 fails libfabric
+#  memory registration). ppn 7 beat ppn 14 by ~13% at 16 nodes
+#  (design/gpu-merge-plan.md section C).
+```
+
+Mixed jobs: add `FOF_PE_SETS_NODES=<CPU process list>` so GPU
+processes stay at sets=1.
+
 ## Tracing with Projections
 
 Charm++ ships two performance-tracing back ends, both **off by default** in

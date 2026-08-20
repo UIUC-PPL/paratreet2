@@ -133,7 +133,7 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t-P [periodic box period L (cubic, all axes); default 0 = off\n");
           CkPrintf("\t    (open boundaries). Minimum-image PBC; requires b < L/2]\n");
           CkPrintf("\t-E [UF_2 mid-walk edge-batch size; 0 = classic post-walk\n");
-          CkPrintf("\t    injection (A/B oracle); default 4096]\n");
+          CkPrintf("\t    injection (A/B oracle); default 16]\n");
           CkPrintf("\t-w [phase-3 walk: dual (default; requires -u dist),\n");
           CkPrintf("\t    transposed (original walk, kept as the A/B oracle)]\n");
           CkPrintf("\t-G [phaseA grid occupancy threshold; a chare denser than\n");
