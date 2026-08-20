@@ -413,16 +413,16 @@ text; `-d oct` is the FoF configuration.
 
 | knob | default | meaning |
 |---|---|---|
-| `FOF_PE_SETS` | 1 (off) | PE-set split (§36/§38): sets per process; phaseB pairs crossing a set boundary are deferred to the phase-3 walk. 14 is the measured optimum at 2B on Frontier and Anvil (−15 to −16% Iter0 at 16 nodes, more at 64/128). Requires `-u dist`. Clamped to PEs/process |
+| `FOF_PE_SETS` | AUTO | PE-set split (§36/§38): sets per process; phaseB pairs crossing a set boundary are deferred to the phase-3 walk. AUTO = one set per PE (equals the measured 2B optimum, s=14 at ppn 14, on Frontier and Anvil: −15 to −16% Iter0 at 16 nodes, more at 64/128) — except under any GPU mode, where AUTO resolves to 1 (engine contract §3). `1` = off; explicit values win and are clamped to PEs/process. Effectively requires `-u dist` (serial stays exact but is a net loss at scale — the app warns). AUTO at shapes other than ppn 14 is on the measurement list |
 | `FOF_PE_SETS_MODE` | 1 | rank→set mapping: 1 = round-robin (correct: scatters SFC-near pieces across sets, dropping the m2-heavy pairs, −96% phaseB), 0 = blocked (comparison arm; −3% phaseB only — §38 mechanism) |
 | `FOF_PE_SETS_NODES` | all | comma-separated process list to split on (singular `_NODE` also accepted). **Mixed CPU/GPU jobs: list only the CPU processes** — a Replace-mode GPU process with the split active aborts by design (engine contract §3) |
-| `FOF_STEALA` | off | phaseA claim pool: any PE claims any piece by CAS, own-first then nearest-centroid; flattens within-process phaseA skew (1.15–1.5 → ~1.05). Part of the standing recommended config |
+| `FOF_STEALA` | 1 | phaseA claim pool: any PE claims any piece by CAS, own-first then nearest-centroid; flattens within-process phaseA skew (1.15–1.5 → ~1.05). `0` = static owner assignment (comparison arm) |
 | `FOF_STEALA_GEO` | 1 | claim priority: 1 = nearest-centroid, 0 = scan-order (comparison arm) |
-| `FOF_PB_PARTS` | 0 (off) | KD partitioning of the phaseB pool into N spatial partitions (partition = natural GPU/shipping batch; 16 was the best 2B value) |
+| `FOF_PB_PARTS` | 16 | KD partitioning of the phaseB pool into N spatial partitions (partition = natural GPU/batch unit; 16 = best 2B value). `0` = off. Rarely engages under the AUTO split (pool near-empty); matters when sets are reduced or scoped |
 | `FOF_PB_M2KEY` | 1 | LPT-sort the phaseB pool by the m2 expected-pairs estimate |
 | `FOF_PB_SPLIT` | 8 | adaptive tail split: split units costlier than N× the mean |
 | `FOF_PB_MERGE` | off | two-round phaseB (B1/mid-merge/B2 over compressed tips) |
-| `FOF_PHASEB_SLICE_MS` | 0 (off) | phaseB drain slice deadline; the claim loop yields by self-send so the PE stays responsive. 2 ms in the standing config |
+| `FOF_PHASEB_SLICE_MS` | 2 | phaseB drain slice deadline; the claim loop yields by self-send so the PE stays responsive. `0` = drain in one call (pre-campaign behavior); the 2 ms default is provisional (Kale, 2026-08-20) |
 | `FOF_KEEPALIVE` | 1 | keep-alive ring: one raw-Converse message per process per period to its ring successor. Suppresses the LCI idle-stall on InfiniBand (Anvil); fabric-scoped comment in fof/FoF.C. `0` = off (reproduces the raw bug for LCI debugging) |
 | `FOF_KEEPALIVE_MS` | 100 | ring period. 100 = workaround + gap-monitor tripwire; 10 = finer monitor sampling; 1000+ = probe mode (deliberately leaves quiet windows past the ~1 s stall onset — a measurement, no longer a workaround) |
 | `FOF_PROCS_PER_PNODE` | 8 | processes per physical node (block structure for the probe and coordinator layouts) |
@@ -462,16 +462,19 @@ at its `getenv` site; none belongs in a production run.
 
 ### Recommended configurations (2026-08)
 
-CPU cluster run (the §36/§38-validated config; −15 to −30% Iter0
-depending on scale):
+CPU cluster run — **the defaults ARE the recommended config** as of
+2026-08-20 (split AUTO, STEALA on, PARTS 16, SLICE 2; the
+§36/§38-validated settings; −15 to −30% Iter0 depending on scale):
 
 ```sh
-FOF_PE_SETS=14 FOF_STEALA=1 FOF_PB_PARTS=16 FOF_PHASEB_SLICE_MS=2 \
-  ./FoF3 -f <input> -d oct -u dist -c stats -l 128
+./FoF3 -f <input> -d oct -u dist -c stats -l 128
 # Frontier: +ppn 14 +lci_ndevices 7 +backend_poll_thread 2
+# A/B against the pre-campaign behaviour: FOF_PE_SETS=1 FOF_STEALA=0 \
+#   FOF_PB_PARTS=0 FOF_PHASEB_SLICE_MS=0
 ```
 
-GPU run (Frontier, device phase 1):
+GPU run (Frontier, device phase 1; `FOF_GPU_PHASE1` makes the split
+default resolve to sets=1 automatically):
 
 ```sh
 PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1 \

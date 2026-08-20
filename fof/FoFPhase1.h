@@ -1239,7 +1239,11 @@ public:
   static bool stealA() {
     static const bool on = [] {
       const char* e = std::getenv("FOF_STEALA");
-      return e && std::atoi(e) != 0;
+      // Default ON (Kale 2026-08-20): part of the standing recommended
+      // config; flattens within-process phaseA skew (1.15-1.5 -> ~1.05)
+      // and was neutral-to-good on every machine measured. =0 restores
+      // the static owner assignment (the comparison arm).
+      return !e || std::atoi(e) != 0;
     }();
     return on;
   }
@@ -1657,7 +1661,9 @@ public:
   static double sliceSeconds() {
     static const double s = [] {
       const char* e = std::getenv("FOF_PHASEB_SLICE_MS");
-      return e ? std::atof(e) / 1e3 : 0.0;
+      // Default 2 ms (Kale 2026-08-20, provisionally): the standing
+      // recommended config's value; 0 restores drain-in-one-call.
+      return e ? std::atof(e) / 1e3 : 2e-3;
     }();
     return s;
   }
@@ -2789,7 +2795,14 @@ public:
       // a cost, a claim flag, and a unit cursor.
       static const int kparts = [] {
         const char* e = std::getenv("FOF_PB_PARTS");
-        return e ? std::atoi(e) : 0;
+        // Default 16 (Kale 2026-08-20): the best 2B value from the
+        // campaign; partitions are the natural GPU/batch unit and the KD
+        // split degrades gracefully on small pools (spans <= 1 close
+        // out; empty ranges are skipped by the drain cursors). =0 turns
+        // partitioning off. NOTE: under the AUTO PE-set default
+        // (sets = ppn) the phaseB pool is near-empty and this rarely
+        // engages; it matters when sets are reduced or scoped.
+        return e ? std::atoi(e) : 16;
       }();
       static const bool pbmerge = [] {
         const char* e = std::getenv("FOF_PB_MERGE");

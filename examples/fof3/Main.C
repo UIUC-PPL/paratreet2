@@ -172,6 +172,15 @@ PARATREET_REGISTER_MAIN(ExMain);
                "dual distribution for this run\n");
       single_distribution = false;
     }
+    // The PE-set split now defaults ON (AUTO = one set per PE). It stays
+    // EXACT under -u serial, but serial's root gather cannot absorb the
+    // split's edge inflation: at 2B it is a net loss against no split at
+    // all (+28%, design/phaseab-balancing.md section 38). Warn rather
+    // than abort — small serial runs (gates, oracles) are fine.
+    if (uf2_mode == UF2Mode::Serial && paratreet::peSetsHere() > 1)
+      CkPrintf("Note: PE-set split active (%d sets) with -u serial — exact "
+               "but slow at scale; set FOF_PE_SETS=1 for serial runs\n",
+               paratreet::peSetsHere());
     conf.single_distribution = single_distribution;
 
     CkPrintf("\n[PARATREET FOF PHASE 3]\n");

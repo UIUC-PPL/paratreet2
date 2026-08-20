@@ -85,10 +85,33 @@ inline long procHighWaterMB() {
 //     sets and drops the expensive pairs (-96%). Section 38 of
 //     design/phaseab-balancing.md; blocked stays reachable as the
 //     comparison arm via FOF_PE_SETS_MODE=0.
+// -1 = AUTO (the default, Kale 2026-08-20): resolve to PEs-per-process in
+// peSetsHere() — the measured optimum at 2B on Frontier and Anvil (s=14 at
+// ppn 14; sets == ppn defers ALL cross-PE pairs to the phase-3 walk) —
+// UNLESS a GPU mode is requested, where the engine contract (section 3)
+// requires the sets=1 state on device processes: the device engine covers
+// every intra-process pair itself, and in Verify mode a split CPU chain
+// would legitimately disagree with the device. The GPU sensing is by env
+// here (not fofGpuMode()) because common.h is framework-level and the fof
+// module is not visible; the envs are process-global so every process
+// resolves identically. Explicit FOF_PE_SETS always wins (and a Replace-
+// mode process with an explicit split still aborts, by the guard in
+// deviceLaunch). AUTO at shapes other than ppn 14 is on the measurement
+// list (design/gpu-merge-plan.md section D).
 inline int peSets() {
   static const int v = [] {
     const char* e = std::getenv("FOF_PE_SETS");
-    int x = e ? std::atoi(e) : 1;
+    if (!e) {
+      auto on = [](const char* n) {
+        const char* v = std::getenv(n);
+        return v != nullptr && std::atoi(v) != 0;
+      };
+      if (on("FOF_GPU_PHASE1") || on("FOF_GPU_VERIFY") ||
+          on("FOF_GPU_STAGE0"))
+        return 1;
+      return -1;
+    }
+    int x = std::atoi(e);
     return x >= 1 ? x : 1;
   }();
   return v;
@@ -107,8 +130,8 @@ inline int peSetsMode() {
 // tail is broad; top-1 holds 5.4% of the work, top-25 holds 48.8%).
 // FOF_PE_SETS_NODE (singular) is kept for the earlier single-victim runs.
 inline int peSetsHere() {
-  const int s = peSets();
-  if (s <= 1) return 1;
+  const int s0 = peSets();
+  if (s0 == 1) return 1;
   static const bool scoped = [] {
     return std::getenv("FOF_PE_SETS_NODE") || std::getenv("FOF_PE_SETS_NODES");
   }();
@@ -131,6 +154,7 @@ inline int peSetsHere() {
     if (!mine) return 1;
   }
   const int n = CkNodeSize(CkMyNode());
+  const int s = (s0 == -1) ? n : s0;   // AUTO: one set per PE
   return s > n ? n : s;
 }
 inline int peSetOfPe(int pe) {

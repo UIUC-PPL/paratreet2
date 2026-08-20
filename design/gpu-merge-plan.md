@@ -127,6 +127,10 @@ unchanged (ppn 14 / ndev 7 / poll 2).
   10-60 ms poller gaps — reconverse scheduler question either way,
   candidate upstream issue.
 - ppn-7 GPU advantage at more node counts; CPU ppn A/B if wanted.
+- The AUTO PE-set default (sets = PEs/process, 2026-08-20) at shapes
+  other than ppn 14 — measured only at s=14/ppn 14; one sweep arm per
+  new shape confirms or retunes it. Also the provisional
+  FOF_PHASEB_SLICE_MS=2 default (Kale unsure, kept for now).
 - The 08-14 GPU node sweep rerun at ppn 7 if the advantage holds.
 
 ## E. Execution record (2026-08-20)
