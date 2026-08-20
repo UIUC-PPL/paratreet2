@@ -228,9 +228,12 @@ own "-i 2 with iteration-1 readout" rule.
 - NOT DONE: the classic-charm arm (no classic build on this machine), the
   mixed CPU/GPU job, and `-i 2` iteration-1 timing readouts.
 
-**B5 — NOT DONE.** Every gate that can run on this machine is green; held
-for a decision, since two of the plan's own gates did not run and the
-first-parent commit is supposed to name the outcome.
+**B5 — DONE.** `60e67ea`, `--no-ff` into main, first-parent. The merged
+tree differs from the gated branch tip by this file alone, so what is on
+main is what the gates above ran against. Merged with two of the plan's own
+gates unrun (classic-charm arm, mixed job), which the merge commit says in
+as many words rather than leaving to be rediscovered. Not pushed:
+`origin/main` is 16 behind.
 
 **C (launch shape).** The plan's recommended GPU default — ppn 7 / ndev 7 /
 poll 1 — was measured at 16 nodes on 08-19, job 5310026 against 5307458
