@@ -77,7 +77,14 @@ inline long procHighWaterMB() {
 //
 //   FOF_PE_SETS=s        sets per process (1 = off, the default)
 //   FOF_PE_SETS_NODE=n   apply only on process n (unset = every process)
-//   FOF_PE_SETS_MODE=0|1 0 = blocked, 1 = round robin (measured better)
+//   FOF_PE_SETS_MODE=0|1 0 = blocked, 1 = round robin (the default).
+//     Round-robin is load-bearing, not a tie-break: pieces are
+//     SFC-ordered across ranks, so BLOCKED sets keep spatially-near
+//     (m2-heavy) pairs same-set and phaseB barely shrinks (-3% at 2B,
+//     Anvil job 20025733), while round-robin scatters neighbours across
+//     sets and drops the expensive pairs (-96%). Section 38 of
+//     design/phaseab-balancing.md; blocked stays reachable as the
+//     comparison arm via FOF_PE_SETS_MODE=0.
 inline int peSets() {
   static const int v = [] {
     const char* e = std::getenv("FOF_PE_SETS");
@@ -89,7 +96,7 @@ inline int peSets() {
 inline int peSetsMode() {
   static const int v = [] {
     const char* e = std::getenv("FOF_PE_SETS_MODE");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : 1;
   }();
   return v;
 }
