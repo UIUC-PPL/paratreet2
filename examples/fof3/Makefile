@@ -2,20 +2,25 @@ include ../../src/Makefile.common
 
 LBS = CommonLBs PrefixLB OrbLB
 LB_LIBS = $(foreach m, $(LBS), -module $(m))
-OPTS = -g -O3 $(INCLUDES) $(FOF_INCLUDES) -DCOUNT_INTERACTIONS=0 -DDEBUG=0 $(MAKE_OPTS)
+OPTS = -g -O3 $(INCLUDES) $(FOF_INCLUDES) -DCOUNT_INTERACTIONS=0 -DDEBUG=0 $(GPU_OPTS) $(MAKE_OPTS)
 CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 
 all: FoF3
 # FragData/FoFPhase3 live in the fof module; track them explicitly since
 # Makefile.common only adds -I flags, not header dependencies.
-DATA = $(FOF_PATH)/FoFData.h $(FOF_PATH)/FoFPhase3.h $(FOF_PATH)/FoFPhase1.h
+# FoFPhase1.h was MISSING here until 2026-08-12: Main.h includes it, so a
+# change to phase 1 did not rebuild Main.o and the link silently kept a
+# stale instantiation of the templated chare (this cost a job when the
+# GPU tree-upload stage appeared to do nothing at all). Any fof header
+# reachable from Main.h belongs in this list.
+DATA = $(FOF_PATH)/FoFData.h $(FOF_PATH)/FoFPhase1.h $(FOF_PATH)/FoFPhase3.h
 VISITORS = FragCheckVisitor.h
 
 Main.decl.h: Main.ci $(DATA)
 	$(CHARMC) $<
 
-FoF3: Main.decl.h Main.o FoF3.o $(PARATREET_PATH)/libparatreet.a $(FOF_PATH)/libfof.a $(TRACE_STAMP)
-	$(CHARMC) -language charm++ -module CommonLBs -o FoF3 FoF3.o Main.o $(TRACE_FLAGS) $(FOF_LD_LIBS) $(LD_LIBS)
+FoF3: Main.decl.h Main.o FoF3.o $(PARATREET_PATH)/libparatreet.a $(FOF_PATH)/libfof.a $(FOF_GPU_LIB) $(TRACE_STAMP)
+	$(CHARMC) -language charm++ -module CommonLBs -o FoF3 FoF3.o Main.o $(TRACE_FLAGS) $(FOF_LD_LIBS) $(FOF_GPU_LD_LIBS) $(LD_LIBS)
 
 FoF3.o: FoF3.C Main.h $(VISITORS) $(DATA) Main.decl.h
 	$(CHARMC) -c $<

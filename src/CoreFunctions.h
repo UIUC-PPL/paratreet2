@@ -9,6 +9,8 @@ struct Particle;
 template<typename T>
 class Node;
 
+namespace paratreet { struct DNode; }  // src/DeviceTree.h; pointer only here
+
 template<typename T>
 class Partition;
 
@@ -69,6 +71,17 @@ namespace paratreet {
         virtual void pup(PUP::er &p) override { PUP::able::pup(p); }
 
         virtual void operator()(Node<T>* local_root, Particle* particles, int n_particles) = 0;
+
+        // Flat-tree-aware form (src/DeviceTree.h). Additive: the default
+        // forwards to the 3-arg operator above, so every existing
+        // PerTreePieceAble keeps compiling and behaving identically and
+        // only clients that want the flat tree override this one.
+        virtual void operator()(Node<T>* local_root, Particle* particles,
+                                int n_particles, const paratreet::DNode* dnodes,
+                                int n_dnodes) {
+          (void)dnodes; (void)n_dnodes;
+          (*this)(local_root, particles, n_particles);
+        }
     };
 }
 

@@ -91,6 +91,34 @@ using namespace paratreet;
              "phaseA %.3f phaseB %.3f merge %.3f relabel %.3f\n",
              p1s.reset, p1s.register_s, p1s.phaseA, p1s.phaseB, p1s.merge,
              p1s.relabel);
+    // Device stages (design/phase1-gpu.md section 18). Printed only when
+    // the device ran, and printed SEPARATELY rather than folded into the
+    // line above: in replace mode the four CPU stages are legitimately
+    // zero, and reporting the device pass as "phaseA" would hide which arm
+    // produced the answer.
+    if (p1s.device_wall > 0) {
+      CkPrintf("FOF3STAT time_s: phase1_device wall %.3f pack %.3f tree %.3f "
+               "pass %.3f blocking %.3f scatter %.3f\n",
+               p1s.device_wall, p1s.device_pack, p1s.device_tree,
+               p1s.device_pass, p1s.device_block, p1s.device_scatter);
+      // The serial home-PE prologue: one PE does this while every other
+      // PE in the process waits, and it sits inside `wall` but outside
+      // every stage on the line above. `other` is the part of the
+      // prologue the three parts do not account for, and is a valid
+      // subtraction because all four are measured on the same PE --
+      // `wall` is NOT, being one driving thread's wall against maxima
+      // taken over all 896 PEs.
+      CkPrintf("FOF3STAT time_s: phase1_devinit prologue %.3f init %.3f "
+               "alloc %.3f plan %.3f other %.3f warmup_offpath %.3f\n",
+               p1s.device_prologue, p1s.device_init, p1s.device_alloc,
+               p1s.device_plan,
+               p1s.device_prologue - p1s.device_init - p1s.device_alloc -
+                   p1s.device_plan,
+               // Not part of `prologue`: this is the context creation done
+               // during the input read. When it is nonzero, `init` should be
+               // ~0 -- that pair is how you tell the hoist actually took.
+               p1s.device_warmup);
+    }
 
     // Step 4 (-u dist; design/step4.md "Tip encoding" as revised by
     // design/sparse-uf2-encoding.md): rewrite every tip to the

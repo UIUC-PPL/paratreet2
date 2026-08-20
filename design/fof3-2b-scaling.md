@@ -1,4 +1,382 @@
-# FoF3 2B-particle node-count scaling (2026-08-10, `uniform-annotation` branch, HEAD `16fd529`)
+# FoF3 2B-particle node-count scaling: CPU chain vs device phase 1 (2026-08-14)
+
+Cosmo25 dataset (`cosmo25cmb.768g2_dm.001024`, N = 1,981,808,640
+particles), OctDecomp, `-u dist`, `-c stats`, b_factor 0.2, 8
+processes/node, 14 PEs/process, **one GPU per process** (8 MI250X GCDs
+per node, the enforced invariant of design/phase1-gpu.md section 2).
+Frontier, LCI/CXI `reconverse` backend, `job_vni` + `cray_shasta`,
+`+lci_ndevices 7`, `+backend_poll_thread 2`.
+
+This is the first node-count sweep of the DEVICE phase-1 path
+(design/phase1-gpu.md section 18: `FOF_GPU_PHASE1=1`, which skips
+phaseA + phaseB + merge + relabel entirely and produces the labels on the
+GPU). Three arms at every node count, same build, same day, same input:
+
+| arm | phase 1 | tree |
+|---|---|---|
+| `cpu_l12` | the CPU chain; `PARATREET_DEVICE_TREE=0`, so no flat-tree emit either | leaf 12 |
+| `replace_l12` | the device path on the SAME tree — apples to apples | leaf 12 |
+| `replace_l128` | the device path on the tree it prefers (section 16) | leaf 128 |
+
+Script: `examples/fof3/scripts/run_fof3_scale_gpu.sbatch`, driven by
+`submit_scale_gpu.sh`. One parameterised script rather than five copies,
+because the body has to stay identical across the sweep for the sweep to
+mean anything.
+
+**Every arm is `-i 2` and the tables below report ITERATION 1.** Iteration
+0 of a device arm additionally pays one-time Kokkos/HIP initialization
+and the first pinned allocation inside phase 1 — 1.986 s vs 1.059 s at 8
+nodes, 1.045 s vs 0.260 s at 128 — so a single-iteration sweep reports
+the device path's startup as its per-iteration cost. Every device
+measurement in design/phase1-gpu.md sections 11-17 was single-iteration
+and carries it. Iteration-0 numbers are in section 6 for comparison with
+the prior CPU sweep (Appendix A), which reported iteration 0.
+
+Loading/decomposition time is excluded throughout (I/O-bound) — all
+phases from tree build onward.
+
+Job IDs: 8n=5264070, 16n=5264095, 32n=5264116, 64n=5264135, 128n=5264075.
+
+## 1. Correctness
+
+**424,897,832 components, max component 185,317,566, identical in every
+arm at every node count** — 27 log2 histogram bins agreeing digit for
+digit across 26 arm-iterations, and unchanged from every prior sweep
+including the 2026-08-10 CPU-only one.
+
+That is a stronger statement than a repeated number. The `replace_l128`
+arms use a different tree from the CPU baseline: different leaf sets,
+different traversal order, different certificate and suppression
+sequences, and — through the section-16 auto-selection — a different
+GPU kernel shape. All of it lands on the same answer.
+
+The 16-node job additionally ran a `verify_l12` arm, which runs BOTH the
+CPU chain and the device pass and compares every particle's label:
+**0 mismatches over 1,981,808,640 particles and 128 processes**, with
+`FOF_COUNT_VERIFY=1` also checking the representative structure against a
+recount from the particles on every PE.
+
+`FOF_COUNT_VERIFY` is deliberately OFF in the timed arms: it rehashes
+every particle inside `depositLabelCounts`, which lands in the
+`component_histogram` column this sweep is measuring.
+
+## 2. Top-line scaling (iteration 1, seconds)
+
+| Nodes | PEs | cpu_l12 phase 1 | replace_l128 phase 1 | speedup | cpu_l12 iteration | replace_l128 iteration | speedup |
+|------:|------:|------:|------:|------:|------:|------:|------:|
+| 8   | 896   | 8.516 | 1.059 | **8.0x** | 13.360 | 6.843 | **1.95x** |
+| 16  | 1792  | 5.342 | 0.669 | **8.0x** | 8.268  | 4.984 | **1.66x** |
+| 32  | 3584  | 4.419 | 0.391 | **11.3x** | 6.502 | 4.205 | **1.55x** |
+| 64  | 7168  | 3.329 | 0.326 | **10.2x** | 5.332 | 4.008 | **1.33x** |
+| 128 | 14336 | 2.714 | 0.260 | **10.4x** | 5.849 | 5.883 | **0.99x** |
+
+**Phase 1 is 8-11x faster at every scale. The application speedup shrinks
+monotonically from 1.95x to parity as node count grows** (1.95, 1.66,
+1.55, 1.33, 0.99). Both facts matter and the second is the one to act on.
+
+## 3. Why phase 1 wins, and why the CPU chain stops scaling
+
+The CPU chain's own breakdown says it (seconds, `cpu_l12`, iteration 1):
+
+| Nodes | phaseA | phaseB | merge | relabel | phaseB as % of CPU phase 1 |
+|------:|-------:|-------:|------:|--------:|------:|
+| 8   | 5.514 | 2.884 | 0.015 | 0.142 | 34% |
+| 16  | 2.345 | 2.935 | 0.011 | 0.111 | 55% |
+| 32  | 1.097 | 3.417 | 0.008 | 0.058 | 75% |
+| 64  | 0.564 | 2.901 | 0.006 | 0.029 | 83% |
+| 128 | 0.268 | 2.513 | 0.004 | 0.014 | **93%** |
+
+**phaseA scales 20.6x over 16x the nodes. phaseB does not scale at all**
+— 2.9 s at 8 nodes, 2.5 s at 128 — because it is cross-PE boundary work
+whose cost tracks the number of PE pairs, not the number of particles.
+By 128 nodes it is 93% of CPU phase 1, and the CPU chain has stopped
+scaling with it.
+
+The device path **does not have a phaseB**. Making the process rather
+than the PE the unit of union-find deletes the phase outright
+(design/phase1-gpu.md section 5), so the device arm carries no term that
+grows with concurrency:
+
+| Nodes | device wall | pack | tree | GPU pass | scatter |
+|------:|------:|------:|------:|------:|------:|
+| 8   | 0.953 | 0.321 | 0.042 | 0.449 | 0.394 |
+| 16  | 0.548 | 0.174 | 0.033 | 0.306 | 0.200 |
+| 32  | 0.308 | 0.089 | 0.021 | 0.193 | 0.103 |
+| 64  | 0.204 | 0.040 | 0.004 | 0.110 | 0.061 |
+| 128 | 0.132 | 0.033 | 0.033 | 0.068 | 0.034 |
+
+Every column scales. The device phase-1 wall drops 7.2x over 16x the
+nodes (45% parallel efficiency) against the CPU chain's 3.1x (20%). This
+is the structural bet of design/phase1-gpu.md section 1, measured across
+the whole sweep rather than at a single point.
+
+## 4. Why the application speedup shrinks: a downstream regression that grows
+
+Apples to apples — `cpu_l12` vs `replace_l12`, the SAME tree, the same
+labels, provably the same phase-3 work — every communication-bound phase
+after phase 1 is slower on the device arm, and the gap grows with node
+count (seconds, iteration 1):
+
+| Nodes | upwardPass | loadCache | phase3 walk | uf2 | downstream total | phase-1 saving | net |
+|------:|------:|------:|------:|------:|------:|------:|------:|
+| 8   | 0.663 -> 0.826 | 0.022 -> 0.036 | 0.513 -> 0.712 | 0.494 -> 1.048 | **+0.93** | 7.14 | +6.21 |
+| 16  | 0.353 -> 0.503 | 0.046 -> 0.096 | 0.378 -> 0.569 | 0.542 -> 0.785 | **+0.63** | 4.52 | +3.88 |
+| 32  | 0.215 -> 0.332 | 0.118 -> 0.218 | 0.324 -> 0.595 | 0.527 -> 0.793 | **+0.75** | 3.95 | +3.19 |
+| 64  | 0.190 -> 0.313 | 0.309 -> 0.452 | 0.231 -> 0.382 | 0.583 -> 0.849 | **+0.68** | 2.98 | +2.29 |
+| 128 | 0.242 -> 0.484 | 1.180 -> 1.482 | 0.189 -> 0.392 | 0.712 -> 1.715 | **+1.75** | 2.41 | **+0.66** |
+
+(All columns `cpu_l12 -> replace_l12`, so the trees, the labels and the
+phase-3 work are identical and only phase 1's implementation differs.)
+
+Ratios sit between 1.4x and 2.4x, at every scale, in every column. Set
+the penalty against what phase 1 saves — 7.14 s at 8 nodes falling to
+2.41 s at 128 — and the whole shape of the top-line table follows: **the
+saving shrinks as the CPU chain scales down, the penalty roughly doubles
+into 128 nodes, and what is left cancels.** The measured whole-iteration
+deltas track the `net` column (4.31, 2.42, 2.09, 1.38, -0.63 s); the
+residual is tree build, which the flat-tree emit makes more expensive at
+leaf 12 and free at leaf 128.
+
+This is design/phase1-gpu.md section 17.3's unexplained phase-3
+regression, and the sweep says three things about it that a single node
+count could not:
+
+1. **It is not the shadow.** Section 17.3 measured it while the device
+   pass ran BESIDE the CPU chain. The CPU chain is gone here and it is
+   still there, at the same ratio.
+2. **It is not memory capacity.** Section 18.9 already showed
+   `FOF_GPU_RELEASE=1` (freeing the ~600 MB of pinned staging after the
+   scatter) moves phase 3 by 12 ms while costing ~100 ms per iteration in
+   re-allocation. And it is not `hapiPollEvents`, eliminated by reading
+   in section 18.4.
+3. **It is communication.** Every regressed column — `upwardPass`,
+   `loadCache`, the phase-3 walk, `uf2` — is message-bound, and the two
+   phases that are not (`tip_encode`, `component_histogram`) move far
+   less. The regression also grows with the node count, which is what a
+   network effect does and what a per-process memory effect does not.
+
+The working hypothesis is therefore an interaction between the HIP
+context's device-memory registrations and libfabric's CXI memory
+registration cache (`FI_MR_CACHE_MONITOR=userfaultfd`), on nodes running
+8 processes that each pin hundreds of megabytes. **That is a hypothesis,
+not a finding.** The test that would separate "having a GPU bound" from
+"having used it" is a run that initializes the device and never launches
+anything; the Projections traces below are the other half of the tool.
+
+Note also that phase-3 cost is tree-dependent: `replace_l128`'s coarse
+tree makes phase 1 cheaper and the phase-3 walk more expensive (0.497 vs
+0.392 s at 128 nodes), so the l12/l128 choice is a phase-1/phase-3
+trade, not a free win. At 64 nodes `replace_l12` is marginally the better
+whole-iteration configuration (3.952 vs 4.008 s).
+
+`loadCache` anti-scales in BOTH arms (0.022 -> 1.180 s on the CPU arm
+alone), exactly as in every prior sweep. That is a pre-existing property
+of the starter-pack broadcast, not something the device path introduced,
+and by 128 nodes it is the single largest term in the iteration.
+
+## 5. Projections traces (16 nodes)
+
+Two traced arms, in the 16-node job only, matching the CPU sweep's
+convention exactly: the binary is linked with `-tracemode projections` at
+every node count (`make GPU=1 PROJECTIONS=1`) and every other arm runs
+`+traceoff`, so the tracing-linked-but-disabled overhead is identical on
+both sides of every comparison in this document.
+
+| arm | traceroot | files | size |
+|---|---|---|---|
+| `traced_cpu_l12` | `.../scale_gpu_5264095/traced_cpu_l12` | 1794 | 2.7 GB |
+| `traced_replace_l128` | `.../scale_gpu_5264095/traced_replace_l128` | 1794 | 2.5 GB |
+
+1792 PE logs plus `.sts` and `.projrc` in each; gzip-verified. Under
+`/lustre/orion/csc710/scratch/rrao/fof3_traces/scale_gpu_5264095/`, on
+Lustre rather than the example directory — 1792 PEs of logs is not a
+thing to point at a home filesystem.
+
+**Both arms are traced, not just the device one.** The open question
+these traces exist to answer is section 4's regression, and a single
+timeline cannot show a difference: it needs the device-free timeline to
+diff against. The two arms differ only in whether phase 1 ran on the GPU,
+and they produce identical labels, so any divergence after phase 1 is the
+effect and not the work.
+
+`+logsize` is 20,000,000 rather than the CPU sweep's 100,000,000.
+`LogPool` `reserve()`s the pool up front, and at 112 PEs per node 100M
+entries reserves ~900 GB of address space per node against 512 GB of RAM
+— survivable only because `reserve()` commits nothing until written.
+Measured usage is ~1.5 MB compressed per PE. `logsize` changes buffering,
+never trace CONTENT, so it costs nothing in comparability.
+
+Timings from the traced arms are close to their untraced twins — traced
+`cpu_l12` iteration 0 is 8.699 s against 8.562 s untraced, traced
+`replace_l128` is 5.374 s against 5.663 s (i.e. the traced arm came out
+FASTER, which is the size of the run-to-run noise) — but they should not
+be quoted as the sweep's numbers.
+
+## 6. Iteration 0, for comparison with the prior sweep
+
+Appendix A reports iteration 0. These are the matching rows (seconds):
+
+| Nodes | cpu_l12 iter 0 | replace_l128 iter 0 | cpu phase 1 | replace phase 1 |
+|------:|------:|------:|------:|------:|
+| 8   | 14.074 | 8.199 | 8.588 | 1.986 |
+| 16  | 8.562  | 5.663 | 5.378 | 1.426 |
+| 32  | 6.724  | 4.739 | 4.478 | 1.065 |
+| 64  | 5.375  | 4.534 | 3.341 | 0.934 |
+| 128 | 5.787  | 6.331 | 2.715 | 1.045 |
+
+The device arm's iteration-0 phase 1 is 0.7-0.9 s above its steady state
+at every node count, and that difference is one-time Kokkos/HIP
+initialization plus the first pinned allocation. It does not scale down
+with node count — at 128 nodes it is 0.785 s of a 1.045 s phase 1, i.e.
+three quarters of the reported cost is startup — which is why the
+steady-state tables above are the ones to read.
+
+The `cpu_l12` rows here are within a few percent of Appendix A's
+(14.074 vs 13.785 at 8 nodes, 8.562 vs 8.636 at 16, 6.724 vs 6.312 at
+32, 5.375 vs 5.255 at 64, 5.787 vs 5.594 at 128), which is the check that
+this sweep's baseline is the same baseline.
+
+## 7. Raw command
+
+```
+env PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1 \
+srun --mpi=cray_shasta --network=job_vni --unbuffered \
+  --cpu-bind=none --distribution=block:block \
+  --ntasks=$((8*NODES)) --gpus-per-node=8 \
+  ./FoF3 -f <input> -d oct -u dist -c stats -l 128 -i 2 +ppn 14 \
+  +pemap 1-7,65-71,9-15,73-79,17-23,81-87,25-31,89-95,33-39,97-103,41-47,105-111,49-55,113-119,57-63,121-127 \
+  +lci_ndevices 7 +backend_poll_thread 2 +traceoff
+```
+
+`PARATREET_DEVICE_TREE=0` and no `FOF_GPU_*` for the CPU arm;
+`FOF_GPU_VERIFY=1` for the verify arm. `LCI_ATTR_BACKEND=ofi`,
+`FI_CXI_RX_MATCH_MODE=hybrid`, `FI_MR_CACHE_MONITOR=userfaultfd`,
+`PMI_MAX_KVS_ENTRIES=4194304`. Built with
+`GPU=1 PROJECTIONS=1` against the HIP-enabled charm
+(`reconverse-linux-x86_64-amd`); see `fof/gpu/rebuild_deps.sh`.
+
+## 8. What this sweep says to do next
+
+1. **The phase-3/uf2/loadCache regression is now the whole story.** Phase
+   1 is solved: 8-11x, scaling, exact. Everything the device path still
+   costs the application lives after it, it is 1.4-2.4x on
+   communication-bound phases, and it grows with node count until it
+   cancels the win entirely at 128. The traces in section 5 are the tool.
+2. **`loadCache` is the largest single term at 128 nodes in BOTH arms**
+   (1.18 s CPU, 1.48 s device, against a 5.8 s iteration) and it
+   anti-scales. That is independent of this work and older than it.
+3. Phase 1's remaining cost is no longer the GPU pass (0.068 s at 128
+   nodes) but the staging around it — pack + scatter is 0.067 s against
+   it, and design/phase1-gpu.md section 12.1's "emit the device form at
+   tree build" would remove most of the tree half.
+
+## 9. The reconverse node-queue change, measured on top of all of the above
+
+Everything above was built against reconverse before `gate-nodelock` was
+merged into `gpu-merge-candidate`. That branch carries `a85140f`, which
+stops every PE from doing a `CmiTryLock(CsdNodeQueueLock)` on every
+scheduler iteration when the node queue is empty: it tracks the queue
+length in a relaxed atomic maintained under the lock and reads it before
+reaching for the lock. It was measured on Anvil at 120 PEs, where the
+effect grows with PEs per process (4201 -> 88 ns idle iteration at 1
+process x 120 PEs). Frontier's 8 x 14 shape is the wide-process case it
+targets.
+
+**It did not build.** `converse.h` gained
+`CsvExtern(std::atomic<int>, CsdNodeQueueLen)`, and this header is
+included by C translation units — GKlib's `b64.c` and friends inside
+ck-libs/metis — where `std::` is a syntax error. The file says so at the
+top: *"note: this file is included by both C and C++ files, so it should
+always have valid C code"*, and it already includes `<stdatomic.h>` for
+exactly this reason. Fixed by declaring the variable `std::atomic<int>`
+to C++ and `_Atomic int` to C, with `CsdNodeQueueLenAdd/Get` macros
+hiding the one piece of syntax that differs, so `CsdNodeEnqueueGeneral`
+(also C++-only as merged, via `.fetch_add`) needs no `#ifdef` at its call
+sites. That is the same split `CmiChunkHeader` already uses in the same
+header for its refcount. Verified by compiling `converse.h` standalone as
+C (gnu11, gnu17, c11, and the compiler default) and as C++ before
+rebuilding.
+
+**Correctness is unaffected.** The full stage-4 gate re-ran on the
+rebuilt stack: 18 arms, 1k/100k/80M, `-c full` where it fits, `-i 3`,
+`FOF_COUNT_VERIFY=1`, all exit 0, all component counts identical, 21
+zero-mismatch reports. At 2B/16 nodes: 424,897,832 components in all nine
+arm-iterations and 0 label mismatches in the verify arm.
+
+### 9.1 At 16 nodes it is a clean win, in every arm
+
+Same script, same node count, same input — the only difference is the
+merge. Iteration 1, seconds:
+
+| | cpu_l12 | replace_l12 | replace_l128 |
+|---|---|---|---|
+| phase 1 | 5.342 -> 4.924 | 0.826 -> 0.804 | 0.669 -> 0.610 |
+| upwardPass | 0.353 -> 0.352 | 0.503 -> 0.463 | 0.375 -> 0.350 |
+| loadCache | 0.046 -> **0.020** | 0.096 -> **0.034** | 0.096 -> **0.041** |
+| phase-3 walk | 0.378 -> 0.355 | 0.569 -> 0.524 | 0.772 -> 0.859 |
+| uf2 | 0.542 -> 0.506 | 0.785 -> 0.674 | 0.784 -> 0.763 |
+| histogram | 0.336 -> 0.342 | 0.549 -> 0.454 | 0.546 -> 0.474 |
+| **iteration** | **8.268 -> 7.740** | **5.852 -> 5.168** | **4.984 -> 4.676** |
+
+**-6% to -12% on the whole iteration, and 17 of the 18 cells move the
+right way.** Two things stand out:
+
+- **`loadCache` falls 57-65% in every arm.** That is the largest relative
+  improvement anywhere in the table, and `loadCache` is the term section
+  4 flagged as anti-scaling worst — 1.18 s of a 5.8 s iteration at 128
+  nodes. A change that halves it at 16 nodes is pointed straight at the
+  biggest remaining term at scale.
+- **It helps the DEVICE arms more.** `uf2` improves 0.036 s on the CPU
+  arm and 0.111 s on `replace_l12`; the histogram is flat on the CPU arm
+  and -0.095 s on `replace_l12`. That fits what the change does: it cuts
+  the latency of an idle PE noticing work, and the device arms are the
+  ones with 13 PEs idling through the GPU pass.
+
+It does NOT change the GPU-vs-CPU ratio at 16 nodes (1.659x before,
+1.655x after) — both arms got faster by about the same factor — and it
+takes roughly a quarter out of section 4's downstream regression without
+closing it: the `cpu_l12 -> replace_l12` penalty over upwardPass +
+loadCache + phase-3 walk + uf2 goes from +0.634 s to +0.462 s.
+
+### 9.2 At 128 nodes the A/B is inconclusive, and that is the finding
+
+| iteration 1 | before | after |
+|---|---|---|
+| cpu_l12 | 5.849 | 5.772 |
+| replace_l12 | 6.483 | **8.160** |
+| replace_l128 | 5.883 | **5.234** |
+
+The two device arms move in opposite directions by large margins in the
+same job: `replace_l12`'s `loadCache` rises 50% (1.482 -> 2.225 s) while
+`replace_l128`'s `uf2` falls 38% (1.685 -> 1.052 s). This is not
+iteration-to-iteration noise — within every run the two iterations agree
+to a few percent (`replace_l12` loadCache is 2.157/2.225 in the after
+run, 1.481/1.482 in the before run) — it is a whole-run shift that
+differs per arm.
+
+**So the honest reading is that at 128 nodes, with n = 1 per
+configuration, the between-run scatter is larger than the effect and no
+conclusion can be drawn either way.** Quoting the +11% on `replace_l128`
+(0.994x -> 1.103x GPU/CPU speedup) as the result of this change would be
+picking the arm that happened to move the right way. The 16-node A/B,
+where all three arms and 17 of 18 cells moved together, is the one to
+believe; 128 nodes needs repeats before it says anything.
+
+Job IDs: 16n after=5265073, 128n after=5265322 (before: 5264095,
+5264075). Fresh Projections traces for the matched 16-node CPU/device
+pair on the post-merge runtime are at
+`/lustre/orion/csc710/scratch/rrao/fof3_traces/scale_gpu_5265073/`
+(2.7 GB and 2.5 GB, 1794 files each).
+
+---
+
+# Appendix A. The 2026-08-10 CPU-only sweep (`uniform-annotation`, HEAD `16fd529`)
+
+Kept verbatim as the prior record. The sweep above supersedes it for
+current numbers; this one is the reference for what the CPU chain did
+before the device path existed, and its `phase1_stages` table is the one
+the new sweep's phaseA/phaseB discussion is continuous with.
+
 
 Cosmo25 dataset (`cosmo25cmb.768g2_dm.001024`, N = 1,981,808,640 particles),
 OctDecomp, **`-u dist` (framework default — see note below)**, b_factor
@@ -32,13 +410,13 @@ mode-independent and *is* directly comparable.
 Loading/decomposition time is excluded below (I/O-bound, not representative
 of the algorithm) — all phases from tree build onward.
 
-## Correctness
+## A.1 Correctness
 
 **424,897,832 components, identical at every node count (8/16/32/64/128)**
 — unchanged from every prior sweep, including the immediately prior
 stealing-free/`-u serial` sweep.
 
-## Top-line scaling
+## A.2 Top-line scaling
 
 | Nodes | PEs | Tree build (ms) | phase1 total (s) | TreeCanopy cache loading (ms) | Tree traversal (ms) | Iteration 0 total (ms) |
 |------:|-----:|------:|------:|------:|------:|------:|
@@ -54,7 +432,7 @@ Clean, monotonic scaling throughout, and **no 128-node blowup this time**
 That prior blowup was driven entirely by `relabel(p3)` in the serial
 gather/broadcast path, which this run doesn't exercise (see mode note).
 
-## phase1_stages breakdown (seconds) — mode-independent, comparable across sweeps
+## A.3 phase1_stages breakdown (seconds) — mode-independent, comparable across sweeps
 
 | Nodes | reset | register | phaseA | phaseB | merge | relabel |
 |------:|------:|---------:|-------:|-------:|------:|--------:|
@@ -77,7 +455,7 @@ hasn't been eliminated, just lowered. Worth a dedicated before/after
 comparison at matching `-u` mode if you want to confirm the magnitude of
 this drop precisely.
 
-## phase1 detail and phase3 (uf2/walk) breakdown (seconds) — dist-mode path, not comparable to the prior serial-mode sweep
+## A.4 phase1 detail and phase3 (uf2/walk) breakdown (seconds) — dist-mode path, not comparable to the prior serial-mode sweep
 
 | Nodes | tip_encode | fragcount | upwardPass | loadCache | uf2_setup | phase3_walk | edge_gather | uf2 | relabel(p3) | component_histogram |
 |------:|-----------:|----------:|-----------:|----------:|----------:|------------:|------------:|----:|------------:|---------------------:|
@@ -96,7 +474,7 @@ same direction as every prior sweep. `relabel(p3)` stays small throughout
 broadcast bracket to blow up at high PE counts the way `-u serial` did at
 128 nodes in the prior sweep.
 
-## Raw command (per node count N, procs/node = 8 fixed)
+## A.5 Raw command (per node count N, procs/node = 8 fixed)
 
 ```
 srun --mpi=cray_shasta --network=job_vni --unbuffered \

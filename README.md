@@ -117,10 +117,124 @@ Performance tracing is off by default and is a build-time choice
 (`make PROJECTIONS=1` / `make SUMMARY=1`) — see
 "[Tracing with Projections](#tracing-with-projections)" below.
 
+The GPU arm is likewise off by default and is a build-time choice
+(`make GPU=1`) — see "[Building the GPU arm](#building-the-gpu-arm)" below.
+With `GPU` unset the compile and link lines are byte-identical to the CPU
+build, so the CPU chain is never a "GPU build with the GPU turned off".
+
 `make test` in `examples/fof3` runs the standard 12-run small matrix
 ({100, 1k, 10k} x {+p1, +p2, 2 procs x 1 PE, 2 procs x 2 PEs}) against the
 checked-in inputs; every run must print `FOF3 TEST PASSED`. Run it once on
 the cluster before anything larger.
+
+### Building the GPU arm
+
+Phase 1 has a device implementation (`fof/gpu/`, designed in
+`design/phase1-gpu.md`) that replaces the intra-process phaseA + phaseB +
+merge chain with one Kokkos pass over a flat tree. It is a separate build,
+not a runtime switch alone: you need a HIP-enabled Charm++, a Kokkos
+install, and `GPU=1` on the FoF makefiles.
+
+**Extra prerequisites.**
+
+- A **HIP-enabled Charm++**, i.e. a build made with the `amd` option word.
+  The option word is part of the BUILD DIRECTORY NAME —
+  `reconverse-linux-x86_64-amd`, not `reconverse-linux-x86_64` (the `cuda`
+  equivalent on NVIDIA) — and `hapi.h` exists only in the suffixed one, so
+  `CHARM_HOME` must carry the suffix too. The GPU arm needs HAPI for the PE→GPU mapping and the
+  stream; `Makefile.common` detects such a build by the presence of
+  `$(CHARM_HOME)/include/hapi.h`.
+- **ROCm** (developed against 6.2.4) for `hipcc`. On Frontier `module load
+  rocm/6.2.4` is a SILENT NO-OP in a non-interactive shell — it sets no
+  `ROCM_PATH` and does not show up in `module list`, and the CMake builds
+  below (and reconverse's own `find_package(hip REQUIRED CONFIG)`) then fail
+  looking for HIP. Pass the path explicitly instead:
+  `-DCMAKE_PREFIX_PATH=/opt/rocm-6.2.4`.
+- **Kokkos**, built with the HIP backend for the target arch. **Check out a
+  4.x release, not `master`**: master's `Kokkos_BitManipulation.hpp` needs
+  C++20 while `fof/gpu/Makefile` compiles `-std=c++17`, which is ~20 errors
+  that never mention the standard. 4.7.04 is what this was built against.
+  What the Frontier install was configured with:
+
+  ```sh
+  git clone --branch 4.7.04 --depth 1 https://github.com/kokkos/kokkos.git
+  cd kokkos && cmake -B build-hip \
+    -DCMAKE_CXX_COMPILER=/opt/rocm-6.2.4/bin/hipcc \
+    -DCMAKE_PREFIX_PATH=/opt/rocm-6.2.4 \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DKokkos_ENABLE_HIP=ON -DKokkos_ENABLE_SERIAL=ON \
+    -DKokkos_ARCH_AMD_GFX90A=ON \
+    -DCMAKE_INSTALL_PREFIX=$HOME/kokkos
+  cmake --build build-hip -j16 && cmake --install build-hip
+  ```
+
+  The host backend is Serial on purpose: the host side of this arm is Charm
+  PEs, and an OpenMP pool underneath them would contend with the PE threads
+  for the same cores. `KOKKOS_DIR` defaults to `$HOME/kokkos` in both
+  `src/Makefile.common` and `fof/gpu/Makefile`.
+
+**Build order.** The device library comes first, and it is built by `hipcc`
+rather than `charmc` — no Charm header is on its include path and no Charm
+library is linked, so a failure there is a Kokkos/HIP failure and nothing
+else. Then rebuild `fof/` and the application **with `GPU=1`**:
+
+```sh
+cd fof/gpu && make                      # -> libfofdevice.a (hipcc)
+make test                               # standalone gate; needs a GPU node
+cd .. && make clean && make GPU=1       # -> libfof.a with the device arm
+cd ../examples/fof3 && make clean && make GPU=1   # -> FoF3
+```
+
+`make clean` in between is not optional: `GPU=1` changes `-DFOF_GPU` on the
+compile line, and the templated FoF chares live in headers, so a stale
+object silently keeps the CPU-only instantiation. (`libfofdevice.a` is named
+as a link prerequisite, so *that* archive is tracked and a rebuild of it
+does relink the application.)
+
+On NVIDIA, build the device library through the Kokkos nvcc wrapper:
+
+```sh
+cd fof/gpu && make HIPCC=$KOKKOS_DIR/bin/nvcc_wrapper ARCH_FLAG="-arch=sm_80"
+```
+
+**Selecting the arm at run time.** Two environment variables, both needed —
+the build only makes the arm available, it does not turn it on:
+
+| variable | effect |
+| --- | --- |
+| `PARATREET_DEVICE_TREE=1` | emit the flat per-TreePiece tree the device traverses. **Must be set**: the emit happens at TREE BUILD, so phase 1 cannot turn it on later. |
+| `FOF_GPU_PHASE1=1` | *Replace* mode: the device answer is adopted. |
+| `FOF_GPU_VERIFY=1` | *Verify* mode: the CPU chain also runs and every particle's label is compared; any disagreement aborts. Slower, and the right mode for a first run on new hardware. |
+
+`FOF_GPU_PHASE1` set in a binary built without `GPU=1` aborts rather than
+falling back to the CPU — a silent fallback turns "the GPU path regressed"
+into "the GPU path was never on". Replace mode does not implement periodic
+boundaries (`-P`); use verify mode there. Tuning knobs, all off/zero by
+default: `FOF_GPU_ASYNC=1` (non-blocking launch), `FOF_GPU_RELEASE=1` (free
+the pinned staging each iteration), `FOF_GPU_GRID=<occupancy>` (the dense-node
+cell grid), `PARATREET_DEVICE_TREE_VERIFY=1` (check the flat tree against the
+pointer tree).
+
+**One process per GCD is an invariant, not a preference.** Two processes
+sharing a GCD silently halves every measurement, so phase 1 refuses to run
+in that shape. On Frontier, one process per GCD is 8 processes per node; a
+Frontier GCD is half an MI250X, and `--gpus-per-node=8` exposes all eight.
+
+If you launch **fewer** processes per node than there are visible GCDs, note
+that HAPI sets its per-process device count to `visible_GCDs / processes_per_node`
+and hands each process that many devices, while FoF initializes Kokkos on
+exactly one of them (the home PE's). At 8 processes per node that quotient is
+1 and the two agree. At 4 it is 2, and the process's PEs are round-robined
+across two GCDs while Kokkos lives on one. Pin visibility to a single GCD per
+process to keep the shapes in agreement — and pick the one that is NUMA-local
+to the cores the process is pinned to:
+
+```sh
+# Frontier core -> nearest GCD: 0-7:4  8-15:5  16-23:2  24-31:3
+#                               32-39:6 40-47:7 48-55:0  56-63:1
+GCDS=(4 2 6 0)      # for 4 processes taking cores 1-15, 17-31, 33-47, 49-63
+export ROCR_VISIBLE_DEVICES=${GCDS[$SLURM_LOCALID]}
+```
 
 ### Generating datasets
 

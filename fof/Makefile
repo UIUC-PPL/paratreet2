@@ -3,7 +3,11 @@ include ../src/Makefile.common
 # The fof module: FoF chares + drivers over the app-agnostic core (see
 # fof.ci). Build order: sibling unionfind stack first (see the top-level
 # README), then src/ (paratreet.decl.h), then this, then the FoF examples.
-OPTS = -g -O3 $(INCLUDES) $(FOF_INCLUDES) -DDEBUG=0 $(MAKE_OPTS)
+# GPU=1 compiles the device staging chain into FoFPhase1.h
+# (design/phase1-gpu.md stage 0). The device library itself is built
+# separately by hipcc in fof/gpu; this only adds the POD header and the
+# HIP platform macro hapi.h needs (trap 4).
+OPTS = -g -O3 $(INCLUDES) $(FOF_INCLUDES) -DDEBUG=0 $(GPU_OPTS) $(MAKE_OPTS)
 CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 
 all: libfof.a

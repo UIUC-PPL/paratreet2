@@ -52,6 +52,22 @@
 #include "OrientedBox.h"
 #include "unionFindLib.h"
 
+#ifdef FOF_GPU
+// design/phase1-gpu.md section 6.2: the device library's header names
+// neither Kokkos nor HIP, so this translation unit stays a charmc TU.
+// hapi.h is the exception — it needs the vendor's stream typedef, and
+// hapi_portable.h does not pull the vendor header in itself. Build with
+// -D__HIP_PLATFORM_AMD__ or hip_runtime_api.h declares nothing (trap 4).
+#include "gpu/FoFDevice.h"
+#if defined(CMK_HIP)
+#include <hip/hip_runtime_api.h>
+#endif
+#if defined(CMK_HIP) || defined(CMK_CUDA)
+#define FOF_GPU_HAS_HAPI 1
+#include <hapi.h>
+#endif
+#endif
+
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -319,6 +335,42 @@ struct FoFMemoryStats {
   double avg_bytes;
 };
 
+// Stage 4 (design/phase1-gpu.md section 18): what the device path is FOR.
+//
+//   Off      the CPU chain computes phase 1. No device work. Default.
+//   Replace  the device computes phase 1 and the CPU chain does not run.
+//            phaseA, phaseB, merge and relabel are skipped outright; the
+//            device pass produces the four things section 4 names as the
+//            contract (uf_parent, roots, rep_label, root_counts) plus
+//            every particle's group_number, and everything downstream is
+//            unchanged.
+//   Verify   BOTH run: the CPU chain first, then the device pass, then an
+//            exact per-particle comparison. This is the oracle mode of
+//            section 6.4 and it is what every gate run uses. It is also
+//            what FOF_GPU_STAGE0=1 meant through stages 0-3, so that
+//            spelling still selects it.
+//
+// Replace is not the default and should not become one silently: it is
+// selected per run by FOF_GPU_PHASE1=1, and a build without FOF_GPU
+// refuses it rather than quietly falling back to the CPU (a silent
+// fallback would turn "the GPU path regressed" into "the GPU path was
+// never on", which is the failure this project has already paid for
+// twice — traps 16 and 17).
+enum class FoFGpuMode { Off, Replace, Verify };
+
+inline FoFGpuMode fofGpuMode() {
+  static const FoFGpuMode m = [] {
+    auto on = [](const char* e) {
+      const char* v = std::getenv(e);
+      return v != nullptr && std::atoi(v) != 0;
+    };
+    if (on("FOF_GPU_VERIFY") || on("FOF_GPU_STAGE0")) return FoFGpuMode::Verify;
+    if (on("FOF_GPU_PHASE1")) return FoFGpuMode::Replace;
+    return FoFGpuMode::Off;
+  }();
+  return m;
+}
+
 } // namespace paratreet
 
 // Per-process side of phase 1: collects the per-PE TreePiece registry (for
@@ -331,6 +383,8 @@ public:
     Node<Data>* root;
     Particle* parts;
     int n;
+    const paratreet::DNode* dnodes = nullptr;  // src/DeviceTree.h; may be null
+    int n_dnodes = 0;
   };
 
   std::mutex lock;
@@ -382,6 +436,82 @@ public:
 
   std::mutex seen3_lock;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3_pairs;
+
+#ifdef FOF_GPU
+  // --- GPU staging (design/phase1-gpu.md stage 0, second half).
+  // The process's single device, owned here because FoFPhase1Node is the
+  // per-PROCESS branch and one process maps to one GPU by invariant.
+  // Everything in this block is measurement scaffolding: it stages the
+  // process's particles onto the device, round-trips them, and verifies
+  // them, while the CPU chain below still computes the answer. Stage 2
+  // replaces the round trip with the union-find; the staging halves
+  // (K0/K5) are what survive.
+  static_assert(sizeof(paratreet::DNode) == sizeof(fofgpu::DDNode),
+                "DNode and the device library's DDNode must stay identical");
+  fofgpu::Device device;
+  void* dev_stream = nullptr;
+  bool dev_inited = false;
+  std::atomic<long> dev_total{0};   // process-flat particle count
+  std::map<int, long> dev_pe_base;  // PE -> its base in that space (under lock)
+  // Flat-tree layout plan, computed once on the home PE and then written
+  // against concurrently: PE -> per-piece node offset (-1 = no tree).
+  std::map<int, std::vector<int> > dev_piece_node_off;
+  long dev_total_nodes = 0;
+  double dev_t_tree_upload = 0, dev_t_tree_check = 0;
+  // The three components of deviceInitOnHome, which is a SERIAL step on
+  // the home PE that every other PE in the process waits through. Split
+  // because the fixes differ: dev_t_kokkos_init is a fixed per-process
+  // cost (HIP context + code-object load) that is hoistable off the
+  // critical path, dev_t_alloc scales with bytes (~440 MB of pinned host
+  // memory per process at 2B/128 procs) and wants fewer/smaller pinned
+  // buffers, and dev_t_plan is the only part with a genuine dependency on
+  // the tree build. Only the first two are paid once per run.
+  double dev_t_kokkos_init = 0;  // device.init + checkMapping + streams
+  double dev_t_alloc = 0;        // device.resize: pinned host + device
+  double dev_t_plan = 0;         // devicePlanTree
+  // The whole prologue on one PE. This is the quantity to subtract the
+  // three parts above from: they are all measured on the SAME home PE, so
+  // the remainder is meaningful. Subtracting them from device_wall is not
+  // -- device_wall is one driving thread's wall while pack/pass/scatter
+  // are maxima over all PEs that never occur on the same PE, so that
+  // difference is routinely negative and means nothing.
+  double dev_t_prologue = 0;
+  // Device::init when it happens OFF the critical path, in deviceWarmup.
+  // Kept separate from dev_t_kokkos_init so the two are never confused:
+  // whichever one is nonzero tells you where the context creation landed.
+  double dev_t_warmup = 0;
+  long dev_tree_pieces = 0;
+  // Per-iteration deposit counters. resetDevice() below MUST clear them:
+  // they are compared against CkNodeSize(), so a counter left at its
+  // end-of-iteration value never fires the trigger again and the second
+  // iteration hangs with no error. Every run of this path so far has been
+  // -i 1 (the default), which is the only reason it was never seen.
+  std::atomic<int> dev_count_done{0};
+  std::atomic<int> dev_pack_done{0};
+  std::atomic<int> dev_scatter_done{0};
+  double dev_t_launch = 0;          // enqueue -> completion callback
+  double dev_t_block = 0;           // the part of the pass that BLOCKS a PE
+  fofgpu::WalkStats dev_walk;
+  int dev_launch_pe = -1;           // whichever PE packed last (stage 4)
+
+  void resetDevice() {
+    dev_total.store(0);
+    dev_pe_base.clear();
+    dev_piece_node_off.clear();
+    dev_total_nodes = 0;
+    dev_tree_pieces = 0;
+    dev_t_tree_upload = dev_t_tree_check = 0;
+    dev_count_done.store(0);
+    dev_pack_done.store(0);
+    dev_scatter_done.store(0);
+    dev_t_launch = dev_t_block = 0;
+    // dev_t_kokkos_init / dev_t_alloc are deliberately NOT reset: they are
+    // paid once per run and the point of measuring them is to see that.
+    dev_t_plan = 0;
+    dev_launch_pe = -1;
+    dev_walk = fofgpu::WalkStats();
+  }
+#endif
 
   FoFPhase1Node() {}
 
@@ -452,6 +582,13 @@ public:
     int n;
     int home_pe;
     double c[3]; // box center, for the geometry claim priority
+    // Carried so a claim does not DROP the flat device tree: the claim
+    // path rewrites both this PE's treepieces and its registry bucket, and
+    // the registry bucket is what devicePlanTree reads to find the trees.
+    // Without these two fields FOF_STEALA=1 plus a device arm ends in
+    // deviceLaunch's "no flat device tree" abort.
+    const paratreet::DNode* dnodes = nullptr;
+    int n_dnodes = 0;
   };
   std::vector<StealEntry> steal_pool;
   std::unique_ptr<std::atomic<int>[]> steal_claimed;
@@ -494,6 +631,7 @@ public:
       for (auto& s : kv.second) {
         StealEntry e;
         e.root = s.root; e.parts = s.parts; e.n = s.n; e.home_pe = kv.first;
+        e.dnodes = s.dnodes; e.n_dnodes = s.n_dnodes;
         for (int ax = 0; ax < 3; ax++)
           e.c[ax] = 0.5 * ((double)s.root->data.box.lesser_corner[ax] +
                            (double)s.root->data.box.greater_corner[ax]);
@@ -684,9 +822,17 @@ public:
 
   // Called synchronously (ckLocalBranch) by same-process group branches
   // during registration; hence the lock.
-  void registerTreePiece(int pe, Node<Data>* root, Particle* parts, int n) {
+  void registerTreePiece(int pe, Node<Data>* root, Particle* parts, int n,
+                         const paratreet::DNode* dnodes = nullptr,
+                         int n_dnodes = 0) {
     std::lock_guard<std::mutex> g(lock);
-    pe_treepieces[pe].push_back(TreePieceRef{root, parts, n});
+    // Field assignment, not brace init: TreePieceRef has default member
+    // initializers, which under charmc's -std=gnu++11 makes it a
+    // non-aggregate.
+    TreePieceRef ref;
+    ref.root = root; ref.parts = parts; ref.n = n;
+    ref.dnodes = dnodes; ref.n_dnodes = n_dnodes;
+    pe_treepieces[pe].push_back(ref);
   }
 
   // Per-process phaseB wall deposit, the phaseA analogue above. Needed
@@ -897,6 +1043,9 @@ public:
     b_time_sum = 0.0;
     b_time_max = 0.0;
     clearSeen();
+#ifdef FOF_GPU
+    resetDevice();
+#endif
     this->contribute(cb);
   }
 
@@ -1021,15 +1170,26 @@ public:
     Particle* parts; // the TreePiece's own particle block (stable until rebuild)
     int n;
     int offset;      // base of this block in the PE-flat index space
+    // Flat device tree for this TreePiece (src/DeviceTree.h), or null
+    // when PARATREET_DEVICE_TREE is off. Owned by the TreePiece and
+    // stable for the same window as `parts`.
+    const paratreet::DNode* dnodes = nullptr;
+    int n_dnodes = 0;
   };
 
   FoFPhase1(CProxy_FoFPhase1Node<Data> node_proxy_) : node_proxy(node_proxy_) {}
 
   // Synchronous, called on this PE by fof::TreePieceRegisterFn (delivered per
   // TreePiece element through the generic TreePiece::callPerTreePieceFn hook).
-  void registerTreePiece(Node<Data>* root, Particle* parts, int n) {
-    treepieces.push_back(TreePieceRef{root, parts, n, 0});
-    node_proxy.ckLocalBranch()->registerTreePiece(CkMyPe(), root, parts, n);
+  void registerTreePiece(Node<Data>* root, Particle* parts, int n,
+                         const paratreet::DNode* dnodes = nullptr,
+                         int n_dnodes = 0) {
+    TreePieceRef ref;
+    ref.root = root; ref.parts = parts; ref.n = n; ref.offset = 0;
+    ref.dnodes = dnodes; ref.n_dnodes = n_dnodes;
+    treepieces.push_back(ref);
+    node_proxy.ckLocalBranch()->registerTreePiece(CkMyPe(), root, parts, n,
+                                                  dnodes, n_dnodes);
   }
 
   // Periodic boundary conditions (design/pbc.md): the box period, broadcast
@@ -1171,7 +1331,13 @@ public:
       int expect = 0;
       if (!claimed[i].compare_exchange_strong(expect, 1)) return false;
       (pool[i].home_pe == CkMyPe()) ? own_claims++ : foreign_claims++;
-      TreePieceRef r{pool[i].root, pool[i].parts, pool[i].n, 0};
+      // Field-by-field, not a braced aggregate: TreePieceRef's device
+      // members carry default member initializers, which under C++11
+      // (charmc compiles -std=gnu++11) makes the type a non-aggregate.
+      TreePieceRef r;
+      r.root = pool[i].root; r.parts = pool[i].parts; r.n = pool[i].n;
+      r.offset = 0;
+      r.dnodes = pool[i].dnodes; r.n_dnodes = pool[i].n_dnodes;
       treepieces.push_back(r);
       phaseAAdmit(treepieces.back());
       phaseASelfPair(treepieces.back());
@@ -1215,8 +1381,12 @@ public:
       std::lock_guard<std::mutex> g(nb->lock);
       auto& bucket = nb->pe_treepieces[CkMyPe()];
       bucket.clear();
-      for (auto& s : treepieces)
-        bucket.push_back({s.root, s.parts, s.n});
+      for (auto& s : treepieces) {
+        typename FoFPhase1Node<Data>::TreePieceRef ref;
+        ref.root = s.root; ref.parts = s.parts; ref.n = s.n;
+        ref.dnodes = s.dnodes; ref.n_dnodes = s.n_dnodes;
+        bucket.push_back(ref);
+      }
     }
     nb->s1_own += own_claims;
     nb->s1_foreign += foreign_claims;
@@ -1615,6 +1785,624 @@ public:
       for (int i = 0; i < s.n; i++)
         s.parts[i].group_number = rep_label[uf_parent[s.offset + i]];
   }
+
+#ifdef FOF_GPU
+  // --- The device phase-1 chain (design/phase1-gpu.md sections 11-18).
+  //
+  // Five rounds inside the process, driven by atomic deposit counters on
+  // the node branch rather than by reductions — the same shape as the CPU
+  // chain above, and for the same reason: no process should hold every
+  // other process at a stage boundary.
+  //
+  //   1. deviceStage0   every PE   reserve a slice of the flat index space
+  //   2. deviceInit     one PE     bind the device, size buffers, plan the tree
+  //   3. devicePack     every PE   K0 pack + this PE's slice of the flat tree
+  //      ...the LAST PE to finish packing enqueues the pass and arms the
+  //      completion callback, then RETURNS TO THE SCHEDULER.
+  //   4. deviceComplete that PE    the callback: fence, read stats, fan out
+  //   5. deviceScatter  every PE   K5: adopt (Replace) or compare (Verify)
+  //
+  // Stage 4 changed round 3/4. Through stage 3 the device call was
+  // synchronous and pinned to the process's HOME PE, so one scheduler
+  // thread sat inside an entry method for the whole pass — 445 ms at 2B.
+  // Neither constraint is real: HAPI gives every PE of the process the
+  // same device (device_count = visible/procs_per_node = 1 here, so
+  // pes_per_device = ppn and every PE's my_device is identical), and
+  // hapiAddCallback queues the completion event on the CALLING PE, so the
+  // launcher is also the natural completion target. The pass is therefore
+  // enqueued by whichever PE happens to finish packing last and completed
+  // by the same PE, with no scheduler thread blocked in between.
+  //
+  // A nodegroup entry does NOT run on the home PE (measured,
+  // design/phase1-gpu.md section 11.3 trap 2), so the hops are explicit
+  // and go through this PE-indexed GROUP proxy.
+
+  // Completion form. SYNCHRONOUS BY DEFAULT, on measurement.
+  //
+  // Stage 4 built the asynchronous path (enqueue + hapiAddCallback) on
+  // the reasoning that only the leaf-count readback forces a host
+  // synchronization, so the walk/freeze/download tail could run with the
+  // scheduler free. The tail is real -- at 100k the fenced form reports
+  // walk 15.3 ms + freeze 15.6 ms and the async form reports the whole
+  // thing as already finished by the time the callback is serviced. But
+  // measured at 2B on 16 nodes, the enqueue ITSELF does not return until
+  // the pass is essentially done: `blocking` is 307.9 ms of a 308.2 ms
+  // round trip, and the synchronous arm is if anything slightly faster
+  // (5.620 vs 5.724 s per iteration). The async form therefore adds a
+  // HAPI event, a callback dispatch and QD bookkeeping to defer 0.3 ms.
+  //
+  // Why the enqueue blocks is NOT established, and the prediction above
+  // being wrong is the reason to keep both paths rather than delete one.
+  // The suspects are the per-call Kokkos View allocations in the prepare
+  // (hipFree is a synchronizing call) and the HIP launch queue backing up
+  // behind a long kernel. Hoisting those allocations to persist across
+  // iterations would test it and is worth doing on its own merits; if it
+  // makes the enqueue return promptly, FOF_GPU_ASYNC becomes the default.
+  //
+  // Launching from ANY PE is kept in both forms and is not what this
+  // selects: the pass is enqueued by whichever PE packed last either way.
+  static bool gpuAsyncLaunch() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_GPU_ASYNC");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+
+  // Release the pinned staging once the scatter has read the labels
+  // (section 17.3: the memory the device path leaves resident is the
+  // surviving candidate for the phase-3 regression).
+  //
+  // OFF by default, deliberately. Releasing means the next iteration
+  // re-allocates ~600 MB of PINNED host memory, and hipHostMalloc at that
+  // size is not a cheap call — it is hundreds of milliseconds, paid per
+  // iteration, against a hypothesis that is still unmeasured at the scale
+  // where it matters (at 80M on one node the A/B moved phase 3 by 12 ms).
+  // Making a certain per-iteration cost the default to chase an uncertain
+  // one is the wrong way round. FOF_GPU_RELEASE=1 is the other arm.
+  static bool gpuReleaseStaging() {
+    static const bool on = [] {
+      const char* e = std::getenv("FOF_GPU_RELEASE");
+      return e && std::atoi(e) != 0;
+    }();
+    return on;
+  }
+
+  // The stage-3 cell-grid occupancy gate, read once. Both the launch and
+  // the completion report need it and they are now separate methods, so it
+  // cannot stay a local of the launch.
+  static double gpuGridThresh() {
+    static const double g = [] {
+      const char* e = std::getenv("FOF_GPU_GRID");
+      return e ? std::atof(e) : 0.0;
+    }();
+    return g;
+  }
+
+  // Round 1 (broadcast, every PE): reserve this PE's slice of the
+  // process-flat index space. fetch_add gives disjoint bases with no
+  // ordering requirement — the PE that gets base 0 is not special.
+  void deviceStage0(double b2, const CkCallback& cb) {
+    // ENGINE CONTRACT section 3: a GPU process must be the sets=1 case.
+    // The device union-find is process-wide and covers EVERY intra-process
+    // pair; it has no notion of the PE-set split and defers nothing. The
+    // table the phase-3 veto reads (pieceSetTable) is written by the CPU
+    // chain's pool build, which Replace mode skips entirely, so on a
+    // process where the split is configured the table stays EMPTY and
+    // peSetKeepLocalPair's "don't know -> walk it" fallback vetoes the
+    // ownership prune for every local pair. The answer stays right — the
+    // pairs were already merged and re-merging is idempotent — but phase 3
+    // silently loses its prune on that process, which at 2B reads as an
+    // unexplained phase-3 regression rather than as a misconfiguration.
+    // Mixed jobs are still well-formed, which is the point of the split
+    // being per-process: scope it with FOF_PE_SETS_NODES to the CPU
+    // processes and the GPU ones land here at peSetsHere() == 1.
+    if (paratreet::fofGpuMode() == paratreet::FoFGpuMode::Replace &&
+        paratreet::peSetsHere() > 1)
+      CkAbort("FoF GPU: process %d has the PE-set split active "
+              "(FOF_PE_SETS=%d, %d sets here) and the device engine does "
+              "not implement it. List only the CPU processes in "
+              "FOF_PE_SETS_NODES.",
+              CkMyNode(), paratreet::peSets(), paratreet::peSetsHere());
+    b2_ = b2;
+    dev_done_cb_ = cb;
+    dev_t_pack_ = 0;
+    dev_t_scatter_ = 0;
+    auto* nb = node_proxy.ckLocalBranch();
+    dev_n_ = 0;
+    // In Replace mode nothing has run before this, so the flat index
+    // space this PE's TreePieces occupy has to be laid out here — phaseA
+    // is what used to do it, and everything downstream (uf_parent
+    // indexing, materializeLabels) reads s.offset.
+    for (auto& s : treepieces) {
+      s.offset = dev_n_;
+      dev_n_ += s.n;
+    }
+    dev_base_ = nb->dev_total.fetch_add(dev_n_);
+    {
+      // Published so the home PE can rebase the flat trees without
+      // reaching into another PE's group branch.
+      std::lock_guard<std::mutex> g(nb->lock);
+      nb->dev_pe_base[CkMyPe()] = dev_base_;
+    }
+    if (nb->dev_count_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode()))
+      this->thisProxy[CkNodeFirst(CkMyNode())].deviceInitOnHome();
+  }
+
+  // Kokkos/HIP context creation, hoisted OFF the phase-1 critical path.
+  //
+  // Broadcast from ExMain::main, which runs BEFORE Driver::initialize calls
+  // readers.load -- so the 0.38 s (warm) to 0.84 s (cold) this costs
+  // overlaps a multi-second Tipsy read instead of stalling deviceInitOnHome,
+  // where one PE pays it while the other CkNodeSize()-1 PEs of the process
+  // sit idle. Measured at 2B/16 nodes it was 0.844 s of a 0.924 s prologue.
+  //
+  // Home PE only. This is deliberately an entry method on the GROUP and not
+  // the nodegroup: a nodegroup broadcast can be picked up by any PE in the
+  // process, and Kokkos::initialize binds to whatever hapiGetDevice()
+  // returned on the calling thread. Pinning it to CkNodeFirst makes that
+  // identical to the PE deviceInitOnHome will later run on.
+  //
+  // ONLY Device::init moves. hapiCreateStreams/hapiGetStream are per-PE HAPI
+  // state and checkMapping's abort belongs where the mapping is used, so
+  // both stay in deviceInitOnHome -- they cost ~0 next to the context.
+  void deviceWarmup() {
+    if (paratreet::fofGpuMode() == paratreet::FoFGpuMode::Off) return;
+    if (CkMyPe() != CkNodeFirst(CkMyNode())) return;
+    auto* nb = node_proxy.ckLocalBranch();
+    if (nb->dev_inited) return;
+    double t0 = CkWallTimer();
+    deviceBind(nb);
+    nb->dev_t_warmup = CkWallTimer() - t0;
+  }
+
+  // The once-per-process device bind. Factored out because it runs from
+  // either deviceWarmup (overlapped with the input read, the fast path) or
+  // deviceInitOnHome (if the warmup never ran). Both callers are on
+  // CkNodeFirst(CkMyNode()), which is what makes it safe to create the HAPI
+  // streams here: hapiGetStream() is per-PE state and this is the PE that
+  // will use it.
+  void deviceBind(FoFPhase1Node<Data>* nb) {
+    if (nb->dev_inited) return;
+    int device_id = -1;
+#ifdef FOF_GPU_HAS_HAPI
+    hapiCheck(hapiGetDevice(&device_id));
+#endif
+    nb->device.init(device_id);
+    const int procs_per_node = CmiNumNodes() / CmiNumPhysicalNodes();
+    // One process per GPU is an invariant, not a preference
+    // (design/phase1-gpu.md section 2): sharing a GCD silently halves every
+    // later measurement, so refuse rather than run. Checking it here rather
+    // than in phase 1 means it now fails BEFORE the input read, not after.
+    if (!nb->device.checkMapping(procs_per_node))
+      CkAbort("FoF GPU: processes would SHARE a GPU (%d processes on "
+              "this physical node, only %d devices visible). Launch at "
+              "most one process per GCD.",
+              procs_per_node, nb->device.info().n_visible);
+#ifdef FOF_GPU_HAS_HAPI
+    hapiCreateStreams();
+    nb->dev_stream = (void*)hapiGetStream();
+#endif
+    nb->device.setStream(nb->dev_stream);
+    nb->dev_inited = true;
+  }
+
+  // Round 2 (home PE only): bind the device and size the staging buffers.
+  void deviceInitOnHome() {
+    auto* nb = node_proxy.ckLocalBranch();
+    const double t_pro0 = CkWallTimer();
+    // Normally a no-op: deviceWarmup did this during the input read. Left
+    // here so the device arm still works if the warmup never ran, in which
+    // case dev_t_kokkos_init is nonzero and warmup_offpath is 0.
+    if (!nb->dev_inited) {
+      deviceBind(nb);
+      nb->dev_t_kokkos_init = CkWallTimer() - t_pro0;
+    }
+    double t_a0 = CkWallTimer();
+    nb->device.resize((size_t)nb->dev_total.load());
+    // resize() early-returns when the size is unchanged, so on any
+    // iteration after the first this is ~0 -- which is the reading, not a
+    // missing measurement.
+    nb->dev_t_alloc = CkWallTimer() - t_a0;
+    double t_p0 = CkWallTimer();
+    devicePlanTree(nb);
+    nb->dev_t_plan = CkWallTimer() - t_p0;
+    nb->dev_t_prologue = CkWallTimer() - t_pro0;
+    const int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      this->thisProxy[pe].devicePack();
+  }
+
+  // Stage 1 (design/phase1-gpu.md): concatenate the process's per-TreePiece
+  // flat trees into one array and upload it. The trees are built at TREE
+  // BUILD time (src/DeviceTree.h, gated by PARATREET_DEVICE_TREE), so
+  // nothing here walks a tree — this is a memcpy per piece plus an index
+  // rebase, and it is the only part of the flat tree that phase 1 pays for.
+  //
+  // Rebasing: each piece's node indices are piece-local, so a piece placed
+  // at `node_off` has child_begin shifted by node_off; part_begin stays
+  // piece-local and is paired with the piece's particle base, which is
+  // what piece_part_base carries. Keeping part_begin piece-local means the
+  // flat tree is independent of how the PEs happened to lay the particles
+  // out, so it can be built once and reused across phase-1 calls.
+  // Stage 1 (design/phase1-gpu.md): plan the concatenated flat tree.
+  //
+  // The per-TreePiece trees are built at TREE BUILD time
+  // (src/DeviceTree.h, gated by PARATREET_DEVICE_TREE), so nothing here
+  // walks a tree. What is left is a memcpy per piece plus a rebase of the
+  // child links — and at 80M that is 3.2M nodes / 123 MB per process,
+  // which measured 236 ms when one PE did it. So the home PE only
+  // computes the LAYOUT here; the copying is handed to the PEs alongside
+  // the particle pack, each writing its own disjoint slice.
+  //
+  // pe_treepieces is process-shared and holds the pieces in the same
+  // registration order each PE's own `treepieces` does, so the two sides
+  // agree on which slice belongs to whom without any extra bookkeeping.
+  void devicePlanTree(FoFPhase1Node<Data>* nb) {
+    nb->dev_piece_node_off.clear();
+    nb->dev_total_nodes = 0;
+    nb->dev_tree_pieces = 0;
+    std::vector<int> piece_root, piece_base;
+    long nodes = 0;
+    for (auto& kv : nb->pe_treepieces) {
+      auto bit = nb->dev_pe_base.find(kv.first);
+      if (bit == nb->dev_pe_base.end()) continue;
+      long at = bit->second;  // this PE's base in the process-flat space
+      auto& offs = nb->dev_piece_node_off[kv.first];
+      offs.reserve(kv.second.size());
+      for (auto& s : kv.second) {
+        if (s.dnodes != nullptr && s.n_dnodes > 0) {
+          offs.push_back((int)nodes);
+          piece_root.push_back((int)nodes);
+          // part_begin stays PIECE-local in the flat tree, so it is
+          // paired with the piece's particle base here. That keeps the
+          // tree independent of how the PEs laid the particles out, so it
+          // survives being built once and reused.
+          piece_base.push_back((int)at);
+          nodes += s.n_dnodes;
+        } else {
+          offs.push_back(-1);
+        }
+        at += s.n;
+      }
+    }
+    // No flat trees registered (PARATREET_DEVICE_TREE unset?) means no tree
+    // on the device. Left to the guard in deviceLaunch, which aborts: a
+    // warning is not enough once the device is the only arm.
+    if (nodes == 0) return;
+    nb->dev_total_nodes = nodes;
+    nb->dev_tree_pieces = (long)piece_root.size();
+    nb->device.resizeTree(nodes, (int)piece_root.size());
+    std::memcpy(nb->device.hostPieceRoot(), piece_root.data(),
+                piece_root.size() * sizeof(int));
+    std::memcpy(nb->device.hostPieceBase(), piece_base.data(),
+                piece_base.size() * sizeof(int));
+  }
+
+  // Home PE, after every PE has filled its slice.
+  void deviceFinishTree(FoFPhase1Node<Data>* nb) {
+    if (nb->dev_total_nodes == 0) return;
+    fofgpu::TreeStats ts;
+    nb->device.uploadTree(&ts);
+    nb->dev_t_tree_upload = ts.t_upload;
+    nb->dev_t_tree_check = ts.t_check;
+    const long staged = nb->dev_total.load();
+    // Both numbers were recomputed BY THE DEVICE from what actually
+    // landed in its memory, so they check the copy and the rebase rather
+    // than echoing the host.
+    if (ts.bad_nodes != 0)
+      CkAbort("FoF GPU: %ld structurally invalid nodes after tree upload",
+              ts.bad_nodes);
+    if (ts.particles_under_roots != staged)
+      CkAbort("FoF GPU: flat trees cover %ld particles but %ld were staged",
+              ts.particles_under_roots, staged);
+  }
+
+  // Round 3 (every PE): the K0 pack. Reads this PE's own Particle blocks
+  // (~112 B stride) and writes the 20 B device form into its own slice of
+  // the pinned buffer. Owner-writes, disjoint slices, no locking — and
+  // parallel across the process's PEs, which is the whole point: the same
+  // gather on one thread is ~0.1 s at 2B chare sizes.
+  void devicePack() {
+    double t0 = CkWallTimer();
+    auto* nb = node_proxy.ckLocalBranch();
+    float* pos = nb->device.hostPositions();
+    long* order = nb->device.hostOrders();
+    long at = dev_base_;
+    for (auto& s : treepieces) {
+      for (int i = 0; i < s.n; i++, at++) {
+        pos[3 * at] = (float)s.parts[i].position.x;
+        pos[3 * at + 1] = (float)s.parts[i].position.y;
+        pos[3 * at + 2] = (float)s.parts[i].position.z;
+        order[at] = s.parts[i].order;
+      }
+    }
+    dev_t_pack_ = CkWallTimer() - t0;
+
+    // Same round, same owner-writes shape: this PE's slices of the
+    // concatenated flat tree. Rebasing child_begin into the concatenated
+    // array is the only transformation; part_begin stays piece-local.
+    double t1 = CkWallTimer();
+    fofgpu::DDNode* hn = nb->device.hostNodes();
+    auto oit = nb->dev_piece_node_off.find(CkMyPe());
+    if (hn != nullptr && oit != nb->dev_piece_node_off.end()) {
+      size_t k = 0;
+      long part_at = dev_base_;
+      for (auto& s : treepieces) {
+        if (k >= oit->second.size()) break;
+        const int off = oit->second[k++];
+        if (off >= 0 && s.dnodes != nullptr) {
+          std::memcpy(hn + off, s.dnodes,
+                      (size_t)s.n_dnodes * sizeof(fofgpu::DDNode));
+          // Rebase both index spaces into the process-flat ones: child
+          // links into the concatenated node array, and part_begin into
+          // the concatenated particle array. The SOURCE tree stays
+          // piece-local (so it survives being built once at tree build
+          // and reused); only this per-process copy is rebased.
+          for (int i = 0; i < s.n_dnodes; i++) {
+            if (hn[off + i].child_begin >= 0) hn[off + i].child_begin += off;
+            hn[off + i].part_begin += (int)part_at;
+          }
+        }
+        part_at += s.n;
+      }
+    }
+    dev_t_tree_pack_ = CkWallTimer() - t1;
+
+    // Whoever finishes last launches, right here, with no hop to the home
+    // PE (stage 4). Every PE of the process is bound to the same device,
+    // and hapiAddCallback queues the completion event on the PE that arms
+    // it, so the launcher must be a PE that will go on running its
+    // scheduler — which is exactly a PE returning from an entry method.
+    if (nb->dev_pack_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode()))
+      deviceLaunch();
+  }
+
+  // Round 4, part 1 (the last PE to finish packing): enqueue the pass and
+  // arm its completion. NOT an entry method — it runs at the tail of
+  // devicePack on the PE that got there last.
+  void deviceLaunch() {
+    auto* nb = node_proxy.ckLocalBranch();
+    deviceFinishTree(nb);
+    // No flat tree means no traversal: runPhase1 early-returns on
+    // n_nodes == 0 and hostLabels() then holds whatever was last written
+    // there. In Verify mode that surfaces immediately as a wall of
+    // mismatches; in Replace mode it would be ADOPTED as the answer.
+    // devicePlanTree already prints a warning at this point, and a warning
+    // is not enough once the device is the only arm.
+    if (nb->dev_total_nodes == 0)
+      CkAbort("FoF GPU: no flat device tree on process %d - phase 1 has "
+              "nothing to traverse. Set PARATREET_DEVICE_TREE=1; the emit "
+              "happens at TREE BUILD, so it cannot be turned on from here.",
+              CkMyNode());
+    nb->dev_launch_pe = CkMyPe();
+    nb->dev_t_launch = CkWallTimer();
+    // Stage 2: the real pass — whole-process union-find over the staged
+    // particles and the uploaded tree, replacing phaseA + phaseB + merge.
+    // Stage 3: the dense-node cell grid, OFF by default on the device
+    // even though the CPU walk defaults to -G 4. Measured on lambb.00500
+    // (design section 15.3) the grid does exactly what it is supposed to
+    // — the walk drops monotonically with the threshold, 263 -> 217 ->
+    // 202 -> 171 ms — and still loses, because its own stencil pass costs
+    // more than it saves at these densities. It is kept, and kept
+    // reachable through FOF_GPU_GRID, because it is the only thing that
+    // stops a genuinely dense input (larger b, or a deeper halo catalogue)
+    // from going quadratic. Do not read "off" as "not needed".
+    const double gth = gpuGridThresh();
+#ifdef FOF_GPU_HAS_HAPI
+    if (gpuAsyncLaunch()) {
+      // Enqueue and RETURN. Everything after the leaf-count readback is in
+      // flight on the HAPI stream; this PE goes back to its scheduler and
+      // hapiPollEvents — already installed on every PE by hapiInit, so it
+      // costs nothing extra — fires deviceComplete when the stream drains.
+      nb->device.enqueuePhase1((float)b2_, (float)gth);
+      hapiAddCallback((hapiStream_t)nb->dev_stream,
+                      CkCallback(CkIndex_FoFPhase1<Data>::deviceComplete(),
+                                 this->thisProxy[CkMyPe()]),
+                      nullptr);
+      // The number stage 4 is judged by: how much of the pass held a
+      // scheduler thread. It is the enqueue, not the fence in
+      // deviceComplete — by the time that callback is serviced the stream
+      // has already drained, so the fence there measures ~0 whether or
+      // not the design works. This measures the part that BLOCKS: the
+      // synchronous prepare, which the leaf-count readback forces.
+      nb->dev_t_block = CkWallTimer() - nb->dev_t_launch;
+      return;
+    }
+#endif
+    // Fenced form: every sub-kernel wall is real. deviceComplete then just
+    // collects them (completePhase1 is idempotent once the pass has
+    // already been waited on).
+    nb->device.runPhase1((float)b2_, (float)gth, nullptr);
+    deviceComplete();
+  }
+
+  // Round 4, part 2: the pass has drained. On the async path this is a
+  // Charm callback delivered by hapiPollEvents on the launching PE; on the
+  // synchronous path deviceLaunch calls it directly.
+  void deviceComplete() {
+    auto* nb = node_proxy.ckLocalBranch();
+    // Fence + counter readback. On the async path this is ~0 by
+    // construction: the callback fires BECAUSE the stream drained, so
+    // there is nothing left to wait for. dev_t_block, set at the enqueue,
+    // is the number that says whether the design works.
+    nb->device.completePhase1(&nb->dev_walk);
+    nb->dev_t_launch = CkWallTimer() - nb->dev_t_launch;
+    // Synchronous path: the whole pass blocked, by definition.
+    if (!gpuAsyncLaunch()) nb->dev_t_block = nb->dev_t_launch;
+    const fofgpu::WalkStats& w = nb->dev_walk;
+    // A stack overflow means the traversal DROPPED work, which shows up
+    // as silently under-merged components. Never a warning.
+    if (w.stack_overflows != 0)
+      CkAbort("FoF GPU: traversal stack overflowed %ld times - work was "
+              "dropped; raise kStack in FoFDevice.cpp",
+              w.stack_overflows);
+    const int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      this->thisProxy[pe].deviceScatter();
+  }
+
+  // Round 5 (every PE): take delivery of the device's answer.
+  //
+  // Replace mode ADOPTS it (deviceAdopt below builds the section-4
+  // contract from it). Verify mode COMPARES it against the CPU chain's,
+  // PARTICLE BY PARTICLE — the strongest gate available and an exact one,
+  // not statistical: the CPU chain has already run (phaseA + phaseB +
+  // merge + relabel), so every particle's group_number holds its
+  // PROCESS-level tip — the global order of the minimum-order member of
+  // its process-level component. The device union-find is process-wide
+  // from the start and uses the same union-by-min-order rule, so it must
+  // produce THE SAME VALUE for every particle. Not "the same number of
+  // components": the same label, everywhere.
+  void deviceScatter() {
+    auto* nb = node_proxy.ckLocalBranch();
+    const long* label = nb->device.hostLabels();
+    double t0 = CkWallTimer();
+    long bad = 0;
+    if (paratreet::fofGpuMode() == paratreet::FoFGpuMode::Replace) {
+      deviceAdopt(label);
+    } else {
+      long at = dev_base_;
+      for (auto& s : treepieces)
+        for (int i = 0; i < s.n; i++, at++)
+          if (label[at] != s.parts[i].group_number) bad++;
+    }
+    dev_t_scatter_ = CkWallTimer() - t0;
+    // `bad` is max-reduced below and aborts the run in runFoFPhase1; it is
+    // the only report a mismatch gets.
+    // Every PE has now read hostLabels(), so the staging can go. The last
+    // depositor does it — on whatever PE that is, which is safe because
+    // releaseStaging fences the stream first and nothing else in the
+    // process touches the device until the next iteration's round 2.
+    if (nb->dev_scatter_done.fetch_add(1) + 1 == CkNodeSize(CkMyNode()) &&
+        gpuReleaseStaging())
+      nb->device.releaseStaging();
+    // max-reduced: pack (per PE), launch->completion (per process),
+    // scatter (per PE), failures (summed in as a max so any nonzero
+    // survives to the driver), tree pack (per PE), tree upload (per
+    // process), and the scheduler-visible GPU wait (per process).
+    double vals[12] = {dev_t_pack_,  nb->dev_t_launch,     dev_t_scatter_,
+                       (double)bad,  dev_t_tree_pack_,
+                       nb->dev_t_tree_upload, nb->dev_t_block,
+                       // deviceInitOnHome's three parts. Nonzero on the
+                       // home PE only, so max_double reports the worst
+                       // process rather than an average that would hide it.
+                       nb->dev_t_kokkos_init, nb->dev_t_alloc,
+                       nb->dev_t_plan, nb->dev_t_prologue,
+                       nb->dev_t_warmup};
+    this->contribute(12 * sizeof(double), vals, CkReduction::max_double,
+                     dev_done_cb_);
+  }
+
+  // Build the section-4 contract from the device's labels: uf_parent,
+  // roots, rep_label, root_counts, plus every particle's group_number.
+  //
+  // Section 4 expected this to force a PROCESS-WIDE rep_label, because the
+  // device union-find is process-wide and a component's minimum-order root
+  // can live in any PE's range — and it warned that the read-after-write
+  // hazard in applyTipEncoding/materializeLabels would then need deposit
+  // barriers, calling that "a bug being introduced". It does not, and the
+  // reason is worth keeping: NOTHING DOWNSTREAM READS ROOT IDENTITY.
+  // applyTipEncoding, applyGlobalMap, applySliceOnPE, applyUF2Labels and
+  // depositLabelCounts all iterate `roots` and only ever transform
+  // rep_label[r] or sum root_counts[r] BY LABEL — depositLabelCounts says
+  // so in as many words ("duplicate labels across roots need no
+  // pre-merging here"). So the representative structure only has to
+  // satisfy rep_label[uf_parent[i]] == label[i]; it does not have to agree
+  // with the device's roots, and it can stay strictly per-PE.
+  //
+  // Which makes the cheapest valid construction a RUN-LENGTH ENCODING:
+  // walk this PE's particles in order and open a new representative every
+  // time the label changes. One linear pass, no hashing, perfect locality,
+  // and it degrades gracefully — in the worst case (every particle a
+  // different label) every particle is its own representative, which is
+  // still correct, just no cheaper than a per-particle rewrite. Morton
+  // order makes that worst case unreachable in practice: materializeLabels
+  // already relies on consecutive particles nearly always sharing a root.
+  //
+  // FOF_COUNT_VERIFY=1 recomputes the counts from the particles and aborts
+  // on disagreement, so this construction is gated by machinery that
+  // already existed.
+  void deviceAdopt(const long* label) {
+    int n_local = 0;
+    density_x = 0.0;
+    size_x = 0.0;
+    max_piece_n = 0;
+    for (auto& s : treepieces) {
+      s.offset = n_local;
+      n_local += s.n;
+      // Kept identical to phaseABody's: the phase3Stats cost-model probes
+      // read these and a device run should still populate them.
+      double vol = (double)s.root->data.box.volume();
+      if (vol > 0) density_x += (double)s.n * (double)s.n / vol;
+      size_x += std::pow((double)s.n, 1.28);
+      if ((long)s.n > max_piece_n) max_piece_n = s.n;
+    }
+    uf_parent.resize(n_local);
+    rep_label.assign(n_local, -1);
+    root_counts.assign(n_local, 0);
+    roots.clear();
+    // flat_order stays EMPTY: it exists so find()/unite() can compare
+    // global orders, and neither runs on this path (frozen_ blocks them).
+    flat_order.clear();
+    int run = -1;
+    long run_label = 0;
+    long at = dev_base_;
+    for (auto& s : treepieces) {
+      for (int i = 0; i < s.n; i++, at++) {
+        const long g = label[at];
+        const int k = s.offset + i;
+        if (run < 0 || g != run_label) {
+          run = k;
+          run_label = g;
+          roots.push_back(k);
+          rep_label[k] = g;
+        }
+        uf_parent[k] = run;
+        root_counts[run]++;
+        s.parts[i].group_number = g;
+      }
+    }
+    frozen_ = true;
+    // Per-PE load signal for phase3Stats. On the CPU path it is the
+    // phaseA wall; here the only per-PE phase-1 work is the staging, so
+    // that is what it reports. Same meaning (this PE's share of phase 1),
+    // different constituent — do not compare the two across modes.
+    t_phaseA = dev_t_pack_ + dev_t_tree_pack_;
+    t_phaseB = 0.0;
+  }
+
+  long dev_base_ = 0;
+  int dev_n_ = 0;
+  double dev_t_pack_ = 0;
+  double dev_t_tree_pack_ = 0;
+  double dev_t_scatter_ = 0;
+  CkCallback dev_done_cb_;
+#else
+  // CPU-only build: fof.ci declares these entries unconditionally (it has
+  // no preprocessor), so they need definitions. deviceStage0 closes its
+  // callback so a caller that asks for the stage without a GPU build gets
+  // an immediate, honest "nothing happened" rather than a hang; the rest
+  // are unreachable.
+  //
+  // A CPU-only binary asked for FOF_GPU_PHASE1 does NOT reach here:
+  // runFoFPhase1 aborts at the top instead. Closing the callback with
+  // zeros would otherwise mean phase 1 silently produced no labels at all.
+  void deviceStage0(double, const CkCallback& cb) {
+    // TWELVE, matching what runFoFPhase1 reads back out of this reduction
+    // (gv[0]..gv[11]). Unreachable today — the driver aborts on
+    // FOF_GPU_PHASE1 in a non-FOF_GPU binary before it gets here — but a
+    // short message under a driver that reads twelve is an over-read, and
+    // the abort above it is the only thing standing between the two.
+    double vals[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    this->contribute(12 * sizeof(double), vals, CkReduction::max_double, cb);
+  }
+  void deviceInitOnHome() {}
+  void deviceWarmup() {}
+  void devicePack() {}
+  void deviceComplete() {}
+  void deviceScatter() {}
+#endif  // FOF_GPU
 
   // --- Within-process chain (design/phase1-scaling.md, 2026-07-25).
   // Every stage of phaseA -> phaseB -> merge -> relabel reads and writes
@@ -3547,6 +4335,16 @@ class TreePieceRegisterFn : public paratreet::PerTreePieceAble<Data> {
                           int n_particles) override {
     fof_.ckLocalBranch()->registerTreePiece(local_root, particles, n_particles);
   }
+
+  // Flat-tree form (src/DeviceTree.h). dnodes is null unless
+  // PARATREET_DEVICE_TREE is on, and phase 1's CPU paths never read it,
+  // so this is the same registration either way.
+  virtual void operator()(Node<Data>* local_root, Particle* particles,
+                          int n_particles, const paratreet::DNode* dnodes,
+                          int n_dnodes) override {
+    fof_.ckLocalBranch()->registerTreePiece(local_root, particles, n_particles,
+                                            dnodes, n_dnodes);
+  }
 };
 
 template <typename Data>
@@ -3587,6 +4385,18 @@ namespace paratreet {
 struct FoFPhase1Stages {
   double reset = 0, register_s = 0, phaseA = 0, phaseB = 0, merge = 0,
          relabel = 0;
+  // Device path (design/phase1-gpu.md section 18). Zero when the CPU chain
+  // computed phase 1; in Replace mode the four CPU stages above are zero
+  // instead, because they genuinely did not run. `device_wall` is the wall
+  // of the whole device chain on the driving thread, so it is the one to
+  // compare against phaseA+phaseB+merge+relabel.
+  double device_wall = 0, device_pack = 0, device_tree = 0, device_pass = 0,
+         device_scatter = 0, device_block = 0;
+  // The serial home-PE prologue inside device_wall, broken out. These are
+  // NOT part of device_pass and do not overlap the stages above; they are
+  // the reason iteration 0's device_wall exceeds the sum of its stages.
+  double device_init = 0, device_alloc = 0, device_plan = 0,
+         device_prologue = 0, device_warmup = 0;
 };
 
 // Convenience driver for the full phase-1 sequence. Must be called from a
@@ -3622,12 +4432,36 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
         CkCallbackResumeThread());
   }
   local.register_s = CkWallTimer() - t;
-  // One broadcast starts the within-process chain; the single global
-  // reduction at its end delivers the max-reduced stage walls.
-  void* result = nullptr;
-  fof.startPhase1Chain(b2, grid_occupancy_threshold,
-                       CkCallbackResumeThread(result));
-  {
+
+  const FoFGpuMode gpu_mode = fofGpuMode();
+#ifndef FOF_GPU
+  // Refusing beats falling back. A binary built without FOF_GPU that
+  // quietly ran the CPU chain when asked for the device path would report
+  // "the GPU path" timings that are the CPU path's, which is the same
+  // class of silent-no-op as trap 16's untraced traced run.
+  if (gpu_mode != FoFGpuMode::Off)
+    CkAbort("FoF: FOF_GPU_PHASE1/FOF_GPU_VERIFY was set but this binary was "
+            "built without FOF_GPU. Rebuild with GPU=1 (fof/gpu/rebuild_deps.sh).");
+#endif
+  // The device traversal has no periodic wrap (design/pbc.md is a CPU-only
+  // path so far, and section 8 lists PBC as explicitly deferred). Under
+  // Verify that shows up as mismatches on the boundary particles; under
+  // Replace it would be a quietly wrong answer at the box faces, which is
+  // exactly the kind of result that looks plausible.
+  if (gpu_mode == FoFGpuMode::Replace &&
+      (period.x != 0 || period.y != 0 || period.z != 0))
+    CkAbort("FoF GPU: FOF_GPU_PHASE1 does not implement periodic boundaries "
+            "(period %g %g %g). Run without -P, or use FOF_GPU_VERIFY to "
+            "measure the device pass beside the CPU answer.",
+            (double)period.x, (double)period.y, (double)period.z);
+
+  // The CPU chain: one broadcast starts the within-process chain; the
+  // single global reduction at its end delivers the max-reduced stage
+  // walls. SKIPPED ENTIRELY in Replace mode — that is stage 4.
+  if (gpu_mode != FoFGpuMode::Replace) {
+    void* result = nullptr;
+    fof.startPhase1Chain(b2, grid_occupancy_threshold,
+                         CkCallbackResumeThread(result));
     CkReductionMsg* m = (CkReductionMsg*)result;
     const double* v = (const double*)m->getData();
     local.phaseA = v[0];
@@ -3635,6 +4469,43 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
     local.merge = v[2];
     local.relabel = v[3];
     delete m;
+  }
+  // The device chain (design/phase1-gpu.md sections 11-18).
+  //
+  // In Verify mode it runs AFTER the CPU chain, deliberately: the chain
+  // has then written every particle's PROCESS-level tip into
+  // group_number, which is exactly what the device union-find computes,
+  // so the check is an exact per-particle comparison against an answer
+  // this codebase already trusts. The device pass reads only positions,
+  // orders and the flat tree, and writes only its own buffers, so it
+  // cannot perturb the result it is being checked against.
+  //
+  // In Replace mode it is the only thing that runs, and deviceAdopt turns
+  // its labels into the section-4 contract that everything downstream
+  // consumes.
+  if (gpu_mode != FoFGpuMode::Off) {
+    double tg = CkWallTimer();
+    void* gres = nullptr;
+    fof.deviceStage0(b2, CkCallbackResumeThread(gres));
+    CkReductionMsg* gm = (CkReductionMsg*)gres;
+    const double* gv = (const double*)gm->getData();
+    local.device_wall = CkWallTimer() - tg;
+    local.device_pack = gv[0];
+    local.device_pass = gv[1];
+    local.device_scatter = gv[2];
+    local.device_tree = gv[4] + gv[5];
+    local.device_block = gv[6];
+    local.device_init = gv[7];
+    local.device_alloc = gv[8];
+    local.device_plan = gv[9];
+    local.device_prologue = gv[10];
+    local.device_warmup = gv[11];
+    // The timings above are what `-c stats` reports as the phase1_device
+    // line; gv[3] is the verify-mode mismatch count, and nonzero is fatal.
+    if (gv[3] != 0)
+      CkAbort("FoF GPU: the device labeling disagrees with the CPU "
+              "labeling on %ld particles", (long)gv[3]);
+    delete gm;
   }
   if (stages) *stages = local;
 }

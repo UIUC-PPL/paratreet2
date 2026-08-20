@@ -33,3 +33,11 @@ inputs/*.dat
 inputs/1m*.tipsy
 inputs/8m*.tipsy
 inputs/16m*.tipsy
+
+# GPU stage-0 gate build products (design/phase1-gpu.md section 11)
+fof/gpu/*.o
+fof/gpu/*.a
+fof/gpu/fof-device-test
+fof/gpu/stage0.*.out
+fof/gpu/stage0.*.err
+tests/kokkos-spike/kokkos-spike
