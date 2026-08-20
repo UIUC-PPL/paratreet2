@@ -30,7 +30,7 @@ module load craype-x86-trento libfabric/2.3.1 craype-network-ofi \
   cray-libsci/24.11.0 PrgEnv-gnu/8.6.0 rocm/6.2.4 cmake/3.30.5 \
   python/3.13.0 darshan-runtime/3.4.6-mpi
 
-export LD_LIBRARY_PATH=/ccs/home/rrao/charm_reconverse/lib:/ccs/home/rrao/charm_reconverse/lci/lib64:$LD_LIBRARY_PATH
+export LD_LIBRARY_PATH=/ccs/home/rrao/charm_reconverse/lib:$LD_LIBRARY_PATH
 export LCI_ATTR_BACKEND=ofi
 export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_MR_CACHE_MONITOR=userfaultfd
