@@ -1614,3 +1614,30 @@ priority — piece count correlates -0.084 with cross time and -0.237
 with TOTAL phaseA time (an outcome of speed, not a cause of load);
 what varies is per-piece cost (4.9x median-to-max). The -13.3% ceiling
 stands but has no reachable mechanism as specified.
+
+## 38. ANVIL CONFIRMATION OF THE SPLIT (job 20025733, 2B/16 nodes,
+## 2026-08-20): the section-36 result is machine-independent
+
+Ten arms, two reps each, all EXACT (424,897,832 / max_size
+185,317,566, identical histograms). Iteration-0 means:
+
+    base-serial (no split, -u serial)   4206 ms
+    dist-nosplit (no split, -u dist)    4160 ms
+    blocked (sets 4, MODE=0, dist)      3881 ms
+    rec  (sets 14, MODE=1, dist)        3596 ms   -14.5% vs base
+    rec-serial (sets 14, MODE=1, serial) 5392 ms  +28% vs base — WORSE
+                                                  than doing nothing
+
+- The recommended config's -14.5% at 16 nodes matches Frontier's
+  -16.2% (section 36) on a different machine, fabric, and allocation.
+- phaseB elimination reproduces: 0.708 s -> 0.027 s.
+- The -u dist prerequisite reproduces: rec-serial also kills phaseB
+  (0.069) but uf2 blows up 0.341 -> 1.600 s and the net is a loss —
+  serial's root-gather cannot absorb the split's edge inflation.
+- MODE is load-bearing, not cosmetic, and the mechanism is visible in
+  the numbers: blocked at sets=4 drops ~75% of the PAIRS (99.7k of
+  ~133k) but phaseB barely moves (0.687 vs 0.708) — contiguous-rank
+  sets align with SFC locality, so the retained same-set pairs are
+  the near, m2-heavy ones. Round-robin (MODE=1) scatters spatial
+  neighbours across sets and drops the expensive pairs; that is the
+  entire difference between -3% and -96% of phaseB.
