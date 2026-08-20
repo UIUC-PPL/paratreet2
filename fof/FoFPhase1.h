@@ -1883,6 +1883,27 @@ public:
   // process-flat index space. fetch_add gives disjoint bases with no
   // ordering requirement — the PE that gets base 0 is not special.
   void deviceStage0(double b2, const CkCallback& cb) {
+    // ENGINE CONTRACT section 3: a GPU process must be the sets=1 case.
+    // The device union-find is process-wide and covers EVERY intra-process
+    // pair; it has no notion of the PE-set split and defers nothing. The
+    // table the phase-3 veto reads (pieceSetTable) is written by the CPU
+    // chain's pool build, which Replace mode skips entirely, so on a
+    // process where the split is configured the table stays EMPTY and
+    // peSetKeepLocalPair's "don't know -> walk it" fallback vetoes the
+    // ownership prune for every local pair. The answer stays right — the
+    // pairs were already merged and re-merging is idempotent — but phase 3
+    // silently loses its prune on that process, which at 2B reads as an
+    // unexplained phase-3 regression rather than as a misconfiguration.
+    // Mixed jobs are still well-formed, which is the point of the split
+    // being per-process: scope it with FOF_PE_SETS_NODES to the CPU
+    // processes and the GPU ones land here at peSetsHere() == 1.
+    if (paratreet::fofGpuMode() == paratreet::FoFGpuMode::Replace &&
+        paratreet::peSetsHere() > 1)
+      CkAbort("FoF GPU: process %d has the PE-set split active "
+              "(FOF_PE_SETS=%d, %d sets here) and the device engine does "
+              "not implement it. List only the CPU processes in "
+              "FOF_PE_SETS_NODES.",
+              CkMyNode(), paratreet::peSets(), paratreet::peSetsHere());
     b2_ = b2;
     dev_done_cb_ = cb;
     dev_t_pack_ = 0;
@@ -2368,8 +2389,13 @@ public:
   // runFoFPhase1 aborts at the top instead. Closing the callback with
   // zeros would otherwise mean phase 1 silently produced no labels at all.
   void deviceStage0(double, const CkCallback& cb) {
-    double vals[7] = {0, 0, 0, 0, 0, 0, 0};
-    this->contribute(7 * sizeof(double), vals, CkReduction::max_double, cb);
+    // TWELVE, matching what runFoFPhase1 reads back out of this reduction
+    // (gv[0]..gv[11]). Unreachable today — the driver aborts on
+    // FOF_GPU_PHASE1 in a non-FOF_GPU binary before it gets here — but a
+    // short message under a driver that reads twelve is an over-read, and
+    // the abort above it is the only thing standing between the two.
+    double vals[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    this->contribute(12 * sizeof(double), vals, CkReduction::max_double, cb);
   }
   void deviceInitOnHome() {}
   void deviceWarmup() {}
