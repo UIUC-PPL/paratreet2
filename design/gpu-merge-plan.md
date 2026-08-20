@@ -128,3 +128,118 @@ unchanged (ppn 14 / ndev 7 / poll 2).
   candidate upstream issue.
 - ppn-7 GPU advantage at more node counts; CPU ppn A/B if wanted.
 - The 08-14 GPU node sweep rerun at ppn 7 if the advantage holds.
+
+## E. Execution record (2026-08-20)
+
+Branch `gpu-phase1-rebase`, eleven rebased commits plus three new ones, on
+top of main `7fa3531`. Worktrees and job logs under
+`/lustre/orion/csc710/scratch/rrao/gpu-merge/`.
+
+**A1 (LCI fork) — DONE.** The fork is deleted; the stack runs autofetched
+upstream `uiuc-hpc/lci` at `ca88ce2c`. The three fork commits survive on
+GitHub and in `~/lci-fork-archive/`, to be reopened as upstream PRs if
+Frontier ever needs them (A3's tail).
+
+**A2, A3 — NOT DONE.** Runtime-layer items, untouched here: the reconverse
+lock A/B still wants its one 2B job, and neither charm nor reconverse has
+been sent upstream.
+
+**B1 — DONE.** The scripts were already committed at `f7375a3` (which also
+carries `run_fof3_nosmt_8p_nd7.sbatch`, added 08-19). The four IN-REPO
+runbook defects from relay16 section 6 are fixed: `KOKKOS_DIR` now defaults
+to `$(HOME)/kokkos` in both makefiles, and the README pins the Kokkos clone
+to 4.7.04, says to pass `-DCMAKE_PREFIX_PATH=/opt/rocm-6.2.4` because
+`module load rocm/6.2.4` is a non-interactive no-op, and makes the `-amd`
+suffix on `CHARM_HOME` unmissable. Defect 5 (the clone list) was already
+covered by README's Prerequisites.
+
+**B2 — DONE, and cheaper than expected.** `git rebase --onto main f3d9bf2`
+hit exactly ONE textual conflict: `examples/fof3/Makefile`'s `DATA` list,
+where both sides had independently added `FoFPhase1.h` (kept the branch's,
+which carries the comment explaining the stale-instantiation trap it
+fixed). Nothing had to be dropped — the branch never touched the S3,
+shedding or reservation code the cleanup removed, so the fork point's age
+cost nothing. `fof/FoFPhase1.h` auto-merged despite +849 on one side and
++1094 on the other: the two sets of edits are in disjoint regions.
+
+Auto-merging is not compiling, and the tree did not compile. Two braced
+initializations that main wrote in the `FOF_STEALA` claim path stopped
+resolving, because gpu-phase1 gave `TreePieceRef` default member
+initializers and an NSDMI disqualifies a class from being an aggregate
+under C++11 — which is what charmc compiles (`-std=gnu++11`). `libfof.a`
+still built; the chares are templates, so only the application instantiates
+them. Repaired at `69a1be2`, which also carries the device tree through a
+claim: both rewritten structures had been dropping `dnodes`, so
+`FOF_STEALA=1` plus any device arm would have ended in deviceLaunch's "no
+flat device tree" abort.
+
+**B3 — DONE; one contract gap found and closed.** Sections 1, 2, 4 and 5
+hold as written. Section 4 holds structurally: the `dev_done_cb_` reduction
+that releases the driver's `CkCallbackResumeThread` is contributed by every
+PE only after `deviceAdopt`, so labels are complete and nothing is in
+flight. Section 5 holds because the keep-alive ring is `CcdCallFnAfter` —
+raw Converse, invisible to QD.
+
+Section 3 held only by omission, which is the gap. `pieceSetTable()` is
+written by the CPU chain's pool build, and Replace mode skips that chain
+entirely; with `FOF_PE_SETS` unset `peSetKeepLocalPair` returns before it
+ever reads the table, so the standing configuration is fine by accident.
+Configure the split on a GPU process and the table stays EMPTY, the
+"don't know -> walk it" fallback vetoes the ownership prune for every local
+pair, and phase 3 silently loses its prune while still producing the RIGHT
+count. `21e9aaa` refuses that combination in `deviceStage0` (a broadcast,
+so the check is per-process) and names `FOF_PE_SETS_NODES` as the fix,
+which keeps the contract's mixed case well-formed.
+
+**An unrelated main-side bug rides in with the rebase.** `TreePiece::reset()`
+on main clears `particles` unconditionally, but `buildTree()` takes its
+next input by swapping in `incoming_particles`, which nothing refills for an
+app that does not move particles. Reproduced on main at `7fa3531`, fof3
+10k `-c stats -i 3`: iteration 0 reports 3549 components, iterations 1 and 2
+report **0**, in 0.8 ms, with no error. The same command on the rebased tree
+reports 3549 three times. Every multi-iteration measurement taken on main
+since the fork was measuring an empty tree — including, had it been run, B4's
+own "-i 2 with iteration-1 readout" rule.
+
+**B4 — laptop and single-node rows DONE.**
+
+- CPU matrix, reconverse, job 5314421 (25 s): all 16 runs `FOF3 TEST
+  PASSED`, plus 100k `-c full` (33933 components, O(n^2) crosscheck agreeing)
+  and split-active 10k `FOF_PE_SETS=2` at exactly the 3549 gold with the
+  split engaging (piece_pairs_dropped 2112/2130). Zero nonzero exits. Run
+  under `srun --network=single_node_vni` rather than `charmrun ++local`:
+  the reconverse/LCI transport needs a VNI even for two processes on one
+  node.
+- Device arm, 1 node x 8 proc x 7 PE, job 5314453 (32 s): `FOF_GPU_VERIFY`
+  exit 0 — and verify mode aborts on any per-particle disagreement, so that
+  is an exact match against the CPU labeling, not a matching count.
+  `FOF_GPU_PHASE1` gave 33933 / max_size 26042 / identical log2 histogram,
+  three-way exact with the verify arm and with the CPU-only gate. The
+  section-3 guard aborts as designed on `FOF_PE_SETS=2`.
+- GPU=0 is NOT byte-equivalent to main, deliberately: the `reset()` fix
+  above changes `-i > 1` behaviour, and the branch also hardens
+  `Makefile.common` so `PROJECTIONS=0` means off rather than on.
+- 2B / 16 nodes, device arm, job 5314471 (33 s wall): **424,897,832
+  components, max_size 185,317,566** — the gold pair, reproduced on top of
+  main's PE-set split and cleanup, which this code had never seen before
+  the rebase. `phase1_devinit init 0.000`, `phase1_device wall 0.582 s`,
+  Iteration 0 4290.5 ms (5307458 was 4303.9, 5310026 was 4239.2 — inside
+  the spread of the two pre-rebase jobs at this shape). exit 0.
+- NOT DONE: the classic-charm arm (no classic build on this machine), the
+  mixed CPU/GPU job, and `-i 2` iteration-1 timing readouts.
+
+**B5 — NOT DONE.** Every gate that can run on this machine is green; held
+for a decision, since two of the plan's own gates did not run and the
+first-parent commit is supposed to name the outcome.
+
+**C (launch shape).** The plan's recommended GPU default — ppn 7 / ndev 7 /
+poll 1 — was measured at 16 nodes on 08-19, job 5310026 against 5307458
+(ndev 4 + poll stride 2), same shape otherwise: iteration 0 4239.2 vs
+4303.9 ms untraced, tree traversal 2180 vs 2261 ms, `phase1_device` flat to
+the millisecond, components bit-identical. Every pair moves the opposite way
+on the traced arm, which is the noise signature. So the two configurations
+are interchangeable here, and ndev 7 is the one that is valid under any
+threading contract — but note it is only reachable with the poll stride
+UNSET: `+ppn 7 +lci_ndevices 7 +backend_poll_thread 2` is one thread per
+device with the odd ranks silenced, which is the silent 8-minute init hang
+of job 5302111. The "ask him why ppn 7" item is still open.
