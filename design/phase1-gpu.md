@@ -668,10 +668,15 @@ itself is `-O3` and unaffected.
    file is not valid UTF-8". Archives must arrive through `-L`/`-l`.
 6. **charmc's link line names liblci.so but not liblct.so**, so ld
    cannot resolve the transitive DT_NEEDED ("undefined reference to
-   `LCT_*`"). Needs `-Wl,-rpath-link` into `charm_reconverse/lci/lib64`;
-   adding `-Wl,-rpath` for it and for the charm build's own `lib` also
-   makes the binary runnable without LD_LIBRARY_PATH setup
-   (`libreconverse.so` is not on any default path either).
+   `LCT_*`"). Needs `-Wl,-rpath-link` into the charm build's own `lib`
+   (`$CHARM/lib`), which ships `liblci.so` and `liblct.so` side by side;
+   adding `-Wl,-rpath` for it makes the binary runnable without
+   LD_LIBRARY_PATH setup (`libreconverse.so` is not on any default path
+   either). Until 2026-08-19 this pointed at `charm_reconverse/lci/lib64`,
+   the local LCI fork — a different build of a different revision, which
+   worked only because it was ABI-compatible by luck. The fork has been
+   deleted; charm autofetches LCI from uiuc-hpc via FetchContent and
+   installs it into `$CHARM/lib`.
 7. **charmc defaults to `-std=gnu++11`** here; Kokkos needs C++17 in any
    TU that sees it, and the firewall header is cleaner at 17. Pass
    `-c++-option -std=gnu++17`.
