@@ -32,7 +32,12 @@ PARATREET_REGISTER_MAIN(ExMain);
     conf.release_arg("u");
     conf.min_n_treepieces = CkNumPes() * 8;
     conf.min_n_partitions = CkNumPes() * 8;
-    conf.max_particles_per_leaf = 12;
+    // 32: the measured CPU-chain optimum (Frontier 2B/16 full sweep,
+    // relays 62/63, 2026-08-21 — a shallow U over 24-48; the old 12
+    // costs +11.5%, the GPU arm's 128 costs +47% here). Leaf size does
+    // not change the FoF answer, only the phaseA/walk work split. GPU
+    // (Replace-mode) runs should pass -l 128, their own true optimum.
+    conf.max_particles_per_leaf = 32;
     // Oct decomposition/tree is the FoF configuration (design/phase1.md);
     // run with -d oct. Phase 3 requires the matching decompositions
     // (runFoFPhase3 enforces it).

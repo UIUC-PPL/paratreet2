@@ -471,12 +471,11 @@ CPU cluster run — **the defaults ARE the recommended config** as of
 ```sh
 ./FoF3 -f <input> -d oct -u dist -c stats
 # LEAF SIZE IS A FIRST-ORDER KNOB WITH OPPOSITE OPTIMA PER ARM
-#   (relays 61-64, full sweeps, 2B/16): CPU-only optimum -l 32 (clean
-#   shallow U over 24-48; default 12 costs +11.5%, the GPU's 128 costs
-#   +47%); GPU optimum -l 128 (true interior minimum; 12 costs +28%,
-#   384 costs +53%). Pass -l 32 on CPU runs until/unless the default
-#   changes.
-# Frontier: +ppn 7 +pemap <nosmt map>, -l 32 -> 4785-4811 ms at 2B/16
+#   (relays 61-64, full sweeps, 2B/16): CPU-only optimum -l 32 — NOW
+#   THE DEFAULT (was 12, which costs +11.5%; the GPU's 128 costs +47%
+#   on the CPU chain); GPU optimum -l 128 (true interior minimum; 12
+#   costs +28%, 384 costs +53%) — pass -l 128 explicitly on GPU runs.
+# Frontier: +ppn 7 +pemap <nosmt map> -> 4785-4811 ms at 2B/16
 #   (production build). The once-headline "ppn 7 beats ppn 14 by 17%"
 #   was an artifact of measuring at Debug build + leaf 128: at the
 #   shipping configuration the ppn effect is +0.8% (real, nearly
