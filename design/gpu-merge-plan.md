@@ -119,7 +119,15 @@ So "half the PEs", not "half the cores": no silicon idles either way.
 **Recommended defaults today:** GPU arm ppn 7 / ndev 7 / poll 1 on
 upstream LCI (one thread per domain — valid under ANY threading
 contract, fewest projections artifacts among the fast shapes); CPU arm
-unchanged (ppn 14 / ndev 7 / poll 2).
+~~unchanged (ppn 14 / ndev 7 / poll 2)~~ **superseded 2026-08-21
+(relays 46/47): ppn 7 wins on CPU too, 16.5-17.2% at 2B/16** — a
+thread-count effect in the SMT-hostile phase-3 walk, not the AUTO
+split (set effect +0.4%, inside spread; the split does its job at both
+shapes). The two arms converge on ppn 7 for DIFFERENT reasons: GPU =
+helper-thread headroom on the free siblings; CPU = the walk cannot
+tolerate SMT sharing. Open discriminator if ever needed (needs a
+HIP-free charm build): ppn 14 across two processes on 14 PHYSICAL
+cores — penalty vanishes = SMT, survives = PE count.
 
 ## D. Non-blocking follow-ups
 

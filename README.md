@@ -470,7 +470,13 @@ CPU cluster run — **the defaults ARE the recommended config** as of
 
 ```sh
 ./FoF3 -f <input> -d oct -u dist -c stats -l 128
-# Frontier: +ppn 14 +lci_ndevices 7 +backend_poll_thread 2
+# Frontier: +ppn 7 +pemap <nosmt map> +lci_ndevices 7 +backend_poll_thread 1
+#   ppn 7 (no SMT) beats ppn 14 by 16.5-17.2% at 2B/16 in two 3-rep jobs
+#   (relays 46/47, jobs 5319650/5319793): a THREAD-COUNT effect in the
+#   phase-3 walk (-42%, SMT-hostile pointer chasing), while phaseA is
+#   SMT-neutral (-3%); NOT an artifact of the AUTO split (set effect
+#   measured at +0.4%, inside spread). ppn 14 remains valid; it is just
+#   slower here.
 # A/B against the pre-campaign behaviour: FOF_PE_SETS=1 FOF_STEALA=0 \
 #   FOF_PB_PARTS=0 FOF_PHASEB_SLICE_MS=0
 ```

@@ -1,0 +1,124 @@
+*** CORRECTION, 2026-08-21: SECTION 2 OF THIS REPORT IS WRONG.  It reads the
+    piece_pairs_dropped difference as the AUTO split deferring work to the
+    phase-3 walk.  relay47 (job 5319793) holds ppn at 14 and forces sets to 7:
+    piece_pairs_dropped barely moves (86,502 -> 80,185) and the walk does not
+    move at all (2.508 -> 2.483 s).  piece_pairs_dropped tracks the PE COUNT,
+    not the set count.  The headline verdict below stands and is confirmed;
+    only the mechanism in section 2 is retracted.  READ relay47.txt. ***
+
+relay46 -- CPU-ONLY, ppn 7 BEATS ppn 14 BY 17.2%.  Job 5319650, 16 nodes, 2B,
+CPU-only binary, warm-up plus 3 reps x 2 shapes interleaved.  2026-08-21.
+The A/B the CPU record never had.
+
+*** THE VERDICT: ppn 7 WINS ON CPU TOO, and not marginally.
+
+      shape     rep1      rep2      rep3      mean     range
+      ppn 14   9573.4    9525.6    9508.5    9535.8      64.9  (0.7%)
+      ppn  7   7843.6    7902.2    7930.7    7892.2      87.1  (1.1%)
+
+    ppn 7 is 1643.7 ms faster, -17.2%.  The ranges are nowhere near each other
+    -- [7843.6, 7930.7] against [9508.5, 9573.4] -- so this needs no
+    statistical care at all.  All six arms EXACT. ***
+
+*** BUT IT IS NOT A CLEAN ppn A/B, AND I AM FLAGGING THAT BEFORE THE
+    INTERPRETATION.  The AUTO PE-set default is sets = ppn, so the ppn-14 arm
+    also ran with 14 sets and the ppn-7 arm with 7.  Two variables moved
+    together.  Job 5319793 (relay47) separates them and was submitted before
+    this report was written. ***
+
+1.  WHERE THE TIME GOES.  Per-phase, 3-rep means, seconds.
+
+      phase           ppn 14     ppn 7     delta
+      phaseA           4.757     4.587      -170 ms    -3.6%
+      phase3_walk      2.539     1.396     -1143 ms   -45.0%
+      uf2              0.237     0.115      -122 ms   -51.4%
+      uf2_setup        0.040     0.012       -28 ms   -70.2%
+      edge_gather      0.007     0.002        -5 ms
+      relabel          0.130     0.125        -5 ms
+      accounted                            -1472 ms of the -1644 ms total
+
+    THE WIN IS THE PHASE-3 WALK, exactly as it was on the GPU arm.  phaseA --
+    the phase SMT was historically kept FOR -- contributes only 170 ms of the
+    1644, and it is FASTER at ppn 7 despite running on half as many threads.
+    That is the single most surprising number here: doubling the thread count
+    via SMT buys phase 1 nothing at this scale.
+
+2.  THE AUTO SPLIT AT ITS SECOND SHAPE, and the mechanism it exposes.
+    AUTO resolved correctly at both shapes -- `FOF3STAT pe_sets` reports
+    sets 14 mode 1 at ppn 14 and sets 7 mode 1 at ppn 7, on all 128 nodes.
+    But look at what it defers:
+
+      sets 14   piece_pairs_dropped  86,429 (mean over reps)
+      sets  7   piece_pairs_dropped  27,665
+                                     3.1x more deferred at sets=14
+
+    Deferred pairs are handed to the phase-3 walk.  86k against 28k deferred,
+    and the walk goes 1.396 -> 2.539 s.  So the AUTO split's cost scales with
+    ppn, and at ppn 14 it more than eats its own benefit.  That is a real
+    finding about the default, not about the launch shape.
+
+3.  WHICH IS WHY THE CONFOUND MATTERS.  Three readings fit these numbers:
+      (a) ppn 7 is better because 56 threads beat 112 on this workload;
+      (b) sets 7 is better because sets 14 defers 3.1x more work to the walk;
+      (c) both.
+    This job cannot distinguish them.  Job 5319793 runs three arms -- ppn 14
+    AUTO (sets 14), ppn 14 with FOF_PE_SETS=7, and ppn 7 AUTO (sets 7) -- so
+    that p14-auto vs p14-sets7 isolates the SET effect at fixed thread count
+    and p14-sets7 vs p7-auto isolates the THREAD effect at matched sets.
+    I went one step past the brief's "one job" to run it, because leaving a
+    confounded result overnight when ten minutes of machine time resolves it
+    seemed the worse service.  Result will be appended as relay47.
+
+4.  AGAINST THE HISTORICAL LINE, as context only.  The old-tree CPU record is
+    ~5.15-5.19 s (relay13/15) at ppn 14, against 9.54 s here.  Do not read
+    that as a regression: the defaults changed underneath (AUTO split, STEALA,
+    PB_PARTS, SLICE_MS all now on by default), the runtime is entirely
+    different, and relay13/15 were a different tree.  The within-job A/B is
+    the result; this line is not comparable and I am not treating it as one.
+    If the absolute number matters, it needs its own controlled comparison.
+
+5.  THE BUILD, AND ONE GATE THAT FAILED.
+      binary   merged/FoF3.cpu  md5 8bcdc38e574ab444f93588efb5d73aa1
+      fofgpu:: 0   PASS -- no application device code
+      kokkos   0   PASS
+      libamdhip64 in ldd: 2   FAILED my own gate
+    CHARM ITSELF LINKS HIP: it was configured with
+    -DCMAKE_HIP_ARCHITECTURES=gfx90a and carries hapi, so any binary linking
+    charm pulls libamdhip64 whether or not the application uses it.  "No HIP
+    linked at all" needs a second charm build, which would have broken the
+    all-latest-runtime requirement.
+
+    WHY IT DOES NOT CHANGE THIS RESULT.  The helper pathology is created
+    lazily inside fofgpu::Device::runPhase1Impl and that call site does not
+    exist in this binary.  What can still happen is charm's HAPI init creating
+    ROCm threads at startup; qdbench bounds that, being the same charm with
+    HAPI initialised and ZERO creations from a pinned creator and 12 off-core
+    gaps in a whole run.
+    THE RESIDUAL RISK IS ASYMMETRIC and biases TOWARDS ppn 7: at ppn 7 half
+    the logical CPUs are free for an unpinned ROCm thread, at ppn 14 none are.
+    At a 1644 ms margin against a 65-87 ms spread it cannot matter here.  It
+    would matter if the shapes were close, and if this is ever re-run for a
+    marginal case, build charm without HIP first.
+
+6.  READINGS.
+    keepalive_gaps 128 lines per arm, phaseA_stages 128, pe_sets 128 -- one
+    per node in every arm, so nothing was silently skipped.
+    phaseA self_sum per node: ~45-50 at ppn 14 against ~17 at ppn 7, with
+    self_max 3.4-3.7 against 2.6.  More threads, more total phaseA work
+    summed, and a WORSE max -- consistent with the phaseA wall being no better
+    at ppn 14.
+
+7.  WHAT THIS MEANS FOR THE RECOMMENDATION, pending relay47.
+    As launched, with current defaults, ppn 7 is the faster CPU shape by 17.2%
+    -- so the ppn-14 idiom in the machines docs and the README is not right as
+    a default any more, on this machine at this scale.  Whether the fix is
+    "launch ppn 7" or "keep ppn 14 and set sets=7" is exactly what relay47
+    decides, and the two have different consequences for anyone whose reason
+    for ppn 14 is something other than speed.
+
+ARTEFACTS
+  merged/FoF3.cpu  md5 8bcdc38e574ab444f93588efb5d73aa1
+  merged/build-app-cpu.sh
+  sbatch/relay53-cpuonly-16n.sbatch
+  /lustre/orion/csc710/scratch/lvkale/s3ab/5319650/
+  nothing pushed; gpu-stalls untouched

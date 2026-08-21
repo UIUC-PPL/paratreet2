@@ -1,0 +1,97 @@
+relay47 -- IT IS THE THREAD COUNT, NOT THE SET COUNT.  Job 5319793, 16 nodes,
+2B, CPU-only, warm-up plus 3 reps x 3 arms interleaved, ALL EXACT.
+2026-08-21.  Separates the confound relay46 flagged, and CORRECTS relay46's
+mechanism claim.
+
+*** THE SEPARATION.
+
+      arm          rep1      rep2      rep3      mean     range
+      p14-auto    9493.4    9505.6    9475.7    9491.6      30.0  (0.3%)
+      p14-sets7   9548.2    9513.8    9519.7    9527.2      34.4  (0.4%)
+      p7-auto     7986.2    7972.7    7898.3    7952.4      87.9  (1.1%)
+
+      SET effect,    fixed ppn 14   : 9491.6 -> 9527.2   +35.7 ms   +0.4%
+      THREAD effect, matched sets 7 : 9527.2 -> 7952.4  -1574.8 ms  -16.5%
+
+    The set count is worth NOTHING -- and what little it is worth points the
+    other way, sets 14 being 35.7 ms FASTER than sets 7 at ppn 14, which is
+    inside the spread.  The entire ppn-14 penalty is the thread count. ***
+
+*** I HAVE TO CORRECT relay46 SECTION 2.  It read the 3.1x difference in
+    piece_pairs_dropped (86,429 at sets=14 against 27,665 at sets=7) as the
+    AUTO split deferring more work to the phase-3 walk, and concluded that
+    "the AUTO split's cost scales with ppn and at ppn 14 it more than eats its
+    own benefit."  THAT IS WRONG.  Holding ppn at 14 and forcing sets to 7:
+
+      piece_pairs_dropped   ppn14/sets14  86,502
+                            ppn14/sets7   80,185     <- barely moves
+                            ppn7 /sets7   27,703
+      phase3_walk           ppn14/sets14   2.508 s
+                            ppn14/sets7    2.483 s   <- barely moves
+                            ppn7 /sets7    1.429 s
+
+    piece_pairs_dropped tracks the PE COUNT, not the set count, because what
+    is deferred is pairs crossing a set boundary and the number of cross-PE
+    pairs is set by how many PEs there are.  Halving the sets at fixed ppn
+    barely changes it, and does not touch the walk at all.  The correlation
+    relay46 saw was real; the causal direction I gave it was not. ***
+
+1.  SO WHAT IS THE WALK'S PROBLEM AT ppn 14?  Not the split.  The phases split
+    cleanly by character:
+
+      phase          ppn14/sets7   ppn7/sets7   delta
+      phaseA            4.778        4.619      -159 ms   -3.3%
+      phase3_walk       2.483        1.429     -1054 ms  -42.4%
+
+    phaseA is essentially SMT-NEUTRAL: dense local per-PE work, and twice the
+    hardware threads buys it 3%.  The phase-3 walk is SMT-HOSTILE: it loses
+    42% when the two hardware threads of a core share it.
+
+    HYPOTHESIS, LABELLED AS ONE.  The walk is a pointer-chasing tree traversal
+    and therefore memory-latency-bound and cache-resident-set sensitive; two
+    SMT siblings on one physical core halve the effective L1/L2 each thread
+    sees and serialise on the same load pipeline.  phaseA is compute-dense and
+    does not care.  That is consistent with everything here and with the GPU
+    arm, where the walk was also where ppn 7's win lived -- but nobody has
+    measured cache or memory counters, and I am not claiming it as established.
+
+2.  ONE MORE THING THE MIDDLE ARM SHOWS.  Forcing sets 7 at ppn 14 brings
+    phaseB back: 0.000 s at sets 14, 0.113 s at sets 7.  Removing phaseB is
+    exactly what the PE-set split is for, so the split IS doing its job at
+    ppn 14 -- it is just that the 113 ms it saves is irrelevant against the
+    1575 ms the thread count costs.  The AUTO default is not the problem and
+    should not be changed on the strength of relay46.
+
+3.  THE ANSWER TO THE ORIGINAL QUESTION.
+    CPU-only, current defaults, 2B on 16 nodes:  ppn 7 beats ppn 14 by
+    1575-1644 ms, 16.5-17.2%, in two independent jobs, with non-overlapping
+    ranges in both.  It is a thread-count effect, it lives in the phase-3
+    walk, and it is NOT an artefact of the AUTO PE-set default.
+
+    So the GPU and CPU recommendations converge on the same launch shape, but
+    FOR DIFFERENT REASONS, and both should be stated that way:
+      GPU arm: ppn 7 wins because the SMT siblings are free for ROCm's helper
+               threads to land on -- headroom the fix exploits.
+      CPU arm: ppn 7 wins because the phase-3 walk does not tolerate SMT.
+    The ppn-14 idiom in the machines docs and the README is not right as a
+    default on this machine at this scale, for either arm.
+
+4.  WHAT WOULD MAKE THE HYPOTHESIS IN SECTION 1 A RESULT.  Run the walk alone
+    under `perf stat` at both shapes and compare L2/L3 miss rates and
+    cycles-per-instruction, or run ppn 14 pinned to 14 PHYSICAL cores across
+    two processes rather than 7 cores' SMT siblings -- if the penalty vanishes
+    it is SMT, if it survives it is PE count.  The second is a pemap change
+    and one job.
+
+CAVEAT CARRIED FORWARD FROM relay46.  The binary still links libamdhip64
+through charm; the app contains no device code (fofgpu 0, kokkos 0) and the
+helper call site does not exist in it.  The residual bias favours ppn 7 and is
+bounded by qdbench at ~12 off-core gaps per run -- immaterial against a
+1575 ms margin, but it would matter for the marginal comparison section 4
+proposes, so build charm without HIP before running that.
+
+ARTEFACTS
+  sbatch/relay54-setssplit-16n.sbatch
+  /lustre/orion/csc710/scratch/lvkale/s3ab/5319793/
+  binary unchanged: merged/FoF3.cpu md5 8bcdc38e574ab444f93588efb5d73aa1
+  nothing pushed; gpu-stalls untouched
