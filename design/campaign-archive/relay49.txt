@@ -1,0 +1,132 @@
+relay49 -- THE CPU REGRESSION IS THE BUILD, AND IT IS TWO DEFECTS NOT ONE.
+Jobs 5320405 (five arms, ppn 14) and 5320452 (four arms, GPU, production).
+2026-08-21.  Kale's catch, confirmed and quantified -- with one part of his
+premise corrected.
+
+*** THE DECOMPOSITION.  Five arms, ppn 14, 2 reps each, ALL EXACT.
+
+      arm                                        iter0     phaseA   walk
+      A0  old bin, old prod runtime, OLD defaults 9644.6 ms  5.899   0.604
+      A   old bin, old prod runtime, relay15 cfg  7693.0 ms  4.889   0.938
+      B   new tree, Debug runtime, TRACE LINKED   9583.2 ms  4.808   2.537
+      C2  new tree, Debug runtime, no trace       8848.5 ms  4.652   2.043
+      C1  new tree, RELEASE runtime, no trace     7466.3 ms  4.568   1.005
+
+      B  -> C2    -734.7 ms   LINKED TRACING alone            -7.7%
+      C2 -> C1   -1382.2 ms   the Debug runtime alone        -15.6%
+                              together 2117 ms = the whole B->C1 gap
+      C1 vs A    -226.7 ms    the new tree on a production runtime is
+                              FASTER than the old tree on the old one ***
+
+*** SO: C1 ~= A, the branch his decision tree called "the whole regression is
+    the build flag".  There is NO tree regression and NO runtime-version
+    regression. ***
+
+*** BUT IT IS TWO DEFECTS, AND HE ONLY KNEW ABOUT ONE.
+    (1) charm configured CMAKE_BUILD_TYPE=Debug with CMAKE_CXX_FLAGS_DEBUG=-g.
+        That is not "error checking on" -- charm and reconverse are compiled
+        with NO OPTIMIZATION AT ALL.  Worth 15.6%.
+    (2) The application linked -tracemode projections.  Tracing was never
+        ENABLED at runtime, but the hooks are compiled into the message path
+        and phaseA is fine-grained.  Worth 7.7%.
+    I found (2) only because a --with-production charm does not build
+    libtrace-projections.a, so the production arm could not be built with
+    PROJECTIONS=1 -- "charmc: No such tracemode projections".  Chasing that
+    error revealed that the relay15 reference binary has TraceProjections 0
+    while merged/FoF3.cpu has 461.  Had I run his three arms as specified,
+    the answer would have read "the build flag explains two thirds" and sent
+    somebody after a phantom remainder. ***
+
+1.  LCI IS NOT IN THE FRAME.  merged/lci-install was built
+    CMAKE_BUILD_TYPE=Release in both stacks and is SHARED by the Debug and
+    Release charm builds, so it is identical on both sides of every arm here.
+
+2.  THE PART OF HIS PREMISE THAT IS WRONG: THE 5.15 s REFERENCE DOES NOT
+    REPRODUCE, ON ITS OWN BINARY, ON ITS OWN RUNTIME, IN ITS OWN CONFIG.
+    relay15 (job 5304461) recorded Iter0 5144.8-5192 ms with phaseA
+    1.966-2.000 s.  Arm A here is that exact binary (md5 2607c277...) on that
+    exact runtime (~/software/charm/lib) with relay15's configuration
+    (FOF_PE_SETS=14 MODE=1, STEALA, PB_PARTS, PHASEB_SLICE_MS, ppn 14,
+    ndev 7 -- checked against relay15.txt item 4, it matches).  It gives
+    7693.0 ms with phaseA 4.889 s.
+
+    phaseA is 2.5x slower on a BYTE-IDENTICAL binary and runtime.  That is
+    not the build, not the tree, not the configuration -- all three are held
+    fixed.  So the "1.97 -> 4.76 s phaseA" signature in his brief is NOT
+    evidence for the build hypothesis: phaseA is 4.89 s on the OLD build too,
+    today.  The build hypothesis is carried entirely by the WALK
+    (0.938 old vs 2.537 new-Debug vs 1.005 new-Release) and by uf2.
+
+    REMAINING SUSPECTS for the 5.15 s gap, none tested: the runtime libfabric
+    (BUILDS.md records the production charm as built against 1.20.1; every
+    job here loads 2.3.1), node placement, or something in job 5304461 I have
+    not reconstructed.  THE NEXT JOB IS ONE ARM: arm A with libfabric/1.20.1
+    loaded instead of 2.3.1.
+
+    UNTIL THEN, 5.15 s SHOULD NOT BE USED AS A BASELINE.  It is not
+    reproducible today by the artefact that produced it.
+
+3.  A0 EARNS ITS PLACE.  With the old defaults -- no FOF_* set at all --
+    phaseB costs 2.041 s, which FOF_PE_SETS=14 drives to 0.001 s.  That is
+    1951.6 ms of the A0->A difference and it is the PE-set split doing
+    exactly what it was built for, measured on the OLD binary.
+
+4.  RE-BASELINE ON THE PRODUCTION RUNTIME, job 5320452, GPU, all EXACT.
+    Binary FoF3.gpu-prod: production charm, no tracing, affinity fix present.
+
+      arm            Debug+traced   production      delta
+      ppn 7  fix         3504.9        2881.9      -623.0   -17.8%
+      ppn 7  nofix       5148.0        4135.9     -1012.1   -19.7%
+      ppn 14 nofix       5944.9        4355.6     -1589.3   -26.7%
+      ppn 14 fix         5278.3        3991.2     -1287.1   -24.4%
+
+      the fix, Debug+traced :  5148.0 -> 3504.9   -31.9%
+      the fix, production   :  4135.9 -> 2881.9   -30.3%
+
+    EVERY ABSOLUTE WALL MEASURED SINCE relay16 WAS INFLATED BY 18-27%.  The
+    fix's relative value survives intact -- 30.3% against 31.9% -- which is
+    the expected result, since both sides of every A/B carried the same
+    build.  THE NEW HEADLINE NUMBER FOR THE BEST GPU SHAPE IS 2881.9 ms, not
+    3504.9.
+    CAVEAT: this job is ONE rep per arm.  At ppn 7 the fixed arm has been
+    stable to under 1% across three reps, so the ppn-7 pair is trustworthy;
+    the ppn-14 pair is inside its own ~700 ms spread and should not be read.
+
+5.  WHAT STANDS AND WHAT DOES NOT.
+    STANDS: every relative A/B in relay37-relay48 -- the affinity fix, the
+      ppn 7 vs ppn 14 verdict, the SMT finding, the OS-interference negative,
+      the AUTO-split result.  Same build on both sides of each.
+    DOES NOT: every absolute wall since relay16, GPU and CPU.  Multiply by
+      roughly 0.73-0.82 to estimate the production figure, or re-measure.
+    ALSO DOES NOT: the 5.15 s CPU reference, for the separate reason in item 2.
+
+6.  MADE PERMANENT.  merged/build-runtime-merged.sh now passes
+    --with-production, with a comment saying why.  The same needs doing in the
+    runbook and in gpu-stalls/build-charm-up.sh before anyone rebuilds there.
+    AND A SECOND RULE: do not link PROJECTIONS=1 for timing runs.  It costs
+    7.7% with tracing switched off.  Build a separate traced binary when
+    traces are wanted, which is what FoF3.latest.tr already is.
+
+7.  TWO ERRORS OF MINE IN THIS SEQUENCE, both caught by gates, both recorded.
+    - Job 5320323: the per-arm gate globbed the resolved library path against
+      a COLON-SEPARATED library list, so it never matched and gated out every
+      arm but A.  Fixed by passing the charm lib dir separately.
+    - Job 5320439: I derived the re-baseline script from relay51, whose BIN
+      was FoF3.latest, so my substitution for FoF3.latest.tr silently did not
+      match and the run used the WRONG BINARY.  The ldd gate could not catch
+      it, because libreconverse.so is resolved by SONAME through
+      LD_LIBRARY_PATH and therefore always agrees with whatever the script
+      says.  Fixed by gating on the BINARY's own identity -- nm
+      TraceProjections must be 0 for a production arm -- and rerun as 5320452.
+      THE GENERAL LESSON: a gate that checks the environment cannot detect a
+      wrong binary.  Gate on the artefact.
+
+ARTEFACTS
+  merged/charm-prod, merged/reconverse-prod   Release runtime, same refs
+  merged/FoF3.cpu-prod     b558cc059f71e43a2cf4afd791b6fef3
+  merged/FoF3.cpu-notrace  e63ffc12ed62429988e3f7fc614832c4
+  merged/FoF3.gpu-prod     54a8de358d87b17e4d382169da88c426
+  merged/build-prod-stack.sh, build-two-cpu.sh, build-gpu-prod.sh
+  sbatch/relay59-prodbuild-16n.sbatch, relay60-gpuprod-16n.sbatch
+  unchanged: merged/FoF3.cpu 8bcdc38e..., bin/FoF3.2b.cleanup 2607c277...
+  nothing pushed

@@ -1,0 +1,124 @@
+relay48 -- THE ppn-14 PENALTY IS SMT NOT PAYING FOR ITSELF.  IT IS NOT OS
+INTERFERENCE.  Jobs 5320076 and 5320090, 16 nodes, 2B, CPU-only, 3 reps per
+arm.  Plus the traces for the best GPU shape, job 5320106.  2026-08-21.
+
+*** THE FOUR PLACEMENTS.  1792 PEs cannot be run without SMT -- there are only
+    896 physical cores on 16 nodes -- but 896 PEs CAN be run with it, and
+    holding PE count at 896 in three arms is what finally separates the
+    variables.
+
+      placement              PEs  cores  SMT      mean        vs p7-phys
+      p7-phys   8proc x 7PE   896    56   no    7813-7916 ms   baseline
+      p14-phys  4proc x14PE   896    56   no       8130.5 ms     +2.6%
+      p14-smt   8proc x14PE  1792    56   yes      9550.6 ms      +22%
+      p7-smt    8proc x 7PE   896    28   yes     13963.0 ms      +79%
+
+    All arms EXACT. ***
+
+*** SMT IS WORTH ABOUT 12% OF THROUGHPUT ON THIS WORKLOAD.  p7-smt runs the
+    SAME 896 PEs on HALF the physical cores and is 1.787x slower.  If the
+    second hardware thread gave nothing, halving the cores would cost exactly
+    2x.  It cost 1.787x, so SMT recovers 2/1.787 = 1.12x. ***
+
+*** WHICH SETTLES IT: at ppn 14, going from 896 PEs on physical cores to 1792
+    PEs using SMT -- same ppn, same 56 physical cores -- is 8130.5 -> 9550.6
+    ms, +17.5%.  ADDING PARALLELISM ON SMT THREADS IS A NET LOSS HERE.  The
+    extra 896 PEs buy ~12% more compute capacity and cost more than that in
+    parallel overhead. ***
+
+1.  KALE'S OS-INTERFERENCE HYPOTHESIS: MEASURED, AND IT IS NO.
+    He asked whether the ppn-14 phase-3 cost could be the same 10-16 ms
+    preemptions we chased on the GPU arm, on the reasoning that ppn 14 leaves
+    nowhere for OS work to land.  The kernel's own cumulative accounting --
+    /proc/<tid>/schedstat run_delay, summed over the PE threads on the batch
+    node, differenced across each run:
+
+      arm         PE cpu_ms      runqueue wait    as % of PE cpu
+      p14-smt     ~2,070,000     2143-2376 ms      0.10-0.12%
+      p14-phys      ~820,000      100-148 ms       0.01-0.02%
+      p7-phys       ~830,000      0.1-530 ms       0.00-0.06%
+      p7-smt      ~1,350,000      484-1907 ms      0.04-0.14%
+
+    At ppn 14 the PEs wait 0.11% of their CPU time on the runqueue, about
+    19 ms per PE over a 9.5 s run.  That cannot produce a 17-22% penalty.
+    And p14-phys, which fills every physical core and leaves the least room of
+    all, has the LOWEST wait in the set.
+
+    THE COMPARISON THAT MAKES THIS CONCLUSIVE: on the GPU arm the victim PE
+    showed 2.7 SECONDS of runqueue wait against 0.0 ms for unshared PEs.  The
+    signal is unmistakable when it is real.  It is not here.  The reasoning
+    was sound; the machine is not paying it.
+
+2.  WHAT EACH PAIR ISOLATES, stated so nobody over-reads a single comparison.
+      p7-phys vs p14-phys  same PEs, same cores, no SMT either.  Differs in
+                           PEs-per-process (7 vs 14) and process count
+                           (128 vs 64).  +2.6%.  Fat processes cost little.
+      p7-phys vs p7-smt    same PEs, same ppn, same process count.  Differs in
+                           physical cores (56 vs 28) with SMT engaged.  The
+                           SMT throughput number comes from here.
+      p14-phys vs p14-smt  same ppn, same physical cores.  Differs in PE count
+                           (896 vs 1792), SMT, and process count.  +17.5%.
+
+    CONFOUND I FLAGGED BEFORE RUNNING AND AM RESTATING: engaging SMT at fixed
+    PE count necessarily halves the physical cores in use, so p7-smt also has
+    half the aggregate L3 and memory bandwidth.  Both effects push the same
+    way.  The 12% figure is therefore the COMBINED value of the second
+    hardware thread, which is the number the launch-shape decision needs; it
+    is not a clean measure of SMT execution-unit sharing alone.
+
+3.  AN ARM FAILED FIRST TIME AND IT WAS MY ERROR, not the application's.
+    p14-phys aborted in all three reps of job 5320076 with
+      Error: CmiSetCPUAffinity failed to bind PE #53 to PU P#61
+    An srun step launched with --ntasks=64 INHERITS --cpus-per-task=14 from
+    the batch header, so the step received only 4 x 14 = 56 logical CPUs per
+    node and the later processes' pemap entries (cores 33-63) were outside
+    the step's cpuset.  Four tasks per node covering 56 physical cores needs
+    --cpus-per-task=28 on the srun.  Job 5320090 re-ran it correctly.
+    WORTH KEEPING: a step that changes --ntasks must revisit --cpus-per-task,
+    because the inherited value silently shrinks the step's cpuset rather
+    than failing.
+
+4.  WHERE THIS LEAVES THE SHAPE QUESTION.
+    CPU-only, current defaults, 2B on 16 nodes: ppn 7 is the right launch
+    shape, and the reason is now known -- SMT returns ~12% while the extra
+    896 PEs cost more than that.  It is NOT the AUTO PE-set default (relay47),
+    NOT OS interference (this report), and only 2.6 points of it are
+    PEs-per-process.
+    Together with the GPU arm, both converge on ppn 7 for different reasons:
+    on GPU the SMT siblings are free headroom for ROCm's helper threads; on
+    CPU the SMT siblings do not pay for the parallelism they add.
+
+5.  TRACES DELIVERED, job 5320106.  Best GPU shape: all-latest stack, ppn 7,
+    affinity fix ACTIVE, +lci_ndevices 4 +backend_poll_thread 2.  EXACT.
+    Iteration 0 = 3585.7 ms against 3504.9-3524.4 ms untraced, so tracing
+    costs about 60-80 ms, ~2%.
+
+      /lustre/orion/csc710/scratch/lvkale/s3ab/5320106/traces/gpu-p7-fix-traced
+
+      896  FoF3.latest.tr.<pe>.log.gz     Projections
+        1  FoF3.latest.tr.sts             Projections symbol table
+        1  FoF3.latest.tr.projrc
+      896  FoF3.latest.tr.<pe>.sum        summary
+      896  FoF3.latest.tr.<pe>.sumd       sumDetail
+        1  FoF3.latest.tr.sum.sts         summary symbol table
+      1.4 GB total
+
+    sumDetail kept FULL 1 ms RESOLUTION -- the header reads
+      ver:7.1 cpu:0/896 numIntervals:22397 numEPs:498 intervalSize:1.000000e-03
+    so shrink() never fired and no bins were merged.
+
+    NOTE ON WHY THIS WORKED: the charm we are on is 90ef159b9, whose commit
+    message is "trace-summary: self-closing shutdown for reconverse
+    (summary/sumDetail wrote no files)".  Before that commit the summary modes
+    produced nothing under reconverse.  The binary is FoF3.latest.tr, built
+    with PROJECTIONS=1 SUMMARY=1 -> "-tracemode projections -tracemode
+    summary", md5 f3249ceabf560f6d6c1a6cc64555bfeb.
+
+ARTEFACTS
+  merged/FoF3.latest.tr   md5 f3249ceabf560f6d6c1a6cc64555bfeb  (both modes)
+  merged/build-app-trace.sh
+  sbatch/relay55-smt-16n.sbatch, relay56-p14phys-16n.sbatch, relay57-traces-16n.sbatch
+  scripts/relay48-rundelay.py     per-rank PE runqueue wait from a monitor capture
+  scripts/monitor-threads.py      now takes an hz argument (use 1 Hz when every
+                                  logical CPU is pinned)
+  nothing pushed; gpu-stalls untouched

@@ -459,7 +459,7 @@ at its `getenv` site; none belongs in a production run.
 | `FOF_GPU_VERIFY` | off | Verify mode: device runs alongside the CPU chain and mismatches abort (`FOF_GPU_STAGE0` is the historical spelling) |
 | `FOF_GPU_ASYNC`, `FOF_GPU_GRID`, `FOF_GPU_WALK` | off/0 | launch and walk-shape controls (design/phase1-gpu.md) |
 | `FOF_GPU_RELEASE`, `FOF_COUNT_VERIFY` | off | measurement-mode changers — do not enable in timed runs |
-| `FOF_HELPER_CPUS` | derived | landing zone for ROCm/HIP helper threads (the affinity fix in fof/gpu/FoFDevice.cpp): unset = the pemap's SMT siblings, automatic and correct at ppn 7 (−22% at 2B/16, job 5319480); at ppn 13/14 every sibling is a PE, so name the OS-reserved CCD-first cores `0,8,16,24,32,40,48,56` and add `--core-spec=0 --cpus-per-task=16` to Slurm (−17%). The fix DECLINES with a warning when no safe CPU exists — a silent decline never masquerades as success |
+| `FOF_HELPER_CPUS` | derived | landing zone for ROCm/HIP helper threads (the affinity fix in fof/gpu/FoFDevice.cpp): unset = the pemap's SMT siblings, automatic and correct at ppn 7 (fix worth ~−30% on a production build, relay49 job 5320452; best GPU shape 2881.9 ms at 2B/16); at ppn 13/14 every sibling is a PE, so name the OS-reserved CCD-first cores `0,8,16,24,32,40,48,56` and add `--core-spec=0 --cpus-per-task=16` to Slurm. The fix DECLINES with a warning when no safe CPU exists — a silent decline never masquerades as success |
 | `FOF_NO_AFFINITY_FIX` | off | `1` disables the helper-thread affinity fix (the A/B arm) |
 
 ### Recommended configurations (2026-08)
@@ -499,6 +499,15 @@ Mixed jobs: add `FOF_PE_SETS_NODES=<CPU process list>` so GPU
 processes stay at sets=1.
 
 ## Tracing with Projections
+
+**Timing-run rule (relay49, 2026-08-21): never link `PROJECTIONS=1`
+into a binary used for timing.** The hooks sit in the message path and
+cost **7.7% at 2B/16 even with tracing disabled at runtime**. Build a
+separate traced binary when traces are wanted. Second build rule from
+the same incident: charm/reconverse must be built `--with-production`
+— a default (Debug) cmake build compiles the runtime with no
+optimization at all and cost 15.6% on the same workload.
+
 
 Charm++ ships two performance-tracing back ends, both **off by default** in
 this tree. They are not runtime switches: tracing has to be *linked in*
