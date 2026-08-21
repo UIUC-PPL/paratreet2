@@ -3657,6 +3657,32 @@ public:
     this->contribute(cb);
   }
 
+  // CONTRACT (read before touching; violating clause 1 reproduced the
+  // 2026-08-05 phantom-components bug twice):
+  //  1. INPUT: this PE's shard of (label, partial_count) pairs, deposited
+  //     by depositLabelCounts from every PE of the process. Label SIGN is
+  //     the classifier, shared with BOTH label producers (dist
+  //     applyUF2Labels, serial runFoFPhase3's map): label >= 0 means the
+  //     component is UNTOUCHED by cross-process edges, so the summed
+  //     count in this process IS the component's complete size and may be
+  //     binned here; label < 0 means TOUCHED — the sum here is one
+  //     process's share only, and it must go to touched_totals_ for
+  //     stage-3 global summing (collectTouchedCounts), never into the
+  //     bins. The same label never appears in both classes.
+  //  2. Duplicate labels across the shard's pairs are expected (multiple
+  //     roots per label, multiple depositing PEs) and are summed here —
+  //     depositLabelCounts deliberately does not pre-merge.
+  //  3. OUTPUT: a 6-element tuple reduction (log2 size bins[64], count,
+  //     max; then the same three filtered by min_component_size) summed
+  //     over ALL PEs of ALL processes — every PE must contribute exactly
+  //     once even if it owns no shard (my_shard >= label_shards.size()).
+  //  4. Bin rule: bin = floor(log2(size)), size >= 1.
+  //  5. touched_totals_ must survive until collectTouchedCounts and be
+  //     cleared here first (re-entry per iteration).
+  // COST NOTE (Kale, 2026-08-21): ~280 ms of the 2B/16 CPU iteration,
+  // dominated by the per-shard unordered_map build over ~hundreds of
+  // thousands of pairs per PE. The labels' structure permits a dense
+  // direct-indexed rework — see design note / pending optimization.
   void histogramShard(int min_component_size, const CkCallback& cb) {
     int my_shard = CkMyRank();
     auto* nb = node_proxy.ckLocalBranch();
@@ -3677,8 +3703,9 @@ public:
           continue;
         }
         long size = kv.second; // untouched fragment: complete local total
-        int bin = 0;
-        while (bin < 63 && (1L << (bin + 1)) <= size) bin++;
+        // floor(log2(size)) in one op (was a shift-loop; size >= 1 always
+        // — a label cannot be deposited with a zero count)
+        int bin = 63 - __builtin_clzl((unsigned long)size);
         bins[bin]++; n++;
         if (size > maxs) maxs = size;
         if (size >= (long)min_component_size) {
