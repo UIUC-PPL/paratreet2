@@ -1,0 +1,187 @@
+relay61 / relay62 -- THE 5.15 s CPU REFERENCE, AND WHAT IT WAS HIDING
+2026-08-21, jobs 5321505 (relay61) and 5321567 (relay62)
+
+====================================================================
+1.  THE ANSWER IN ONE PARAGRAPH
+====================================================================
+
+The 5.15 s iteration of 2026-08-18 reproduces exactly, today, on the same
+machine.  There is no drift, no libfabric problem, and the environment is
+not the cause.  The 5.15 s reference and every relay16+ measurement are
+DIFFERENT PROBLEM SIZES.  cleanup-validate-2b-16n.sbatch passes no -l, so
+it ran the FoF3 default of 12 particles per leaf; every script descended
+from the GPU runbook passes "-c stats -l 128 -i 1".  One flag is the whole
+2.5 s.  Chasing it further produced the useful result: -l 128 is right for
+the GPU arm and badly wrong for the CPU-only arm, where leaf 32 is worth
+-32.0% against the value we have been running.
+
+====================================================================
+2.  HOW IT WAS FOUND -- NO MACHINE TIME
+====================================================================
+
+Both logs were already on scratch and both print the effective config:
+
+    5304461/rep1.log        Maximum number of particles per leaf: 12
+    5320405/A-old-prod-r1   Maximum number of particles per leaf: 128
+
+examples/fof3/Main.C, ExMain::setDefaults:
+    conf.max_particles_per_leaf = 12;
+
+"-c stats -l 128 -i 1" entered with sbatch/gpu-repro-16n.sbatch, written
+2026-08-18 21:49 -- three hours AFTER the 5.15 s run at 18:54 -- copied
+from Ritvik's reference job 5303289, and inherited by every script since,
+including every CPU-only script.
+
+Everything else about the two runs already agreed, which is what made the
+diagnosis safe to make from the archive:
+
+    63946 TreePieces both        decomposition 6383.7 vs 6532.4 ms
+    components 424897832 both    max_size 185317566 both
+    log2_histogram IDENTICAL in all 27 buckets
+
+The whole 2510 ms sits inside the iteration and almost all of it is phaseA
+(2.000 -> 4.881 s), carried in Pre-traversal (2441 -> 5213 ms).  Leaf size
+does not change the FoF answer.  It changes how much brute-force pair work
+phaseA does inside a leaf.
+
+TWO FACTS CHECKED RATHER THAN ASSUMED, both against the environment
+hypothesis that came in from the laptop session:
+
+  - The LOGIN DEFAULT already loads libfabric/2.3.1.  The old binary in a
+    bare login shell resolves libfabric.so.1 ->
+    /opt/cray/libfabric/2.3.1/lib64.  The module block in the new scripts
+    re-loads what is already there.  BUILDS.md records the production
+    charm as BUILT against 1.20.1, but that is a build-time fact and does
+    not describe what it loads at run time.
+  - FI_MR_CACHE_MONITOR is a memory-registration setting.  The regression
+    is 2.9 s of phaseA, which is local compute, not the fabric.
+
+Both were still measured rather than dismissed.  See section 3.
+
+====================================================================
+3.  relay61, job 5321505 -- THE CONTROLLED BISECTION
+====================================================================
+
+The #SBATCH block was copied VERBATIM from cleanup-validate-2b-16n.sbatch:
+no --gpus-per-node, no --cpus-per-task, no --threads-per-core, no
+--exclusive, no --qos, -p batch.  A job-level directive cannot be varied
+per arm, so the whole job ran under the OLD spec and the NEW spec's pieces
+were added at the srun/env level where they can be isolated.  Old binary
+FoF3.2b.cleanup (md5 2607c277, matching the 08-18 record), old runtime,
+2B on 16 nodes, ppn 14, relay15 pemap.  Warm-up discarded, 2 reps per arm,
+rep1 of every arm before rep2 of any.  ALL 17 RUNS EXACT.  Every arm gated
+on the leaf size the app PRINTED, not on what the script meant to pass.
+
+    arm                        leaf   mean      spread   vs A1
+    A1  verbatim 08-18          12   5189.4 ms    9.8      --
+    A3  + -c stats              12   5212.1      21.9     +23
+    A4  + FI_MR_CACHE_MONITOR   12   5250.4       7.8     +61
+    A5  + the module block      12   5097.9      20.9     -91
+    A6  - STEALA_GEO - PB_M2KEY 12   5228.2      16.2     +39
+    A7  the ENTIRE new harness  12   5119.0      83.2     -70
+    A2  A1 + "-l 128" only     128   7760.8      10.2   +2571
+    A8  new harness + -l 128   128   7609.0      44.3   +2420
+
+A1 lands inside the 08-18 band (recorded 5144.8 - 5192 ms).  THE MACHINE
+DID NOT DRIFT.
+
+A7 is the closure test: the module block, FI_MR_CACHE_MONITOR, the gcd
+wrapper and -c stats ALL AT ONCE, at leaf 12, is 70 ms FASTER than the
+verbatim 08-18 script.  The harness contributes nothing.
+
+A2 is the isolation: the verbatim script plus the single flag -l 128,
+nothing else changed, reproduces the full regression.
+
+ON THE LAPTOP SESSION'S BROADER CONSEQUENCE.  FI_MR_CACHE_MONITOR=
+userfaultfd does cost something -- 61 ms, 1.2%, consistent in sign across
+both reps and non-overlapping with A1.  It is real but small, and the
+module block it travels with more than pays it back (-91 ms, also
+non-overlapping).  Removing it will not move the 2881.9 ms GPU headline
+meaningfully.  Two reps; I would not press these three sub-1.5% arms
+further without more.
+
+====================================================================
+4.  relay62, job 5321567 -- THE LEAF SIZE IS A REAL KNOB, BOTH WAYS
+====================================================================
+
+Production binaries, ppn 7, PEMAP7, ndev 4, poll 2, affinity fix ON, 2
+reps each, all 13 runs EXACT, every arm gated on printed leaf size and on
+fofgpu symbol count so a GPU binary cannot masquerade as the CPU one.
+
+    leaf    FoF3.gpu-prod           FoF3.cpu-prod
+     12    3606.9 ms  (+27.7%)     5365.3 ms  (+11.5%)
+     32    3074.3     (+ 8.8%)     4811.9     BEST
+    128    2825.0     BEST         7081.0     (+47.2%)
+
+-l 128 IS CORRECT ON THE GPU.  It was never a mistake there -- it came
+from Ritvik's reference run and it wins.  Leaf 12 would cost the GPU arm
+28%.  The flag was only wrong where it was inherited without thought into
+CPU-only scripts.
+
+THE CPU-ONLY HEADLINE IMPROVES BY 32.0%, from 7081.0 to 4811.9 ms, from
+one flag.  The cpu-l32 reps landed 0.5 ms apart.  Note this also beats the
+5.15 s reference everyone was trying to recover: leaf 12 was not optimal
+either, it was merely closer than 128.
+
+THE MECHANISM, from rep 1 of each arm:
+
+              CPU phaseA   CPU Pre-trav   GPU phaseA   GPU Pre-trav
+    leaf  12    2.540 s      2941 ms      0.000 (dev)    1089 ms
+    leaf  32    2.378        2709         0.000           989
+    leaf 128    4.575        4871         0.000           797
+
+On CPU phaseA is host union-find and a large leaf costs brute-force pair
+work inside the leaf.  On GPU phase1 runs on the device (FOF_GPU_PHASE1=1,
+so phaseA reads 0.000) and a larger leaf is a bigger, better-shaped unit
+of device work.  The two arms want opposite things for a reason.
+
+The GPU Pre-traversal is STILL FALLING at 128, which is the one thing this
+sweep did not settle: 128 was the largest value tried and won, so it may
+be the edge of the range rather than a maximum.  relay63 (job 5321648)
+pushes GPU to 192/256/384 and brackets the CPU interior minimum with
+16/24/32/48/64.  PENDING -- see section 6.
+
+====================================================================
+5.  CORRECTIONS
+====================================================================
+
+  - The laptop session's SCRIPT LINEAGE instinct was right and the two
+    candidate carriers it named were both wrong.  The carrier is an app
+    argument, not the environment.
+
+  - MINE, from relay49/relay59.  Arm A0 was specified as "the same binary
+    and runtime with NO FOF_* set at all, i.e. its own defaults, so A0 vs
+    A separates the configuration changed from the machine drifted."  It
+    only unset the FOF_* ENVIRONMENT.  It kept -l 128 on the command line.
+    It was never the control it claimed to be, and its 9644.6 ms is not
+    "the old defaults".
+
+  - RESUME.md said "Prime suspect: libfabric (production charm was built
+    against 1.20.1, every job here loads 2.3.1).  NEXT JOB IS ONE ARM: arm
+    A with libfabric/1.20.1."  That job is no longer worth running.  The
+    08-18 run ALSO loaded 2.3.1 -- it is the login default and always was
+    -- so there is no version difference between the two dates to test.
+
+  - "Until then 5.15 s is not a usable baseline" is now resolved: it is a
+    usable baseline FOR LEAF 12, and it should never be compared against a
+    leaf-128 number again.
+
+====================================================================
+6.  WHAT IS STILL OPEN
+====================================================================
+
+  1. relay63, job 5321648, PENDING at the time of writing.  Fine sweep:
+     CPU 16/24/32/48/64 and GPU 128/192/256/384.  Until it lands, the
+     recommended CPU leaf is 32 on the strength of a three-point sweep,
+     and the GPU optimum is only known to be "at least 128".
+
+  2. EVERY ABSOLUTE CPU-ONLY WALL IN THE CAMPAIGN was measured at leaf
+     128 and is inflated accordingly.  relay46/47/48's CPU shape results
+     (ppn 7 beats ppn 14 by 16.5-17.2%, SMT worth ~12%, the p7/p14/SMT
+     decomposition) are all RELATIVE A/Bs at a fixed leaf size, so they
+     stand.  The absolute numbers in them do not.
+
+  3. Whether the ppn-7-beats-ppn-14 CPU result survives at leaf 32 is
+     untested.  The walk was where that win lived (-42%), and leaf size
+     moves the walk (0.536 / 0.495 / 0.691 s at 12 / 32 / 128).  Worth one
+     job before the CPU recommendation is rewritten.

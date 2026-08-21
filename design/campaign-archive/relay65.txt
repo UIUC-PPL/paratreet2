@@ -1,0 +1,112 @@
+relay65 -- TRACES AT THE TWO BEST CONFIGURATIONS.  Job 5322240, 16 nodes,
+2B, 896 PEs, both arms EXACT.  2026-08-21.
+
+====================================================================
+1.  WHERE THE TRACES ARE
+====================================================================
+
+    /lustre/orion/csc710/scratch/lvkale/s3ab/5322240/traces/gpu-best
+    /lustre/orion/csc710/scratch/lvkale/s3ab/5322240/traces/cpu-best
+
+Each holds the complete set, verified after the writes flushed, no
+zero-length files in either:
+
+    896  .log.gz      Projections, one per PE
+      1  .sts
+    896  .sum         summary
+    896  .sumd        sumDetail, 1 ms bins
+      1  .sum.sts
+      1  .projrc
+
+    arm        du -sh    APPARENT (what a tarball carries)
+    gpu-best    1.4 G     775,290,088 bytes
+    cpu-best    1.5 G     863,856,230 bytes
+
+The two sizes differ by about 2x from each other's `du -sh` reading and
+from the apparent size: that is Lustre block allocation, not content.  Plan
+any transfer against the APPARENT number.
+
+====================================================================
+2.  WHAT WAS TRACED, AND THE ONE THING TO KNOW BEFORE READING THEM
+====================================================================
+
+    GPU       FoF3.gpu-prodtr  ppn 7, PEMAP7, ndev 4, poll 2, -l 128
+              affinity fix ON and it ANNOUNCED:
+              "[fofgpu] affinity fix active (SMT siblings): HIP helper
+               threads will inherit 7 CPUs, not this PE's core"
+              PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1
+    CPU-only  FoF3.cpu-prodtr  ppn 7, PEMAP7, ndev 7, poll 1, -l  32
+              no device environment
+
+Both are the configurations in RECOMMENDATION-affinity-fix.md.
+
+THE BINARIES ARE NOT THE PRODUCTION BINARIES AND COULD NOT HAVE BEEN.  A
+charm built --with-production does not build libtrace-projections.a or
+libtrace-summary.a at all, so merged/charm-prod cannot link a traced
+application -- that is the "charmc: No such tracemode projections" error
+from relay49.  The way out is that --with-production and --enable-tracing
+are ORTHOGONAL in charm/buildcmake: Release comes from opt_production at
+lines 640/687, TRACING=1 from opt_tracing at lines 341/732.
+merged/build-prodtr-stack.sh passes both and gates on both, giving an
+OPTIMIZED runtime that can still trace.  Every earlier trace in this
+campaign was taken on a Debug runtime; these are the first that are not.
+
+    charm-prodtr   CMAKE_BUILD_TYPE Release   TRACING 1
+                   libtrace-projections.a and libtrace-summary.a present
+    FoF3.gpu-prodtr  md5 830d9d016dc5218eb1ef709ff54c3360
+                     fofgpu 305  TraceProjections 475  TraceSummary 524
+                     affinity-fix symbols 5
+    FoF3.cpu-prodtr  md5 4fb96ce7d93b87b1878cf8690ce77da3
+                     fofgpu   0  TraceProjections 475  TraceSummary 524
+                     affinity-fix symbols 0 -- correct, the fix lives in
+                     fof/gpu which a CPU-only build does not compile
+
+merged/charm-prod, FoF3.gpu-prod and FoF3.cpu-prod were NOT touched; their
+md5s were re-checked after the build and are unchanged.
+
+====================================================================
+3.  THE TRACING COST, MEASURED RATHER THAN ASSUMED
+====================================================================
+
+    arm        traced Iter0    production        cost
+    gpu-best     2863.1 ms     2825 - 2882 ms    inside the range
+    cpu-best     4938.5 ms     4785 - 4812 ms    +2.7% to +3.2%
+
+I warned in the job header that this could be as much as the 7.7% relay49
+measured for linked tracing on the CPU iteration.  It is not: the GPU arm
+lands inside the production spread and the CPU arm is about 3% above it.
+So these traces are close to the real thing, and the walls in them can be
+read almost at face value -- but they are not identical to the production
+numbers and should not be quoted as them.
+
+The phase breakdowns match the production runs closely:
+
+    gpu-best   phaseA 0.000 (on device)  Pre-traversal  797.1 ms
+               walk 0.582  Tree traversal 1214.6 ms
+    cpu-best   phaseA 2.379              Pre-traversal 2711.7 ms
+               walk 0.586  Tree traversal 1248.6 ms
+
+Note the GPU Pre-traversal of 797.1 ms against relay62's 797.4 ms at the
+same leaf size, on a different day and a different allocation.
+
+====================================================================
+4.  THE WARM-UP, AND WHY ITS TRACES WERE DELETED
+====================================================================
+
+The first arm of every job pays the cold read of the 76 GB input: 28 s srun
+wall here against 13-16 s for the two keepers.  Tracing that would have
+baked the cold-read anomaly into the decomposition phase of a trace someone
+would later read as representative.  The warm-up ran the CPU configuration,
+produced a complete 896-PE trace set, and that set was deleted.  Its Iter0
+was 4909.7 ms against the keeper's 4938.5, so the warm-up cost the
+iteration nothing measurable -- it is the decomposition it protects.
+
+====================================================================
+5.  SUPERSEDED
+====================================================================
+
+The traces at .../s3ab/5320106/traces/gpu-p7-fix-traced (job 5320106,
+binary merged/FoF3.latest.tr) are DEBUG-RUNTIME traces at -l 128 and are
+superseded by gpu-best here for any question about the recommended
+configuration.  They are still the right traces for anything that referred
+to them specifically.  RESUME.md updated.
