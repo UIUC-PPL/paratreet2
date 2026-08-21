@@ -106,7 +106,7 @@ public:
       start_time = CkWallTimer();
       CkReductionMsg* result;
       readers.load(config.input_file, CkCallbackResumeThread((void*&)result));
-      CkPrintf("Loading Tipsy data and building universe: %.3lf ms\n",
+      CkPrintf("Loading input data and building universe: %.3lf ms\n",
           (CkWallTimer() - start_time) * 1000);
       
       if(config.origin_of("dSoft") != paratreet::FieldOrigin::Unknown) {

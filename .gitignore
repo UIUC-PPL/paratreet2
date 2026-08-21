@@ -28,6 +28,7 @@ examples/gravity/Gravity
 # committed (small ones like 100k ~3.6 MB may be).
 inputgen/plummer
 inputgen/tipsyPlummer
+inputgen/tipsy2nchilada
 inputgen/uniform
 inputs/*.dat
 inputs/1m*.tipsy
@@ -41,3 +42,5 @@ fof/gpu/fof-device-test
 fof/gpu/stage0.*.out
 fof/gpu/stage0.*.err
 tests/kokkos-spike/kokkos-spike
+tests/nchilada/nchilada-test
+tests/nchilada/nchilada-fixture/

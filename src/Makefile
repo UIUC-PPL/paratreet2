@@ -3,7 +3,7 @@ include Makefile.common
 OPTS = -g -Ofast $(INCLUDES) -DDEBUG=0 $(MAKE_OPTS)
 CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 
-OBJS = Paratreet.o Loadable.o Reader.o Writer.o Particle.o BoundingBox.o Decomposition.o Modularization.o TreeSpec.o ThreadStateHolder.o
+OBJS = Paratreet.o Loadable.o Reader.o NChiladaReader.o Writer.o Particle.o BoundingBox.o Decomposition.o Modularization.o TreeSpec.o ThreadStateHolder.o
 # FoF (and its unionfind/htram sibling dependencies) live in the separate
 # fof/ module — see fof/Makefile. This core library is application-free.
 TIPSY_OBJS = NChilReader.o SS.o TipsyFile.o TipsyReader.o hilbert.o

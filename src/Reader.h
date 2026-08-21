@@ -93,8 +93,11 @@ class Reader : public CBase_Reader {
     // std::vector<Key> SFCsplitters;
     Reader();
 
-    // Loading particles and assigning keys
+    // Loading particles and assigning keys. load() picks the input format
+    // (see Reader.C) and hands off to one of the two loaders below.
     void load(std::string, const CkCallback&);
+    void loadTipsy(const std::string&, const CkCallback&);
+    void loadNChilada(const std::string&, const CkCallback&);
     void setSoft(const double dSoft, const CkCallback&);
     void computeUniverseBoundingBox(const CkCallback& cb);
     void assignKeys(BoundingBox, const CkCallback&);

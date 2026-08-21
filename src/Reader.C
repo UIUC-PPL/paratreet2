@@ -1,16 +1,176 @@
 #include "TipsyFile.h"
+#include "NChiladaReader.h"
 #include "Reader.h"
 #include "Utility.h"
 #include "Modularization.h"
 #include <iostream>
 #include <cstring>
 #include <algorithm>
+#include <sys/stat.h>
+#include <cerrno>
 
 Reader::Reader() : particle_index(0) {}
 
-void Reader::load(std::string input_file, const CkCallback& cb) {
-  
+namespace {
 
+/// Split the global particle range evenly over the Reader branches and
+/// return this branch's [start, start + count). Both input formats -- and
+/// ChaNGa's loaders -- use exactly this arithmetic, so a snapshot converted
+/// from one format to the other puts the same particles on the same Reader.
+void myParticleRange(int64_t n_total, int reader_index, int64_t& start,
+                     int64_t& count) {
+  count = n_total / n_readers;
+  const int64_t excess = n_total % n_readers;
+  start = count * reader_index;
+  if (reader_index < excess) {
+    count++;
+    start += reader_index;
+  } else {
+    start += excess;
+  }
+}
+
+/// Number of elements [lo, hi) and [a, b) have in common.
+int64_t overlap(int64_t lo, int64_t hi, int64_t a, int64_t b) {
+  return std::max<int64_t>(0, std::min(hi, b) - std::max(lo, a));
+}
+
+/// Fill dest[0, count) from the NChilada family directory `dir`, starting
+/// at that family's particle `start`. Each attribute is a separate field
+/// file, so it is staged through a bounded buffer and scattered into the
+/// particle structs: the temporary stays a few MB however large a share of
+/// the snapshot this Reader holds.
+void loadNCFamily(const std::string& dir, Particle::Type type, int64_t start,
+                  int64_t count, Particle* dest) {
+  const int64_t kChunk = 1 << 18;   // particles staged at a time
+  std::vector<Vector3D<Real>> vecs;
+  std::vector<Real> scalars;
+
+  for (int64_t done = 0; done < count; done += kChunk) {
+    const int64_t n = std::min<int64_t>(kChunk, count - done);
+    const int64_t s = start + done;
+    Particle* p = dest + done;
+
+    vecs.resize(n);
+    NChilada::readField(dir + "/pos", s, n, &vecs[0]);
+    for (int64_t i = 0; i < n; ++i) p[i].position = vecs[i];
+
+    // Velocity and softening are defaulted rather than required. FoF needs
+    // only positions (and masses for the bounding box), so a snapshot cut
+    // down to those still loads; the reported kinetic energy is then zero.
+    if (NChilada::readOptionalField(dir + "/vel", s, n, &vecs[0])) {
+      for (int64_t i = 0; i < n; ++i) p[i].velocity = vecs[i];
+    } else {
+      for (int64_t i = 0; i < n; ++i) p[i].velocity = Vector3D<Real>(0.0);
+    }
+
+    scalars.resize(n);
+    NChilada::readField(dir + "/mass", s, n, &scalars[0]);
+    for (int64_t i = 0; i < n; ++i) p[i].mass = scalars[i];
+
+    if (NChilada::readOptionalField(dir + "/soft", s, n, &scalars[0])) {
+      for (int64_t i = 0; i < n; ++i) p[i].soft = scalars[i];
+    } else {
+      for (int64_t i = 0; i < n; ++i) p[i].soft = 0.0;
+    }
+
+    for (int64_t i = 0; i < n; ++i) p[i].type = type;
+  }
+}
+
+} // anonymous namespace
+
+// Picks the input format. An NChilada snapshot is a DIRECTORY of
+// per-attribute field files, a Tipsy snapshot a single file -- the same
+// test ChaNGa's Main::setupICs uses to choose a loader. NChilada exists
+// because the Tipsy header's counts are 32-bit, capping a Tipsy snapshot
+// near 2^31 particles.
+void Reader::load(std::string input_file, const CkCallback& cb) {
+  struct stat s;
+  if (stat(input_file.c_str(), &s) != 0) {
+    CkPrintf("Reader %d cannot stat input %s: %s\n", thisIndex,
+        input_file.c_str(), strerror(errno));
+    CkAbort("Input file missing or unreadable -- see stdout");
+  }
+  if (S_ISDIR(s.st_mode)) loadNChilada(input_file, cb);
+  else loadTipsy(input_file, cb);
+}
+
+void Reader::loadNChilada(const std::string& dirname, const CkCallback& cb) {
+  try {
+    NChilada::Header h;
+    if (!NChilada::loadHeader(dirname, h)) {
+      CkPrintf("Reader %d found no particles under NChilada directory %s "
+               "(expected gas/pos, dark/pos or star/pos)\n", thisIndex,
+               dirname.c_str());
+      CkAbort("NChilada reading failure in Reader -- see stdout");
+    }
+    start_time = h.time;
+
+    int64_t start_particle = 0, n_particles = 0;
+    myParticleRange(h.nbodies, thisIndex, start_particle, n_particles);
+    const int64_t end_particle = start_particle + n_particles;
+
+    particles.resize(n_particles);
+
+    // Global ordering is gas, then dark, then star -- the Tipsy convention,
+    // and what ChaNGa's loadNChilada assumes -- so this branch's slice is a
+    // contiguous piece of at most one family each.
+    const int64_t gas_end = h.nsph;
+    const int64_t dark_end = h.nsph + h.ndark;
+    const int64_t n_gas = overlap(start_particle, end_particle, 0, gas_end);
+    const int64_t n_dark = overlap(start_particle, end_particle, gas_end, dark_end);
+    const int64_t n_star = overlap(start_particle, end_particle, dark_end, h.nbodies);
+
+    int64_t off = 0;
+    if (n_gas > 0) {
+      loadNCFamily(dirname + "/gas", Particle::Type::eGas,
+                   std::max<int64_t>(start_particle, 0), n_gas, &particles[off]);
+      off += n_gas;
+    }
+    if (n_dark > 0) {
+      loadNCFamily(dirname + "/dark", Particle::Type::eDark,
+                   std::max<int64_t>(start_particle, gas_end) - gas_end, n_dark,
+                   &particles[off]);
+      off += n_dark;
+    }
+    if (n_star > 0) {
+      loadNCFamily(dirname + "/star", Particle::Type::eStar,
+                   std::max<int64_t>(start_particle, dark_end) - dark_end, n_star,
+                   &particles[off]);
+      off += n_star;
+    }
+    CkAssert(off == n_particles);
+
+    BoundingBox box;
+    box.pe = 0.0;
+    box.ke = 0.0;
+    box.n_sph = n_gas;
+    box.n_dark = n_dark;
+    box.n_star = n_star;
+    for (int64_t i = 0; i < n_particles; ++i) {
+      particles[i].order = start_particle + i;
+      box.grow(particles[i].position);
+      box.mass += particles[i].mass;
+      box.ke += particles[i].mass * particles[i].velocity.lengthSquared();
+    }
+    box.ke /= 2.0;
+    box.n_particles = particles.size();
+
+    #if DEBUG
+    std::cout << "[Reader " << thisIndex << "] Built bounding box: " << box << std::endl;
+    #endif
+
+    contribute(sizeof(BoundingBox), &box, BoundingBox::reducer(), cb);
+  }
+  catch (XDRException& e) {
+    CkPrintf("Reader %d failed to read NChilada directory %s: %s\n", thisIndex,
+        dirname.c_str(), e.getText().c_str());
+    CkAbort("NChilada reading failure in Reader -- see stdout");
+  }
+}
+
+void Reader::loadTipsy(const std::string& input_file, const CkCallback& cb) {
   try {
     // Open tipsy file
     Tipsy::TipsyReader r(input_file);

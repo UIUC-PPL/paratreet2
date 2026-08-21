@@ -107,7 +107,8 @@ In order (the core library is application-free; the FoF chares live in the
 cd src && make                 # -> libparatreet.a  (core toolkit, no FoF)
 cd ../fof && make              # -> libfof.a        (FoF module; needs ../unionfind)
 cd ../examples/fof3 && make    # -> FoF3
-cd ../../inputgen && make      # -> plummer, uniform, tipsyPlummer
+cd ../../inputgen && make      # -> plummer, uniform, tipsyPlummer,
+                               #    tipsy2nchilada
 ```
 
 Non-FoF examples (`examples/gravity` — monopole Barnes-Hut,
@@ -236,9 +237,36 @@ GCDS=(4 2 6 0)      # for 4 processes taking cores 1-15, 17-31, 33-47, 49-63
 export ROCR_VISIBLE_DEVICES=${GCDS[$SLURM_LOCALID]}
 ```
 
+### Input formats
+
+`-f <input>` takes either format; the Reader picks between them by whether the
+path is a file or a directory (`src/Reader.C`, the same test ChaNGa uses):
+
+- **Tipsy** — a single file. Its header stores the particle counts in 32-bit
+  fields, so a Tipsy snapshot tops out near 2^31 particles.
+- **NChilada** — a *directory* of per-attribute field files, which is the
+  format to use past that limit:
+
+  ```
+  <dir>/description.xml           optional, purely descriptive
+  <dir>/{gas,dark,star}/pos       required per family (also fixes its count)
+  <dir>/{gas,dark,star}/mass      required per family
+  <dir>/{gas,dark,star}/{vel,soft}  read when present, else defaulted to 0
+  ```
+
+  Each field file is `FieldHeader | min | max | numParticles values`, XDR
+  (big-endian) encoded; a family directory that is not there is simply an
+  empty family, and a field whose min equals its max may omit the values.
+  Any float or integer type code is accepted and converted. Particles are
+  numbered gas, then dark, then star — the same global ordering Tipsy uses,
+  so a snapshot converted between the two formats gives identical results.
+  Only `pos`, `vel`, `mass` and `soft` are read; the other attributes a
+  snapshot may carry (`GasDensity`, `timeform`, ...) have no home in
+  ParaTreeT's `Particle` and are ignored.
+
 ### Generating datasets
 
-Generate `.dat` files and convert to tipsy (the reader consumes tipsy):
+Generate `.dat` files and convert to tipsy:
 
 ```sh
 cd inputgen
@@ -249,6 +277,19 @@ cd inputgen
 ./uniform 42 1000000 1m-uniform.dat   # uniform unit box; arg 1 IS the seed
 ./tipsyPlummer 1m.dat 1m.tipsy        # .dat -> tipsy (works for either)
 ```
+
+To get an NChilada test input, convert a tipsy one:
+
+```sh
+./tipsy2nchilada 1m.tipsy 1m.nchilada          # float32 fields
+./tipsy2nchilada 1m.tipsy 1m-f64.nchilada double  # float64 pos/vel
+```
+
+The converter holds the whole snapshot in memory, which is fine for anything
+Tipsy can express; it exists to build test inputs and to give the two reader
+paths a common answer to agree on. `examples/fof3/scripts/run_fof3_nchilada_check.sbatch`
+runs that comparison: the same 100k snapshot as Tipsy, as float32 NChilada and
+as float64 NChilada must produce identical `FOF3STAT components` lines.
 
 Suggested sizes: 1M and 8M for shakeout, then 32M, 64M, 100M+ as memory
 allows. Generate both a Plummer and a uniform box at each size you assess:
