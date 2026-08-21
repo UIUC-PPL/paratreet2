@@ -1,0 +1,101 @@
+relay45 -- THREE REPS PER ARM.  Job 5319626, 16 nodes, 2B, GPU replace arm,
+one warm-up plus 15 measured arms, ALL EXACT.  2026-08-21.
+Settles the two questions relay44 left open, and RETRACTS one of its numbers.
+
+*** Q1 SETTLED: THE FIXED WALL TIME IS IDENTICAL ACROSS THE TWO STACKS.
+    merged 3528.8 ms, all-latest 3524.4 ms -- 4.4 ms apart on ~3.5 s.  The
+    all-latest stack preserves the fixed configuration exactly. ***
+
+*** Q2 RETRACTED: THE UNFIXED ARM'S "+465 ms" WAS MOSTLY NOISE.  Three-rep
+    means differ by 140.9 ms, not 465.3, and the ranges OVERLAP
+    (merged [4515.5, 4713.3] against latest [4594.6, 4879.2]).  A ~140 ms
+    (3%) difference may be real but three reps with overlapping ranges cannot
+    establish it, and I am not claiming it. ***
+
+*** Q3: THE FIX IS WORTH -23.0% ON THE OPTION-1 STACK AND -25.4% ON THE
+    ALL-LATEST STACK.  relay44's -31.9% was a single-rep artefact of the same
+    noise; the honest figure remains "about -23%". ***
+
+1.  THE DESIGN, and why it is arranged this way.
+    Five configurations x 3 reps, INTERLEAVED rep-major so drift over the job
+    hits every configuration equally.  Running three of one and then three of
+    the next would confound drift with configuration.
+    One WARM-UP arm first, discarded: the first arm of every job pays the cold
+    read of the 76 GB input, which is the largest single confound in a rep
+    study (27 s srun wall against 16-19 s).
+    The two binaries link against DIFFERENT runtimes, so LD_LIBRARY_PATH is
+    set PER ARM and every arm re-gates on the resolved libraries.  Getting
+    that wrong is relay16 trap 6a and would silently run one stack while
+    claiming the other.
+
+2.  THE NUMBERS.  Iteration 0, milliseconds.
+
+      config          rep1      rep2      rep3      mean     range   range%
+      merged-fix     3509.4    3536.6    3540.4    3528.8      30.9    0.9%
+      merged-nofix   4713.3    4516.8    4515.5    4581.9     197.8    4.3%
+      latest-fix     3450.8    3461.0    3661.4    3524.4     210.6    6.0%
+      latest-nofix   4594.6    4694.7    4879.2    4722.8     284.6    6.0%
+      latest-p14     5409.8    5409.7    6108.4    5642.7     698.7   12.4%
+
+      fix worth      merged  -1053.1 ms  -23.0%
+                     latest  -1198.4 ms  -25.4%
+
+3.  Q4, THE NOISE QUESTION -- and it needs the drift correction to read.
+    Raw, the answer looks mixed:
+
+      stack    fixed range        unfixed range      ratio
+      merged    30.9 ms (0.9%)    197.8 ms (4.3%)    6.4x
+      latest   210.6 ms (6.0%)    284.6 ms (6.0%)    1.4x
+
+    BUT REP 3 WAS GLOBALLY SLOW.  Four of the five configurations hit their
+    maximum in rep 3 -- merged-fix, latest-fix, latest-nofix and latest-p14.
+    That is an external drift late in the job, and it is exactly what the
+    interleaving was there to expose.  Excluding rep 3 as drifted:
+
+      stack    fixed range        unfixed range      ratio
+      merged    27.2 ms (0.8%)    196.5 ms (4.3%)    7.2x
+      latest    10.2 ms (0.3%)    100.1 ms (2.2%)    9.8x
+
+    Read that way BOTH stacks agree: THE FIXED CONFIGURATION IS 7-10x MORE
+    REPRODUCIBLE THAN THE UNFIXED ONE.  That is consistent with the mechanism
+    -- what the fix removes is a stochastic preemption, so removing it should
+    cut variance as well as the mean.
+
+    I AM FLAGGING THE POST-HOC EXCLUSION RATHER THAN HIDING IT.  Dropping rep
+    3 is defensible only because the drift is visible across four independent
+    configurations, not because it helps the conclusion; the raw table above
+    is the primary result and the merged stack shows the effect (6.4x) without
+    any exclusion at all.  A cleaner design would run more reps and test for
+    drift formally.
+
+4.  THE ppn 14 SPREAD, now measured directly rather than inferred.
+    Three reps of ONE configuration: 5409.8, 5409.7, 6108.4 ms.  Two reps
+    0.15 ms apart and one 698.7 ms higher.  So the ppn-14 configuration has a
+    very reproducible FLOOR with occasional large excursions, and a single-rep
+    delta under ~700 ms at ppn 14 means nothing.  That supersedes the
+    "400-670 ms" range I gave in relay44 and the "~400 ms" in relay43.
+
+    AND IT CORRECTS relay44's READING OF A COINCIDENCE.  relay44 flagged two
+    ppn-14 arms landing 0.1 ms apart (5278.400 / 5278.288) as chance.  Here
+    two more land 0.15 ms apart (5409.847 / 5409.701), in the same
+    configuration.  Twice is not chance: the ppn-14 unfixed configuration
+    appears to hit a hard, reproducible floor, and what varies is whether a
+    run escapes it.  I do not know the mechanism and am not guessing at one.
+
+5.  WHAT THIS SETTLES.
+      - The all-latest stack preserves the fixed wall time exactly (4.4 ms).
+      - The fix is worth about -23% (-23.0% / -25.4%), on both stacks.
+      - relay44's -31.9% and its "+465 ms unfixed slowdown" are both retracted
+        as single-rep noise.
+      - The fixed configuration is far more REPRODUCIBLE, which is a second,
+        independent benefit of the fix and was not previously measured.
+      - ppn-14 single-rep deltas under ~700 ms carry no information.
+    STILL OPEN: whether the ~140 ms unfixed difference between stacks is real
+    (would need many more reps for a 3% effect); and the charm branch
+    assumption, which is Ritvik's to confirm.
+
+ARTEFACTS
+  sbatch/relay52-reps-16n.sbatch
+  /lustre/orion/csc710/scratch/lvkale/s3ab/5319626/
+  binaries unchanged: merged/FoF3.merged b89898c1..., merged/FoF3.latest 0df9e001...
+  nothing pushed; gpu-stalls untouched
