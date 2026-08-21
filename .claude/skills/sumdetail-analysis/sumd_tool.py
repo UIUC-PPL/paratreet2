@@ -201,6 +201,11 @@ def main():
                 for e in groups[pat]:
                     sv = per_pe[pe][e][4]
                     if sv:
+                        # PEs can record more intervals than the first file
+                        # promised (they stop tracing at slightly different
+                        # times); grow rather than crash.
+                        if len(sv) > len(series):
+                            series.extend([0.0] * (len(sv) - len(series)))
                         for k, v in enumerate(sv):
                             series[k] += v
             print(f"\n== {pat}: busy-PE count per {b} ms bin (sum busy_ms/bin/{b})")

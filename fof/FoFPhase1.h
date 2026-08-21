@@ -111,9 +111,10 @@ namespace paratreet {
 // 43 bits = 8.8e12 particles. 20 process bits = 1,048,576 processes. The
 // remaining top bit is the SIGN bit of the (signed long) group_number and
 // must stay clear: negative values are reserved for the -1 "never
-// labeled" sentinel and for final component labels (-(comp+2)), which
-// keeps the label namespace disjoint from untouched fragments' encoded
-// tips without any enumeration.
+// labeled" sentinel. (Historical: dense UF_2 component serials were once
+// encoded as -(comp+2) to stay disjoint from encoded tips; since the
+// prefix removal all final labels ARE encoded tips — the component's
+// boss tip — so the namespace is unified and non-negative.)
 constexpr int kUF2IdxBits = 43;
 constexpr int kUF2ProcBits = 20;
 constexpr uint64_t kUF2IdxMask = (uint64_t(1) << kUF2IdxBits) - 1;
@@ -3219,12 +3220,11 @@ public:
     this->contribute(cb);
   }
 
-  // Owner-writes rewrite from encoded tip to UnionFindLib's componentNumber,
-  // read directly out of the node's uf2_vertices array (UnionFindLib wrote
-  // componentNumber in place during find_components -- same storage
-  // initUF2 handed it, no gather needed). Final labels are arbitrary
-  // per-run serial ids (find_components' prefix-sum boss numbering), NOT
-  // the "order of the min-order member" convention -u serial produces; the
+  // Owner-writes rewrite from encoded tip to UnionFindLib's componentNumber.
+  // Since the prefix removal (2026-08-21), componentNumber is the BOSS'S OWN
+  // vertexID — an encoded tip, globally unique, non-negative — not a dense
+  // serial. Labels remain arbitrary per-run values (which boss wins depends
+  // on union order), NOT the min-order convention -u serial produces; the
   // fof3 harness canonicalizes both by re-deriving min order per label
   // group from the gathered records, so this is fine (design/step4.md,
   // decision 3).
@@ -3243,15 +3243,16 @@ public:
     this->contribute(cb);
   }
 
-  // Step 2: owner-writes rewrite. A tip PRESENT in the touched-label map
-  // becomes -(componentNumber + 2): negative, so the final label namespace
-  // is disjoint from untouched fragments' (non-negative) encoded tips, and
-  // distinct from the -1 sentinel. A tip ABSENT from the map was never
-  // referenced by any merge edge — the fragment is its own component and
-  // keeps its encoded tip as its (globally unique) label. This is the
-  // identity-if-absent convention relabel/applyGlobalMap already use.
-  // Labels are arbitrary per-run values either way; the fof3 harness
-  // canonicalizes by min order per label group (design/step4.md).
+  // Step 2: owner-writes rewrite, and since the prefix removal the label
+  // NAMESPACE IS UNIFIED: a tip PRESENT in the touched-label map takes its
+  // component's boss tip (the componentNumber, itself an encoded tip); a
+  // tip ABSENT from the map was never referenced by any merge edge — the
+  // fragment is its own component and keeps its own encoded tip. Either
+  // way the final label is a non-negative encoded tip of some member of
+  // the component, distinct from the -1 sentinel; the old -(comp+2)
+  // negative encoding existed only to keep dense serials disjoint from
+  // untouched tips and is gone. Labels are arbitrary per-run values either
+  // way; the fof3 harness canonicalizes by min order per label group.
   void applyUF2Labels(const CkCallback& cb) {
     auto* nb = node_proxy.ckLocalBranch();
     auto& labels = nb->uf2_labels;
@@ -3261,8 +3262,8 @@ public:
       uint64_t local_id = (uint64_t)rep_label[r] & paratreet::kUF2IdxMask;
       auto it = labels.find(local_id);
       if (it != labels.end()) {
-        CkEnforce(it->second != -1);
-        rep_label[r] = -(it->second + 2);
+        CkEnforce(it->second >= 0);   // a boss tip: sign bit clear
+        rep_label[r] = it->second;
       } // else: untouched fragment keeps its encoded tip
     }
     materializeLabels();

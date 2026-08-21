@@ -4,7 +4,15 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+// endian.h is Linux-only; macOS spells the big-endian-to-host
+// conversions via libkern. Only be32toh/be64toh are used here.
+#ifdef __APPLE__
+#include <libkern/OSByteOrder.h>
+#define be32toh(x) OSSwapBigToHostInt32(x)
+#define be64toh(x) OSSwapBigToHostInt64(x)
+#else
 #include <endian.h>
+#endif
 #include <sys/stat.h>
 #include <vector>
 
