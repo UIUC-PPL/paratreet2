@@ -111,10 +111,10 @@ namespace paratreet {
 // 43 bits = 8.8e12 particles. 20 process bits = 1,048,576 processes. The
 // remaining top bit is the SIGN bit of the (signed long) group_number and
 // must stay clear: negative values are reserved for the -1 "never
-// labeled" sentinel. (Historical: dense UF_2 component serials were once
-// encoded as -(comp+2) to stay disjoint from encoded tips; since the
-// prefix removal all final labels ARE encoded tips — the component's
-// boss tip — so the namespace is unified and non-negative.)
+// labeled" sentinel and for touched-component labels -(x + 2) — since
+// the prefix removal x is the component's boss TIP rather than a dense
+// serial, but the sign still carries the counter's touched-vs-untouched
+// classification (FoFPhase3.h sign-contract comment).
 constexpr int kUF2IdxBits = 43;
 constexpr int kUF2ProcBits = 20;
 constexpr uint64_t kUF2IdxMask = (uint64_t(1) << kUF2IdxBits) - 1;
@@ -3243,16 +3243,15 @@ public:
     this->contribute(cb);
   }
 
-  // Step 2: owner-writes rewrite, and since the prefix removal the label
-  // NAMESPACE IS UNIFIED: a tip PRESENT in the touched-label map takes its
-  // component's boss tip (the componentNumber, itself an encoded tip); a
-  // tip ABSENT from the map was never referenced by any merge edge — the
-  // fragment is its own component and keeps its own encoded tip. Either
-  // way the final label is a non-negative encoded tip of some member of
-  // the component, distinct from the -1 sentinel; the old -(comp+2)
-  // negative encoding existed only to keep dense serials disjoint from
-  // untouched tips and is gone. Labels are arbitrary per-run values either
-  // way; the fof3 harness canonicalizes by min order per label group.
+  // Step 2: owner-writes rewrite. A tip PRESENT in the touched-label map
+  // takes -(bossTip + 2) — since the prefix removal componentNumber is the
+  // component's boss tip, but the NEGATION STAYS: the distributed
+  // component counter classifies touched-vs-untouched BY SIGN (contract
+  // shared with the serial path, FoFPhase3.h; dropping it reintroduces
+  // the 2026-08-05 phantom-components bug — rediscovered 2026-08-21 when
+  // this rewrite briefly returned bare boss tips). A tip ABSENT from the
+  // map keeps its own (non-negative) encoded tip. Labels are arbitrary
+  // per-run values; the fof3 harness canonicalizes by min order.
   void applyUF2Labels(const CkCallback& cb) {
     auto* nb = node_proxy.ckLocalBranch();
     auto& labels = nb->uf2_labels;
@@ -3262,8 +3261,17 @@ public:
       uint64_t local_id = (uint64_t)rep_label[r] & paratreet::kUF2IdxMask;
       auto it = labels.find(local_id);
       if (it != labels.end()) {
-        CkEnforce(it->second >= 0);   // a boss tip: sign bit clear
-        rep_label[r] = it->second;
+        // NEGATE per the sign contract shared with the serial path and
+        // REQUIRED by the distributed component counter (FoFPhase3.h
+        // ~638 and the 2026-08-05 phantom-components incident): negative
+        // = touched by a cross-process edge (per-process piece sizes
+        // need global summing); positive = untouched, process-local.
+        // The prefix removal made componentNumber a boss TIP rather than
+        // a dense serial; the counter contract is about SIGN, not value,
+        // so the negated boss tip serves it unchanged. (LONG_MAX-2 guard:
+        // the maximal encodable tip would overflow the negation.)
+        CkEnforce(it->second >= 0 && it->second <= (long)(~0UL >> 1) - 2);
+        rep_label[r] = -(it->second + 2);
       } // else: untouched fragment keeps its encoded tip
     }
     materializeLabels();
