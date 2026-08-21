@@ -1,0 +1,129 @@
+relay63 + relay64 -- THE TWO LEAF OPTIMA, AND WHAT IS LEFT OF THE CPU
+ppn RESULT.  Jobs 5321648 (fine leaf sweep) and 5321787 (ppn x leaf).
+2026-08-21.  All 32 measured arms EXACT, every leaf gate ok, no
+CmiSetCPUAffinity failure in any arm.
+
+====================================================================
+1.  HEADLINE
+====================================================================
+
+*** THE CPU LEAF OPTIMUM IS 32 AND THE CURVE IS A CLEAN U.  Best CPU-only
+    number is now 4785-4811 ms against the 7466.3 ms that stood this
+    morning. ***
+
+*** THE GPU LEAF OPTIMUM IS 128 AND IT IS A TRUE INTERIOR MINIMUM.  My
+    relay62 caution -- that 128 might be the edge of the range rather than
+    a maximum -- is RESOLVED AND WRONG.  The curve rises past 128 and rises
+    steeply.  There is no further gain available from leaf tuning on the
+    GPU arm, and 2825-2852 ms stands. ***
+
+*** THE ppn 7 vs ppn 14 CPU RESULT LARGELY DISSOLVES AT THE SHIPPING
+    CONFIGURATION.  It was +22%.  The build fix takes it to +5.5%.  The
+    leaf fix takes it to +0.8%.  It is still real -- the ranges do not
+    overlap -- but "ppn 7 beats ppn 14 by 16.5-17.2% on CPU too" is no
+    longer a true statement about the code we would ship. ***
+
+====================================================================
+2.  relay63, job 5321648 -- THE TWO CURVES
+====================================================================
+
+Production binaries, ppn 7, PEMAP7, ndev 4, poll 2, fix on, 2 reps each.
+
+    CPU (FoF3.cpu-prod)              GPU (FoF3.gpu-prod)
+    leaf   mean      range           leaf   mean      range
+     16   5118.2 ms   26.4            128  2852.5 ms    9.7   BEST
+     24   4831.3      12.6            192  3059.3      24.9
+     32   4785.3      30.5  BEST      256  3451.5      38.9
+     48   4916.5      10.5            384  4316.7     113.6
+     64   5223.2       6.0
+
+With relay62's points the two curves are:
+
+    CPU   12 5365.3 | 16 5118.2 | 24 4831.3 | 32 4785.3 | 48 4916.5
+          64 5223.2 | 128 7081.0
+    GPU   12 3606.9 | 32 3074.3 | 128 2825.0/2852.5 | 192 3059.3
+          256 3451.5 | 384 4316.7
+
+Both have a genuine interior minimum.  CPU is shallow and broad between 24
+and 48 (4785-4917, under 3%); GPU is sharper, and 384 costs 53% over 128.
+
+====================================================================
+3.  relay64, job 5321787 -- ppn x LEAF, 3 REPS
+====================================================================
+
+FoF3.cpu-prod, 2B/16n, 3 reps, interleaved, warm-up discarded.
+
+    arm                     ndev/poll  ntasks  mean       range   vs A
+    A  p7-phys   leaf  32     7 / 1      128   4811.3 ms   33.6    --
+    B  p14-smt   leaf  32     7 / 2      128   4850.8      27.5   +0.82%
+    C  p14-phys  leaf  32     7 / 2       64   4963.0      44.5   +3.15%
+    D  p7-phys   leaf 128     7 / 1      128   7057.3      53.7    --
+    E  p14-smt   leaf 128     7 / 2      128   7444.7      50.4   +5.49%
+    F  p7-phys   leaf  32     4 / 2      128   4794.4      11.8   -0.35%
+
+WHAT HAPPENED TO THE ppn RESULT, in three steps:
+
+    relay48, Debug build, leaf 128   p7 7813-7916  p14-smt 9550.6   +22%
+    relay64 D/E, production, leaf 128  7057.3              7444.7   +5.5%
+    relay64 A/B, production, leaf  32  4811.3              4850.8   +0.8%
+
+The Debug build was inflating the ppn-14 penalty by a factor of four, and
+the wrong leaf size was inflating what remained by a factor of seven.  What
+survives is 0.82%, with non-overlapping ranges (A [4791.9, 4825.5] against
+B [4833.9, 4861.4]), so it is a real effect and it is nearly worthless.
+
+AND relay48's SMT DECOMPOSITION INVERTS AT leaf 32.  relay48 had p14-phys
+at +2.6% and p14-smt at +22%, i.e. putting the extra 896 PEs on SMT
+siblings was the expensive part and 4-processes-of-14 on physical cores was
+nearly free.  At leaf 32 it is the other way round: p14-smt +0.82%,
+p14-phys +3.15%.  The 1792-PE SMT shape is now the BETTER of the two ppn-14
+shapes.  I am not going to explain that from this job; it is one more
+result that was measured at the wrong leaf size and needs re-deriving if
+anyone wants the mechanism.
+
+F IS THE BRIDGE TO relay62 AND IT HOLDS.  relay62 measured ppn 7 at leaf 32
+with ndev 4 / poll 2 and got 4811.9 ms; F is that exact configuration in
+this job and gives 4794.4 ms, 17.5 ms apart across two allocations.  A vs F
+is 16.9 ms with overlapping ranges, so the product-rule choice (ndev 7 /
+poll 1 against ndev 4 / poll 2) does not matter at ppn 7.  The two jobs can
+be read together.
+
+====================================================================
+4.  WHAT THE CPU-ONLY RECOMMENDATION IS NOW
+====================================================================
+
+    ppn 7, PEMAP7 (physical cores only), -l 32, production build.
+    4785-4811 ms.
+
+Against what stood this morning (7466.3 ms, ppn 14, leaf 128, production)
+that is -35.9%.  Against the Debug-era ppn-7 number in RESUME (7892.2 ms)
+it is -39.4%.
+
+The ppn part of that recommendation is now carried by 0.8%, not 17%.  If
+there is any reason to prefer ppn 14 -- and on this evidence there is
+nearly no cost to it -- that choice is now open in a way it was not.
+
+====================================================================
+5.  CORRECTIONS
+====================================================================
+
+  - MINE, from relay62 and repeated to Kale in the campaign summary: "GPU
+    Pre-traversal is still falling at 128, so 128 may be the edge of the
+    range rather than a maximum, and 2825.0 ms is the best measured, not
+    necessarily the best available."  relay63 tested it.  128 is a true
+    minimum.  No further gain is available there.
+
+  - relay46/47/48's CPU shape results: the RELATIVE A/Bs were said to
+    stand because both sides carried the same build.  That is true as far
+    as it goes, but it is not the same as the results being TRANSFERABLE.
+    The +22% ppn-14 penalty is a fact about a Debug build at leaf 128 and
+    is 0.8% in the shipping configuration.  A relative A/B measured at the
+    wrong operating point can still be the wrong answer to the question
+    someone actually asks.
+
+  - RESUME's "ppn 7 beats ppn 14 by 16.5-17.2% on CPU too" and "the
+    ppn-14 idiom in the machines docs and the README is not right as a
+    default on this machine at this scale, for either arm" -- the first is
+    superseded, the second is no longer supported on the CPU arm.  On the
+    GPU arm ppn 7 still wins decisively (2881.9 against 3991.2 with the fix
+    on, relay49), and that is untouched by any of this.

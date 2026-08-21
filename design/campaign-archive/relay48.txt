@@ -1,3 +1,27 @@
+*** CORRECTION HEADER added 2026-08-21 14:10.  THE SHAPE RESULTS IN THIS
+    REPORT WERE MEASURED ON A DEBUG-BUILD RUNTIME AT "-l 128", AND BOTH OF
+    THOSE TURNED OUT TO BE WRONG OPERATING POINTS.
+
+    -l 128 is the GPU reference value, inherited into the CPU-only scripts;
+    the CPU optimum is 32 and 128 costs 48% there (relay62/relay63).  The
+    runtime was CMAKE_BUILD_TYPE=Debug, worth another 15.6% (relay49).
+
+    RE-MEASURED ON THE PRODUCTION BUILD AT -l 32, 3 reps (relay64, job
+    5321787), the ppn-14 penalty this report puts at +22% is:
+
+        Debug build,  -l 128    +22%      <- this report
+        production,   -l 128    +5.5%
+        production,   -l  32    +0.8%     <- the shipping configuration
+
+    And the SMT decomposition INVERTS: p14-smt +0.82% is now BETTER than
+    p14-phys +3.15%, where this report has them at +22% and +2.6%.
+
+    The relative A/Bs here are internally valid -- both sides of each carried
+    the same build and the same leaf -- but they are NOT transferable to the
+    configuration we now recommend.  The OS-interference measurement
+    (runqueue wait 0.10-0.12% of PE cpu at ppn 14) is untouched by any of
+    this.  See reports/relay63.txt. ***
+
 relay48 -- THE ppn-14 PENALTY IS SMT NOT PAYING FOR ITSELF.  IT IS NOT OS
 INTERFERENCE.  Jobs 5320076 and 5320090, 16 nodes, 2B, CPU-only, 3 reps per
 arm.  Plus the traces for the best GPU shape, job 5320106.  2026-08-21.

@@ -129,7 +129,18 @@ tolerate SMT sharing.
 **Leaf-size caveat (08-21 later): the CPU shape measurements ran at
 -l 128 (a GPU-runbook flag wrongly inherited by the CPU scripts —
 the resolution of the 5.15 s mystery); the CPU verdict awaits a
-default-leaf (-l 12) recheck.** Open discriminator if ever needed (needs a
+default-leaf (-l 12) recheck.**
+**FINAL (relays 61-64, 08-21 afternoon): leaf optima are CPU 32 / GPU
+128 (both true interior minima). At production build + leaf 32 the CPU
+ppn effect collapses to +0.8% — real, nearly worthless; ppn is a free
+choice on the CPU arm. GPU arm: ppn 7 remains decisive (2881.9 vs
+3991.2 with the fix). Best walls: CPU 4785-4811 ms, GPU 2825-2882 ms.
+The 5.15 s reference reproduces exactly at its own leaf (A1 5189.4 in
+the 08-18 band) — no machine drift ever existed. Lesson attached to
+relays 46-48: a relative A/B at the wrong operating point can be the
+wrong answer to the question asked (the +22% ppn penalty was 4x Debug
+inflation x 7x leaf inflation over a 0.8% shipping effect; the SMT
+decomposition inverts at leaf 32).** Open discriminator if ever needed (needs a
 HIP-free charm build): ppn 14 across two processes on 14 PHYSICAL
 cores — penalty vanishes = SMT, survives = PE count.
 

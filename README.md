@@ -470,15 +470,19 @@ CPU cluster run — **the defaults ARE the recommended config** as of
 
 ```sh
 ./FoF3 -f <input> -d oct -u dist -c stats
-# LEAF SIZE: let -l default (12) on the CPU arm. -l 128 is the GPU
-#   arm's leaf and costs the CPU chain ~2.5x in phaseA (the 2026-08-21
-#   "5.15 s mystery": one flag inherited from the GPU runbook into the
-#   CPU scripts).
-# Frontier: +ppn 7 +pemap <nosmt map> +lci_ndevices 7 +backend_poll_thread 1
-#   ppn 7 (no SMT) beat ppn 14 by 16.5-17.2% at 2B/16 in two 3-rep jobs
-#   (relays 46/47) — a thread-count effect in the phase-3 walk, phaseA
-#   SMT-neutral, AUTO split exonerated. CAVEAT: those jobs ran -l 128;
-#   the shape verdict is pending a recheck at the default leaf.
+# LEAF SIZE IS A FIRST-ORDER KNOB WITH OPPOSITE OPTIMA PER ARM
+#   (relays 61-64, full sweeps, 2B/16): CPU-only optimum -l 32 (clean
+#   shallow U over 24-48; default 12 costs +11.5%, the GPU's 128 costs
+#   +47%); GPU optimum -l 128 (true interior minimum; 12 costs +28%,
+#   384 costs +53%). Pass -l 32 on CPU runs until/unless the default
+#   changes.
+# Frontier: +ppn 7 +pemap <nosmt map>, -l 32 -> 4785-4811 ms at 2B/16
+#   (production build). The once-headline "ppn 7 beats ppn 14 by 17%"
+#   was an artifact of measuring at Debug build + leaf 128: at the
+#   shipping configuration the ppn effect is +0.8% (real, nearly
+#   worthless) — choose ppn freely on CPU. (On the GPU arm ppn 7
+#   remains decisive.) The relay48 SMT decomposition also inverts at
+#   leaf 32 — do not quote it outside its operating point.
 # A/B against the pre-campaign behaviour: FOF_PE_SETS=1 FOF_STEALA=0 \
 #   FOF_PB_PARTS=0 FOF_PHASEB_SLICE_MS=0
 ```

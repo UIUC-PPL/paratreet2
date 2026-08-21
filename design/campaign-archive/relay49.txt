@@ -1,3 +1,29 @@
+*** CORRECTION HEADER added 2026-08-21 14:10.  SECTION 2 OF THIS REPORT IS
+    RETRACTED.  It says the 5.15 s CPU reference "DOES NOT REPRODUCE, ON ITS
+    OWN BINARY, ON ITS OWN RUNTIME, IN ITS OWN CONFIG", names libfabric as
+    the prime suspect, and directs the next job to be one arm with
+    libfabric/1.20.1.  All of that is wrong.
+
+    IT REPRODUCES.  Running the 08-18 sbatch VERBATIM on 2026-08-21 gives
+    5189.4 ms against its recorded 5144.8-5192 (relay61, job 5321505).  The
+    gap was never drift: arm A in THIS report passed "-l 128" while the
+    08-18 script passed no -l and ran the FoF3 default of 12 particles per
+    leaf.  Two different problem sizes.  The libfabric suspicion was also
+    wrong on its own terms -- 2.3.1 is the LOGIN DEFAULT and was loaded on
+    both dates; the "built against 1.20.1" line in BUILDS.md is a build-time
+    fact that does not describe what is loaded at run time.
+
+    ALSO MINE TO OWN: arm A0 here is described as "the same binary and
+    runtime with NO FOF_* set at all, i.e. its own defaults".  It only unset
+    the FOF_* ENVIRONMENT and kept -l 128 on the command line, so it was
+    never that control and its 9644.6 ms is not "the old defaults".
+
+    WHAT STILL STANDS: the build decomposition in the headline table
+    (linked tracing -7.7%, the Debug runtime -15.6%, C1 ~= A), section 4's
+    production re-baseline, and the 2881.9 ms GPU headline -- reconfirmed
+    at 2825.0 and 2852.5 ms on 2026-08-21 (relay62, relay63).
+    See reports/relay61.txt. ***
+
 relay49 -- THE CPU REGRESSION IS THE BUILD, AND IT IS TWO DEFECTS NOT ONE.
 Jobs 5320405 (five arms, ppn 14) and 5320452 (four arms, GPU, production).
 2026-08-21.  Kale's catch, confirmed and quantified -- with one part of his
