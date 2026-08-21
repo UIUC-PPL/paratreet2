@@ -1,0 +1,336 @@
+# CHARM/RECONVERSE DIAGNOSTIC INSTRUMENTATION -- STANDALONE.
+#
+# Extracted from the stall campaign's cumulative patch 0018 because it is the
+# one piece of that instrumentation with use beyond the investigation that
+# produced it.  It is INDEPENDENT of the ROCm affinity fix (that is
+# gpu-helper-affinity-fix.diff, one file, in the parent folder).
+#
+# Two files, both in charm: src/ck-core/qd.C and src/ck-core/init.C.
+# APPLY:  cd <charm> && git apply <this file>
+#
+# (1) QUIESCENCE DETECTION BECOMES VISIBLE IN PROJECTIONS.
+#     QdMsg travels as a raw Converse message dispatched by CmiHandleMessage,
+#     and neither charm nor reconverse puts a trace hook there -- so a QD shows
+#     up as the waitQD() that posts it, the onQD() that ends it, and NOTHING in
+#     between.  At 896 PEs that gap was 53-81 ms, six times per run.
+#       9100  QD wait for STILL_IDLE   BRACKETED; its length is the per-hop
+#                                      wait for CcdPROCESSOR_STILL_IDLE
+#       9101/9102/9103  QD phase 0/1/2       9104  round restart (PE 0)
+#       9105  QD detected (PE 0)             9106  QD started (PE 0)
+#     Always on; a traced run costs a few tens of thousands of extra records.
+#     The arrival timestamp rides inside the QdMsg, so overlapping QD messages
+#     on one PE cannot confuse the bracket, and registration is lazy and
+#     per-PE so startup ordering cannot break it.
+#
+# (2) AN OFF-CORE DETECTOR FOR THE SCHEDULER.  Gated on FOF_SCHED_GAP_US=<us>;
+#     when unset the callback is never registered and nothing changes.
+#       9110  BRACKETED; thread was NOT on a CPU -- its length is the gap
+#       9111  BRACKETED; thread WAS running, inside one iteration
+#       9112  point event; ru_nivcsw advanced across the gap
+#     HOW IT DECIDES, which is the part worth reusing.  The TRIGGER is a
+#     wall-clock delta across CcdSCHEDLOOP raises (cheap: CmiWallTimer is
+#     clock_gettime via the vDSO).  But a wall gap ALONE proves nothing -- it
+#     is equally consistent with the kernel descheduling the thread and with
+#     the thread running flat out inside one iteration.  So on the rare
+#     trigger it asks the kernel: clock_gettime(CLOCK_THREAD_CPUTIME_ID),
+#     which advances only while the thread executes, plus
+#     getrusage(RUSAGE_THREAD).ru_nivcsw.
+#     KNOWN LIMIT, stated because the first version got this wrong:
+#     CLOCK_THREAD_CPUTIME_ID is also flat while a thread is BLOCKED IN A
+#     SYSCALL, so 9110 alone cannot separate preemption from blocking. That is
+#     what 9112 is for. Do not read 9110 on its own.
+#
+# WHAT IT FOUND: a quiet QD episode is (number of rounds) x one scheduler
+# timeslice, not the idle gate -- the median STILL_IDLE hop is 3 MICROSECONDS.
+
+diff --git a/src/ck-core/init.C b/src/ck-core/init.C
+index b6ea5e6f3..bcffd84c1 100644
+--- a/src/ck-core/init.C
++++ b/src/ck-core/init.C
+@@ -1223,8 +1223,149 @@ void CpdFreeze(void);
+ 
+ extern int _dummy_dq;
+ 
++// ---------------------------------------------------------------------------
++// OFF-CORE DETECTOR.  Research instrument, OFF unless FOF_SCHED_GAP_US is set.
++// Added 2026-08-20; see ~/software/reports/relay37.txt and relay38.txt.
++//
++// WHAT IT IS MEASURING.  On Frontier at 896 PEs, 2-7% of PEs run a broadcast
++// 3-16 ms after the OTHER PEs IN THE SAME PROCESS took the same message out of
++// the same memory, with a hard ceiling near 15.9 ms and almost nothing between
++// 20 us and 3 ms.  A bimodal distribution with a ceiling looks like a
++// scheduling quantum.  Kale's reading is that the worker pthread is
++// descheduled.  Projections cannot decide that on its own: an idle PE emits no
++// records whether it is on a core or not.
++//
++// HOW IT DECIDES, and this is the whole point of the instrument.
++//
++//   TRIGGER (cheap, every iteration).  The scheduler raises CcdSCHEDLOOP at the
++//   top of every iteration of both its loops, so a keep-callback there sees the
++//   loop's own heartbeat.  CmiWallTimer is clock_gettime(CLOCK_REALTIME)
++//   through the vDSO, about 25 ns, and the idle loop iterates far faster than
++//   the threshold, so a wall gap over FOF_SCHED_GAP_US means SOMETHING took the
++//   thread away from the top of the loop.
++//
++//   A WALL GAP ALONE PROVES NOTHING.  It is equally consistent with (a) the
++//   kernel descheduling this thread and (b) the thread running flat out inside
++//   ONE iteration -- a long entry method, a long progress() call, a page fault.
++//   The first version of this code logged the wall gap and stopped there, which
++//   would have produced a confident and possibly wrong answer.
++//
++//   VERDICT (expensive, only on the rare gap).  Ask the kernel:
++//     * clock_gettime(CLOCK_THREAD_CPUTIME_ID) -- THIS THREAD's own CPU clock.
++//       It advances only while the thread is executing.  If the wall clock
++//       advanced 16 ms and this clock advanced ~0, the thread was not running.
++//       That is the discriminator, and it is a direct kernel measurement, not
++//       an inference.
++//     * getrusage(RUSAGE_THREAD).ru_nivcsw -- INVOLUNTARY context switches for
++//       this thread.  If it advanced across the gap the kernel preempted us.
++//       Corroborating, and the same counter relay23 used (patch 0016).
++//   A reference sample of both is refreshed every FOF_SCHED_GAP_US/2, so the
++//   comparison window is at most 1.5x the gap and the verdict stays sharp.
++//
++// WHAT LANDS IN THE TRACE
++//   9110  BRACKETED, length = the gap.  Thread's own CPU clock did NOT advance:
++//         it was OFF CORE.
++//   9111  BRACKETED, length = the gap.  Thread's CPU clock DID advance: it was
++//         running, inside one iteration.  Not a scheduling event.
++//   9112  point event, emitted when ru_nivcsw advanced across the gap.
++//
++// COST.  One vDSO clock read per scheduler iteration, plus two syscalls per
++// FOF_SCHED_GAP_US/2 of wall time per PE (at 1000 us that is 4000 syscalls per
++// second per PE, well under 1% of a core), plus two syscalls per logged gap.
++// When the variable is unset the callback is never registered and CcdSCHEDLOOP
++// raises against an empty list, exactly as it does today.
++// ---------------------------------------------------------------------------
++#include <time.h>
++#include <sys/resource.h>
++#ifndef RUSAGE_THREAD
++#define RUSAGE_THREAD 1          // glibc exposes this only under _GNU_SOURCE
++#endif
++
++#define TRACE_SCHED_GAP_OFF    9110
++#define TRACE_SCHED_GAP_ON     9111
++#define TRACE_SCHED_GAP_NIVCSW 9112
++
++CpvStaticDeclare(double, _sgLast);        // wall time at the previous iteration
++CpvStaticDeclare(double, _sgThresh);      // gap threshold, seconds
++CpvStaticDeclare(double, _sgEvery);       // reference-sample interval, seconds
++CpvStaticDeclare(double, _sgSampWall);    // wall time of the reference sample
++CpvStaticDeclare(double, _sgSampCpu);     // this thread's CPU clock at it
++CpvStaticDeclare(long,   _sgSampNivcsw);  // this thread's ru_nivcsw at it
++
++static inline void _sgSample(double *cpu, long *niv)
++{
++  struct timespec ts;
++  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);   // per-THREAD, not per-process
++  *cpu = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
++  struct rusage ru;
++  *niv = (getrusage(RUSAGE_THREAD, &ru) == 0) ? ru.ru_nivcsw : -1;
++}
++
++static void _schedGapCheck(void *)
++{
++  const double now = CmiWallTimer();
++  const double prev = CpvAccess(_sgLast);
++  CpvAccess(_sgLast) = now;
++
++  if (prev > 0.0 && (now - prev) > CpvAccess(_sgThresh)) {
++    double cpu; long niv;
++    _sgSample(&cpu, &niv);
++    const double dwall = now - CpvAccess(_sgSampWall);
++    const double dcpu  = cpu - CpvAccess(_sgSampCpu);
++    const long   dniv  = niv - CpvAccess(_sgSampNivcsw);
++    if (dniv > 0) traceUserEvent(TRACE_SCHED_GAP_NIVCSW);
++    // The thread's own CPU clock is the verdict.  Half the wall gap is a wide
++    // margin: a spinning thread tracks wall time almost exactly, a descheduled
++    // one barely moves.
++    traceUserBracketEvent((dwall > 0.0 && dcpu < 0.5 * dwall)
++                            ? TRACE_SCHED_GAP_OFF : TRACE_SCHED_GAP_ON,
++                          prev, now);
++    CpvAccess(_sgSampWall) = now;
++    CpvAccess(_sgSampCpu) = cpu;
++    CpvAccess(_sgSampNivcsw) = niv;
++  } else if (now - CpvAccess(_sgSampWall) > CpvAccess(_sgEvery)) {
++    double cpu; long niv;
++    _sgSample(&cpu, &niv);
++    CpvAccess(_sgSampWall) = now;
++    CpvAccess(_sgSampCpu) = cpu;
++    CpvAccess(_sgSampNivcsw) = niv;
++  }
++}
++
++void initSchedGap(void)
++{
++  CpvInitialize(double, _sgLast);
++  CpvInitialize(double, _sgThresh);
++  CpvInitialize(double, _sgEvery);
++  CpvInitialize(double, _sgSampWall);
++  CpvInitialize(double, _sgSampCpu);
++  CpvInitialize(long,   _sgSampNivcsw);
++  CpvAccess(_sgLast) = 0.0;
++  const char *e = getenv("FOF_SCHED_GAP_US");
++  const int us = (e != NULL) ? atoi(e) : 0;
++  CpvAccess(_sgThresh) = (us > 0 ? us : 1000) * 1e-6;
++  CpvAccess(_sgEvery)  = CpvAccess(_sgThresh) * 0.5;
++  double cpu; long niv;
++  _sgSample(&cpu, &niv);
++  CpvAccess(_sgSampWall) = CmiWallTimer();
++  CpvAccess(_sgSampCpu) = cpu;
++  CpvAccess(_sgSampNivcsw) = niv;
++  if (us > 0) {
++    traceRegisterUserEvent("sched gap: thread OFF CORE", TRACE_SCHED_GAP_OFF);
++    traceRegisterUserEvent("sched gap: thread running (long call)", TRACE_SCHED_GAP_ON);
++    traceRegisterUserEvent("sched gap: involuntary ctx switch", TRACE_SCHED_GAP_NIVCSW);
++    CcdCallOnConditionKeep(CcdSCHEDLOOP, (CcdCondFn)_schedGapCheck, NULL);
++    if (CmiMyPe() == 0)
++      CmiPrintf("[charm] FOF_SCHED_GAP_US=%d: scheduler gaps over %d us are "
++                "logged as Projections user events %d (off core) / %d (running) "
++                "/ %d (nivcsw)\n", us, us, TRACE_SCHED_GAP_OFF,
++                TRACE_SCHED_GAP_ON, TRACE_SCHED_GAP_NIVCSW);
++  }
++}
++
+ void initQd(char **argv)
+ {
++  initSchedGap();
+ 	CpvInitialize(QdState*, _qd);
+ 	CpvAccess(_qd) = new QdState();
+ 	if (CmiMyRank() == 0) {
+diff --git a/src/ck-core/qd.C b/src/ck-core/qd.C
+index 39533f5ec..ae96333c3 100644
+--- a/src/ck-core/qd.C
++++ b/src/ck-core/qd.C
+@@ -2,6 +2,52 @@
+ 
+ #include "ck.h"
+ 
++// ---------------------------------------------------------------------------
++// PROJECTIONS INSTRUMENTATION FOR THE QD PROTOCOL.  Research instrument added
++// 2026-08-20; see ~/software/reports/relay37.txt.
++//
++// QdMsg travels as a raw Converse message dispatched by CmiHandleMessage, and
++// neither charm nor reconverse puts a trace hook there.  So Projections shows
++// the waitQD() that posts a detection and the onQD() that ends it, and NOTHING
++// in between -- on Frontier at 896 PEs that gap is 53-81 ms with the machine
++// otherwise completely idle, six times per run.  These user events make each
++// leg, each round and each idle wait a first-class Projections record.
++//
++// TRACE_QD_IDLEWAIT is the one that matters most: it brackets the interval
++// from the QD message landing on a PE to the CcdPROCESSOR_STILL_IDLE
++// condition actually firing, so its LENGTH is the per-hop idle wait.  Summed
++// over a round it should account for the ~21 ms per round we measured
++// indirectly from idle-exit waves.
++//
++// Cost when tracing is off: traceUserEvent and friends are no-ops in a
++// non-traced build, and one predictable branch per QD message otherwise.  QD
++// messages number a few tens of thousands per run, so this is free.
++// ---------------------------------------------------------------------------
++#define TRACE_QD_IDLEWAIT  9100
++#define TRACE_QD_PHASE0    9101
++#define TRACE_QD_PHASE1    9102
++#define TRACE_QD_PHASE2    9103
++#define TRACE_QD_ROUND     9104
++#define TRACE_QD_DETECTED  9105
++#define TRACE_QD_START     9106
++
++// Registered lazily, per PE, so this cannot depend on where initQd sits in the
++// startup order relative to trace initialisation.  PE 0 always runs CkStartQD,
++// so PE 0's table -- the one written to the .sts -- always has the names.
++static void _qdTraceInit(void)
++{
++  static thread_local bool done = false;
++  if (done) return;
++  done = true;
++  traceRegisterUserEvent("QD wait for STILL_IDLE", TRACE_QD_IDLEWAIT);
++  traceRegisterUserEvent("QD phase 0 (ask children)", TRACE_QD_PHASE0);
++  traceRegisterUserEvent("QD phase 1 (report counts)", TRACE_QD_PHASE1);
++  traceRegisterUserEvent("QD phase 2 (dirty check)", TRACE_QD_PHASE2);
++  traceRegisterUserEvent("QD round restart (PE 0)", TRACE_QD_ROUND);
++  traceRegisterUserEvent("QD detected (PE 0)", TRACE_QD_DETECTED);
++  traceRegisterUserEvent("QD started (PE 0)", TRACE_QD_START);
++}
++
+ class QdMsg {
+   private:
+     int phase; // 0..2
+@@ -12,8 +58,11 @@ class QdMsg {
+       struct { char dirty; } p4;
+     } u;
+     CkCallback cb;
++    double tArrive;   // instrumentation only: when this message reached the PE
+   public:
+     int getPhase(void) { return phase; }
++    double getArrive(void) { return tArrive; }
++    void setArrive(double t) { tArrive = t; }
+     void setPhase(int p) { phase = p; }
+     CkCallback getCb(void) { CkAssert(phase==0); return cb; }
+     void setCb(CkCallback cb_) { CkAssert(phase==0); cb = cb_; }
+@@ -139,12 +188,15 @@ static inline void _handlePhase1(QdState *state, QdMsg *msg)
+           DEBUGP(("ALL: %p getCCreated:%lld getCProcessed:%lld\n", state, state->getCCreated(), state->getCProcessed()));
+           if(state->getCCreated()==state->getCProcessed()) {
+             if(state->oldCount == state->getCProcessed()) {// counts unchanged in second round
++              traceUserEvent(TRACE_QD_ROUND);
+               _bcastQD2(state, msg);    // almost reached, one pass to make sure
+             } else {
+               state->oldCount = state->getCProcessed();
++              traceUserEvent(TRACE_QD_ROUND);
+               _bcastQD1(state, msg);    // may have reached, go over again
+             }
+           } else {
++            traceUserEvent(TRACE_QD_ROUND);
+             _bcastQD1(state, msg);    // not reached, go over again
+           }
+         } else {
+@@ -175,9 +227,11 @@ static inline void _handlePhase2(QdState *state, QdMsg *msg)
+   if(state->allReported()) {
+     if(CmiMyPe()==0) {
+       if(state->isDirty()) {
++        traceUserEvent(TRACE_QD_ROUND);
+         _bcastQD1(state, msg);   // dirty, restart again
+       } else {             
+           // quiescence detected, send callbacks
++        traceUserEvent(TRACE_QD_DETECTED);
+         DEBUGP(("[%d] quiescence detected at %f.\n", CmiMyPe(), CmiWallTimer()));
+         QdCallback* cb;
+         while(NULL!=(cb=state->deq())) {
+@@ -204,6 +258,15 @@ static inline void _handlePhase2(QdState *state, QdMsg *msg)
+ static void _callWhenIdle(QdMsg *msg)
+ {
+   DEBUGP(("[%d] callWhenIdle msg:%p \n", CmiMyPe(), msg));
++  _qdTraceInit();
++  // The bracket LENGTH is the time this hop spent waiting for this PE to be
++  // still-idle.  Read the phase before dispatching: the handlers free the
++  // message or send it onwards.
++  const double tA = msg->getArrive();
++  const int ph = msg->getPhase();
++  if (tA > 0.0) traceUserBracketEvent(TRACE_QD_IDLEWAIT, tA, CmiWallTimer());
++  traceUserEvent(ph == 0 ? TRACE_QD_PHASE0 :
++                 ph == 1 ? TRACE_QD_PHASE1 : TRACE_QD_PHASE2);
+   QdState *state = CpvAccess(_qd);
+   switch(msg->getPhase()) {
+     case 0 : _handlePhase0(state, msg); break;
+@@ -226,8 +289,10 @@ void _qdHandler(envelope *env)
+   DEBUGP(("[%d] _qdHandler msg:%p \n", CmiMyPe(), msg));
+   if (_dummy_dq > 0)
+     CcdCallFnAfter((CcdVoidFn)_invokeQD,(void *)msg, _dummy_dq*1000); // in ms
+-  else
++  else {
++    msg->setArrive(CmiWallTimer());   // instrumentation: start of the idle wait
+     CcdCallOnCondition(CcdPROCESSOR_STILL_IDLE, (CcdCondFn)_callWhenIdle, (void*) msg);
++  }
+ }
+ 
+ // when a message is sent or received from an immediate handler from comm
+@@ -264,8 +329,11 @@ void QdState::sendCount(bool isCreated, int count)
+ 
+ void CkStartQD(const CkCallback& cb)
+ {
++  _qdTraceInit();
++  traceUserEvent(TRACE_QD_START);
+   QdMsg *msg = (QdMsg*) CkAllocMsg(0,sizeof(QdMsg),0);
+   msg->setPhase(0);
++  msg->setArrive(0.0);
+   msg->setCb(cb);
+   envelope *env = UsrToEnv((void *)msg);
+   CmiSetHandler(env, _qdHandlerIdx);
