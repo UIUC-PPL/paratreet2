@@ -459,6 +459,8 @@ at its `getenv` site; none belongs in a production run.
 | `FOF_GPU_VERIFY` | off | Verify mode: device runs alongside the CPU chain and mismatches abort (`FOF_GPU_STAGE0` is the historical spelling) |
 | `FOF_GPU_ASYNC`, `FOF_GPU_GRID`, `FOF_GPU_WALK` | off/0 | launch and walk-shape controls (design/phase1-gpu.md) |
 | `FOF_GPU_RELEASE`, `FOF_COUNT_VERIFY` | off | measurement-mode changers — do not enable in timed runs |
+| `FOF_HELPER_CPUS` | derived | landing zone for ROCm/HIP helper threads (the affinity fix in fof/gpu/FoFDevice.cpp): unset = the pemap's SMT siblings, automatic and correct at ppn 7 (−22% at 2B/16, job 5319480); at ppn 13/14 every sibling is a PE, so name the OS-reserved CCD-first cores `0,8,16,24,32,40,48,56` and add `--core-spec=0 --cpus-per-task=16` to Slurm (−17%). The fix DECLINES with a warning when no safe CPU exists — a silent decline never masquerades as success |
+| `FOF_NO_AFFINITY_FIX` | off | `1` disables the helper-thread affinity fix (the A/B arm) |
 
 ### Recommended configurations (2026-08)
 
@@ -481,8 +483,10 @@ PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1 \
   ./FoF3 -f <input> -d oct -u dist -c stats -l 128
 # +ppn 7 +lci_ndevices 7 +backend_poll_thread 1 (one thread per domain;
 #  ndevices x processes/node must stay near 56 — 112 fails libfabric
-#  memory registration). ppn 7 beat ppn 14 by ~13% at 16 nodes
-#  (design/gpu-merge-plan.md section C).
+#  memory registration). ppn 7 beats ppn 14 by ~27% with the helper-
+#  thread affinity fix active (automatic at ppn 7; see FOF_HELPER_CPUS
+#  in the knobs table and design/campaign-archive/
+#  RECOMMENDATION-affinity-fix.md).
 ```
 
 Mixed jobs: add `FOF_PE_SETS_NODES=<CPU process list>` so GPU

@@ -938,7 +938,189 @@ void Device::releaseStaging() {
   // before then.
 }
 
+
+// ---------------------------------------------------------------------------
+// relay41 FIX: keep ROCm's helper threads off the PE cores.
+//
+// WHAT WAS WRONG.  ROCm creates its helper threads lazily, on the first real
+// HIP work, from whatever thread happens to be calling -- and pthread_create
+// hands the child the CALLER'S affinity mask.  Under Charm's +pemap that
+// caller is a worker PE pinned to exactly one core, so the helper is born
+// welded to that core and then alternates with the PE at the scheduler
+// timeslice.  Measured on Frontier at 896 PEs (reports/relay40.txt,
+// relay41.txt): the victim PE accumulates 2.7 SECONDS of runqueue wait in a
+// 26 s run while every unshared PE accumulates 0.0 ms, each quiescence
+// detection round costs a full 16 ms slice, and an LD_PRELOAD interposer on
+// pthread_create pins the blame precisely -- 256 libamdhip64 and 128
+// libhsa-runtime64 creations from a PINNED creator, with this function at
+// frames #14/#15 of the backtrace.
+//
+// WHERE IS SAFE, and this is the whole design decision.  NOT "every CPU in
+// the cpuset".  A Charm PE that has nothing to do SPINS in the scheduler's
+// idle loop, so every PE core carries a permanently runnable thread; a
+// wide-masked helper would simply pick one of them and start swapping it out.
+// The victim would rotate instead of disappearing, which is no fix at all.
+// The SMT SIBLINGS of the PE cores carry nothing: the pemap never names them,
+// so their runqueues are empty.  A helper there gets a runqueue to itself.  It
+// shares the physical core's execution units with its PE, which costs a few
+// percent WHILE IT IS ACTUALLY RUNNING, but it never deschedules anyone.
+// (Cores 0/8/16/... and their siblings are not in the job's cpuset on
+// Frontier -- the first core of each L3 group is reserved -- so the obvious
+// "park it on a spare core" is not available.)
+//
+// The caller's OWN core is deliberately excluded from the widened mask, so
+// the child cannot inherit it.  The calling PE is therefore migrated to a
+// sibling for the duration of this one call and put straight back.
+//
+// FOF_NO_AFFINITY_FIX=1 disables the whole thing, for A/B.
+// ---------------------------------------------------------------------------
+#if defined(__linux__)
+#include <sched.h>
+#include <dirent.h>
+
+namespace {
+
+// Parse a Linux cpu-list -- "0,8,16" or "0-3,8" or "4,68" -- into `out`.
+// `skip` is excluded (used to drop a core from its own sibling list); pass -1
+// to keep everything.
+void fof_parse_cpulist(const char* buf, cpu_set_t* out, int skip) {
+  const char* p = buf;
+  while (*p) {
+    char* end = nullptr;
+    long a = strtol(p, &end, 10);
+    if (end == p) break;
+    long b = a;
+    if (*end == '-') { p = end + 1; b = strtol(p, &end, 10); }
+    for (long x = a; x <= b; ++x)
+      if ((int)x != skip && x >= 0 && x < CPU_SETSIZE) CPU_SET((int)x, out);
+    p = (*end == ',') ? end + 1 : end;
+    if (*end == '\0') break;
+  }
+}
+
+// Add the SMT siblings of cpu `c` (excluding c) to `out`, from sysfs.
+// thread_siblings_list is either "4,68" or "4-5" depending on the machine.
+void fof_add_siblings(int c, cpu_set_t* out) {
+  char path[160];
+  snprintf(path, sizeof path,
+           "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list", c);
+  FILE* f = fopen(path, "r");
+  if (!f) return;
+  char buf[256];
+  if (fgets(buf, sizeof buf, f)) fof_parse_cpulist(buf, out, c);
+  fclose(f);
+}
+
+// The logical CPUs the pemap left empty: for every thread of this process that
+// is pinned to exactly one core, that core's SMT sibling.  Any core that some
+// thread is pinned to is then removed, so the result cannot contain a PE core
+// even on a machine where SMT siblings overlap the pemap.
+bool fof_helper_mask(cpu_set_t* out) {
+  CPU_ZERO(out);
+  cpu_set_t pinned;
+  CPU_ZERO(&pinned);
+  DIR* d = opendir("/proc/self/task");
+  if (!d) return false;
+  int npinned = 0;
+  struct dirent* e;
+  while ((e = readdir(d)) != nullptr) {
+    if (e->d_name[0] == '.') continue;
+    long tid = strtol(e->d_name, nullptr, 10);
+    if (tid <= 0) continue;
+    cpu_set_t m;
+    CPU_ZERO(&m);
+    if (sched_getaffinity((pid_t)tid, sizeof m, &m) != 0) continue;
+    if (CPU_COUNT(&m) != 1) continue;            // not a pinned PE
+    for (int c = 0; c < CPU_SETSIZE; ++c)
+      if (CPU_ISSET(c, &m)) { CPU_SET(c, &pinned); fof_add_siblings(c, out); ++npinned; break; }
+  }
+  closedir(d);
+  if (npinned == 0) return false;
+  for (int c = 0; c < CPU_SETSIZE; ++c)
+    if (CPU_ISSET(c, &pinned)) CPU_CLR(c, out);  // never hand back a PE core
+  return CPU_COUNT(out) > 0;
+}
+
+// RAII: widen for the duration of a block, restore on the way out.
+struct FoFHelperAffinityScope {
+  cpu_set_t save;
+  bool active;
+  FoFHelperAffinityScope() : active(false) {
+    static const bool off = (getenv("FOF_NO_AFFINITY_FIX") != nullptr);
+    if (off) return;
+    CPU_ZERO(&save);
+    if (sched_getaffinity(0, sizeof save, &save) != 0) return;
+    if (CPU_COUNT(&save) != 1) return;      // not pinned: nothing to protect
+
+    cpu_set_t safe;
+    CPU_ZERO(&safe);
+    const char* how = "SMT siblings";
+
+    // FOF_HELPER_CPUS names the landing zone explicitly, e.g. the CCD-first
+    // cores 0,8,16,24,32,40,48,56 that Frontier reserves for system services
+    // and that --core-spec=0 makes available.  A GPU-completion helper IS a
+    // service thread, so that is where it belongs -- and unlike the sibling
+    // set it survives ppn 14, where every SMT sibling is itself a PE.
+    // The list is the SAME on every process; each process's helpers land on
+    // whichever of those CPUs the kernel picks, and locality is preserved
+    // because the CCD-first core shares an L3 with that process's own PEs.
+    const char* env = getenv("FOF_HELPER_CPUS");
+    if (env && *env) {
+      fof_parse_cpulist(env, &safe, -1);
+      how = "FOF_HELPER_CPUS";
+      if (CPU_COUNT(&safe) == 0) {
+        static bool warned_bad = false;
+        if (!warned_bad) {
+          warned_bad = true;
+          fprintf(stderr, "[fofgpu] WARNING: FOF_HELPER_CPUS=\"%s\" parsed to "
+                          "an empty set; falling back to SMT siblings\n", env);
+        }
+        how = "SMT siblings";
+      }
+    }
+    if (CPU_COUNT(&safe) == 0 && !fof_helper_mask(&safe)) {
+      // Nothing safe exists -- every CPU this process can see already has a PE
+      // pinned to it.  That is the ppn 14 case.  DECLINE rather than guess,
+      // but SAY SO: a silent decline reads as "the fix is working".
+      static bool warned = false;
+      if (!warned) {
+        warned = true;
+        fprintf(stderr,
+                "[fofgpu] WARNING: affinity fix DECLINED -- no CPU is free of "
+                "pinned PEs, so HIP helper threads will inherit this PE's core "
+                "and preempt it in ~16 ms slices (see reports/relay42.txt). "
+                "Either leave one CPU per process unpinned, or run with "
+                "--core-spec=0 and set FOF_HELPER_CPUS to the reserved "
+                "cores.\n");
+      }
+      return;
+    }
+    if (sched_setaffinity(0, sizeof safe, &safe) == 0) {
+      active = true;
+      static bool announced = false;
+      if (!announced) {
+        announced = true;
+        fprintf(stderr, "[fofgpu] affinity fix active (%s): HIP helper threads "
+                        "will inherit %d CPUs, not this PE's core\n",
+                how, CPU_COUNT(&safe));
+      }
+    }
+  }
+  ~FoFHelperAffinityScope() {
+    if (active) sched_setaffinity(0, sizeof save, &save);
+  }
+};
+
+}  // namespace
+#define FOF_HELPER_AFFINITY_SCOPE FoFHelperAffinityScope fof_aff_scope_
+#else
+#define FOF_HELPER_AFFINITY_SCOPE do {} while (0)
+#endif
+
 void Device::runPhase1Impl(float b2, float grid_thresh, bool async) {
+  // See the block above: ROCm spawns its helpers from here, and they
+  // inherit this PE's single-core mask unless we widen it first.
+  FOF_HELPER_AFFINITY_SCOPE;
   p_->pending = WalkStats();
   p_->in_flight = false;
   WalkStats& st = p_->pending;
