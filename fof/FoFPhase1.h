@@ -434,6 +434,40 @@ public:
         label_shards.emplace_back(new LabelShard);
     }
   }
+  // Dense component-count accumulator (Kale, 2026-08-21; replaces the
+  // per-shard unordered_map that dominated histogramShard's ~280 ms at
+  // 2B/16). Key fact: an UNTOUCHED label's low 43 bits are a particle
+  // GLOBAL ORDER inside this process, and a process's orders are a
+  // CONTIGUOUS range under the SFC decomposition — so (order - lo) is a
+  // dense index. Deposits are relaxed atomic adds; histogramShard scans
+  // its slice, bins nonzero cells, and WRITES ZERO as it reads, so the
+  // scan is also the reset for the next iteration (cells start zeroed at
+  // allocation, and -c full runs never touch the array at all).
+  // Bounds come from the freeze (mergeOrderBounds below), which is
+  // barriered long before any deposit, in BOTH -u modes.
+  std::atomic<long> order_lo{LONG_MAX}, order_hi{-1};
+  void mergeOrderBounds(long lo, long hi) {
+    long cur = order_lo.load(std::memory_order_relaxed);
+    while (lo < cur &&
+           !order_lo.compare_exchange_weak(cur, lo, std::memory_order_relaxed)) {}
+    cur = order_hi.load(std::memory_order_relaxed);
+    while (hi > cur &&
+           !order_hi.compare_exchange_weak(cur, hi, std::memory_order_relaxed)) {}
+  }
+  std::unique_ptr<std::atomic<long>[]> dense_hist;
+  long dense_lo = 0, dense_width = 0;
+  void ensureDenseHist() {
+    std::lock_guard<std::mutex> g(label_shards_init_lock);
+    long lo = order_lo.load(), hi = order_hi.load();
+    if (hi < lo) { dense_width = 0; return; }  // no particles registered
+    long width = hi - lo + 1;
+    if (dense_hist && dense_width == width && dense_lo == lo) return;
+    dense_hist.reset(new std::atomic<long>[width]);
+    for (long i = 0; i < width; i++)
+      dense_hist[i].store(0, std::memory_order_relaxed);
+    dense_lo = lo;
+    dense_width = width;
+  }
 
   std::mutex seen3_lock;
   std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> seen3_pairs;
@@ -1544,11 +1578,20 @@ public:
     // materializeLabels()'s indexed load.
     roots.clear();
     rep_label.assign(uf_parent.size(), -1);
-    for (size_t r = 0; r < root_counts.size(); r++)
-      if (root_counts[r] > 0) {
-        roots.push_back((int)r);
-        rep_label[r] = flat_order[r];
-      }
+    {
+      long lo = LONG_MAX, hi = -1;
+      for (size_t r = 0; r < root_counts.size(); r++)
+        if (root_counts[r] > 0) {
+          roots.push_back((int)r);
+          rep_label[r] = flat_order[r];
+          if (flat_order[r] < lo) lo = flat_order[r];
+          if (flat_order[r] > hi) hi = flat_order[r];
+        }
+      // Order bounds for the dense component-count accumulator: tips are
+      // global orders and the process's range is contiguous (SFC), so
+      // [lo, hi] over root tips bounds every future untouched label.
+      if (hi >= lo) node_proxy.ckLocalBranch()->mergeOrderBounds(lo, hi);
+    }
     frozen_ = true;
 
     // Write the frozen tips into the node annotation, bottom up.
@@ -3641,6 +3684,43 @@ public:
         CkAbort("freeze-time component counts diverge from particle labels");
       }
     }
+    static const bool dense = [] {
+      const char* e = std::getenv("FOF_HIST_DENSE");
+      return !e || std::atoi(e) != 0;   // default ON; =0 is the A/B arm
+    }();
+    if (dense) {
+      // DENSE PATH (Kale, 2026-08-21): positive (untouched) labels sum by
+      // relaxed atomic add into the node's dense order-indexed array — no
+      // hashing, no allocation. The low 43 bits of an untouched label are
+      // its fragment tip = a global order inside this process's SFC range
+      // (serial-mode labels are bare orders, so the mask is the identity
+      // there). Negative (touched) labels are few and keep the shard-pair
+      // side path for stage 3.
+      nb->ensureDenseHist();
+      std::vector<std::vector<std::pair<long, long>>> tbuckets(n_shards);
+      for (int r : roots) {
+        long label = rep_label[r];
+        if (label >= 0) {
+          long order = (long)((uint64_t)label & paratreet::kUF2IdxMask);
+          CkEnforce(order >= nb->dense_lo &&
+                    order < nb->dense_lo + nb->dense_width);
+          nb->dense_hist[order - nb->dense_lo].fetch_add(
+              root_counts[r], std::memory_order_relaxed);
+        } else {
+          tbuckets[labelShardMix(label) % n_shards].emplace_back(
+              label, root_counts[r]);
+        }
+      }
+      for (int r = 0; r < n_shards; r++) {
+        if (tbuckets[r].empty()) continue;
+        auto& shard = *nb->label_shards[r];
+        std::lock_guard<std::mutex> g(shard.m);
+        shard.pairs.insert(shard.pairs.end(), tbuckets[r].begin(),
+                           tbuckets[r].end());
+      }
+      this->contribute(cb);
+      return;
+    }
     // Per-root pairs, labels current in rep_label; histogramShard sums by
     // label, so duplicate labels across roots need no pre-merging here.
     std::vector<std::vector<std::pair<long, long>>> buckets(n_shards);
@@ -3690,6 +3770,39 @@ public:
     // 2 x (64 bins + count + max): totals then survivors.
     long bins[64] = {0}, sbins[64] = {0};
     long n = 0, maxs = 0, sn = 0, smaxs = 0;
+    static const bool dense = [] {
+      const char* e = std::getenv("FOF_HIST_DENSE");
+      return !e || std::atoi(e) != 0;
+    }();
+    auto binOne = [&](long size) {
+      // floor(log2(size)) in one op; size >= 1 always (a label cannot be
+      // deposited with a zero count)
+      int bin = 63 - __builtin_clzl((unsigned long)size);
+      bins[bin]++; n++;
+      if (size > maxs) maxs = size;
+      if (size >= (long)min_component_size) {
+        sbins[bin]++; sn++;
+        if (size > smaxs) smaxs = size;
+      }
+    };
+    if (dense && nb->dense_width > 0 && my_shard < CkNodeSize(CkMyNode())) {
+      // DENSE PATH: this PE scans its contiguous slice of the process's
+      // order-indexed accumulator. Reading a nonzero cell yields a
+      // complete untouched-component size (deposits are barriered before
+      // this stage); writing zero back as we read resets the array for
+      // the next iteration — the scan IS the cleanup. Touched labels
+      // never entered the array; they arrive via the shard-pair side
+      // path below.
+      int nsh = CkNodeSize(CkMyNode());
+      long b0 = nb->dense_width * my_shard / nsh;
+      long b1 = nb->dense_width * (my_shard + 1) / nsh;
+      for (long i = b0; i < b1; i++) {
+        long size = nb->dense_hist[i].load(std::memory_order_relaxed);
+        if (size == 0) continue;
+        nb->dense_hist[i].store(0, std::memory_order_relaxed);
+        binOne(size);
+      }
+    }
     if (my_shard < (int)nb->label_shards.size()) {
       auto& shard = *nb->label_shards[my_shard];
       std::unordered_map<long, long> totals;
@@ -3702,16 +3815,9 @@ public:
           touched_totals_.emplace_back(kv.first, kv.second);
           continue;
         }
-        long size = kv.second; // untouched fragment: complete local total
-        // floor(log2(size)) in one op (was a shift-loop; size >= 1 always
-        // — a label cannot be deposited with a zero count)
-        int bin = 63 - __builtin_clzl((unsigned long)size);
-        bins[bin]++; n++;
-        if (size > maxs) maxs = size;
-        if (size >= (long)min_component_size) {
-          sbins[bin]++; sn++;
-          if (size > smaxs) smaxs = size;
-        }
+        // Positive pairs exist here only on the FOF_HIST_DENSE=0 arm
+        // (the dense path routes every positive label into the array).
+        binOne(kv.second);
       }
     }
     CkReduction::tupleElement tuple[] = {
