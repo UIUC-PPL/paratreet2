@@ -125,7 +125,11 @@ thread-count effect in the SMT-hostile phase-3 walk, not the AUTO
 split (set effect +0.4%, inside spread; the split does its job at both
 shapes). The two arms converge on ppn 7 for DIFFERENT reasons: GPU =
 helper-thread headroom on the free siblings; CPU = the walk cannot
-tolerate SMT sharing. Open discriminator if ever needed (needs a
+tolerate SMT sharing.
+**Leaf-size caveat (08-21 later): the CPU shape measurements ran at
+-l 128 (a GPU-runbook flag wrongly inherited by the CPU scripts —
+the resolution of the 5.15 s mystery); the CPU verdict awaits a
+default-leaf (-l 12) recheck.** Open discriminator if ever needed (needs a
 HIP-free charm build): ppn 14 across two processes on 14 PHYSICAL
 cores — penalty vanishes = SMT, survives = PE count.
 
