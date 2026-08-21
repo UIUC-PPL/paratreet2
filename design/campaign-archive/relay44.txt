@@ -1,0 +1,122 @@
+relay44 -- OPTION 2, THE ALL-LATEST TEST.  Job 5319605, 16 nodes, 2B, GPU
+replace arm, four arms.  2026-08-21.
+
+*** VERDICT 1: THE ALL-LATEST STACK BUILDS, RUNS, AND IS EXACT.  LCI ca88ce2
+    and charm 90ef159b9 + reconverse 6f34e68 built from scratch with no
+    intervention; the app built against them; all four arms produced
+    424897832 components and max_size 185317566.  There is no runtime-merge
+    problem to report. ***
+
+*** VERDICT 2: THE FIX SURVIVES, AND ITS FIXED WALL TIME IS PRESERVED.
+    ppn 7 with the fix is 3504.9 ms against option 1's 3635.2 ms -- 130 ms
+    apart, inside the spread.  The fix is worth -31.9% here against -22.4% in
+    option 1, but read that carefully: the improvement in the RATIO comes from
+    the UNFIXED arm getting slower (4682.7 -> 5148.0 ms), not from the fixed
+    arm getting faster. ***
+
+*** VERDICT 3: THE DECLINE WARNING STILL FIRES.  ppn 14 fix-on printed
+    "affinity fix DECLINED" and matched its control, as designed. ***
+
+1.  THE SIX SHAs, as built.
+
+      paratreet2  main                       7c28411
+      htram       (default branch)           3f2ee40    unchanged
+      unionfind   master                     c00032f
+      charm       reconverse-specific-build  90ef159b9
+      reconverse  main                       6f34e68    "GPU/RDMA #204"
+      lci         master                     ca88ce2
+
+    NOTE FOR ANYONE SCRIPTING THIS: htram and lci have no branch called
+    `main` -- both are on `master`.  A script that checks out `main` fails
+    silently and leaves them wherever they were.  Both happened to be at the
+    wanted SHA already; I verified rather than assumed.
+
+    THE CHARM LINE IS THE ASSUMPTION.  90ef159b9 on
+    `reconverse-specific-build` is Kale's 99% call on the successor of the
+    deleted `gpu-merge-candidate`.  If Ritvik overrules it this morning, only
+    the charm layer re-runs: the LCI and app builds are independent of it and
+    the job script needs one path changed.
+
+2.  THE FIX IS UPSTREAM, AND I VERIFIED IT FROM THE COMMIT.
+    `git checkout -- fof/gpu/FoFDevice.cpp` first, so the pull was clean, then
+    pulled main.  `git show HEAD:fof/gpu/FoFDevice.cpp | grep -c
+    FOF_HELPER_CPUS` = 5, with FOF_NO_AFFINITY_FIX and the DECLINED warning
+    also present in the TRACKED file, and the working tree clean.  Commit
+    7c28411, "GPU helper-thread affinity fix: keep ROCm's helpers off the PE
+    cores (-22% at 2B/16)".  Nothing in this run depends on my patch file.
+
+3.  THE RUNTIME BUILD, which was the part that could have failed.
+      LCI ca88ce2        cmake, build, install all clean.  FI_THREAD_DOMAIN
+                         strings 0 -- the upstream contract is intact.
+      charm 90ef159b9 + reconverse 6f34e68 against that LCI: clean, hapi.h
+                         present, libck.a fa79433e4f44b0ccadd9c4072a717d80,
+                         libreconverse resolving to the new liblci.so.
+      app                merged/FoF3.latest, md5
+                         0df9e001dfd87c62de3c5810edc9bf93, fofgpu 305,
+                         LogPool 38, TraceProjections 461, the fix present.
+    Scripts: merged/build-runtime-merged.sh, merged/build-app-latest.sh.
+
+4.  THE READOUT, side by side with option 1 (job 5319480).  All eight arms
+    EXACT.
+
+      arm                  option 1        all-latest        delta
+      ppn 7  fix on        3635.2 ms        3504.9 ms       -130.3 ms
+      ppn 7  fix off       4682.7 ms        5148.0 ms       +465.3 ms
+      ppn 14 fix off       5681.9 ms        5944.9 ms       +263.0 ms
+      ppn 14 fix on        5278.4 ms        5278.3 ms         -0.1 ms
+
+      fix worth            -1047.5 ms       -1643.1 ms
+                             -22.4%           -31.9%
+
+    THE LAST ROW OF THE TABLE IS A COINCIDENCE AND SHOULD BE READ AS A
+    WARNING, NOT A RESULT.  5278.400 and 5278.288 ms are two independent
+    single reps of arms in which the fix DECLINES and does nothing, landing
+    0.1 ms apart.  With a measured spread of hundreds of milliseconds that is
+    chance.  It is a good reminder of what single reps can look like.
+
+5.  WHAT I THINK THE NUMBERS MEAN, and what I do not claim.
+
+    THE FIXED ARM IS PRESERVED.  3504.9 against 3635.2 ms, 130 ms apart, well
+    inside the spread.  That is the question the test was for, and the answer
+    is yes.
+
+    THE UNFIXED ARM MOVED MORE (+465 ms), and that is what makes the ratio
+    look better.  I would NOT report "the all-latest stack improves the fix to
+    -32%".  Two readings fit and one rep cannot separate them: either the new
+    runtime costs the unfixed configuration something, or the unfixed
+    configuration is simply noisier.  The second is plausible on mechanism --
+    the thing the fix removes is a stochastic preemption, so removing it
+    should reduce variance as well as the mean -- and the data is weakly
+    consistent with it: across the two jobs the FIXED ppn 7 arm moved 130 ms
+    while the UNFIXED one moved 465 ms.  Two samples is not evidence.  If this
+    matters, three reps per arm would settle it.
+
+    THE ppn 14 SPREAD IS WIDER THAN I SAID.  C and D differ ONLY by an
+    environment variable the fix ignored (it declined and said so), yet they
+    are 666 ms apart here, against 403 ms in job 5319480 and 394 ms in
+    5319180.  So the single-rep spread at ppn 14 is 400-670 ms on ~5.5-6 s,
+    7-11%.  My earlier "~400 ms" was the low end of three samples.  Nothing in
+    this report or relay43 turns on a delta smaller than that.
+
+6.  KEEPALIVE GAPS, riding free.  128 lines per arm, one per process, as
+    expected.  Arrival counts 75k-118k with 990-1029 gaps over 100 ms in every
+    arm including the fixed one, so the fix does not touch that path.  The
+    only outlier is arm A's worst gap, 12254.5 ms at t = 13.31 s: that is the
+    cold read of the 76 GB input, which the FIRST arm of every job pays (its
+    srun wall was 27 s against 16-19 s for the rest).  Arms B, C and D show
+    worst gaps of 1.3-1.6 s.
+
+7.  WHAT THIS SETTLES AND WHAT IT DOES NOT.
+    SETTLED: the current runtime combination works; the fix is upstream and
+    active; ppn 7 fixed is the fastest configuration measured on any stack
+    (3504.9 ms); the decline warning behaves in the field.
+    NOT SETTLED: whether the unfixed slowdown is real or noise (needs reps);
+    the charm branch assumption (needs Ritvik); and anything at ppn 14 finer
+    than ~670 ms.
+
+ARTEFACTS
+  merged/FoF3.latest            md5 0df9e001dfd87c62de3c5810edc9bf93
+  merged/build-runtime-merged.sh, merged/build-app-latest.sh
+  sbatch/relay51-alllatest-16n.sbatch
+  /lustre/orion/csc710/scratch/lvkale/s3ab/5319605/
+  nothing pushed; gpu-stalls untouched throughout
