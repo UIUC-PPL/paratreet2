@@ -533,7 +533,10 @@ default resolve to sets=1 automatically):
 ```sh
 PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1 \
   ./FoF3 -f <input> -d oct -u dist -c stats -l 128
-# +ppn 7 +lci_ndevices 7 +backend_poll_thread 1 (one thread per domain;
+# +ppn 7 +lci_ndevices 7 +backend_poll_thread 1 — poll 1 is REQUIRED at
+#  this shape: one PE per device, so stride 2 permanently silences the
+#  odd devices and HANGS (perf-sweep-2026-08-21.md section 4); poll 1
+#  costs nothing. (one thread per domain;
 #  ndevices x processes/node must stay near 56 — 112 fails libfabric
 #  memory registration). ppn 7 beats ppn 14 by ~27% with the helper-
 #  thread affinity fix active (automatic at ppn 7; see FOF_HELPER_CPUS
