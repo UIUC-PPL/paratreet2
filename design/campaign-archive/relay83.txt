@@ -1,0 +1,174 @@
+relay83 -- THE SHARDING MEASUREMENT, and a GPU headline that did NOT harden.
+2026-08-22, job 5327046.  paratreet2 724782d + unionfind cd2d9c8, clean trees.
+Binaries FoF3.cpu-prod-v80 600e968a003c6ebec4dbcfcbcf4c137e and
+         FoF3.gpu-prod-v80 f38c87d7ccc692183cfb3e34309b7d79.
+Every arm EXACT.
+
+====================================================================
+0.  TWO THINGS TO READ BEFORE THE NUMBERS
+====================================================================
+
+*** A GATE BUG OF MINE, NOT A RUN PROBLEM.  Both gpu-szON arms print
+    "!!! sizes knob did not take !!! add_size still ran".  They are wrong.
+    When I rewrote run() for this job I dropped the `if [ "$sz" = 0 ]`
+    conditional around the sizes gate, so it demanded sizes-OFF behaviour from
+    every arm including the sizes-ON ones.  The gpu-szON runs are correct:
+    addsize_root > 0 and addsize_SKIPPED == 0 is exactly right with the knob
+    on.  Every other gate in the job (EXACT, leaf, wave-off) is sound. ***
+
+*** THE GPU HEADLINE DID NOT HARDEN.  IT WEAKENED.  That is why the extra
+    reps were worth folding in -- see section 3. ***
+
+====================================================================
+1.  THE HOP HISTOGRAM -- what sharding would cost in messages
+====================================================================
+
+climb_local_hops_log2 counts WITHIN-CHARE hops per climb episode.  Bucket 0 =
+the parent was immediately remote (zero local hops); bucket b>=1 = 2^(b-1) to
+2^b - 1 hops.  Under a sharded element every one of those hops becomes an
+intra-process message.
+
+CPU, 2 reps each, sizes off in both arms:
+
+    arm                      b0        b1       b2      b3    episodes
+    A localcomp ON      230,538   131,849    2,077      11     364,475
+                        213,676   161,993    2,089       9     377,767
+    B localcomp OFF     188,431   142,635   15,146   2,785     348,997
+                        203,998   130,736   21,977   2,822     359,533
+
+    total local hops (from the exact counters, not histogram midpoints)
+      A   136,122 and 166,265     mean 151,194
+      B   190,306 and 191,944     mean 191,125     +26% over A
+
+    share of episodes with ZERO local hops
+      A   63.3% and 56.6%         B   54.0% and 56.7%
+
+*** WITH COMPRESSION ON, ABOUT 60% OF CLIMB EPISODES NEVER TAKE A LOCAL HOP AT
+    ALL -- the parent is already remote -- and almost all of the rest take
+    exactly one.  Episodes of 2-3 hops are 0.57% and 4-7 hops are 10 per run.
+    Turning compression off raises total hops only 26%, but it moves the TAIL
+    by two orders of magnitude: 2-3 hops x7 to x10, and 4-7 hops from ~10 to
+    ~2,800. ***
+
+So B does bound the message volume from above, and the bound is not alarming:
+**~151k intra-process messages per run today, ~191k with compression disabled.**
+
+====================================================================
+2.  local_union AGAINST TOTAL SUBMISSIONS -- and the GPU arm is a
+    COMPLETELY DIFFERENT PROBLEM
+====================================================================
+
+Distributed chains = fb1_root, and a flip re-issues union_request so it starts
+an extra chain; distinct distributed edges = fb1_root - fb2_flip.
+Submissions = those + local_union.
+
+    arm            local_union            distributed          total
+    CPU  A         787,000  63.4%         454,271  36.6%     1,241,271
+                   794,811  63.6%         455,146  36.4%     1,249,957
+    CPU  B         793,667  63.8%         451,208  36.2%     1,244,875
+                   791,383  63.7%         450,594  36.3%     1,241,977
+    GPU  szON       53,594  11.0%         433,792  89.0%       487,386
+                    53,040  10.9%         434,335  89.1%       487,375
+    GPU  szOFF      52,917  10.9%         434,463  89.1%       487,380
+                    51,718  10.6%         435,676  89.4%       487,394
+
+*** THE GPU ARM SUBMITS 2.6x FEWER EDGES AND HAS ALMOST NO LOCAL FAST PATH:
+    487k against 1.24M, and 11% local against 63.5%.  That is the PE-set split
+    showing up in the accounting.  FOF_GPU_PHASE1 forces peSets=1
+    (src/common.h), so phase 1 already merged every intra-process pair and what
+    reaches uf2 is genuinely cross-process.  On CPU, peSets = ppn = 7 defers
+    every cross-PE pair inside a process to the walk, and uf2's fast path then
+    absorbs 790k of them for free. ***
+
+WHAT THAT MEANS FOR THE SHARDED DESIGN.  Sharding lifts the tail-concurrency
+cap from 1 PE per process to ppn, and pays two costs.  They are wildly
+different between the arms:
+
+    cost                         CPU arm            GPU arm
+    intra-process hop messages   ~151k (<=191k)     ~123k-149k
+    local fast path LOST         ~790k edges        ~53k edges
+                                 become distributed chains, >=2 messages each
+
+*** ON CPU THE DOMINANT COST IS NOT THE HOPS, IT IS LOSING THE FAST PATH:
+    ~790k edges promoted to full two-phase finds against ~151k added hop
+    messages, a ratio of about 5 to 1 in edges and worse in messages.  ON GPU
+    the fast path is only 53k, so the two costs are comparable and both small.
+    Sharding is a far cheaper proposition on the GPU arm than on the CPU arm,
+    and the CPU arm's cost is manufactured by the PE-set split rather than
+    being intrinsic. ***
+
+A caveat before anyone budgets from these: sharding also CHANGES the numbers it
+is being budgeted against.  With more elements per process, pairs that are
+same-chare today stop being same-chare, so the local_union count is not a
+constant to be subtracted -- it is the thing being converted.  The table bounds
+the conversion, it does not predict the post-sharding steady state.
+
+====================================================================
+3.  LOCAL PATH COMPRESSION IS WORTH NOTHING ON THE WALL
+====================================================================
+
+    A  localcomp ON    4579.5 ms  [4565.7 .. 4593.4]   walk 0.410 s
+    B  localcomp OFF   4562.3 ms  [4528.1 .. 4596.4]   walk 0.408 s
+
+Ranges OVERLAP; B is nominally 17 ms faster, which is noise.  Disabling the
+compression raises local hops 26% and the 4-7 hop tail 250-fold and costs
+NOTHING measurable.
+
+That is the third independent mechanism to shorten chains and buy no time --
+after the compression wave (relay77) and the backward short-circuit
+(relay78, -32% remote climb hops, wall unchanged).  Chain length is not the
+constraint, and this is now measured three different ways.
+
+====================================================================
+4.  THE GPU FOF_UF_SIZES HEADLINE -- NOT CONFIRMED
+====================================================================
+
+Kale offered to fold an extra GPU rep pair in if I wanted the headline harder
+than n=2 before it went into RECOMMENDATION-affinity-fix.md.  I did, and it
+changed the answer.
+
+    job      arm        Iter0                        n
+    relay80  szON    2630.9 [2630.9..2630.9]         2
+             szOFF   2562.2 [2547.9..2576.5]         2   -68.7 ms  -2.61%  SEPARATED
+    relay83  szON    2625.4 [2592.7..2658.1]         2
+             szOFF   2598.2 [2590.7..2605.7]         2   -27.2 ms  -1.04%  OVERLAPS
+
+    POOLED   szON    2628.1 [2592.7..2658.1]         4
+             szOFF   2580.2 [2547.9..2605.7]         4   -47.9 ms  -1.83%  OVERLAPS
+
+*** THE GPU EFFECT IS NOT ESTABLISHED.  relay80's separation was an artefact
+    of an unusually tight sizes-ON pair (two reps 0.012 ms apart, which is
+    itself a warning sign) against a sizes-OFF pair that happened to land low.
+    With four reps each the ranges overlap and the direction is all that
+    survives.  2562.2 ms MUST NOT be quoted as the GPU headline, and -2.61%
+    must not be quoted as the GPU effect. ***
+
+The CPU effect is a different matter and does stand: relay79 (-1.92%, 2 reps,
+separated) and relay82 (-2.41%, 3 reps, separated) agree, and both are
+WITHIN-JOB pairings, which is the right way to measure it.
+
+*** BUT THE CPU ABSOLUTE HEADLINE IS JOB-DEPENDENT AND I OVERSTATED ITS
+    STABILITY.  Sizes-off across four jobs: 4541.0 (relay79), 4464.8
+    (relay80), 4467.2 (relay82), 4579.5 (relay83).  That is a 115 ms spread,
+    2.6%, comparable to the effect itself.  In relay80's write-up I called
+    this arm "strikingly stable" on three points; the fourth refutes it.
+    RETRACTED.  Quote the within-job DELTA with confidence and the absolute
+    wall as a range. ***
+
+NOTE: relay83 used the v80 binary, which adds ufh_note in the climb path.  It
+is called once per climb episode (~370k per run) and does a clzl plus an array
+increment, so it cannot account for 100 ms; the between-job spread is the
+explanation, not the instrumentation.
+
+====================================================================
+5.  WHAT I CHANGED IN THE RECOMMENDATION AS A RESULT
+====================================================================
+
+RECOMMENDATION-affinity-fix.md was rewritten today.  Because of section 4 it
+does NOT carry 2562.2 ms or -2.61% as the GPU headline.  It states
+FOF_UF_SIZES=0 as established on CPU (-2.4%, two jobs, both separated,
+within-job pairing) and as directionally supported but NOT established on GPU
+(-1.8% pooled, ranges overlap), and it gives the absolute walls as ranges
+across jobs rather than as single numbers.  Setting it remains the
+recommendation on both arms -- it is free and it is EXACT everywhere -- but the
+GPU number is not a claim I can defend at n=4.
