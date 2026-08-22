@@ -34,9 +34,10 @@ class ExMain: public paratreet::Main<FragData> {
   // App-specific flags (parsed by getopt in main(); see README):
   //   -b <factor>  linking-length factor: b = factor * (V/N)^(1/3)
   //   -c <mode>    correctness-check mode: full | stats | auto
-  //   -u <mode>    UF_2 implementation: dist (default) | serial (see
-  //                design/step4.md; serial kept for A/B against the
-  //                gather-to-one v1/3a path)
+  //   -u <mode>    UF_2 implementation: dist (default) | serial | gather
+  //                (see design/step4.md; serial kept for A/B against the
+  //                gather-to-one v1/3a path, gather is the staged-gather
+  //                experiment of design/staged-gather.md)
   //   -m <int>     minimum component size (particles) for REPORTING: a
   //                component "survives" if its size >= m. Default 0 = report
   //                everything (byte-identical to pre-step-5 output). When m>0
@@ -47,7 +48,9 @@ class ExMain: public paratreet::Main<FragData> {
   double fof_b_factor = 0.2;
   enum class CheckMode { Auto, Full, Stats };
   CheckMode check_mode = CheckMode::Auto;
-  enum class UF2Mode { Dist, Serial };
+  // Gather (-u gather; design/staged-gather.md) is an EXPERIMENT arm: same
+  // labels as Serial, bitwise, from a contracted gather.
+  enum class UF2Mode { Dist, Serial, Gather };
   // Dist is the default (Kale, 2026-08-11: distributed union-find is a
   // research focus and the preferred production path). Serial remains one
   // flag away (-u serial): its quiescence-free bracket is immune to the

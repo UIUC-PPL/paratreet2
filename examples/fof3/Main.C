@@ -80,7 +80,8 @@ PARATREET_REGISTER_MAIN(ExMain);
         case 'u':
           if (strcmp(optarg, "dist") == 0)        uf2_mode = UF2Mode::Dist;
           else if (strcmp(optarg, "serial") == 0) uf2_mode = UF2Mode::Serial;
-          else CkAbort("-u requires one of: dist, serial");
+          else if (strcmp(optarg, "gather") == 0) uf2_mode = UF2Mode::Gather;
+          else CkAbort("-u requires one of: dist, serial, gather");
           break;
         case 'g':
           fof_frag_histogram = true;
@@ -131,7 +132,11 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t    cross-process edges to processor 0, sequential\n");
           CkPrintf("\t    union-find there, sliced label-map delivery back;\n");
           CkPrintf("\t    no quiescence detection in that bracket, so it\n");
-          CkPrintf("\t    also sidesteps the LCI idle-stall)]\n");
+          CkPrintf("\t    also sidesteps the LCI idle-stall), gather\n");
+          CkPrintf("\t    (design/staged-gather.md experiment: contract\n");
+          CkPrintf("\t    same-process edges per process first, gather only\n");
+          CkPrintf("\t    the contracted cross-process edges to processor 0;\n");
+          CkPrintf("\t    bitwise-identical labels to serial)]\n");
           CkPrintf("\t-m [min component size for REPORTING (default 0 = report all);\n");
           CkPrintf("\t    when >0, also prints a FOF3STAT surviving line for\n");
           CkPrintf("\t    components with size >= m (a reporting filter only)]\n");
@@ -204,7 +209,8 @@ PARATREET_REGISTER_MAIN(ExMain);
              check_mode == CheckMode::Full ? "full" :
              check_mode == CheckMode::Stats ? "stats" : "auto");
     CkPrintf("UF_2 implementation: %s\n",
-             uf2_mode == UF2Mode::Dist ? "dist" : "serial");
+             uf2_mode == UF2Mode::Dist ? "dist" :
+             uf2_mode == UF2Mode::Gather ? "gather" : "serial");
     CkPrintf("Min component size for reporting: %d%s\n",
              fof_min_component_size,
              fof_min_component_size == 0 ? " (report all)" : "");

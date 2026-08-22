@@ -43,6 +43,23 @@ module fof {
     // at this point in the module).
     entry void applyGlobalMapSlice(const std::vector<std::pair<long, long> >&,
                                    const CkGroupID&, const CkCallback&);
+    // Staged gather (-u gather; design/staged-gather.md). Phase 2a builds
+    // the process-local union-find over same-process edges (barrier on the
+    // callback: a contractRemote batch may otherwise land before the
+    // receiver's forest exists); phase 2b routes each cross edge, with this
+    // process's endpoint replaced by its local root, to the other
+    // endpoint's owner; contractRemote finishes the contraction on the
+    // receiving side and dedups. forwardContracted concat-reduces the
+    // contracted edges to the driver; expandAndApplySlice expands the
+    // LOCAL-ROOT-keyed slice into this process's full tip -> label map and
+    // triggers applySliceOnPE. Tips and labels are `long` (encoded tips use
+    // 63 bits) — an int here would truncate silently.
+    entry void contractLocalEdges(const CkCallback&);
+    entry void routeCrossEdges();
+    entry void contractRemote(const std::vector<std::pair<long, long> >&);
+    entry void forwardContracted(const CkCallback&);
+    entry void expandAndApplySlice(const std::vector<std::pair<long, long> >&,
+                                   const CkGroupID&, const CkCallback&);
     // Responsiveness + transfer probe (campaign P0, FOF_PROBE=1;
     // design/phaseab-balancing.md section 14).
     entry void probeStart(const CkCallback&);
@@ -96,6 +113,10 @@ module fof {
     entry void collect(const CkCallback&);
     entry void resetPhase3(const CkCallback&);
     entry void flushPhase3Edges(const CkCallback&);
+    // Staged gather (-u gather) phase 1: partition this PE's edge buffer
+    // into same-process / cross-process halves on the node branch. The
+    // reduction is [local, cross] counts (sum_long) and the staging barrier.
+    entry void stagePhase3Edges(const CkCallback&);
     entry void phase3Stats(const CkCallback&);
     entry void depositNodeRedundant(const CkCallback&);
     entry void applyGlobalMap(const std::vector<std::pair<long, long> >&, const CkCallback&);

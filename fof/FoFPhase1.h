@@ -1195,6 +1195,155 @@ public:
     }
   }
 
+  // ---- Staged gather (-u gather; design/staged-gather.md). Per-process
+  // contraction of the phase-3 edge set before the serial finisher on PE 0.
+  //
+  // BITWISE-EQUIVALENCE INVARIANT: the process-local union-find below MUST
+  // union by MIN encoded tip, exactly as the PE-0 finisher does
+  // (FoFPhase3.h). A component's minimum is the minimum over its
+  // local-subcomponent minima, so contraction composed with the global
+  // min-union yields the same root per tip as the flat union over raw edges.
+  //
+  // Nodegroup entries are NOT serialized against each other, so every
+  // mutable member here is guarded by stage_lock (the trySeenInsert
+  // discipline). Sends are issued outside the lock.
+  std::mutex stage_lock;
+  std::vector<std::pair<long, long>> stage_local;  // both endpoints owned here
+  std::vector<std::pair<long, long>> stage_cross;  // exactly one endpoint here
+  std::unordered_map<long, long> stage_parent;     // process-local UF
+  // Every LOCALLY-OWNED tip this process has seen, whether it arrived in a
+  // staged edge or in a contractRemote batch from the other endpoint's
+  // owner. This is the key set of the per-process tip -> label map; it is
+  // NOT the same as stage_parent's key set (a tip whose only edge was
+  // staged on the peer process reaches us only through contractRemote).
+  std::unordered_set<long> stage_tips;
+  std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> stage_seen;
+  std::vector<std::pair<long, long>> stage_to_root;  // deduped contracted edges
+
+  void clearStaged() {
+    std::lock_guard<std::mutex> g(stage_lock);
+    stage_local.clear();
+    stage_cross.clear();
+    stage_parent.clear();
+    stage_tips.clear();
+    stage_seen.clear();
+    stage_to_root.clear();
+  }
+
+  // Non-entry: called via ckLocalBranch by FoFPhase1::stagePhase3Edges on
+  // each PE of this process. Must complete on every PE before
+  // contractLocalEdges runs (the staging barrier orders them).
+  void appendStaged(const std::vector<std::pair<long, long>>& loc,
+                    const std::vector<std::pair<long, long>>& cross) {
+    std::lock_guard<std::mutex> g(stage_lock);
+    stage_local.insert(stage_local.end(), loc.begin(), loc.end());
+    stage_cross.insert(stage_cross.end(), cross.begin(), cross.end());
+  }
+
+  // Phase 2a: the process-local union-find over same-process edges. Split
+  // from the routing step below because a contractRemote batch may arrive
+  // before this process has built its own forest; the barrier on cb is what
+  // makes every branch's forest complete before any routing begins.
+  void contractLocalEdges(const CkCallback& cb) {
+    const int me = CkMyNode();
+    std::lock_guard<std::mutex> g(stage_lock);
+    for (auto& e : stage_local) {
+      stage_tips.insert(e.first);
+      stage_tips.insert(e.second);
+      long ra = findRoot(stage_parent, e.first);
+      long rb = findRoot(stage_parent, e.second);
+      if (ra == rb) continue;
+      if (ra < rb) stage_parent[rb] = ra;  // union by min encoded tip
+      else         stage_parent[ra] = rb;
+    }
+    for (auto& e : stage_cross) {
+      if ((int)((uint64_t)e.first >> paratreet::kUF2IdxBits) == me)
+        stage_tips.insert(e.first);
+      if ((int)((uint64_t)e.second >> paratreet::kUF2IdxBits) == me)
+        stage_tips.insert(e.second);
+    }
+    this->contribute(cb);
+  }
+
+  // Phase 2b: replace this process's endpoint of each cross edge with its
+  // local root and hand the edge to the other endpoint's owner. Plain sends
+  // only; the driver closes this step with CkWaitQD.
+  void routeCrossEdges() {
+    const int me = CkMyNode();
+    const int n_procs = CkNumNodes();
+    std::vector<std::vector<std::pair<long, long>>> out(n_procs);
+    {
+      std::lock_guard<std::mutex> g(stage_lock);
+      for (auto& e : stage_cross) {
+        long a = e.first, b = e.second;
+        const int oa = (int)((uint64_t)a >> paratreet::kUF2IdxBits);
+        const int ob = (int)((uint64_t)b >> paratreet::kUF2IdxBits);
+        // Every staged edge has at least one endpoint owned here (the walk
+        // emits against a process-local target fragment); routing assumes
+        // the other endpoint is the single remote one.
+        CkEnforce(oa == me || ob == me);
+        int dest;
+        if (oa == me) { a = findRoot(stage_parent, a); dest = ob; }
+        else          { b = findRoot(stage_parent, b); dest = oa; }
+        out[dest].emplace_back(a, b);
+      }
+    }
+    for (int p = 0; p < n_procs; p++)
+      if (!out[p].empty()) this->thisProxy[p].contractRemote(out[p]);
+  }
+
+  void contractRemote(const std::vector<std::pair<long, long>>& in_edges) {
+    const int me = CkMyNode();
+    std::lock_guard<std::mutex> g(stage_lock);
+    for (auto& e : in_edges) {
+      long a = e.first, b = e.second;
+      if ((int)((uint64_t)a >> paratreet::kUF2IdxBits) == me) {
+        stage_tips.insert(a);
+        a = findRoot(stage_parent, a);
+      }
+      if ((int)((uint64_t)b >> paratreet::kUF2IdxBits) == me) {
+        stage_tips.insert(b);
+        b = findRoot(stage_parent, b);
+      }
+      long lo = std::min(a, b), hi = std::max(a, b);
+      if (stage_seen.insert(paratreet::packTipPair(lo, hi)).second)
+        stage_to_root.emplace_back(lo, hi);
+    }
+  }
+
+  // Phase 3: hand the fully contracted cross edges to the driver. Every
+  // branch contributes (empty buffers included) so the reduction closes.
+  void forwardContracted(const CkCallback& cb) {
+    std::lock_guard<std::mutex> g(stage_lock);
+    this->contribute(stage_to_root.size() * sizeof(std::pair<long, long>),
+                     stage_to_root.data(), CkReduction::concat, cb);
+  }
+
+  // Phase 5: expand PE 0's LOCAL-ROOT-keyed slice into the full per-process
+  // tip -> label map and drive the existing per-PE application.
+  // SIGN CONTRACT (FoFPhase3.h): every tip touched by any edge ends
+  // negative, roots included — a local-only component's tips take
+  // -(localRoot + 2), which is exactly what the flat serial union-find
+  // computes for them.
+  void expandAndApplySlice(const std::vector<std::pair<long, long>>& slice,
+                           const CkGroupID& fof_gid, const CkCallback& cb) {
+    std::unordered_map<long, long> root_label(slice.begin(), slice.end());
+    global_slice.clear();
+    {
+      std::lock_guard<std::mutex> g(stage_lock);
+      global_slice.reserve(stage_tips.size());
+      for (long t : stage_tips) {
+        long r = findRoot(stage_parent, t);
+        auto it = root_label.find(r);
+        global_slice.emplace(t, it != root_label.end() ? it->second : -(r + 2));
+      }
+    }
+    CProxy_FoFPhase1<Data> fof_proxy(fof_gid);
+    int first = CkNodeFirst(CkMyNode());
+    for (int pe = first; pe < first + CkNodeSize(CkMyNode()); pe++)
+      fof_proxy[pe].applySliceOnPE(cb);
+  }
+
 private:
   static long findRoot(std::unordered_map<long, long>& parent, long x) {
     auto it = parent.find(x);
@@ -3462,7 +3611,28 @@ public:
     node_proxy.ckLocalBranch()->clearSeen();
     node_proxy.ckLocalBranch()->clearNodeRedundant();
     node_proxy.ckLocalBranch()->clearRedun();
+    node_proxy.ckLocalBranch()->clearStaged();
     this->contribute(cb);
+  }
+
+  // Staged gather (-u gather; design/staged-gather.md) phase 1: partition
+  // this PE's already-deduplicated edge buffer by ownership and append both
+  // halves to the process branch. Both endpoints owned here = LOCAL (the
+  // PE-set split manufactures these; they never need to leave the process);
+  // anything else = CROSS. The reduction carries [local, cross] counts and
+  // is also the staging barrier.
+  void stagePhase3Edges(const CkCallback& cb) {
+    const int me = CkMyNode();
+    std::vector<std::pair<long, long>> loc, cross;
+    for (auto& e : edge_buf3) {
+      const int oa = (int)((uint64_t)e.first >> paratreet::kUF2IdxBits);
+      const int ob = (int)((uint64_t)e.second >> paratreet::kUF2IdxBits);
+      if (oa == me && ob == me) loc.push_back(e);
+      else                      cross.push_back(e);
+    }
+    long counts[2] = {(long)loc.size(), (long)cross.size()};
+    node_proxy.ckLocalBranch()->appendStaged(loc, cross);
+    this->contribute(sizeof(counts), counts, CkReduction::sum_long, cb);
   }
 
   // Gather-to-one completion pattern: a concat reduction. Every PE

@@ -707,6 +707,250 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
   return r;
 }
 
+// ---- Staged gather (-u gather; design/staged-gather.md). EXPERIMENT.
+//
+// Same answer as -u serial, BITWISE (same FOF3STAT components line), from a
+// smaller gather: each process retires its own same-process edges through a
+// process-local union-find first and ships only fully contracted
+// cross-process edges to PE 0. The PE-set split manufactures the
+// same-process edges this absorbs; -u serial ships them all to the root.
+//
+// Equivalence rests on both union-finds unioning by MIN encoded tip: a
+// component's minimum is the minimum over its local-subcomponent minima, so
+// contraction composed with the global min-union gives every tip the same
+// root as the flat union over raw edges. Local-only components keep their
+// local root as boss, which is what the flat union-find computes for them.
+//
+// Structure below: walk section DUPLICATED from runFoFPhase3 (marked in
+// place), then five phases on the driver thread — stage, contract + route,
+// gather, serial finish, sliced map delivery + per-process expansion.
+//
+// Reading the phase3Stats tuple is likewise duplicated from runFoFPhase3
+// into this helper, which only this path calls (the serial and dist paths
+// keep their own copies untouched).
+inline void readPhase3Stats(CProxy_FoFPhase1<FragData>& fof,
+                            FoFPhase3Result& r) {
+  fof.depositNodeRedundant(CkCallbackResumeThread());
+  void* stats_result = nullptr;
+  fof.phase3Stats(CkCallbackResumeThread(stats_result));
+  CkReductionMsg* stats_msg = (CkReductionMsg*)stats_result;
+  CkReduction::tupleElement* stats_elems = nullptr;
+  int n_stats_elems = 0;
+  stats_msg->toTuple(&stats_elems, &n_stats_elems);
+  CkEnforce(n_stats_elems == 10);
+  const long* stats = (const long*)stats_elems[0].data;
+  r.edges_emitted = stats[0];
+  r.edges_sent = stats[1];
+  r.negative_prunes = stats[2];
+  r.positive_prunes = stats[3];
+  r.suppression_prunes = stats[4];
+  r.same_frag_prunes = stats[5];
+  r.leaf_visits = stats[6];
+  r.redundant_descents = stats[7];
+  // Per-(g,f) histogram is a dist-path readout only (as on the serial path).
+  memset(r.redun_bins, 0, sizeof(r.redun_bins));
+  r.redun_distinct = 0;
+  r.redun_max_per_pair = 0;
+  r.peak_edge_buf = *(const long*)stats_elems[1].data;
+  {
+    const long* mins = (const long*)stats_elems[2].data;
+    const long* maxs = (const long*)stats_elems[3].data;
+    const double* tsum = (const double*)stats_elems[4].data;
+    const double* tmin = (const double*)stats_elems[5].data;
+    const double* tmax = (const double*)stats_elems[6].data;
+    r.leaf_visits_min = mins[0];
+    r.emitted_min = mins[1];
+    r.redundant_proc_min = mins[2];
+    r.leaf_visits_max = maxs[0];
+    r.emitted_max = maxs[1];
+    r.redundant_proc_max = maxs[2];
+    double n_pes = (double)CkNumPes();
+    r.t_phaseA_min = tmin[0]; r.t_phaseA_avg = tsum[0] / n_pes; r.t_phaseA_max = tmax[0];
+    r.t_phaseB_min = tmin[1]; r.t_phaseB_avg = tsum[1] / n_pes; r.t_phaseB_max = tmax[1];
+    r.t_pb_maxpair_min = tmin[2]; r.t_pb_maxpair_avg = tsum[2] / n_pes;
+    r.t_pb_maxpair_max = tmax[2];
+    r.units_min = mins[3];
+    r.units_max = maxs[3];
+    r.units_total = stats[8];
+    r.x_min = tmin[3]; r.x_avg = tsum[3] / n_pes; r.x_max = tmax[3];
+    const double* csum = (const double*)stats_elems[7].data;
+    double sx = tsum[3], sy = tsum[0];
+    double num = n_pes * csum[0] - sx * sy;
+    double den = std::sqrt(std::max(0.0, n_pes * csum[1] - sx * sx)) *
+                 std::sqrt(std::max(0.0, n_pes * csum[2] - sy * sy));
+    r.density_r = den > 0 ? num / den : 0.0;
+    const double* pskew = (const double*)stats_elems[8].data;
+    r.a_within = pskew[0];
+    r.a_proc_avg_max = pskew[1];
+    r.max_piece_n = (long)pskew[2];
+    const double* scorr = (const double*)stats_elems[9].data;
+    double ssx = scorr[0];
+    double snum = n_pes * scorr[1] - ssx * sy;
+    double sden = std::sqrt(std::max(0.0, n_pes * scorr[2] - ssx * ssx)) *
+                  std::sqrt(std::max(0.0, n_pes * csum[2] - sy * sy));
+    r.size_r = sden > 0 ? snum / sden : 0.0;
+  }
+  delete[] stats_elems;
+  delete stats_msg;
+}
+
+inline FoFPhase3Result runFoFPhase3Staged(
+    CProxy_Partition<FragData> partitions,
+    CProxy_FoFPhase1<FragData> fof,
+    CProxy_FoFPhase1Node<FragData> fof_node,
+    double linking_length,
+    Vector3D<Real> period = Vector3D<Real>(0, 0, 0),
+    bool dual_walk = false,
+    CProxy_TreePiece<FragData> treepieces = CProxy_TreePiece<FragData>(),
+    CProxy_CacheManager<FragData> cache = CProxy_CacheManager<FragData>()) {
+  auto& config = paratreet::getConfiguration();
+  CkEnforce(config.decomp_type == paratreet::treepieceDecompForTree(config.tree_type));
+  CkEnforce(!fof_node.ckGetGroupID().isZero());
+  double t_pre = CkWallTimer();
+  verifySharedLeavesUnlessSingle(partitions);
+
+  double b2 = linking_length * linking_length;
+  fof.resetPhase3(CkCallbackResumeThread());
+
+  // --- BEGIN walk section, duplicated verbatim from runFoFPhase3 above
+  // (design/staged-gather.md permits the duplication for the experiment).
+  double t0 = CkWallTimer();
+  bool counter_done = dual_walk && !std::getenv("FOF_WALK_QD") &&
+                      !cache.ckGetGroupID().isZero();
+  if (dual_walk) {
+    if (counter_done) {
+      CkCallbackResumeThread walk_done;
+      {
+        CkCallbackResumeThread armed;
+        cache.armWalkCompletion(walk_done, armed);
+      } // every process armed before any walk entry can run
+      treepieces.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+      // walk_done's destructor blocks here until every process's credit
+      // counter has reached zero and the done reduction has fired.
+    } else {
+      treepieces.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+      CkWaitQD();
+    }
+  } else {
+    if (paratreet::getConfiguration().single_distribution)
+      CkAbort("transposed phase-3 walk needs the Partition array; use the dual"
+              " walk (-w dual) under single_distribution");
+    partitions.startDown<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
+    CkWaitQD();
+  }
+  double t1 = CkWallTimer();
+  // --- END duplicated walk section.
+
+  // Phase 1: stage each PE's edge buffer onto its process branch, split by
+  // ownership. The reduction is the staging barrier and carries the counts.
+  long n_local = 0, n_cross = 0;
+  {
+    void* staged = nullptr;
+    fof.stagePhase3Edges(CkCallbackResumeThread(staged));
+    CkReductionMsg* smsg = (CkReductionMsg*)staged;
+    const long* c = (const long*)smsg->getData();
+    n_local = c[0];
+    n_cross = c[1];
+    delete smsg;
+  }
+
+  // Phase 2: process-local contraction, then routing of the cross edges to
+  // the far endpoint's owner. The two steps are separately barriered
+  // because a contractRemote batch must never overtake the receiver's own
+  // forest construction; routing itself is plain sends, closed by QD.
+  fof_node.contractLocalEdges(CkCallbackResumeThread());
+  fof_node.routeCrossEdges();
+  CkWaitQD();
+
+  // Phase 3: gather the contracted edges to this (PE 0, driver) thread.
+  void* result = nullptr;
+  fof_node.forwardContracted(CkCallbackResumeThread(result));
+  CkReductionMsg* msg = (CkReductionMsg*)result;
+  long n_edges = msg->getSize() / (long)sizeof(std::pair<long, long>);
+  const auto* edges = (const std::pair<long, long>*)msg->getData();
+
+  FoFPhase3Result r;
+  readPhase3Stats(fof, r);
+  // The staging partition is exhaustive: every buffered edge is LOCAL or CROSS.
+  CkEnforce(r.edges_sent == n_local + n_cross);
+  double t2 = CkWallTimer();
+
+  // Phase 4: the serial finisher, identical in form to runFoFPhase3's loop
+  // (global dedup + lazy parent map + min-tip union + path compression).
+  // Its input is the contracted edge set, not the raw one; see the
+  // equivalence argument in the header comment.
+  std::unordered_set<paratreet::TipPairKey, paratreet::TipPairKeyHash> unique;
+  std::unordered_map<long, long> parent;
+  auto find = [&](long x) -> long {
+    auto it = parent.find(x);
+    if (it == parent.end()) { parent.emplace(x, x); return x; }
+    long root = x;
+    while (parent[root] != root) root = parent[root];
+    while (parent[x] != root) { long next = parent[x]; parent[x] = root; x = next; }
+    return root;
+  };
+  long n_unique = 0;
+  for (long e = 0; e < n_edges; e++) {
+    long lo = edges[e].first, hi = edges[e].second;
+    if (!unique.insert(paratreet::packTipPair(lo, hi)).second) continue;
+    n_unique++;
+    long ra = find(lo), rb = find(hi);
+    if (ra == rb) continue;
+    if (ra < rb) parent[rb] = ra;
+    else         parent[ra] = rb;
+  }
+  delete msg;
+  r.edges_unique = n_unique;
+
+  // Local root -> final label. Keys are LOCAL ROOTS only; each process
+  // expands them over its own tips in expandAndApplySlice. Same sign
+  // contract as runFoFPhase3 (see its comment): negative marks an
+  // edge-touched component, roots included.
+  std::vector<std::pair<long, long>> map_vec;
+  r.tips_remapped = 0;
+  for (auto& kv : parent) {
+    long root = find(kv.first);
+    map_vec.emplace_back(kv.first, -(root + 2));
+    if (root != kv.first) r.tips_remapped++;
+  }
+  double t3 = CkWallTimer();
+
+  CkPrintf("FOF3STAT gather: local %ld cross %ld contracted %ld\n",
+           n_local, n_cross, n_edges);
+
+  // Phase 5: sliced delivery (gather mode ALWAYS slices — a per-process map
+  // is inherently sliced, so the broadcast fallback has nothing to offer)
+  // plus the per-process expansion to the full tip -> label map.
+  {
+    int n_procs = CkNumNodes();
+    std::vector<std::vector<std::pair<long, long>>> slices(n_procs);
+    for (auto& kv : map_vec) {
+      uint64_t owner = (uint64_t)kv.first >> paratreet::kUF2IdxBits;
+      CkEnforce(owner < (uint64_t)n_procs);
+      slices[owner].push_back(kv);
+    }
+    long max_slice = 0;
+    for (auto& s : slices) max_slice = std::max(max_slice, (long)s.size());
+    CkPrintf("FOF3STAT relabel_map: entries %ld bytes %ld mode sliced "
+             "max_slice %ld\n", (long)map_vec.size(),
+             (long)map_vec.size() * (long)sizeof(map_vec[0]), max_slice);
+    CkCallbackResumeThread applied;
+    // Every process gets a message (empty slice included) so all PEs
+    // contribute to the closing reduction.
+    for (int p = 0; p < n_procs; p++)
+      fof_node[p].expandAndApplySlice(slices[p], fof.ckGetGroupID(), applied);
+    // applied's destructor blocks until every PE has applied and
+    // contributed.
+  }
+  double t4 = CkWallTimer();
+  r.t_setup = t0 - t_pre;
+  r.t_walk = t1 - t0;
+  r.t_gather = t2 - t1;
+  r.t_uf2 = t3 - t2;
+  r.t_relabel = t4 - t3;
+  return r;
+}
+
 // Step 4: distributed UF_2 (-u dist; see design/step4.md and
 // FoFPhase1.h's "Step 4" comment block). Replaces the gather-to-one serial
 // UF_2 above with UnionFindLib driving the union/labeling over the

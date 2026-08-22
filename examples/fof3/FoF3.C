@@ -526,11 +526,16 @@ using namespace paratreet;
     // dual-tree traversal on either path; serial + dual is the
     // configuration that works under single-distribution mode.
     Vector3D<Real> pbc(pbc_period, pbc_period, pbc_period);
-    FoFPhase3Result pr = uf2_mode == UF2Mode::Dist
+    FoFPhase3Result pr =
+        uf2_mode == UF2Mode::Dist
         ? paratreet::runFoFPhase3Dist(proxy_pack.partition, fof, fof_node, b, pbc,
                                       walk_mode == WalkMode::Dual,
                                       proxy_pack.treepiece, uf_node_map_gid,
                                       fof_uf2_stream_batch)
+        : uf2_mode == UF2Mode::Gather
+        ? paratreet::runFoFPhase3Staged(proxy_pack.partition, fof, fof_node, b,
+                                        pbc, walk_mode == WalkMode::Dual,
+                                        proxy_pack.treepiece, proxy_pack.cache)
         : paratreet::runFoFPhase3(proxy_pack.partition, fof, b, pbc,
                                   walk_mode == WalkMode::Dual,
                                   proxy_pack.treepiece, proxy_pack.cache,

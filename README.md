@@ -436,7 +436,7 @@ the knobs exist for scale tuning, A/B oracles, and diagnostics.
 |---|---|---|
 | `-b` | 0.2 | linking-length factor; b = factor·(V/N)^(1/3) |
 | `-c` | auto | correctness check: `full` (O(N²) serial oracle), `stats`, `auto` (full below a size gate) |
-| `-u` | dist | UF_2 backend: `dist` (distributed UnionFindLib) or `serial` (gather to PE 0). **`dist` is required whenever the PE-set split is on** — serial's root gather cannot absorb the split's edge inflation (+28% net at 2B, design/phaseab-balancing.md §38) |
+| `-u` | dist | UF_2 backend: `dist` (distributed UnionFindLib), `serial` (gather every raw edge to PE 0), or `gather` (staged: per-process contraction retires same-process edges, cross edges contracted on both ends en route, only root-pair edges reach PE 0 — design/staged-gather.md; EXPERIMENT, bitwise-identical labels to serial, unmeasured at scale). **`dist` remains the shipping mode**; serial's root gather cannot absorb the split's edge inflation (+28% net at 2B, §38), which `gather` exists to test the repair of |
 | `-E` | 16 | mid-walk edge-batch size streamed to UF_2 (overlaps phase-3 walk with union-find); `0` = classic post-walk injection (the no-overlap A/B oracle); large values silently never fire (per-PE yield is 266–924 at 2B scales) |
 | `-G` | 4 | phaseA grid occupancy threshold (particles per b/√6 cell) above which a chare is solved by the cell grid instead of the tree walk; `0` = walk-only oracle |
 | `-w` | dual | phase-3 walk: `dual` (requires `-u dist`) or `transposed` (original walk, A/B oracle) |
