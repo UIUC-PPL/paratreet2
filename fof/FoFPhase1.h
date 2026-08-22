@@ -456,11 +456,28 @@ public:
   }
   std::unique_ptr<std::atomic<long>[]> dense_hist;
   long dense_lo = 0, dense_width = 0;
+  // Dense is a FAST PATH, not an assumption (relay70's two lessons):
+  // (1) GPU Replace mode skips the freeze, so the bounds never get set —
+  // width 0 must mean "fall back", never assert; (2) the process's order
+  // range is NOT contiguous at Frontier scale (width reached ~2e9 cells
+  // = 16 GB and a 5.5 s single-thread zero at 2B/128 processes), so
+  // dense engages only when the range is genuinely compact
+  // (FOF_HIST_DENSE_MAX cells, default 16M = 128 MB/process). Everything
+  // else takes the sort+scan pair path below, which beats the hash map
+  // without any structural assumption.
+  static long denseHistMaxCells() {
+    static const long v = [] {
+      const char* e = std::getenv("FOF_HIST_DENSE_MAX");
+      return e ? std::atol(e) : (1L << 24);
+    }();
+    return v;
+  }
   void ensureDenseHist() {
     std::lock_guard<std::mutex> g(label_shards_init_lock);
     long lo = order_lo.load(), hi = order_hi.load();
-    if (hi < lo) { dense_width = 0; return; }  // no particles registered
+    if (hi < lo) { dense_width = 0; return; }  // no bounds (e.g. GPU mode)
     long width = hi - lo + 1;
+    if (width > denseHistMaxCells()) { dense_width = 0; return; }
     if (dense_hist && dense_width == width && dense_lo == lo) return;
     dense_hist.reset(new std::atomic<long>[width]);
     for (long i = 0; i < width; i++)
@@ -3697,16 +3714,18 @@ public:
       // there). Negative (touched) labels are few and keep the shard-pair
       // side path for stage 3.
       nb->ensureDenseHist();
+      const long dlo = nb->dense_lo, dw = nb->dense_width;
       std::vector<std::vector<std::pair<long, long>>> tbuckets(n_shards);
       for (int r : roots) {
         long label = rep_label[r];
-        if (label >= 0) {
-          long order = (long)((uint64_t)label & paratreet::kUF2IdxMask);
-          CkEnforce(order >= nb->dense_lo &&
-                    order < nb->dense_lo + nb->dense_width);
-          nb->dense_hist[order - nb->dense_lo].fetch_add(
+        long order = (long)((uint64_t)label & paratreet::kUF2IdxMask);
+        if (label >= 0 && dw > 0 && order >= dlo && order < dlo + dw) {
+          nb->dense_hist[order - dlo].fetch_add(
               root_counts[r], std::memory_order_relaxed);
         } else {
+          // negatives (touched), and any positive the dense window does
+          // not cover (dense disabled, GPU mode, or a range outlier):
+          // the pair path sums them with sort+scan in histogramShard.
           tbuckets[labelShardMix(label) % n_shards].emplace_back(
               label, root_counts[r]);
         }
@@ -3804,20 +3823,23 @@ public:
       }
     }
     if (my_shard < (int)nb->label_shards.size()) {
+      // Pair path: sort + linear scan-sum (relay70 retired the
+      // unordered_map — pointer-chasing hash builds were the 0.5 s at
+      // 2B; a sort of the same pairs is cache-friendly and needs no
+      // structural assumption). Carries: touched labels always; ALL
+      // positive labels when dense is disabled; range outliers ever.
       auto& shard = *nb->label_shards[my_shard];
-      std::unordered_map<long, long> totals;
-      totals.reserve(shard.pairs.size());
-      for (auto& p : shard.pairs) totals[p.first] += p.second;
-      shard.pairs.clear();
-      shard.pairs.shrink_to_fit();
-      for (auto& kv : totals) {
-        if (kv.first < 0) { // touched: global summing needed (stage 3)
-          touched_totals_.emplace_back(kv.first, kv.second);
-          continue;
-        }
-        // Positive pairs exist here only on the FOF_HIST_DENSE=0 arm
-        // (the dense path routes every positive label into the array).
-        binOne(kv.second);
+      std::vector<std::pair<long, long>> pairs;
+      pairs.swap(shard.pairs);
+      std::sort(pairs.begin(), pairs.end(),
+                [](const std::pair<long, long>& a,
+                   const std::pair<long, long>& b) { return a.first < b.first; });
+      for (size_t i = 0; i < pairs.size();) {
+        long label = pairs[i].first, total = 0;
+        for (; i < pairs.size() && pairs[i].first == label; i++)
+          total += pairs[i].second;
+        if (label < 0) touched_totals_.emplace_back(label, total);
+        else binOne(total);
       }
     }
     CkReduction::tupleElement tuple[] = {
