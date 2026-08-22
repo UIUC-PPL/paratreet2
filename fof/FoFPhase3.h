@@ -781,6 +781,22 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
 #endif
   if (uf2_stream_batch > 0)
     fof.enableUF2Streaming(uf_proxy, uf2_stream_batch, CkCallbackResumeThread());
+  // Arm periodic compression waves (FOF_WAVE mode + FOF_WAVE_MS period;
+  // both must be set). v2 of the wave trigger: relay74/75 showed the
+  // single post-flush wave below can never help — at that barrier the
+  // forest is shallow under both -E settings — while the drain it
+  // targets (334-409 ms at 2B, 128 PEs ~97% idle) runs DURING the
+  // union cascade. Armed here, each element self-fires passes through
+  // the walk and the cascade drain; ticks are QD-safe (message-free
+  // unless a structural union happened, see unionFindLib.C) so the
+  // CkWaitQD below still fires, and find_components disarms.
+  {
+    static const int wave_ms = [] {
+      const char* e = std::getenv("FOF_WAVE_MS");
+      return e ? std::atoi(e) : 0;
+    }();
+    if (wave_ms > 0) uf_proxy.wave_arm();
+  }
 
   // The boundary walk: identical to v1/3a. Tips are already encoded (see
   // precondition above), so the edges FoFEdgeVisitor buffers into edge_buf3
