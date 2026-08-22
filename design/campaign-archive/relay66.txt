@@ -1,0 +1,261 @@
+*** CORRECTION HEADER, added 2026-08-21 20:30.  Section 5's payoff estimate
+    ("halving the window ... treat -10% as the honest target") was made
+    BEFORE any per-pair cost existed.  Measured since: the best implementable
+    static rule is worth -6.4% and the absolute ceiling of the whole family
+    is -12.1% (relay69, job 5324186).  Everything else in this report --
+    the walk window, the tail decomposition, the loaded-vs-waiting finding,
+    and the r=0.939 cross-arm stability -- is measurement and stands. ***
+
+relay66 -- REASSIGNING SYMMETRIC SUBTREE PAIRS AT THE WALK TAIL.
+Kale's question, 2026-08-21.  Feasibility, utility, clarification.
+Measured on the relay65 traces (job 5322240), both arms, 896 PEs.
+
+====================================================================
+0.  THE SHORT ANSWERS
+====================================================================
+
+FEASIBILITY: yes, and cheaper than it sounds.  The unit of work is ALREADY
+a (source node, target node) pair on a stack; the tie-break is ONE pure
+expression in one place; and duplicated work is already absorbed by the
+edge gather and the union-find, so the protocol does not have to be exact.
+
+UTILITY: real on the GPU arm, mis-targeted on the CPU arm.  On GPU the walk
+window is 581 ms of a 2863 ms iteration, per-PE walk time is 53.5 ms mean
+against a 369 ms MAX (6.89x), and in the tail the busiest PEs are 63-81%
+occupied BY THE WALK.  On CPU the tail is dominated by union-find, not the
+walk, 3:1 -- reassigning walk pairs would not touch it.
+
+CLARIFICATION: the load is 94% predictable from the data alone (r = 0.939
+between two different binaries at two different leaf sizes), which means a
+cheaper static reassignment may capture most of the win without any handoff
+protocol.  Three questions at the end.
+
+====================================================================
+1.  YOUR PREMISE IS CORRECT, AND HERE IS ITS SIZE
+====================================================================
+
+Walk = entry method `goDown(travIdx)`.  NOT `startDual`, which is only the
+launcher and carries ~0.1% of the time; the walk body runs in goDown, re-
+entered after every remote node fetch.
+
+    GPU arm (FoF3.gpu-prodtr, ppn 7, -l 128, fix on)
+      walk window                581 ms   (iteration 2863 ms -> 20.3%)
+      walk CPU                 47968 ms over 896 PEs = 53.5 ms/PE
+      per-PE  p50 40.1  p90 119.0  p99 213.0  MAX 369.1 ms   max/mean 6.89x
+      PEs doing NO walk at all: 11
+
+    CPU arm (FoF3.cpu-prodtr, ppn 7, -l 32)
+      walk window                575 ms   (iteration 4938 ms -> 11.6%)
+      walk CPU                 21967 ms over 896 PEs = 24.5 ms/PE
+      per-PE  p50 21.4  p90 49.0  p99 84.5  MAX 97.4 ms      max/mean 3.97x
+
+THE WALK IS NEVER DENSE.  Peak participation is 45% of PEs (GPU) and 42%
+(CPU).  It is not that the walk starts wide and narrows -- it never uses
+more than half the machine at any instant.
+
+    GPU, active PEs across the walk window, 10 slices
+      0-10%  368   10-20%  402   20-30%  274   30-40%  129   40-50%   44
+     50-60%   13   60-70%    5   70-80%    3   80-90%    2  90-100%    1
+
+    71% of the window is spent with fewer than 25% of PEs walking, and that
+    tail carries only 23.6% of the walk CPU.  Machine-wide utilisation in
+    the last 349 ms is 1.82%.
+
+====================================================================
+2.  THE ONE MEASUREMENT THAT DECIDES IT: IS THE TAIL LOADED OR WAITING?
+====================================================================
+
+A long thin tail can be imbalance (a few PEs with too much work) or a
+dependence chain (a few PEs waiting on round trips).  Reassignment fixes
+the first and does nothing for the second.  They look identical in a
+utilisation plot.  So: what are the tail PEs actually DOING?
+
+    GPU tail, 349 ms, by entry method (PE-ms across all 896)
+        3456.1  goDown                    <-- THE WALK, dominant
+        1136.8  insertDataFindBoss
+         326.9  requestNodes
+         279.9  union_requests
+         172.3  addCache
+      busiest PEs: 840 at 81.3% busy, 343 at 76.7%, 825 68.7%, 364 68.6%,
+                   342 63.6%, 854 49.7%, 791 46.8%, 350 43.3%
+
+    CPU tail, 275 ms
+         712.8  insertDataFindBoss        <-- UNION-FIND, dominant
+         225.0  goDown
+         118.4  requestNodes
+         108.4  union_requests
+      busiest PE 350 at 70.8% busy
+
+*** ON THE GPU ARM THE TAIL IS THE WALK AND THE STRAGGLERS ARE GENUINELY
+    LOADED -- 63-81% busy.  That is imbalance, and your scheme addresses
+    it directly.
+
+*** ON THE CPU ARM THE TAIL IS THE UNION-FIND FIND-BOSS CHAIN, 3.2x more
+    than the walk.  Moving walk pairs around would leave it untouched.
+    Note also that on CPU the busiest PE spends only 97 ms of a 575 ms
+    window walking (17%), so even a perfect walk reassignment could not
+    compress that window much. ***
+
+====================================================================
+3.  THE OVERLOAD IS DATA-DETERMINED, NOT TRANSIENT
+====================================================================
+
+Per-PE walk time, CPU arm against GPU arm -- different binary, different
+leaf size (32 vs 128), different run, different nodes:
+
+      Pearson r = 0.939 over 896 PEs
+      top-25 busiest PEs: 17 in common   (chance ~0.7)
+      top-50 busiest PEs: 31 in common   (chance ~2.8)
+      top-100:            74 in common   (chance ~11.2)
+
+The same PEs are heavy in both arms.  The overload is a property of WHICH
+TREE PIECES LANDED WHERE and of the parity tie-break, not of machine noise.
+
+Concentration (GPU): the top 100 PEs, 11% of the machine, hold 32.7% of
+all walk CPU; the top 25 hold 11.4%.
+
+That cuts both ways for your proposal, and it is the main thing I would
+want your judgement on -- see section 6.
+
+====================================================================
+4.  FEASIBILITY
+====================================================================
+
+WHAT IS ALREADY IN YOUR FAVOUR:
+
+(a) The unit of work is already exactly what you describe.  DualTraverser
+    carries a stack of (source node, target payload) pairs and expands it
+    with `nodes.emplace(node->getChild(i), curr_payload)` (Traverser.h).
+    A handoff message is two node keys plus the traversal index.  Nothing
+    has to be invented to name the work.
+
+(b) The tie-break is ONE expression, in one place (Traverser.h ~806):
+
+        int target_piece = tp.thisIndex, source_piece = node->tp_index;
+        bool keep = (((target_piece + source_piece) & 1) == 0)
+                        ? (target_piece < source_piece)
+                        : (target_piece > source_piece);
+        if (!keep) continue;
+
+    Parity of the index sum picks the side.  It is deliberately balanced in
+    COUNT -- each piece keeps about half its counterparts -- and completely
+    blind to LOAD.  Making it load-aware is a local change.
+
+(c) DUPLICATED WORK IS ALREADY SAFE.  The design comment on
+    SkipMirroredPairs states that "the gather root and the union-find
+    library both absorb any remaining multiplicity."  So if a handed-off
+    pair races with local execution, or a pair is walked on both sides, the
+    answer is still exact -- you lose time, not correctness.  This is a big
+    deal: the protocol can be best-effort rather than transactional.
+
+(d) The receiver needs no new data path.  It holds one side locally and
+    fetches the other through the ordinary cache (requestNodes/addCache),
+    which is what the current owner does for its remote half anyway.  The
+    roles simply transpose.
+
+WHAT HAS TO BE BUILT, AND WHERE THE RISK IS:
+
+(e) COMPLETION DETECTION.  The walk finishes via armWalkCompletion /
+    fireWalkDone.  Migrated pairs must be counted where they end up, or the
+    walk either finishes early (wrong answer) or never (hang).  This is the
+    real work in the proposal, not the entry method.
+
+(f) THE RECEIVER MUST NOT RE-APPLY THE TIE-BREAK and bounce the pair back.
+    The handoff needs a flag saying "you own this, the rule is overridden".
+
+(g) INTERACTION WITH THE TWO EXISTING PRUNES.  SkipLocalSource discards a
+    pair whose source is local, justified by phase-1 completeness; and
+    peSetKeepLocalPair already vetoes that prune narrowly for the PE-set
+    split.  A pair arriving from elsewhere transposes which side is local,
+    so it must be exempted from SkipLocalSource or it will be silently
+    dropped on arrival -- and a silently dropped pair is a WRONG ANSWER,
+    not a slow one.  This is the subtle failure mode; it would show up as
+    components high, exactly the signature recorded when the PE-set split
+    first broke that prune (10k gate 3642 against gold 3549).
+
+(h) You said "not at the level of whole treepiece pairs, because that might
+    have been walked down already" -- agreed, and the trace supports it:
+    the handoff has to name an interior pair, which means the sender must
+    be able to serialise a stack entry mid-descent.  That is easy for the
+    pair itself, but any per-walk memo state (the SEEN suppression the
+    design notes rely on for the 8-way alternating split) does not travel
+    with it.  Worst case that costs re-expansion on the receiver, not
+    incorrectness -- but it should be measured, not assumed.
+
+====================================================================
+5.  UTILITY -- WHAT IT IS WORTH IF IT WORKS PERFECTLY
+====================================================================
+
+    GPU arm.  Walk CPU is 53.5 ms/PE.  If every pair were spread perfectly
+    the walk's compute would be ~54 ms instead of a 581 ms window.  The
+    walk sits inside a 1214.6 ms Tree traversal in a 2863 ms iteration.
+
+      perfect (unreachable)   -527 ms   -18% of the iteration
+      halving the window      -290 ms   -10%
+      taking the top-100 PEs' excess    -150 to -200 ms   -5 to -7%
+
+    I would plan against the middle row and treat -10% as the honest target.
+    That is the same order as the affinity fix (-23%) and worth doing.
+
+    CPU arm.  The equivalent ceiling is -550 ms of a 4938 ms iteration, but
+    the tail is union-find, so the achievable number is much smaller and I
+    would not start here.
+
+    CAVEAT I CANNOT REMOVE FROM THE TRACES: the walk window is 581 ms and
+    the enclosing Tree traversal is 1214.6 ms, so ~630 ms of that phase is
+    something other than goDown.  Compressing the walk shortens the
+    ITERATION only to the extent the walk is on the critical path.  The
+    utilisation collapse to 1.8% during the tail says nothing else is
+    running then, which is good evidence it IS the critical path, but a
+    direct test (artificially shorten the walk, see if the iteration
+    moves) would settle it for the cost of one job.
+
+====================================================================
+6.  CLARIFICATION -- THREE QUESTIONS BACK
+====================================================================
+
+Q1. WHICH ARM ARE YOU AIMING AT?  On GPU the tail is the walk and your
+    scheme fits.  On CPU the tail is insertDataFindBoss and it does not.
+    If the CPU arm is the target, the same style of question applied to
+    the union-find find-boss chain is where the time is.
+
+Q2. GIVEN r = 0.939, DO YOU WANT DYNAMIC HANDOFF OR A BETTER STATIC RULE?
+    The load is predictable from the data.  That means a load-aware
+    replacement for the parity tie-break -- weighting by piece particle
+    count, or by measured walk cost from a previous iteration -- could
+    capture much of the win with no new entry method, no completion-
+    detection change, and none of the risk in (e) and (g) above.  The
+    dynamic scheme is strictly more general and strictly more dangerous.
+    My instinct is to try the static rule first BECAUSE it is measurable
+    against the same traces before any code is written; but this is a
+    judgement about how much generality you want, and it is yours.
+
+Q3. WHAT TRIGGERS A HANDOFF?  A PE with a deep backlog does not know
+    anyone is idle, and an idle PE does not know who is loaded.  Push on
+    overload (I have more than K pending pairs, shed to the counterpart)
+    needs no global state and cannot deadlock; pull on idle needs a work
+    -stealing directory.  Push looks right here because the overload is
+    predictable and concentrated -- 11% of PEs hold 33% of the work -- but
+    I want to know whether you were thinking of a threshold, a periodic
+    check, or something driven by the quiescence machinery.
+
+====================================================================
+7.  METHOD, AND TWO ERRORS OF MINE ALONG THE WAY
+====================================================================
+
+Numbers come from the 896 .sumd files of job 5322240, both arms.
+
+TWO WRONG READINGS I PRODUCED AND CAUGHT BEFORE REPORTING:
+  - I first read the .sumd stream as INTERVAL-major and with RLE "a+b"
+    meaning "a repeated b+1 times".  Both are wrong: it is EP-MAJOR and
+    "a+b" is "a repeated b TIMES".  The wrong reading gave every entry
+    method a near-identical total spanning the whole run, and claimed
+    822 us of work in a bin where the .sum file reports 0% utilisation.
+    The check that settles it is that the RLE must expand to EXACTLY
+    numIntervals*numEPs = 13191*498 = 6,569,118.  The authoritative
+    format note is in paratreet2/.claude/skills/sumdetail-analysis/.
+  - I first took the walk to be `startDual<FoFEdgeVisitor>` because of the
+    name.  It is the launcher; the body is `goDown`.  Attributing to
+    startDual made the walk look like 15 ms/PE spread over the whole 13 s
+    run, which is what prompted the cross-check.
+Tool: scripts/relay66-walktail.py (walk window, per-PE, tail).

@@ -1,0 +1,215 @@
+relay67 -- LOAD-AWARE TIE-BREAK FOR THE SYMMETRIC WALK: THE SCHEME.
+Design document.  Written 2026-08-21, REWRITTEN 2026-08-21 20:30 after the
+instrumented runs (jobs 5323711, 5324186) turned every open question in the
+first version into a measurement.
+
+*** WHAT CHANGED FROM THE FIRST VERSION, READ THIS BEFORE ANYTHING ELSE ***
+
+  1. THE RULE WAS WRITTEN WRONG.  The first version gave it as
+         keep_on_X = ( h % (w[X]+w[Y]) ) < w[Y]
+     evaluated locally by each side.  THAT IS BROKEN.  Both sides compute
+     the same h but compare it against DIFFERENT thresholds, so they do not
+     complement.  Measured over 200,000 random pairs: exactly-one 38.1%,
+     both-keep 30.8%, NEITHER-KEEPS 31.1%.  Neither-keeps is lost edges.
+     Section 2 now gives the correct form and the reason it is correct.
+  2. THE TWO INDEX SPACES WERE CONFLATED.  The hash must be over TREE
+     PIECES and the weights over PEs.  Getting that backwards is worse than
+     doing nothing (6.13x against the current rule's 5.22x).  Section 2.
+  3. THE WEIGHT TABLE IS 896 ENTRIES, NOT 63,946.  The variant that wins
+     weights by PE, not by piece.  Section 3.
+  4. THE WEIGHT OPTIONS ARE NOW MEASURED, not ranked by guesswork.
+     Section 3.
+  5. THE PAYOFF IS -6.4%, not the -10% guessed here originally.  Section 6.
+  6. Section 4(ii)'s warning about w[X]+w[Y] = 0 CAME TRUE on real data and
+     is now a hard requirement, not a caution.  Section 4.
+
+====================================================================
+1.  THE CONSTRAINT THAT SHAPES EVERYTHING
+====================================================================
+
+The present rule (Traverser.h ~806) works because it is a PURE FUNCTION OF
+THE TWO PIECE INDICES, evaluated independently on both PEs, with no
+communication and no agreement protocol:
+
+    keep_on_target = (((target + source) & 1) == 0) ? (target < source)
+                                                    : (target > source)
+
+Side X computes it, side Y computes it, and exactly one of them keeps the
+pair.  Any replacement must preserve exactly that property.
+
+*** THE FAILURE MODE IS NOT SYMMETRIC.  Disagreement where BOTH keep costs
+    time and returns the right answer -- the design comment on
+    SkipMirroredPairs states the gather root and the union-find absorb
+    multiplicity.  Disagreement where NEITHER keeps loses edges: a WRONG
+    ANSWER, components HIGH, the signature the PE-set split produced when
+    it broke the ownership prune (10k gate 3642 against gold 3549, job
+    5287404).  Every choice below puts disagreement on the both-keep side
+    of that line. ***
+
+====================================================================
+2.  THE RULE -- COMPUTE THE KEEPER, DO NOT COMPUTE "DO I KEEP"
+====================================================================
+
+    lo = min(pieceX, pieceY);   hi = max(pieceX, pieceY)   // TREE PIECES
+    a  = pe[lo];                b  = pe[hi]                // their PEs
+    h  = mix64(lo, hi)                                     // canonical
+    winner = ( h % (w[a] + w[b]) ) < w[b]  ?  lo  :  hi
+    keep   = ( winner == myPiece )
+
+Read it as: lo's side keeps the pair with probability w[b]/(w[a]+w[b]), so a
+heavy PE keeps FEWER of its pairs.
+
+WHY THIS FORM AND NOT THE OBVIOUS ONE.  The obvious phrasing asks each side
+"do I keep it?" and compares h against the OTHER side's weight.  Both sides
+then use different thresholds and the two answers are unrelated.  Measured
+over 200,000 random pairs with random weights:
+
+    form                      exactly-one   both    neither
+    "do I keep it"               38.1%     30.8%    31.1%   <- unusable
+    compute the winner          100.0%      0.0%     0.0%
+    current parity rule         100.0%      0.0%     0.0%
+
+In the winner form both sides evaluate ONE expression that yields ONE piece
+id, then ask whether it is theirs.  Exactly-one stops being an algebraic
+identity that has to be checked and becomes structural.  (The parity rule
+already has this property implicitly: it compares the two ids under a
+symmetric test.)
+
+WHY THE HASH IS OVER PIECES AND THE WEIGHTS OVER PEs.  These are different
+index spaces and the distinction is not cosmetic.  Same weights, same data,
+only the hash key changed (job 5324186):
+
+    hash over TREE PIECES   mix64(lo, hi)          3.57x
+    hash over PEs           mix64(peLo, peHi)      6.13x
+    current parity rule (reference)                5.22x
+
+Hashing over PEs is WORSE THAN DOING NOTHING.  Every piece pair between the
+same two PEs draws the same h and goes the same way, so the coin degenerates
+into one all-or-nothing decision per PE pair.  The weights are per-PE; the
+randomness must be per-pair.
+
+WHY A COIN AND NOT A GREEDY ASSIGNMENT.  A deterministic greedy needs both
+sides to agree on a running counter, hence the same global pair list in the
+same order -- and that list is what the canopy descent is discovering.  The
+coin buys agreement for zero communication.
+
+SETTING ALL w EQUAL reduces this to a fair hashed coin, which is a free A/B
+control isolating "weighted" from merely "hashed".  Measured: the hashed
+coin alone is worth almost nothing (4.97x against parity's 5.22x), so the
+gain is the weighting, not the randomisation.
+
+====================================================================
+3.  WHAT GOES IN w[], AND WHAT IT COSTS TO GET
+====================================================================
+
+w indexes over PEs: 896 entries.  Per-PIECE weights were measured and are
+much weaker -- with ~71 pieces per PE the piece-level variance averages out
+before it reaches the PE:
+
+    w = piece degree     4.51x        w = piece cost       4.62x
+    w = PE cost          3.57x   <-- the variant to build
+
+Objective in every row below: balance measured leaf interactions.  Only the
+SOURCE of w varies (job 5324186):
+
+    weight source                         max/mean   what it needs
+    leaf interactions, same run             3.57x    oracle, unobtainable
+    visits, same run                        3.90x    wrong cost unit
+    visits, prior run                       4.15x    wrong unit + drift
+    pair degree                             4.30x    one canopy pre-pass
+    none (current parity rule)              5.22x    --
+
+    wrong cost unit costs   3.57 -> 3.90
+    run-to-run drift adds   3.90 -> 4.15   (it is NOT negligible; an earlier
+                                            note of mine said it was)
+
+READ IT AS TWO PRACTICAL CHOICES:
+
+  PAIR DEGREE (4.30x, about half the available span).  Needs no prior run.
+  The canopy descent enumerates piece pairs before the deep descent; count
+  them, reduce, broadcast, then walk.  Self-contained and general.
+
+  MEASURED FEEDBACK (about 3.8x expected, between the 3.57x oracle and the
+  4.15x wrong-unit-plus-drift measurement).  Needs a prior run of the same
+  input.  The instrument already produces exactly this table and it is 8 MB.
+  Best where the same dataset is run repeatedly.
+
+====================================================================
+4.  WHERE IT GOES, AND THE THREE PLACES IT CAN GO WRONG QUIETLY
+====================================================================
+
+The rule is a few lines at Traverser.h ~806 plus two table lookups.  The
+tables are the risk, not the arithmetic.
+
+(i) COMMUNICATION.  None per pair.  w is a replicated 896-entry integer
+    table and pe[] a replicated 63,946-entry map (~7 KB and ~128 KB).  Both
+    are built ONCE: a reduction to form them, a broadcast to replicate, a
+    barrier before the first decision.  Every PE then looks up the other
+    side's weight locally.
+
+(ii) THE WEIGHTS MUST BE STRICTLY POSITIVE -- w = 1 + cost, NOT w = cost.
+    This was a caution in the first version and is now a measured fact: SOME
+    PIECES DO ZERO LEAF WORK, their pairs being settled by internal-node
+    pruning without ever reaching a leaf test.  With w[a]+w[b] = 0 the
+    modulo is undefined behaviour in C++, not a trap.  The first run of the
+    rule simulation died on exactly this.
+
+(iii) THE TABLES MUST BE BIT-IDENTICAL EVERYWHERE.  If two sides disagree
+    about w or pe they compute different winners, and that yields both-keep
+    (wasted) or NEITHER-keep (wrong answer).  Use INTEGERS -- a float weight
+    from a reduction can differ in the last bit by summation order.
+    Sentinel-initialise both tables and assert no sentinel is read at
+    decision time, which converts a wrong answer into a crash.
+
+(iv) SkipLocalSource MUST BE RECONSIDERED WITH THIS.  It discards a pair
+    whose source is this process's own live data and is evaluated BEFORE the
+    symmetry prune.  Changing which side keeps a pair changes which pairs
+    present as local-source.  Get it wrong and pairs are dropped silently --
+    components high, not a crash.  peSetKeepLocalPair is the precedent for
+    how a narrow veto is done.
+
+GATES for any run of this, all already in the harness: components
+424897832 and max_size 185317566 EXACT, and the 10k smoke gate at 3549,
+which is the gate that caught the last prune-related breakage.
+
+====================================================================
+5.  THE EXPERIMENT THIS DOCUMENT ASKED FOR HAS BEEN RUN
+====================================================================
+
+The first version proposed an instrumented run before writing any rule.
+Done: relay68 (visits) and relay69 (leaf interactions), jobs 5323711 and
+5324186, reports in this folder.  What it settled:
+
+  - the pairs are NOT numerous: 338,927 of them, whole table 8 MB;
+  - leaf interactions are the right cost unit (r 0.951 with walk time,
+    against 0.896 for node-pair visits);
+  - no pair is too big to move -- the heaviest is 47.2% of the ideal per-PE
+    load and none exceeds it, so whole-pair assignment is not blocked;
+  - the simulation reproduces the deployed parity rule exactly, which is the
+    check that the offline evaluation is sound.
+
+====================================================================
+6.  WHAT TO EXPECT
+====================================================================
+
+GPU arm, walk window 581 ms inside a 2863 ms iteration:
+
+    weighted coin, w = 1 + PE cost      -184 ms    -6.4%
+    with pair-degree weights            -120 ms    -4.2%   (4.30x)
+    whole-pair greedy (unreachable)     -322 ms   -11.2%
+    sub-pair splitting (unreachable)    -345 ms   -12.1%
+
+    this document's first version guessed   -10%   with no data
+    relay68 measured                        -4.6%  wrong cost unit
+    relay69 measures                        -6.4%  right cost unit
+
+CPU ARM: do not build it there.  The walk tail is the union-find find-boss
+chain (insertDataFindBoss is 3.2x goDown), which a walk assignment rule
+does not touch.
+
+AND THE CEILING IS STRUCTURAL.  A pair can only be executed by one of its
+TWO owners.  34 PEs are touched by no leaf-producing pair at all and 29
+still are not under a perfect greedy assignment.  Sub-pair splitting -- the
+original motivation for handing off at lower levels -- moves the bound only
+from 2.33x to 2.12x.  To go further the piece->PE MAPPING has to change,
+which is a different piece of work.

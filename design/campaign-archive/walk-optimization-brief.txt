@@ -1,0 +1,177 @@
+WALK OPTIMIZATION BRIEF -- for composing with another idea.
+Written 2026-08-21, revised 20:30 with the measured rule form.  Self-contained: you do not need
+relay66-69 to use this, but they are the evidence and are in uploads/.
+
+All numbers: FoF3, 2B particles, 16 Frontier nodes, 896 PEs, GPU production
+shape (ppn 7, PEMAP7, -l 128, affinity fix on), unless the CPU arm is named.
+
+====================================================================
+1.  THE BUDGET YOU ARE COMPOSING AGAINST
+====================================================================
+
+GPU arm, iteration 0 = 2863 ms (production build; 2825-2882 measured band):
+
+    Pre-traversal (incl. phase1 on device)     797 ms
+    Tree traversal                           1215 ms
+      of which the dual walk (goDown)          581 ms window
+    remainder (uf2, relabel, histogram, ...)  ~850 ms
+
+    phaseA reads 0.000 on this arm -- phase 1 runs on the GPU.
+
+CPU arm, iteration 0 = 4785-4812 ms (ppn 7, -l 32):
+
+    phaseA (host union-find)                 2379 ms   <- dominant
+    Tree traversal                           1249 ms
+      of which the dual walk                  575 ms window
+
+*** WHICH ARM YOUR IDEA TARGETS DECIDES ALMOST EVERYTHING.  On GPU the walk
+    is 20.3% of the iteration and its tail is walk work.  On CPU the walk is
+    11.6% and its tail is the union-find find-boss chain (insertDataFindBoss
+    is 3.2x goDown there), so walk-side work does not touch it. ***
+
+====================================================================
+2.  WHAT THE WALK IS MADE OF
+====================================================================
+
+Measured directly (job 5324186), not modelled:
+
+    distinct tree-piece pairs walked        338,927
+    node-pair examinations                   34.76 million
+    leaf interactions (sum n_src * n_tgt)    48.17 billion   <- the real work
+    per-pair leaf interactions: half of all pairs do ZERO leaf work
+                                heaviest single pair 25.4 million
+
+Machine utilisation DURING the 581 ms walk window:
+    goDown itself       47,968 PE-ms   (4.3% of the window's PE-ms)
+    cache service       71,011 PE-ms   (13.8%) -- requestNodes + addCache
+    everything          119,515 PE-ms  (23.2%)
+    last 349 ms of the window: 1.8% busy, 31 PEs active of 896
+
+*** THE WALK NEVER USES MORE THAN 45% OF THE MACHINE AT ANY INSTANT, and
+    spends 71% of its window below 25% participation.  It is not a phase
+    that starts wide and narrows; it is thin throughout. ***
+
+*** AND THE CACHE SERVICE IS 1.5x THE WALK ITSELF.  Any idea that changes
+    how many remote nodes are fetched is working on a bigger number than
+    the walk's own compute. ***
+
+====================================================================
+3.  WHAT THE TIE-BREAK IDEA DOES, AND ITS HARD CEILING
+====================================================================
+
+The dual walk is symmetric: pair (X,Y) can be executed by X's PE or Y's.
+Today the choice is parity of the index sum -- balanced in COUNT, blind to
+LOAD.  Result: per-PE walk load 5.22x max/mean, 34 PEs doing no leaf work.
+
+Every candidate evaluated offline against the measured per-pair costs:
+
+    current parity rule                     5.22x
+    hash coin (randomise, same idea)        4.97x   <- randomising alone is
+                                                      worth almost nothing
+    weighted by piece degree                4.51x
+    weighted by piece cost                  4.62x
+    weighted by PE cost                     3.57x   <- best implementable
+    whole-pair greedy assignment (bound)    2.33x
+    sub-pair splitting (bound)              2.12x
+
+THE RULE, in the only form that is correct (see relay67 section 2):
+
+    lo = min(pieceX, pieceY);  hi = max(pieceX, pieceY)   // TREE PIECES
+    a  = pe[lo];               b  = pe[hi]                // their PEs
+    winner = ( mix64(lo,hi) % (w[a]+w[b]) ) < w[b] ? lo : hi
+    keep   = ( winner == myPiece )
+
+Compute the WINNER, not "do I keep it" -- the latter has both sides
+comparing the same hash against different thresholds, which yields
+neither-keeps (lost edges) on 31% of pairs.  Hash over PIECES, weight over
+PEs: hashing over PEs instead measures 6.13x, WORSE than the current rule.
+No per-pair communication; w is a replicated 896-entry integer table and
+pe[] a 63,946-entry map, built once by reduction + broadcast.
+w = 1 + cost, never w = cost: some pieces do zero leaf work.
+
+Weight source matters and none of the obtainable ones reach the oracle:
+
+    leaf interactions, same run (oracle)    3.57x   unobtainable
+    measured feedback, prior run           ~3.8x    needs a prior run
+    pair degree (one canopy pre-pass)       4.30x   self-contained
+    none, i.e. today                        5.22x
+
+Translated into the iteration:
+
+    weighted coin, w = 1 + PE cost     -184 ms    -6.4%
+    with pair-degree weights           -120 ms    -4.2%
+    absolute ceiling of the whole idea -345 ms   -12.1%
+
+*** THIS IDEA MOVES WORK, IT DOES NOT REMOVE IT.  Total leaf interactions
+    (48.17e9) and total cache fetches are INVARIANT under any tie-break.
+    That is the key fact for composing. ***
+
+====================================================================
+4.  HOW TO COMPOSE -- AND WHERE YOU WOULD DOUBLE-COUNT
+====================================================================
+
+COMPOSES ADDITIVELY (different quantity, different phase):
+  - anything that REDUCES total work: better pruning, a cheaper leaf test,
+    a larger effective leaf, fewer surviving pairs.  The tie-break then
+    redistributes a smaller total, and the percentages multiply rather than
+    add.
+  - anything in phaseA (CPU arm) or Pre-traversal (GPU arm).  Disjoint.
+  - anything that reduces CACHE FETCHES.  71,011 PE-ms against the walk's
+    47,968 -- this is the larger target and it is untouched by assignment.
+
+COMPETES FOR THE SAME MILLISECONDS (do not add the percentages):
+  - any other scheme that redistributes walk work: work stealing, dynamic
+    handoff, a different piece->PE map, load-balancing the TreePieces.
+    All of them are drawing on the same 581 ms window, and the combined
+    ceiling is the -12.1% above, not the sum of the parts.
+  - anything targeting the walk TAIL specifically.  The tail is 71% of the
+    window but only 24% of the walk's work; two ideas aimed at it are aimed
+    at the same 345 ms.
+
+CHANGES THE GROUND UNDER THIS ANALYSIS (re-measure before trusting section 3):
+  - changing -l.  Leaf interactions scale with leaf size, so the pair cost
+    distribution and therefore the best weights change.  GPU optimum is 128
+    (12 costs +27.7%, 384 costs +52.8%); CPU optimum is 32.
+  - changing the decomposition or the number of TreePieces.  The 5.22x is a
+    property of which pieces landed on which PE.
+  - moving phase 1 off the GPU, or moving the walk onto it.
+
+THE STRUCTURAL FLOOR, which no assignment scheme can pass:
+  a pair can only be executed by one of its TWO owners.  34 PEs are touched
+  by no leaf-producing pair at all and 29 still are not under a perfect
+  greedy assignment.  To use those PEs the piece->PE MAPPING has to change.
+  If the other idea touches decomposition or LB, it can reach headroom the
+  tie-break cannot -- that is the one place the two ideas genuinely add.
+
+====================================================================
+5.  WHAT IS ALREADY BANKED, SO YOU DO NOT RE-CLAIM IT
+====================================================================
+
+    ROCm helper-thread affinity fix        about -23%   (3 reps)
+    production build (charm --with-production,
+      no linked tracing)                        -17.8%
+    leaf size: GPU already at its optimum          0
+               CPU-only -l 128 -> -l 32       -32%
+
+    GPU headline now 2825-2882 ms; CPU-only 4785-4812 ms.
+
+====================================================================
+6.  RELIABILITY OF THE ABOVE
+====================================================================
+
+  - Per-pair costs are MEASURED, not modelled, and the rule simulation
+    reproduces the deployed parity rule exactly, which is the check that the
+    pipeline is sound.
+  - Leaf interactions explain 90% of the variance in per-PE walk TIME
+    (r 0.951).  The residue is cache/fetch and scheduling.  Per-PE leafints
+    imbalance is 5.15x where TIME imbalance is 6.81x, so section 3 is a mild
+    UNDER-estimate of what perfect balance would win.
+  - Every arm of every job cited here produced components 424897832 and
+    max_size 185317566 EXACT.
+  - The 581 ms walk window sits inside a 1215 ms traversal phase, so walk
+    savings reach the iteration only insofar as the walk is on the critical
+    path.  Utilisation collapsing to 1.8% during the tail is good evidence
+    that it is; it has not been proven by a direct experiment.
+
+Evidence: relay66 (walk tail), relay67 (rule design), relay68 (per-pair
+instrument, visits), relay69 (leaf interactions, supersedes relay68 s3).

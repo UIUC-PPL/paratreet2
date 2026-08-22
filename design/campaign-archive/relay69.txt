@@ -1,0 +1,146 @@
+relay69 -- THE COST UNIT WAS WRONG.  Re-run with leaf interactions.
+Job 5324186, 16 nodes, 2B, 896 PEs, GPU production shape.  All arms EXACT.
+2026-08-21.  Supersedes relay68 section 3 and its payoff table.
+
+====================================================================
+1.  LEAF INTERACTIONS ARE THE RIGHT UNIT, AND IT MATTERS
+====================================================================
+
+Both units were carried in the SAME run, on identical pairs, so they are
+directly comparable instead of inferred across two jobs.
+
+    per-PE quantity            r with goDown time    r^2     max/mean
+    node-pair visits (relay68)       +0.896          80%       3.74x
+    leaf interactions (this)         +0.951          90%       5.15x
+    goDown TIME itself                  --            --       6.81x
+
+leafints = sum over leaf-leaf tests of n_particles(src) * n_particles(tgt),
+which is the quantity doLeaf already hands to countLeafInts -- the actual
+n^2 work. It explains 90% of the variance in walk time against 80% for
+visits, and its imbalance (5.15x) is far closer to the truth (6.81x).
+
+*** SO relay68 UNDERSTATED THE PROBLEM.  The real per-PE walk imbalance
+    under the current rule is 5.22x, not the 3.79x visits reported. ***
+
+Neither unit is the whole story: time is still more skewed (6.81x) than even
+leafints (5.15x). The residue is the cache/fetch component and scheduling,
+which no per-pair cost model captures. I am not going to chase it further --
+90% is enough to design a weight on, and the remaining gap makes every
+number below a mild UNDER-estimate of the available gain.
+
+====================================================================
+2.  THE RULES, RE-EVALUATED ON REAL n^2 WORK
+====================================================================
+
+303,817 pairs, 48.17e9 leaf interactions, 99.9% of all measured.
+
+    rule                              leafints   (visits, relay68)
+    MEASURED, what actually ran         5.22x        3.79x
+    current: parity of index sum        5.22x        3.79x   <- reproduced
+    hash coin, w = 1                    4.97x        3.76x
+    weighted, w = piece degree          4.51x        3.47x
+    weighted, w = piece cost            4.62x        3.51x
+    weighted, w = PE cost (oracle)      3.57x        2.92x
+    whole-pair greedy LPT (bound)       2.33x        1.86x
+    sub-pair splitting (bound)          2.12x        1.75x
+
+The simulation again reproduces the deployed rule exactly, which is the
+check that the pipeline is sound.
+
+WHAT CHANGES FROM relay68 AND WHAT DOES NOT:
+
+  CHANGES -- the static rule is worth MORE than I said. Max load falls
+  5.22x -> 3.57x, a 32% cut, against the 23% the visits unit implied.
+
+  DOES NOT CHANGE -- every qualitative conclusion:
+    - the hash coin gains almost nothing (4.97x), so the parity rule is
+      still not the defect;
+    - per-PIECE weights gain little (4.51x), per-PE weights are where the
+      gain is (3.57x);
+    - sub-pair splitting still buys almost nothing over whole pairs
+      (2.33x -> 2.12x, 9%), so granularity is STILL not the binding
+      constraint -- the two-owner restriction is;
+    - no single pair is too big to move: the heaviest is 47.2% of the ideal
+      per-PE load and zero pairs exceed it.
+
+  AND ONE THING GOT WORSE: 34 PEs do NO leaf work at all under the current
+  rule, and 29 still do none under the greedy bound (against 11 either way
+  on visits). The structural floor is more real, not less.
+
+====================================================================
+3.  A DESIGN REQUIREMENT, PREDICTED AND THEN HIT
+====================================================================
+
+relay67 section 4(ii) warned that a partially-filled weight table would give
+w[X]+w[Y] = 0 and divide by zero. That is not hypothetical and it is not
+about partial filling: SOME PIECES DO ZERO LEAF WORK. Their pairs are
+settled by internal-node pruning alone and never reach a leaf test. The
+first run of the simulation died on exactly that, on real data.
+
+    THE RULE MUST USE w = 1 + cost, NOT w = cost.
+
+That is one character in the implementation and a wrong answer if omitted --
+with w[X]+w[Y] = 0 the modulo is undefined behaviour in C++, not a trap.
+
+====================================================================
+4.  WHAT IT IS WORTH -- CORRECTED AGAIN
+====================================================================
+
+GPU arm, walk window 581 ms inside a 2863 ms iteration, scaling by max PE
+load:
+
+    rule                            window   saving   of the iteration
+    current                          581 ms      --        --
+    weighted coin, w = 1 + PE cost   397 ms   -184 ms     -6.4%
+    whole-pair greedy (unreachable)  259 ms   -322 ms    -11.2%
+    sub-pair splitting (unreachable) 236 ms   -345 ms    -12.1%
+
+    relay67 predicted   -10%   (no data)
+    relay68 measured    -4.6%  (wrong cost unit)
+    relay69 measures    -6.4%  (right cost unit)
+
+====================================================================
+5.  THE INSTRUMENT, AND THE DEFECT relay68 REPORTED IS FIXED
+====================================================================
+
+    arm                 Iter0        walk s   verdict
+    warmup             2865.9 ms     0.518    EXACT (discarded)
+    A instrument OFF   2851.4        0.538    EXACT
+    B level 1          2845.5        0.541    EXACT
+    C level 2 + raw    2846.6        0.534    EXACT
+
+Overhead is now inside the run-to-run band on the iteration and about 3% on
+the walk. All four arms EXACT, so the instrument remains passive.
+
+FOF3PAIRS lines: 896 of 896 in BOTH instrumented arms, against 774 and 760
+in relay68. The cause was the length of the printed line -- relay68 emitted a
+40-bucket histogram and a top-8 list per PE and they interleaved and dropped.
+One short line per PE survives. The raw table is the artefact of record
+either way; the per-PE binaries were complete in both jobs.
+
+Raw table: 896 files, 8.2 MB apparent, 24-byte records
+(u32 src, u32 tgt, u64 visits, u64 leafints) at
+/lustre/orion/csc710/scratch/lvkale/s3ab/5324186/pairs-C-raw
+
+====================================================================
+6.  RECOMMENDATION, UNCHANGED IN SHAPE
+====================================================================
+
+1. Build the weighted coin with w = 1 + per-PE measured leaf interactions.
+   Expect about -6%. It needs the piece->PE map replicated alongside the
+   weights, integer arithmetic throughout, and the sentinel/assert from
+   relay67 section 4(ii).
+2. The weights have to come from somewhere: relay67 option C (measured
+   feedback) is now cheap and concrete -- this job produces exactly the
+   table, and it is 8 MB. For a general rule, piece degree recovers about
+   half the gain (4.51x of the 5.22 -> 3.57 span) with no prior run at all.
+3. Still do NOT build the dynamic handoff on this evidence. It buys 9% over
+   whole-pair assignment, and the whole family is capped near -12%.
+4. Beyond that the question is the piece->PE mapping, not the tie-break.
+   34 PEs do no leaf work at all; nothing that only moves pairs between
+   their two existing owners can ever give them any.
+
+FILES. patches/0022-pairstats-instrument.diff (cumulative, uncommitted),
+scripts/relay69-simrules.py (takes `visits` as an argument to reproduce
+relay68's table from the same data), binary merged/FoF3.gpu-pairstats
+md5 53c9da95. merged/FoF3.gpu-prod untouched, md5 re-verified 54a8de35.

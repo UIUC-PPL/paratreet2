@@ -1,0 +1,197 @@
+*** SUPERSEDED HEADER, added 2026-08-21 20:30.  EVERY NUMBER IN SECTION 3
+    AND SECTION 4 OF THIS REPORT USES THE WRONG COST UNIT.
+
+    This job counted NODE-PAIR VISITS.  relay69 (job 5324186) carried both
+    units in one run and showed leaf interactions track walk time far better
+    (r 0.951 / 80% -> 90% of variance), and that visits UNDERSTATE the
+    imbalance: the real figure is 5.22x, not the 3.79x below, and the static
+    rule is worth -6.4%, not -4.6%.
+
+    WHAT STILL STANDS from this report: the pairs are few (338,927, whole
+    table 8 MB); no pair is too big to move; the hash coin alone gains
+    nothing so the parity rule is not the defect; per-PE weights beat
+    per-piece; sub-pair splitting buys little over whole pairs; and the
+    two-owner constraint, not granularity, is the binding limit.
+
+    Read relay69 for the corrected numbers and relay67 for the rule.  This
+    report is kept because it is the only place the visits/leafints
+    comparison can be checked from both sides. ***
+
+relay68 -- PER-PAIR WALK COST MEASURED, AND EVERY CANDIDATE RULE EVALUATED
+AGAINST IT.  Job 5323711, 16 nodes, 2B, 896 PEs, GPU production shape.
+2026-08-21.  All arms EXACT.
+
+====================================================================
+0.  WHAT CHANGED, AND ONE CORRECTION OF MY OWN NUMBER
+====================================================================
+
+*** THE PAIRS ARE NOT NUMEROUS.  338,883 distinct piece pairs; the complete
+    raw table is 5.5 MB.  The online-summary path was built as asked and did
+    no harm, but the volume concern behind it does not apply -- the whole
+    dataset fits in memory on a laptop. ***
+
+*** THE CEILING IS NOT WHAT I TOLD YOU.  relay67 quoted "honest target -10%"
+    for a static rule.  Measured, the best implementable static rule is worth
+    about -4.6% of the GPU iteration, and NO scheme of this family can beat
+    about -11%.  The corrected table is in section 4. ***
+
+*** AND THE REASON TO GO TO LOWER LEVELS LARGELY EVAPORATES.  Splitting work
+    BELOW the piece-pair level -- the thing your original question was built
+    around -- moves the ceiling from 1.86x to 1.75x.  Six percent.  The
+    binding constraint is not the granularity of the work, it is that a pair
+    can only ever be done by one of TWO PEs. ***
+
+====================================================================
+1.  THE INSTRUMENT
+====================================================================
+
+Per-PE hash map keyed by (source piece, target piece), incremented where the
+pair has survived both prunes and is about to be worked.  Cost unit is one
+node-pair examination -- a count, not a clock.  Env-gated: level 1 emits
+online summary statistics, level 2 also writes the raw table.
+
+    arm            Iter0        walk s   verdict
+    warmup        2875.3 ms     0.576    EXACT   (discarded, cold read)
+    A instrument OFF  2931.2    0.601    EXACT
+    B level 1 summary 2894.0    0.607    EXACT
+    C level 2 + raw   2934.5    0.601    EXACT
+
+All EXACT, so the instrument is passive with respect to the answer.  Cost is
+about 4% on the walk and inside the run-to-run band on the iteration.
+
+ONE DEFECT IN THE ONLINE PATH, WORTH KNOWING BEFORE ANYONE RELIES ON IT.
+Only 774 and 760 of 896 FOF3PAIRS lines survived to the job output.  CkPrintf
+from 896 PEs interleaves and drops, so the printed summary is LOSSY.  The
+per-PE binary files are complete -- 896 of 896, and their totals are
+self-consistent -- so every number below comes from the files, not from the
+printed summary.  If the summary path is ever used on its own it needs a
+reduction, not CkPrintf.
+
+====================================================================
+2.  WHAT THE PAIRS LOOK LIKE
+====================================================================
+
+    distinct pairs            338,883
+    total node-pair visits    34,773,165        mean 102.6 per pair
+    per-pair visits   min 1   p50 1   p90 161   p99 2,241   p999 6,641
+                      MAX 17,009
+
+Half of all pairs cost ONE visit.  The work lives entirely in the top
+percentile.  Any rule that treats pairs as interchangeable units will be
+wrong; the weight has to be the cost, not the count.
+
+    current per-PE load: mean 38,809 visits, MAX 147,029, max/mean 3.79x
+    11 PEs walk nothing at all; the top 100 PEs hold 27.7%
+
+ATOMICITY IS NOT THE PROBLEM.  The heaviest single pair is 17,009 visits =
+43.8% of the ideal per-PE load, and ZERO pairs individually exceed that
+ideal.  So whole-pair assignment is not blocked by an indivisible lump, and
+the concern that motivated going below the pair level does not arise here.
+
+====================================================================
+3.  EVERY RULE, EVALUATED ON THE MEASURED COSTS
+====================================================================
+
+303,780 pairs (89.6% of pairs but 99.8% of visits -- the uncovered ones are
+the 1-visit tail whose owner PE could not be resolved).  Assumption stated
+plainly: a pair costs the same whichever side walks it.  Both sides do the
+same pruning; what differs is which half is fetched, so this is an
+approximation, not an identity.
+
+    rule                                  max load   max/mean
+    MEASURED, what actually ran            147,029     3.79x
+    current: parity of index sum           146,946     3.79x   <- reproduced
+    hash coin, w = 1                       145,454     3.75x
+    weighted coin, w = piece degree        135,717     3.50x
+    weighted coin, w = piece visits        137,624     3.55x
+    weighted coin, w = PE visits (oracle)  113,022     2.92x
+    whole-pair greedy LPT (oracle bound)    72,067     1.86x
+    sub-pair splitting (fractional bound)   67,934     1.75x
+
+The simulation reproduces the deployed rule to within 0.06% (146,946 against
+a measured 147,029), which is the check that the whole pipeline is sound.
+
+READ THE ROWS IN ORDER, BECAUSE THEY ARGUE WITH EACH OTHER:
+
+  - The hash coin gains NOTHING (3.75x against 3.79x).  So the parity rule is
+    not the problem and "the tie-break is algebraic" is not the defect.  It
+    is already as good as a fair coin.
+  - Weighting by anything per-PIECE gains little (3.50x).  With ~71 pieces
+    per PE the piece-level variance averages out before it reaches the PE.
+  - Weighting by per-PE load is where the gain is (2.92x), and it needs the
+    piece->PE map replicated as well as the weights.  This is the rule I
+    would build.
+  - But even a perfect oracle assignment of whole pairs stops at 1.86x, and
+    allowing pairs to be split fractionally between their two owners only
+    reaches 1.75x.
+
+WHY THE FLOOR IS 1.75x AND NOT 1.0x.  A pair can only be executed by one of
+its two owners.  That makes this a constrained graph-orientation problem, not
+free bin-packing.  11 PEs are touched by no pair at all and no scheme in this
+family can give them work; 109 PEs remain above 1.5x of mean even under
+perfect fractional splitting.  To go below that floor you would have to
+change WHICH PIECES LIVE ON WHICH PE, or allow a third PE to take the pair --
+which costs the locality that makes either owner the natural choice.
+
+====================================================================
+4.  WHAT IT IS WORTH, CORRECTED
+====================================================================
+
+GPU arm, walk window 581 ms inside a 2863 ms iteration.  Scaling the window
+by the change in max PE load:
+
+    rule                              window    saving   of the iteration
+    current                            581 ms       --        --
+    weighted coin, w = PE visits       448 ms    -133 ms     -4.6%
+    whole-pair greedy (unreachable)    285 ms    -296 ms    -10.3%
+    sub-pair splitting (unreachable)   268 ms    -313 ms    -10.9%
+
+So: the contained, static change is worth about 4.6%.  The entire remaining
+headroom, including your dynamic handoff, is about another 6 points, and it
+is bounded by the graph rather than by the mechanism.
+
+====================================================================
+5.  THE PROXY IS ONLY 80% OF THE STORY, AND IT IS FIXABLE
+====================================================================
+
+Per-PE node-pair visits (this job) against per-PE goDown TIME (relay65
+traces, same configuration):
+
+    Pearson r = 0.896 over 885 PEs   -> visits explains 80% of the variance
+    visits max/mean 3.74x            time max/mean 6.81x
+
+VISITS UNDERSTATES THE IMBALANCE BY NEARLY A FACTOR OF TWO.  The heavy PEs do
+not merely do more visits, they do MORE EXPENSIVE ones -- which at leaf 128
+is what you would expect, since a leaf-leaf test costs the product of the two
+particle counts.  A rule tuned on visits will therefore under-correct.
+
+The fix is free: doLeaf already computes exactly the right quantity --
+`stats->countLeafInts(source->n_particles * target->n_particles)`.  Charging
+THAT to the pair instead of counting stack pops should track time much more
+closely.  I would re-run the instrument with that cost unit before tuning any
+weights, because every number in section 3 is an underestimate of the
+available gain by an unknown factor between 1 and 1.8.
+
+====================================================================
+6.  RECOMMENDATION
+====================================================================
+
+1. Re-run the instrument charging leaf INTERACTIONS rather than visits (a
+   two-line change to the patch already in patches/).  Cheap, and it settles
+   whether section 3's numbers are pessimistic.
+2. If they hold, build the weighted coin with w = per-PE measured load, and
+   expect about -5%.  It is contained: the rule is one expression, the
+   weights are a replicated integer table, and the failure modes are the ones
+   in relay67 section 1 and 4.
+3. Do NOT build the dynamic handoff on the strength of this data.  It carries
+   the completion-detection and prune-interaction risk from relay67 section 4
+   and buys at most 6 points over the static rule, because the ceiling is set
+   by the two-owner constraint and not by granularity.
+4. If more than ~10% of the walk is wanted, the question to ask is about the
+   piece->PE mapping, not about the tie-break.
+
+FILES.  patches/0022-pairstats-instrument.diff (cumulative, uncommitted),
+scripts/relay68-simrules.py, raw table at
+/lustre/orion/csc710/scratch/lvkale/s3ab/5323711/pairs-C-raw (896 files,
+5.5 MB), binary merged/FoF3.gpu-pairstats (md5 a8f0f24c).
+merged/FoF3.gpu-prod is untouched, md5 re-verified 54a8de35.
