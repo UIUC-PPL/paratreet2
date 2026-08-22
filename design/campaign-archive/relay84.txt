@@ -1,0 +1,145 @@
+relay84 -- MESSAGE-DELIVERY GAP for the union-find entry methods, on the 128
+element home PEs, walk window vs drain.  2026-08-22.  No job: analysis of the
+existing relay81 traces (job 5326926).  Scripts scripts/relay84-msggap.py and
+relay84-msggap2.py.
+
+  THE VERDICT, up front: THE RECEIVING PEs ARE KEEPING UP, COMFORTABLY.  The
+  raw creation-to-begin gaps look enormous (median 16.7 ms in the walk window)
+  but they are dominated by cross-process CLOCK OFFSET, which the bidirectional
+  test below measures at p90 10.6 ms and up to 66 ms -- the same order as the
+  quantity being measured.  The clock-FREE receiver-side evidence is
+  unambiguous and points the other way.
+
+  So by Kale's own decision rule this is the second branch: **chain concurrency
+  joins chain length as a closed line, and the next lever is protocol
+  round-trip count -- fold the two-phase find, eliminate the flips.**
+
+====================================================================
+1.  THE TRAP, AND I DID FALL INTO THE SECOND ONE
+====================================================================
+
+Kale warned about the projlog field: on BEGIN_PROCESSING, field 6 is the SOURCE
+PE and the executing PE is the file the record came from.  Verified before
+using it and handled correctly -- match key is (source_pe, event), and event
+ids are unique per PE (19,873 creations, 19,873 distinct ids on the PE I
+checked).  One match was verified by hand end to end: creation 10,719,207 on
+PE 14 event 6635 -> begin 10,720,812 on PE 7, gap 1,605 us.
+
+*** THE ONE I DID FALL INTO WAS CLOCKS, and Kale called it mid-analysis.  My
+    first pass reported find-gap medians of 12.9 ms (walk) and 24.3 ms (drain)
+    and I was about to read them as queuing.  Two things say otherwise: the
+    label group produced NEGATIVE gaps -- messages arriving before they were
+    sent -- and the receiver-side numbers in section 3 cannot support waits of
+    that size. ***
+
+Also worth recording: there are NO same-PE find messages to use as a
+clock-free control.  A same-chare find never becomes a message -- find_boss1
+climbs locally in a while loop and only calls boss_send when it LEAVES the
+chare -- so src != dst always.  That control does not exist; section 3 is the
+substitute.
+
+====================================================================
+2.  HOW BIG THE SKEW IS -- the bidirectional test
+====================================================================
+
+For a pair with true one-way floor L and clock offset d,
+    min(A->B) = L + d      min(B->A) = L - d
+so (minAB + minBA)/2 estimates L and |minAB - minBA|/2 estimates d.
+593 bidirectional home-PE pairs in cpu-szON:
+
+    minAB + minBA  (= 2L, and it is >= 0 for all 593 -- the minima are
+                    self-consistent, so the matching is sound)
+      p01 8    p50 208    p99 86,492    max 131,951  us
+    |minAB - minBA|/2  (= the clock offset)
+      p50 90   p90 10,596  p99 38,498    max 65,977  us
+
+*** MEDIAN TRUE ONE-WAY FLOOR: about 104 us.  MEDIAN CLOCK OFFSET: about
+    90 us -- but the offset tail is 10.6 ms at p90 and 66 ms at the worst pair.
+    A quantity with a 66 ms error bar cannot be used to measure a delay that
+    matters at the tens-of-microseconds scale.  Per-pair minimum subtraction
+    removes a CONSTANT offset, and it barely moved the distribution
+    (16,682 -> 16,531 us at the median), which says the residue is drift or
+    real variation and the two cannot be separated with these timestamps. ***
+
+====================================================================
+3.  THE CLOCK-FREE ANSWER: ARE RECEIVERS KEEPING UP?  YES.
+====================================================================
+
+Everything here is one PE's own clock, so no cross-process comparison is
+involved.  128 home PEs (verified: only multiples of ppn=7 execute
+insertDataFindBoss at all -- PEs 1, 2, 8, 13, 890, 895 execute exactly zero).
+
+    cpu-szON, WALK window (bins 10697..10989, 293 ms)
+      home-PE busy fraction                     53.4%
+        of which  walk EPs 15.6%   cache 26.5%   union-find 9.7%
+      execution durations      p50 2 us   p90 14 us   p99 74 us   max 13.2 ms
+      continuous busy runs     p50 7 us   p90 44 us   p99 152 us  max 44.4 ms
+      per-PE longest busy run  p50 7.2 ms   p90 27.4 ms   max 44.4 ms
+
+    cpu-szON, DRAIN window (bins 10990..11300, 311 ms)
+      home-PE busy fraction                      3.7%
+      continuous busy runs     p50 44 us  p90 377 us  p99 3,385 us
+
+    cpu-szOFF, WALK window          busy 52.7%, runs p50 7 / p90 46 / p99 163 us
+
+*** A MESSAGE CANNOT WAIT IN A QUEUE LONGER THAN ITS RECEIVER IS CONTINUOUSLY
+    BUSY -- an idle PE has an empty queue.  99% of busy runs end within 152 us
+    and the median run is 7 us.  The receiver is going idle constantly.  It is
+    keeping up, and it is not close to saturated: 53% busy in the walk window
+    and 3.7% in the drain, serving items whose median cost is 2 us. ***
+
+Note the run figures are sensitive to how a "break" is defined.  Treating gaps
+under 50 us as continuous gives p99 19.6 ms and per-PE longest p50 30 ms;
+treating any measurable idle as a break gives p99 152 us.  The strict figure is
+the right one for this question, because the scheduler will pick up a queued
+message in any real idle moment.  Both are reported so the sensitivity is
+visible rather than hidden.
+
+====================================================================
+4.  WHAT THIS MEANS FOR THE NODEGROUP DESIGN
+====================================================================
+
+Kale's framing: the drain PEs are 97% idle, so tail concurrency cannot be the
+payoff; the hypothesis was queuing behind walk executions during the
+walk-concurrent cascade.
+
+  - TAIL CONCURRENCY: already excluded by Kale, and confirmed here -- home PEs
+    are 3.7% busy in the drain.
+  - QUEUING BEHIND WALK EXECUTIONS: NOT SUPPORTED.  The home PE is 53% busy in
+    the walk window, its executions have a 2 us median, and its queue provably
+    empties within 152 us in 99% of busy runs.  There is no backlog to relieve.
+  - REAL DELIVERY LATENCY: the floor is about 104 us one-way for the median
+    pair.  That is real, but a nodegroup does not remove it -- vertex ownership
+    stays with the PROCESS, so cross-process messages remain cross-process.
+    Sharding only converts within-chare local hops into intra-process messages,
+    which relay83 counted at ~151k per run and which are ADDED cost, not saved.
+
+*** SO THE NODEGROUP IS NOT JUSTIFIED BY ANYTHING MEASURED HERE.  Chain
+    concurrency joins chain length as a closed line.  Three mechanisms have now
+    shortened chains and bought nothing (the wave, the backward short-circuit,
+    disabling local path compression), and now the concurrency argument fails
+    on the receiver side as well. ***
+
+THE NEXT LEVER IS ROUND-TRIP COUNT, exactly as Kale set out.  The census gives
+the target directly (relay78/83): every distributed edge costs a two-phase
+find -- find_boss1 climbs to v's root, then find_boss2 climbs to w's root --
+and 16.5% of chains are FLIPS that throw the whole two-phase find away and
+re-issue it because the two ROOT ids arrived in the wrong order.  At ~455k
+distributed edges per run that is ~90k wasted round-trip pairs.  Folding the
+two phases and ordering by root id are both round-trip reductions, and
+round-trips at a 104 us floor are what the drain is actually made of.
+
+====================================================================
+5.  WHAT I DID NOT ESTABLISH
+====================================================================
+
+  - The true MEDIAN delivery latency.  Only the floor (about 104 us) is
+    measurable; the median is buried under clock offsets of the same
+    magnitude.  Getting it would need synchronised timestamps, which these
+    traces do not have.
+  - The GPU arms were run through the raw script before the clock problem was
+    understood; their numbers are in the same units and carry the same defect,
+    so they are not quoted here.  The receiver-side argument in section 3 is
+    what matters and it does not depend on them.
+  - Whether the ~104 us floor is transport or scheduler pickup.  It is a floor
+    either way, and neither is addressed by a nodegroup.
