@@ -1,0 +1,553 @@
+relay78 -- WHAT IS ACTUALLY HAPPENING IN THE DRAIN, and a first test of the
+backward short-circuit.  2026-08-22.  Job 5326279, all arms EXACT.
+
+  Kale: "Are the findBoss entry methods leading to more calls to them on other
+  processors?  Leading to change of parent pointers (unions)?  Or just being
+  discarded as belonging to the same cluster?  That can help decide the right
+  remedy."
+
+  ANSWER, in one line: mostly REAL UNIONS, chains about ONE hop long, and
+  same-root discards are 2.8%.  The drain is genuine merging work that is
+  latency-bound, not wasted re-discovery and not deep chains.
+
+  binary   merged/FoF3.cpu-prod-cen  1775a0218343a85ee2213abb720ceb05
+  patch    patches/relay79-unionfind.diff + relay79-paratreet2.diff (cumulative; see patches/APPLY.md)  (working tree on
+           57f2395 / d72ee66, NOT pushed, tree left uncommitted)
+  scripts  sbatch/relay78-census-16n.sbatch
+           scripts/relay78-drainanatomy.py, scripts/relay78-groups.py
+
+====================================================================
+0.  TWO CORRECTIONS OF MINE FIRST
+====================================================================
+
+*** THE TRACE CANNOT ANSWER THIS QUESTION AND MY FIRST ATTEMPT WAS WRONG.
+    I reasoned that each insertDataFindBoss execution creates at most one
+    follow-on, so executions minus creations would count terminations.  It
+    does not: over a whole run sends equal receives, so that difference
+    measures only flow across the window boundary.  The branch taken inside
+    find_boss2 is invisible to Projections.  The numbers below are COUNTED in
+    the library instead.  scripts/relay78-drainanatomy.py carries the
+    retraction in its header. ***
+
+*** relay75 AND relay77 PUT LABELING INSIDE THE DRAIN.  Their 'unionfind' EP
+    group included set_component / need_boss / find_components, which are the
+    LABELING scatter, not merging.  Split out (scripts/relay78-groups.py),
+    labeling is only 139 of 4449 PE-ms, but it does extend the window.  The
+    drain tightens from 313 ms to 265 ms, 958 PE-ms of union protocol at
+    0.67% utilisation and 33.5 active PEs of 896.  Every conclusion in
+    relay75/77 survives; the number moves by 48 ms. ***
+
+====================================================================
+1.  THE PROTOCOL, AND WHAT WAS COUNTED
+====================================================================
+
+union_request(v,w) -> find_boss1 on v carrying partner w
+  find_boss1  parent != -1 : climb (local while-loop, or ONE remote message)
+              parent == -1 : root of v found; send find_boss2 to w
+  find_boss2  parent != -1 : climb
+              parent == -1 and boss1ID >  self : FLIP -- re-issues
+                             union_request and throws the chain away
+              parent == -1 and boss1ID <  self : UNION.  sets parent, starts
+                             an add_size chain that climbs to the root
+              parent == -1 and boss1ID == self : SAME ROOT.  does nothing
+
+Counters at every one of those branch points, summed over the array and
+printed as [UFSTAT].  AGGREGATION is off in our build, so each remote hop is
+a real message.  The UnionFindLib array has 128 elements, one per process.
+
+====================================================================
+2.  THE CENSUS -- arm A (short-circuit off), mean of 2 reps, whole run
+====================================================================
+
+    fb1_root                 543,048     boss1 finds that reached a root
+    fb1_climb_remote         103,173
+    fb1_climb_local           84,425
+    fb2_climb_remote         234,352
+    fb2_climb_local          130,462
+    fb2_UNION                438,068     <-- parent pointer changes
+    fb2_flip                  89,865     <-- restarts the whole find
+    fb2_SAMEROOT_discard      15,116     <-- discarded, same cluster
+    addsize_root             438,068
+    addsize_forward           41,377
+    local_union              794,192     same-chare fast path, no protocol
+
+INTERNAL CHECKS, both exact:
+  union + flip + discard = 543,049  against fb1_root 543,048.  Every boss1
+    root found leads to exactly one terminal find_boss2 outcome.
+  addsize_root = fb2_UNION exactly.  Every union starts one add_size chain
+    that terminates once at a root.
+
+*** THE THREE OUTCOMES KALE ASKED ABOUT
+      UNION (parent pointer changes)      438,068    80.7%
+      FLIP  (restart, id order wrong)      89,865    16.5%
+      SAME-ROOT DISCARD                    15,116     2.8%
+
+    IT IS NOT DISCARDS.  Four out of five find chains end in a real merge. ***
+
+*** AND THE CHAINS ARE ALREADY SHORT.  552,412 climb hops over 543,048
+    chains = 1.02 hops per chain.  There is no deep pointer chain to shorten.
+    That is why the compression wave found only ~260 things to compress
+    (relay77) however it was triggered. ***
+
+A FOURTH OUTCOME KALE DID NOT LIST, AND IT IS 5.9x BIGGER THAN DISCARDS.
+The FLIP: find_boss2 reaches a root whose id is LARGER than the incoming
+boss1, refuses to point at it (min-heap discipline), and re-issues
+union_request from scratch -- the whole two-phase find is thrown away and
+redone.  89,865 of them, 16.5% of all chains.  union_request already orders
+the two VERTEX ids at submission; it cannot order the two ROOT ids, because
+it does not know them yet.
+
+====================================================================
+3.  HOW MUCH OF THAT IS IN THE DRAIN
+====================================================================
+
+The census marks at the fireUF2Edges barrier, which is the END of the walk
+bracket -- and the 265 ms drain sits mostly INSIDE that bracket, because the
+edges stream during the walk (Kale's own correction, relay75).  So the census
+"drain" column is only the post-barrier residue (~40 ms) and cannot carry the
+answer on its own.  The traces bridge it.
+
+Every union starts exactly one add_size chain and only 7% of add_size calls
+take a second hop, so add_size EXECUTIONS in a trace window are a good proxy
+for UNIONS in that window:
+
+    window                 insertDataFindBoss    add_size    ~unions
+    walk    10505-10801 ms        760,198        283,634
+    DRAIN   10802-11066 ms        331,816        145,129    ~132,600
+
+*** ABOUT 30% OF EVERY UNION IN THE RUN HAPPENS INSIDE THE 265 ms DRAIN --
+    roughly 132,600 real merges -- at 0.67% machine utilisation with 33.5
+    PEs busy.  The drain is not re-discovery and it is not idling on nothing.
+    It is a third of the actual merging work, serialised by dependence. ***
+
+====================================================================
+4.  KALE'S BACKWARD SHORT-CIRCUIT, MEASURED
+====================================================================
+
+"If a findBoss request X comes to me from another PE, I record whom it came
+from, do my local traversal, and if I am about to leave the PE doing another
+findBoss for the same chain, I send a backward message asking my sender to
+point to where I am going."
+
+THAT MECHANISM WAS ALREADY IN THE LIBRARY AND COMMENTED OUT, at both call
+sites (unionFindLib.C:346 in find_boss1, :445 in find_boss2).  senderID is
+already carried in every findBossData; shortCircuitData, the entry method and
+short_circuit_parent all exist.  Only the two call sites were disabled.
+Enabled here behind FOF_UF_SHORTCIRCUIT=1.
+
+  A BUG IN THE COMMENTED CODE, which would have bitten on enabling: it
+  declares std::pair<int,int> sender_loc, but getLocationFromID returns
+  std::pair<int,uint64_t> -- the local index would truncate.  Fixed.
+
+  THE RACE KALE NAMED IS HANDLED WITHOUT AN EPOCH.  In this library parent
+  ids strictly DECREASE toward the root (find_boss2 refuses to point at a
+  larger id).  So "closer to the root" is exactly "smaller", and accepting
+  only a strictly smaller id can never move a pointer away from the root,
+  whatever happened since X was sent.  No version, no memory of the send:
+      if (src->parent == -1 || grandparentID >= src->parent) { reject; }
+
+RESULT, 2 reps each:
+
+    arm                        Iter0            remote climb hops
+    A  short-circuit off    4612.4 ms [4582.6..4642.1]     337,525
+    B  short-circuit ON     4604.0 ms [4595.6..4612.5]     228,305   -32.4%
+
+    fb1_climb_remote  103,173 -> 66,374   -35.7%
+    fb2_climb_remote  234,352 -> 161,931  -30.9%
+
+    sc_sent               56,493
+    sc_applied             3,401    6.0%
+    sc_rejected_stale     53,092   94.0%
+
+*** IT WORKS AS A MECHANISM AND BUYS NOTHING ON THE WALL.  Remote climb hops
+    fall by a THIRD -- ranges do not overlap on either counter -- and the
+    iteration does not move (the two arms' ranges overlap).  This is the
+    cleanest evidence yet that CHAIN LENGTH IS NOT THE CONSTRAINT.  Two
+    independent mechanisms have now shortened chains and neither bought
+    time: the wave (relay77) and this. ***
+
+AND 94% OF THE BACKWARD MESSAGES ARE ALREADY REDUNDANT when they arrive.
+Careful about what that means: my guard rejects when the offer is not
+strictly closer to the root than the pointer already is.  That is partly
+Kale's race, and partly the local path compression that find_boss1 and
+find_boss2 already do in their while loops, which has usually got there
+first.  Either way, only 3,401 of 56,493 offers improved anything, and the
+53,092 rejected ones are pure added traffic.
+
+====================================================================
+5.  WHAT THIS SAYS ABOUT THE REMEDY
+====================================================================
+
+Kale: "If it is not long chains (and is mostly discards), we may be better
+off collecting remaining edges and current parent/ancestor/root pointers of
+each vertex involved in one and finishing it there."
+
+The premise splits: it is NOT long chains (confirmed twice over), but it is
+also NOT mostly discards.  It is real merges, at one hop, spread thin.
+
+That still points at collect-and-finish, for a different reason than
+discards, and the volumes say it is tractable:
+
+  1. THE VOLUME IS SMALL.  ~132,600 unions in the drain and 4,310 PE-ms of
+     union protocol over the ENTIRE run.  Collecting the residual edges with
+     both current root ids is a few MB, not a few GB.
+  2. IT WOULD KILL THE FLIPS FOR FREE.  16.5% of chains are thrown away and
+     restarted only because the two ROOT ids arrive in the wrong order.  A
+     collector that already holds both roots orders them once and never
+     flips.
+  3. IT ATTACKS THE RIGHT QUANTITY.  The drain costs 265 ms of wall for
+     958 PE-ms of work -- a ratio of 280x.  Nothing that makes each hop
+     cheaper or each chain shorter can touch that; only removing the
+     round-trips can, and finishing in one place removes them by
+     construction.
+
+THE OPEN RISK, and it should be stated before anyone builds it: the residual
+edges are not known in advance, so "collect what is left" needs a point at
+which the streamed cascade is known to be nearly done -- and relay76 showed
+that the fireUF2Edges barrier is exactly where the forest is NOT settled.
+The collector would have to work from a cheap census rather than a barrier.
+That is the same trigger problem the wave died of, so it deserves an answer
+before code, not after.
+
+NOT MEASURED: the census costs nothing detectable (arm A 4612.4 ms against
+relay77's uncensused 4634.1 ms, overlapping), so the counters can stay on for
+any follow-up.  GPU arm not run.
+
+====================================================================
+6.  KALE WAS RIGHT ABOUT THE PARTIAL ORDER.  MY GUARD IS SOUND, MY
+    JUSTIFICATION FOR IT WAS NOT.
+====================================================================
+
+Kale: "'parent ids decrease' is a partial order.  I don't think it implies
+equivalence between 'closer to root' and 'smaller'."
+
+Correct, and my §4 wording was wrong.
+
+WHAT IS ACTUALLY TRUE.  Every site that assigns a parent gives the vertex a
+STRICTLY SMALLER id -- verified at all five: find_boss2's union branch (guarded
+by boss1ID < src->vertexID, else it flips), anchor (":v will be smaller here"),
+local_union's two direct branches (unionFindLib.C:655-660, which order tip1
+against tip2 first), and local_path_compression (a tip is always an ancestor).
+So along ANY ONE root path ids strictly decrease.
+
+WHY THAT DOES NOT GIVE THE EQUIVALENCE.  Id order is total; ancestry is
+partial.  Two vertices can be id-comparable with neither an ancestor of the
+other.  My argument silently assumed the proposed G and the current parent P'
+both lie on src's CURRENT root path.  That fails exactly under path
+compression: if src's pointer has already jumped over G, then G is no longer on
+src's path at all, and "which is closer to the root" is not even defined for
+the pair.  So "the guard never moves the pointer away from the root" is NOT a
+theorem.  Kale's objection is right as stated.
+
+*** THE GUARD IS STILL SAFE, FOR TWO SIMPLER REASONS THAT DO NOT NEED THE
+    EQUIVALENCE.
+
+    (a) NO CYCLE.  By the min-heap invariant every descendant of src has a
+        strictly LARGER id than src.  The offered G has a smaller id than src
+        (it was an ancestor when the message was built).  So G can never be a
+        descendant of src, and pointing src at G cannot close a cycle.  This is
+        the property the existing CkAssert was groping at.
+
+    (b) RIGHT COMPONENT.  G was in src's tree when the message was built, and
+        trees only ever MERGE, never split.  So G is still in src's tree and
+        following G's parents still reaches the root src should reach.  Labels
+        stay correct even if G is off src's current path.
+
+    (c) WHAT THE COMPARISON ACTUALLY BUYS is not "closer to the root" but a
+        strictly DECREASING id on each accepted write.  That is a well-founded
+        measure, so accepted updates cannot oscillate or livelock.  Progress,
+        not distance. ***
+
+CONSEQUENCE FOR THE §4 READING.  I described the 94% rejected offers as
+"already matched or beaten".  That is stronger than the data supports.  The
+honest statement is: 94% of offers did not carry a strictly smaller parent id
+than the one already installed.  That is consistent with the sender having
+been compressed further already, but it does not prove it.
+
+All arms EXACT with the short-circuit on is evidence the guard is not breaking
+anything, and it is only evidence, not proof.
+
+====================================================================
+7.  WHAT add_size DOES, AND WHY THE ALGORITHM NEEDS IT
+====================================================================
+
+WHAT.  add_size(v, delta) adds delta to the size of the ROOT reachable from v.
+If v is not a root it forwards to v's current parent -- recursively, by remote
+message when the parent is off-chare.  So it is a second pointer-chasing climb,
+running concurrently with the find chains.
+
+WHERE IT IS CALLED.  Only at a union, and always just BEFORE the parent write:
+find_boss2:407-412, anchor:541-546, and inline in local_union:656-659.  The
+merging root src was a root, so src->size is its whole subtree count, and that
+count is handed to the surviving root.
+
+WHY IT MUST FORWARD RATHER THAN JUST WRITE.  Between find_boss2 observing that
+boss1 was a root and the add_size landing there, boss1 may itself have been
+merged under some other root.  A plain write would strand the count on a
+non-root, where nothing would ever read it, and the component size would come
+out short.  Forwarding makes the delta land at whatever the CURRENT root is.
+The comment at unionFindLib.C:721 says exactly this.
+
+WHY IT IS EXACTLY-ONCE, which is the part that makes the whole thing correct.
+The size transfer and the parent write happen inside ONE entry-method
+execution, and Charm entry methods on a chare are non-preemptive.  So any other
+add_size aimed at src is processed strictly before or strictly after, never
+interleaved:
+    processed BEFORE : its delta is already inside src->size and is carried
+                       along by the transfer.
+    processed AFTER  : src now has a parent, so it forwards upward.
+Either ordering counts every vertex exactly once.
+
+THE INVARIANT, PLAINLY.  A vertex's size field is meaningful ONLY while it is a
+root.  Once it has a parent the field is dead -- its contribution has already
+been passed up -- and every later delta bypasses it by forwarding.  The sum of
+size over roots is therefore invariant and equals the vertex count.
+
+WHAT CONSUMES IT.  set_component(i, componentNumber, size) at :1042 delivers
+the label together with its size; the app reports max_size (our EXACT gate
+value 185,317,566) and prune_components uses it.  So a lost or double-counted
+delta breaks the gate immediately.  Every arm in relay74-78 being EXACT is a
+real check on all of the above, not a formality.
+
+MEASURED.  41,377 of 479,445 add_size calls (8.6%) had to forward, i.e. the
+root had moved under them.  Average add_size chain 1.09 hops.  So the
+"root moved" race is real at about one in twelve.
+
+====================================================================
+8.  ACIC AS THE TRIGGER -- and the one number that reshapes the design
+====================================================================
+
+Kale: "The moment has to be after the treewalk is completely finished (or else
+new edges will trickle in).  An asynchronous reduction (every PE contributing
+when it is done with all its treewalks, even though it can still respond to
+others' requests with addCache) will help identify that. ... broadcast /
+async reduction / delay-at-root / broadcast cycles (ACIC).  The reductions
+collect remaining edges not yet submitted.  The question of unions in flight
+has to be dealt with."
+
+THIS IS THE RIGHT SHAPE AND IT SOLVES WHAT KILLED THE WAVE.  The wave needed a
+moment defined on the CASCADE, which has no local completion predicate -- no PE
+can know the cascade is nearly done.  "I have finished my own tree walks" IS
+locally decidable, so a reduction can detect it, and serving addCache after
+contributing is exactly right because cache service is not edge-producing.
+
+*** BUT THE EDGES ARE ALREADY IN.  union_requests batch messages: 73,365 during
+    the walk against 4,000 after the walk is 99% done -- about 5%.  At -E 16
+    that is ~1.24M edges submitted, and essentially all of them are submitted
+    before the drain begins.  So a reduction that collects "remaining edges not
+    yet submitted" would collect almost nothing.  What is left in the drain is
+    the CASCADE of already-submitted edges, not unsent edges. ***
+
+That reframes the payload, and it splits the design in two:
+
+OPTION 1 -- DO NOT STREAM THE BOUNDARY EDGES AT ALL; GATHER THEM.
+  Then nothing is ever in flight, by construction, and the in-flight question
+  disappears instead of being solved.  The volumes say it is tractable:
+      distinct cross-chare edges   ~453,000   (543,048 chains minus the
+                                               89,865 flips, which are
+                                               re-issues of the same edge)
+      vertices they touch          <= ~906,000
+      as a contracted graph        ~7 MB
+  A sequential union-find over 453k edges is a few milliseconds.  The
+  same-chare fast path (794,192 local_unions) stays where it is and only its
+  local ROOTS enter the gather.
+  COST: the streaming overlap, measured at 104 ms (relay76, E0 - E16).
+  GAIN: the whole distributed protocol -- 265 ms of drain and 4,310 PE-ms --
+  becomes gather + sequential pass + one broadcast of the root remapping.
+  ON PAPER that is net 150-200 ms, 3-4% of the CPU iteration, AND it removes
+  the 16.5% flips for free, because whatever finishes centrally holds BOTH
+  roots and orders them once.  NOT MEASURED -- this is arithmetic, not a run.
+
+OPTION 2 -- KEEP STREAMING, MOP UP WITH ACIC.
+  Then in-flight unions must be handled, and ACIC already gives the rounds.
+  Have each PE contribute (union_messages_sent, union_messages_received) in the
+  same reduction.  If the two global totals are EQUAL in a round and no PE did
+  union work since the previous round, nothing is in flight.  That is Mattern's
+  four-counter method: two consecutive consistent rounds, no runtime-wide
+  quiescence needed.  The library already has increase_message_count() hooks
+  under #ifdef PROFILING, so the counting points exist.
+
+  THE HARD PART OF OPTION 2, and it is a real one: to collect mid-cascade you
+  must know WHICH edges are still unresolved, and the library does not track
+  that -- an edge is forgotten the instant its find_boss1 is sent.  Mid-cascade
+  collection therefore needs new per-chare bookkeeping (an outstanding-edge set,
+  retired on union / discard / flip).  Option 1 needs none of it.
+
+MY READING: option 1 is the one the numbers favour, and it is also the smaller
+change.  The 104 ms of lost overlap is a known, already-measured price; the
+265 ms drain and the flips are the return.  Option 2 keeps the overlap but buys
+the in-flight problem and the bookkeeping with it.
+
+NOT MEASURED and worth stating: whether the gather itself scales -- 453k edges
+is one reduction, but the broadcast of the remapping is up to ~906k entries,
+and neither has been timed at 16 nodes.
+
+====================================================================
+9.  -u serial IS OPTION 1, AND THE CAMPAIGN ALREADY MEASURED IT.
+    MY §8 ARITHMETIC WAS INCOMPLETE -- RETRACTED.
+====================================================================
+
+Kale: "Option 1 has been explored in previous campaigns.  It has other
+additional costs beyond the cost of gathering (propagating results back?).
+You may find options for that in the code (-u serial)."
+
+Found, and he is right on both counts.
+
+WHAT -u serial IS (FoFPhase3.h:412-441, UF2Mode::Serial):
+    verifySharedLeaves -> resetPhase3 -> walk + CkWaitQD
+    -> flushPhase3Edges (CONCAT REDUCTION of all edges to the PE 0 driver)
+    -> serial UF_2 on PE 0
+    -> applyGlobalMap BROADCAST
+    -> relabel barrier
+The propagate-back Kale suspected is real and is two of those five stages:
+the map broadcast and the relabel barrier.  My §8 estimate counted only the
+gather and the sequential pass.  RETRACTED.
+
+WHAT THE RECORD ALREADY SAYS:
+  - FoFPhase3.h:418 "The gather-to-one UF_2 is fine to about a million edges
+    (49k edges at 80M particles / 32 processes measured 2026-08-04); the
+    distributed UF_2 (-u dist) exists for beyond that."  Our 2B run submits
+    ~1.24M edges -- at or past that stated ceiling.
+  - Main.C:180-188: with the PE-set split active (default AUTO, one set per
+    PE) "serial's root gather cannot absorb the split's edge inflation: at 2B
+    it is a NET LOSS against no split at all (+28%,
+    design/phaseab-balancing.md section 38)".
+
+So gather-to-one at 2B is measured and it loses.  §8's "net 150-200 ms on
+paper" ignored the propagate-back, the single-PE gather, and the split's edge
+inflation, and it should not be quoted.
+
+ONE BONUS THE SERIAL PATH HAS that is worth remembering: its whole uf2
+bracket is QD-FREE BY CONSTRUCTION -- gather reduction in, map broadcast plus
+relabel reduction out -- which also makes it a workaround for the LCI
+idle-stall, where the -u dist bracket's dependent chains and closing QD each
+pay the penalty serially (FoFPhase3.h:433-441).
+
+THE ONE VARIANT THE RECORD DOES NOT COVER, flagged only because Kale said he
+will revisit: -u serial gathers ALL edges (~1.24M).  The dist path already
+resolves 794,192 same-process unions locally on the chare, leaving only
+~453,000 cross-process edges.  A gather of the CONTRACTED set is about a
+third the size of what serial gathers today, and that is a different
+experiment from the one that measured +28%.
+
+====================================================================
+10. add_size IS DEAD WORK IN THIS APPLICATION.  KALE IS RIGHT, AND IT
+    IS STRONGER THAN "THERE IS ANOTHER PASS".
+====================================================================
+
+Kale: "Isn't there another pass at the end for finding sizes via a custom
+reduction over all non-local components, after every local tip gets its
+global label?"
+
+There is, and it is the ONLY one that is read.  The evidence chain, all of it
+checked in the source:
+
+  1. The app SEEDS the field meaningfully: FoFPhase1.h:1145
+     "v.size = kv.second; // fragment size (particle count), not the default 1".
+  2. The library maintains it at every union through add_size, forwarding to
+     the current root (§7).
+  3. find_components -> set_component propagates BOTH componentNumber and
+     componentSize to every vertex (unionFindLib.C:1042 and the set_component
+     body).
+  4. *** THE APP READS BACK LABELS ONLY.  collectComponentLabels
+     (unionFindLib.h:146) copies componentNumber and nothing else:
+         for (auto& kv : lazy_store) out[kv.first] = kv.second.componentNumber;
+     and lazy mode is on by construction -- unionFindInitOnePerNode broadcasts
+     enableLazyMode before `ready` fires (unionFindLib.C:1451). ***
+  5. componentSize appears EXACTLY ONCE in the whole app: FoFPhase1.h:1144
+     "v.componentSize = -1;".  It is never read.
+  6. The app never calls prune_components, return_vertices/get_vertices, or
+     report_surviving_components.
+  7. The library's size-consuming path -- merge_count_results plus the custom
+     componentCountMap reduction -- is inside "#if 0 /* Old Code: Reduction
+     using custom structs & maps */".  Dead.
+  8. The app computes sizes ITSELF at the end, from the labels, exactly as
+     Kale described:
+         depositLabelCounts
+         -> histogramShard   (tuple reduction: bins, n_components, MAX_SIZE)
+         -> collectTouchedCounts (cross-process sum over the TOUCHED,
+            i.e. non-local, components only; bins and max_size recomputed
+            from those pairs, FoFPhase1.h:4813-4836)
+
+*** SO max_size -- OUR EXACT GATE VALUE 185,317,566 -- COMES FROM THE LABEL
+    HISTOGRAM, NOT FROM THE LIBRARY'S size.  add_size maintains a quantity
+    that nothing in this application reads. ***
+
+WHAT IT COSTS, from the relay78 census and the traces:
+    add_size calls per run                 479,445
+      of which forwarding hops              41,377   (8.6%)
+    add_size executions in the 265 ms drain 145,129
+      of 476,945 drain protocol messages     30.4%
+
+So roughly THIRTY PERCENT of the drain's message traffic maintains a dead
+field.  This is the cheapest candidate on the table: it REMOVES work instead
+of adding a mechanism, and it needs no trigger -- which is precisely what
+killed the wave.
+
+HONEST CAVEATS, because this is not automatically a win:
+  - add_size is NOT on the find dependence chain.  It is fire-and-forget,
+    issued just before the parent write, and nothing waits on it.  In a
+    latency-bound drain the length is set by the longest dependence chain, so
+    removing a side flow need not shorten it.
+  - But Charm entry methods are non-preemptive: every add_size execution
+    delays whatever find message is queued behind it on that PE, and only
+    ~39 PEs are active in the drain.  Whether that queuing matters is exactly
+    what a measurement would settle.
+  - The library is shared.  Removing add_size outright would break any client
+    that DOES read sizes (dense mode, prune_components).  The right form is a
+    knob, and the library already has the lazy/dense split to hang one on.
+  - local_union also does a direct "size +=" (unionFindLib.C:656-659).  Those
+    are local and harmless; a no-sizes mode can leave them or skip them.
+
+COST TO FIND OUT: one env knob in the library, one production build, one
+16-node job with two arms.  About ten minutes of machine time.  Not run --
+Kale has not asked for it.
+
+====================================================================
+11. CORRECTION: "ON-CHARE" WAS A MISLEADING WAY TO PUT IT, AND KALE
+    IS RIGHT ABOUT WHERE THOSE EDGES COME FROM
+====================================================================
+
+Kale: "'on-chare'?  I assume you mean within process.  But I thought with PE
+sets we are leaving those edges to the dual-walk phase."
+
+Both halves are right, and my sentence in section 9 implied something false.
+
+"ON-CHARE" MEANS WITHIN ONE PROCESS.  UnionFindLib is created by
+unionFindInitOnePerNode -- one library chare per PROCESS, element i on the
+first PE of process i -- so for this library chare == process.  128 chares on
+16 nodes at 8 processes per node.  I should have written "within a process".
+
+AND THE PE-SET POINT IS EXACTLY RIGHT.  With FOF_PE_SETS AUTO the split
+resolves to PEs-per-process (src/common.h:89-91: "sets == ppn defers ALL
+cross-PE pairs to the phase-3 walk"), so at ppn 7 every pair that crosses a PE
+boundary -- including pairs inside the SAME process -- is omitted from the
+phaseB pool and left to the dual walk.  Those edges absolutely do go through
+the walk.
+
+WHAT I SHOULD HAVE SAID.  The 794,192 local_unions are not edges that skipped
+the walk.  They are walk-generated uf2 edges whose two endpoints happen to map
+to the SAME union-find chare, so union_request's fast path
+(unionFindLib.C:173-180) resolves them with a local sequential union and ZERO
+messages.  The sequence is: PE-set split defers the pair -> dual walk emits the
+edge -> uf2 receives it -> same-process pairs are absorbed for free.
+
+    uf2 edges submitted at 2B/16n, ppn 7      ~1,247,000
+      same-process, absorbed by local_union      794,192   64%
+      cross-process, run through find_boss        453,183   36%
+
+*** AND THIS IS THE MECHANISM BEHIND THE +28% SERIAL NOTE.  The PE-set split
+    manufactures those 794k same-process edges.  The DIST path absorbs them for
+    nothing -- no messages at all.  The SERIAL path cannot: flushPhase3Edges
+    concatenates EVERY edge to PE 0, so the split's inflation lands squarely in
+    the gather, which is precisely what Main.C:180-188 records as "serial's
+    root gather cannot absorb the split's edge inflation: at 2B it is a net
+    loss against no split at all (+28%)".  The two facts are one fact. ***
+
+WHICH MAKES THE UNTRIED VARIANT SHARPER THAN I PUT IT IN SECTION 9.
+Contract-then-gather is not a general nicety -- it is specifically the repair
+for what makes serial lose under the split: keep uf2's local_union fast path so
+the 794k never enter the gather, and concatenate only the ~453k cross-process
+edges expressed as (local_root_a, local_root_b).  That is about a third of what
+-u serial gathers today, and it is a different experiment from the one that
+measured +28%.  Still flagged only -- Kale said he will revisit.

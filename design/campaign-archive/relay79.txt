@@ -1,0 +1,98 @@
+relay79 -- add_size IS DEAD WORK, AND REMOVING IT IS WORTH -1.9%.
+2026-08-22.  Job 5326437, all arms EXACT.
+
+  binary  merged/FoF3.cpu-prod-nsz  e87d47d9814a79bebc328225fe42fa17
+  patch   patches/relay79-unionfind.diff + relay79-paratreet2.diff (see patches/APPLY.md)
+          (working tree on 57f2395 / d72ee66, NOT pushed)
+  job     sbatch/relay79-nosizes-16n.sbatch
+
+THE CLAIM UNDER TEST (relay78 section 10, from the source): the union-find
+`size` field is never read in FoF3.  The app seeds it, the library maintains it
+through add_size, set_component propagates it -- and then
+collectComponentLabels returns componentNumber ONLY.  Sizes and max_size come
+from the LABEL histogram at the end.
+
+====================================================================
+1.  THE RESULT
+====================================================================
+
+CPU best, ppn 7, -l 32, -E 16, 2 reps each, warm-up discarded.
+
+    arm                      Iter0                    walk       uf2
+    A  FOF_UF_SIZES=1     4629.9 ms [4625.2..4634.7]  0.499 s   0.039 s
+    B  FOF_UF_SIZES=0     4541.0 ms [4538.2..4543.7]  0.420 s   0.040 s
+
+    B - A   -88.9 ms   -1.92%      ranges SEPARATED by 81 ms
+    walk    -79 ms     -15.8%      the cost was in the walk bracket, where
+                                   the cascade runs concurrently -- NOT in
+                                   the uf2 residue, which does not move
+
+*** BOTH B REPS ARE EXACT.  The gate checks components (424,897,832) AND
+    max_size (185,317,566).  If `size` were read anywhere on the path to
+    either number, arm B would have come out DIFFERS.  It did not.  That is
+    direct evidence for the relay78 section 10 source analysis, not just
+    consistency with it. ***
+
+====================================================================
+2.  THE KNOB GATE AND THE INTERNAL CONTROL
+====================================================================
+
+The knob is positive on both sides, and one identity is exact:
+
+    arm A   addsize_root 437,962-439,761   addsize_SKIPPED 0
+    arm B   addsize_root 0                 addsize_SKIPPED 436,538 / 438,207
+    and in BOTH B reps  addsize_SKIPPED == fb2_UNION  EXACTLY
+      (435,751 == 435,751 walk;  437,563 == 437,563 walk)
+
+That identity is the check that the gating is in the right place: one skip per
+union, no more and no fewer.
+
+INTERNAL CONTROL -- skipping add_size must not change the union protocol
+itself, and it does not.  Across the four arms:
+
+    counter                 A reps              B reps
+    fb1_root            544,878 / 543,359   541,184 / 543,258
+    fb2_UNION           439,761 / 437,962   436,538 / 438,207
+    fb2_SAMEROOT_discard 15,150 /  15,075    15,021 /  15,091
+    fb2_flip             89,967 /  90,322    89,625 /  89,960
+
+All four move by less than run-to-run variation.  The forest built is the same
+forest; only the size bookkeeping is gone.
+
+====================================================================
+3.  WHAT WAS REMOVED
+====================================================================
+
+    add_size calls per run        ~479,000   (438,000 root + 41,000 forwarding)
+    of the drain's protocol messages   30.4%
+    cost measured                  -88.9 ms of a 4630 ms iteration
+
+The prediction in relay78 section 10 was hedged: add_size is NOT on the find
+dependence chain -- it is fire-and-forget, issued just before the parent write,
+and nothing waits on it -- so removing a side flow need not shorten a
+latency-bound drain.  It shortened it anyway, and the -79 ms in the WALK
+bracket says why: Charm entry methods are non-preemptive, so every add_size
+execution was delaying whatever find message sat behind it in the queue.
+Removing the traffic removes that queuing delay.
+
+====================================================================
+4.  WHAT THIS IS AND IS NOT
+====================================================================
+
+IT IS: the cheapest result of the campaign.  It removes work rather than adding
+a mechanism, it needs no trigger -- the thing that killed the wave -- and it is
+one env knob.
+
+IT IS NOT a library change that can be pushed as-is.  unionFindLib is shared,
+and a client that DOES read sizes (dense mode, prune_components) would break
+silently.  The knob form is right; what belongs upstream is a documented
+no-sizes mode, defaulting to the current behaviour, with FoF3 opting in.  Note
+also that local_union still does its direct "size +=" (unionFindLib.C:656-659);
+those are local and message-free, so they were left alone, and it means the
+field is inconsistent rather than absent under the knob -- which is exactly why
+this must be opt-in rather than a deletion.
+
+NOT MEASURED: the GPU arm, and a traced run of arm B to confirm the drain
+itself shrank rather than only the queuing around it.  The wall and the walk
+bracket both moved, so the direction is not in doubt; the mechanism inside the
+drain is inferred, not seen.

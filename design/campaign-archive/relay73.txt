@@ -1,3 +1,13 @@
+*** CORRECTION HEADER, added 2026-08-22 by relay74 (job 5324786).
+    Section 2 attributes 82% of the GPU gain to the component_histogram row
+    and then calls that row "the PREFIX REMOVAL, not the dense histogram".
+    THE 82% ARITHMETIC STANDS; THE ATTRIBUTION DOES NOT.  A three-point
+    build ladder shows the row's gain is the SORT-SCAN PAIR PATH, and that
+    the prefix removal slightly worsens it.  See reports/relay74.txt.
+    THE -9.61% MEASUREMENT ITSELF IS UNAFFECTED: it is a paired OLD-vs-NEW
+    comparison and does not depend on which commit inside NEW earns it.
+    The GPU arm has not been ladder-tested. ***
+
 relay73 -- THE GPU HEADLINE, PINNED.  Job 5324710, 16 nodes, 2B, 896 PEs.
 2026-08-21.  Three reps, PAIRED against the old binary in one allocation.
 

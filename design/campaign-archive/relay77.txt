@@ -1,0 +1,162 @@
+relay77 -- THE PERIODIC MID-CASCADE WAVE (FOF_WAVE_MS).  It is worse, and the
+attribution says exactly why.  2026-08-22.
+
+  paratreet2 main   57f2395   (40cfafb arms the waves at walk start)
+  unionfind  master d72ee66   (QD-safe periodic tick)
+  PULLED from GitHub this morning; queue was empty, per the standing policy.
+  Nothing pushed, nothing modified locally.
+
+  binaries   merged/FoF3.cpu-prod-wms    635043ae4ff57c7c86eb3f6cc0efc375
+             merged/FoF3.cpu-prodtr-wms  32c9c90746dd65c47541434a660cec25
+  scripts    merged/build-wavems.sh, merged/build-wavems-tr.sh
+             sbatch/relay77-waveperiodic-16n.sbatch  (job 5325960)
+             sbatch/relay77tr-traces-16n.sbatch      (job 5325970)
+             scripts/relay77-waveattrib.py
+
+BUILD GATE.  unionFindLib.ci gained "entry void wave_arm()", so the 2026-08-21
+stale-decl.h trap was live.  Full scrub, then the gate read the REGENERATED
+header rather than the build's exit status: wave_arm 17 occurrences,
+compression_wave 17, wave_need_root_batch 19, "long compNum" 10 (the 08-21
+truncation still fixed), int compNum 0.  Binary gate: FOF_WAVE_MS present,
+the new "run total" banner present (an old unionfind would not carry it),
+boss_count_prefix 0, TraceProjections 0 on the production binary and 475 on
+the traced one.
+
+====================================================================
+1.  THE SCREEN -- job 5325960, 2 reps each, all arms EXACT
+====================================================================
+
+CPU best: ppn 7, -l 32, -E 16, production, warm-up arm discarded.
+
+    arm                     mean Iter0      range            walk     passes
+    A  wave off              4634.1 ms   [4626.6..4641.5]   0.502 s     0
+    B  FOF_WAVE_MS=25        7936.8 ms   [7737.5..8136.0]   3.420 s     9
+    C  FOF_WAVE_MS=10       12794.2 ms  [12109.6..13478.9]  8.189 s    15.5
+
+    B  +3302.7 ms   +71.3%    ranges SEPARATED from A
+    C  +8160.2 ms  +176.1%    ranges SEPARATED from A
+
+Halving the period roughly doubles the loss.  The cost lands in the WALK
+(0.502 -> 3.420 -> 8.189 s), not in the uf2 residue (0.038 -> 0.429 -> 0.516).
+
+*** THE NUMBER THAT SETTLES IT IS NOT THE WALL, IT IS THE REWRITE COUNT.
+    A rewrote nothing.  B rewrote 255.  C rewrote 263.  The single-shot v1 at
+    the barrier rewrote ~259.  Nine passes and sixteen passes find the SAME
+    amount to compress as one pass did.  The benefit is capped at about 260
+    parents no matter when or how often the wave fires; only the cost moves. ***
+
+The traced run makes the cap explicit -- element 0, pass by pass:
+
+    pass    1    2    3    4    5    6    7    8    9
+    rewrote 215  36   0    2    3    0    0    0    0     cumulative 256
+
+Everything compressible is found by pass 2.  Passes 3-9 are pure cost.
+
+====================================================================
+2.  THE ACCEPTANCE TEST -- job 5325970, traced pair, same stack
+====================================================================
+
+Kale's rule for this campaign: the wall is a screen, the attribution is the
+acceptance test.  Traced cpu-off and cpu-w25, both EXACT, 896/896 log.gz and
+896/896 .sumd on both.  relay75's off-arm traces are from e2a877e/2ad91a8 and
+cannot serve as the control for this stack, so the off arm was re-traced here.
+Analysed with scripts/relay77-waveattrib.py.
+
+  *** A DEFECT IN relay75's SCRIPT, FOUND AND FIXED HERE.  relay75-ufattrib.py
+      had NO pattern for the wave's own entry methods -- wave_need_root_batch
+      and wave_set_root -- so wave cost was UNCOUNTED, not merely mixed into
+      union-find.  relay77-waveattrib.py splits 'wave' into its own group.
+      Anyone re-reading relay75's wave numbers should use the new script. ***
+
+    traced walls (tracing costs CPU +2.7-3.2%, NOT production numbers)
+      cpu-off   4648.0 ms    walk 0.550 s   uf2 0.053 s
+      cpu-w25   9935.3 ms    walk 5.395 s   uf2 0.499 s
+
+    TOTAL CPU over the whole run, PE-ms
+      group        cpu-off     cpu-w25
+      walk         21633.2     21729.5     unchanged
+      unionfind     4449.3      4164.7     unchanged
+      wave              0.0    25636.9     <-- NEW COST
+      ALL        6543908.5   6530772.2
+
+*** THE WAVE COSTS 25,637 PE-ms TO SAVE NOTHING ON A 4,165 PE-ms UNION-FIND.
+    It spends 6.2 times the entire union-find CPU of the run.  That is the
+    whole result in one line. ***
+
+    THE DRAIN, measured the same way in both arms
+      quantity                    cpu-off      cpu-w25
+      drain length                 313 ms      5570 ms      18x LONGER
+      union-find CPU in it        1097.1      967.6 PE-ms   UNCHANGED
+      ALL CPU in it               2831.2    28601.2 PE-ms
+      machine utilisation          1.01%       0.57%
+      mean active PEs               39.3        10.4 of 896
+      wave CPU in it                 0.0    22735.9 PE-ms
+
+*** THE ACCEPTANCE TEST FAILS OUTRIGHT.  The 313 ms drain did not shorten.
+    The union-find work inside it is the SAME (1097 -> 968 PE-ms, inside the
+    run-to-run spread).  What the wave did was wrap that unchanged cascade in
+    a second, larger cascade of its own and stretch the window 18-fold. ***
+
+WHERE THE PASSES LAND.  88.7% of the wave's CPU falls AFTER the walk is 99%
+complete -- it is not mistimed early, it is mistimed late, and it arrives on
+top of the very idleness it was meant to remove.
+
+      inside the walk   bins 10284..10608     2899.8 PE-ms   11.3%
+      inside the drain  bins 10609..16178    22735.9 PE-ms   88.7%
+
+      burst   bins             ms    wave PE-ms   walk PE-ms in same bins
+        1-5   10282..10335     ~50          2.7                    1996.2
+        6     10339..15678    5340      22850.3                   18250.9
+        7     15680..16137     458       2783.9                       0.0
+
+Nine passes from element 0 produce ONE 5.34-second continuous burst of wave
+entry methods.  Each pass is a full sweep over every local vertex that emits a
+global message cascade; the cascades overlap and take seconds to drain.  The
+pass cost does not depend on how much there is to compress.
+
+====================================================================
+3.  WHY THE MECHANISM CANNOT WORK, IN ONE PARAGRAPH
+====================================================================
+
+A wave pass costs O(all vertices) in sweep plus a global message cascade that
+is itself latency-bound in exactly the way the drain is.  What it can win is
+capped at ~260 parent rewrites, and pass 2 already has all of them.  Fixed
+large cost, fixed tiny benefit, so firing more often can only lose -- which is
+precisely what B and C measure, and why halving the period doubles the loss.
+
+This is the constraint the relay75 addendum named this morning.  The addendum
+retracted "the forest must be deep and STABLE" and said the real constraint is
+COST PER FIRING, because compression degrades gracefully and stability is not
+required.  relay77 confirms that reading from the other side: stability was
+never the problem, and firing during the cascade -- exactly what relay75
+section 6 point 3 asked for -- makes things much worse, not better.
+
+The wave has now been tested at THREE trigger points, and the evidence is
+complete:
+    at the barrier, -E 16   forest already settled     ~259 rewrites, +57 ms
+    at the barrier, -E  0   forest not yet built       ~259 rewrites, +29 ms
+    periodic, mid-cascade   the forest is deep here     255-263 rewrites, +71%
+The rewrite count is the same in all three.  There is no trigger point that
+helps, because the trigger was never what limited it.
+
+====================================================================
+4.  VERDICT
+====================================================================
+
+1. KEEP FOF_WAVE=0 and FOF_WAVE_MS=0.  Both are already the defaults; the code
+   is safe to leave in place.  Every arm in relay74, relay76 and relay77 is
+   EXACT -- the mechanism is correct, it is simply not worth its cost.
+2. PARK THE WAVE.  Do not build v3.  A better trigger cannot fix a mechanism
+   whose benefit is capped at ~260 rewrites and whose cost is a global sweep.
+3. THE TARGET IS STILL REAL AND STILL UNCLAIMED.  313 ms on CPU (relay75:
+   348 ms CPU, 274 ms GPU), ~1% utilisation, 39 PEs of 896, union-find work of
+   only ~4.4 PE-seconds stretched over it.  It is a dependence chain, and
+   shortening chains is still the right idea -- but by making the chains
+   shorter as they FORM (in the union protocol itself), not by sweeping the
+   forest afterwards.  That is a different piece of work from this one.
+4. relay75's wave numbers should be re-read with scripts/relay77-waveattrib.py,
+   since relay75-ufattrib.py could not see wave entry methods at all.
+
+NOT DONE, and deliberately: mode 2 at 2B (known +12.69%, relay76), and any GPU
+arm.  The CPU result is so far outside the spread that a GPU confirmation would
+not change the verdict.

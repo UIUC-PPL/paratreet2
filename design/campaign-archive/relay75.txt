@@ -1,0 +1,238 @@
+relay75 -- ANATOMY OF THE UNION-FIND DRAIN, and what it means for the wave.
+2026-08-22, overnight, autonomous.
+PART 1 below is complete and rests on the EXISTING relay65 traces (job
+5322240).  PARTS 2 and 3 are jobs 5324831 (traces of the current stack) and
+5324916 (the wave-position test); both were still queued at 00:52 and their
+sections are appended when they land.
+
+====================================================================
+1.  THE DRAIN, MEASURED -- and Kale's observation confirmed exactly
+====================================================================
+
+Kale, 2026-08-22: "in the cpu-best traces the walk plus UF was 10.7 to 11.3
+(600 ms) and the last 300 ms of which was a very low utilization tail, which
+had nothing but union-find".
+
+Measured on those same traces with entry-method attribution across the WHOLE
+run (scripts/relay75-ufattrib.py), rather than from the uf2 bracket, which by
+construction cannot see this:
+
+    walk EPs active            bins 10700..11274
+    union-find EPs active      bins 10693..11335
+    walk is 99% complete by    bin  11001
+
+    THE DRAIN: 334 ms after the walk is 99% done
+      union-find CPU in it       1053.7 PE-ms   (23.2% of all union-find)
+      ALL CPU in it              2782.1 PE-ms
+      machine utilisation        0.93%
+      mean active PEs            37.3 of 896
+      perfectly spread, that work is 3.1 ms -- not 334 ms
+
+His 300 ms is 334 ms and his "nothing but union-find" is right: union-find is
+1053.7 of the 2782.1 PE-ms in the window, and the rest is mostly the runtime
+idling.
+
+*** THE DECISIVE NUMBER IS NOT THE 334 ms, IT IS THE RATIO.  Total union-find
+    CPU over the ENTIRE run is 4544.3 PE-ms = 5.07 ms per PE.  Union-find is
+    not compute-heavy at all.  The drain is 1054 PE-ms of work stretched over
+    334 ms of wall -- a factor of 108.  This is a POINTER-CHASING DEPENDENCE
+    CHAIN, not a load imbalance and not a work problem.  No amount of
+    rebalancing touches it; shortening the chains is the only lever, which is
+    exactly what a compression wave is for. ***
+
+====================================================================
+2.  THE SHAPE OF THE DRAIN  -- corrected, see the sampling error below
+====================================================================
+
+*** A SAMPLING ERROR OF MINE, CAUGHT AND CORRECTED.  My first pass read only
+    the first 96 PE logs and found "14 participants, median 5 bursts, median
+    span 16.7 ms, one PE engaged for 305 of 334 ms", and I wrote that the
+    drain looked like a deep chain that funnels to a few PEs.  THAT WAS AN
+    ARTEFACT OF THE SAMPLE.  The heavy participants are concentrated in the
+    high-numbered PEs (350-861), which were not in the first 96.  Reading ALL
+    896 logs gives a completely different and much simpler picture. ***
+
+All 896 Projections logs, relay75 cpu-off, over the 348 ms drain:
+
+    PEs with union-find activity in the drain      128 of 896  (14%)
+    span of activity, per participating PE         median 309.6 ms
+                                                   p90    340.1 ms
+                                                   max    348.0 ms
+    PEs still doing union-find in the LAST 100 ms  128 -- ALL of them
+    events per PE                                  2,668 to 33,309
+
+So it is NOT one long chain funnelling to a boss.  It is 128 PEs, all
+engaged for essentially the WHOLE drain, all still working at the end, each
+doing thousands of small union-find operations.
+
+    union-find CPU in the drain    1196 PE-ms
+    per participating PE            9.3 ms of CPU over 348 ms of wall
+    => each participant is about 97% IDLE, waiting
+
+That is a distributed latency-bound cascade across 14% of the machine, not a
+serial chain.  Every one of those PEs is waiting on remote round trips
+almost all of the time, and they finish together.
+
+====================================================================
+3.  WHY THE WAVE DID NOT HELP, QUANTITATIVELY
+====================================================================
+
+e2a877e fires the wave in runFoFPhase3Dist AFTER t2, at the fireUF2Edges
+barrier, and before the QD that drains the remaining cascades.  Its comment
+says that QD "is exactly the near-idle tail the wave shortens".
+
+    t_uf2 (= fireUF2Edges + QD + find_components)      ~50 ms in relay65
+    walk EP activity ends                              bin 11274
+    so the fireUF2Edges barrier sits at roughly         bin 11285
+    the drain runs                                     bins 11001..11335
+
+*** ABOUT 284 ms OF THE 334 ms DRAIN HAS ALREADY ELAPSED BEFORE THE WAVE
+    FIRES -- roughly 85% of it.  The trace shows a small bump at bins
+    11268-11293, which is the barrier plus find_components; everything
+    before it is the drain the wave was meant to shorten, already spent. ***
+
+That single fact explains all three relay74 observations without needing any
+other mechanism: the wave rewrites only ~256 parents at 2B (the forest is
+already largely settled by the time it runs), it costs +50 ms (a broadcast
+and cascade over a settled forest), and the drain is untouched (it happened
+upstream).
+
+SO THE relay74 VERDICT NEEDS RESTATING.  It is not "the compression wave is
+a bad idea".  On this evidence the wave is aimed at exactly the right
+structure -- a deep dependence chain that rebalancing cannot fix -- and v1
+simply fires at the wrong milestone.  The fireUF2Edges barrier is attractive
+because it is census-free, but edge streaming (-E 16) moved the work off it.
+
+BEST CASE IF IT FIRED AT THE RIGHT POINT: the drain is 334 ms of a 4556 ms
+CPU iteration, so about 7%.  That is an upper bound, not a forecast -- it
+assumes chains collapse to depth <= 2 and the drain collapses with them.
+
+====================================================================
+4.  WHAT IS STILL OPEN (jobs queued at 00:52, sections to follow)
+====================================================================
+
+  - job 5324831 (relay75 traces): does the 334 ms drain still exist on the
+    CURRENT stack?  The prefix removal changed when labeling starts, so it
+    could have moved.  Three traced arms: cpu wave-off, cpu FOF_WAVE=1,
+    gpu wave-off.  The cpu-wave1 arm will show directly whether the wave
+    touches the drain region at all.
+  - job 5324916 (relay76): the position hypothesis tested with NO code
+    change.  -E 0 turns edge streaming off, moving the whole cascade into
+    the uf2 bracket where the wave fires.  If the wave is sound but mistimed
+    it should rewrite far more than 256 parents there and RECOVER time; if
+    it still costs time with a deep forest in front of it, the mechanism is
+    wrong rather than its position.
+
+Tools written for this: scripts/relay75-ufattrib.py (entry-method
+attribution across the whole run, plus automatic drain detection) and
+scripts/relay75-chain.py (Projections-level burst/wait structure).
+
+====================================================================
+5.  THE ANSWERS  (jobs 5324831 and 5324916, landed 02:15)
+====================================================================
+
+5a.  THE DRAIN SURVIVES THE PREFIX REMOVAL, ON BOTH ARMS.
+
+    stack / arm                 drain   union-find    util    active PEs
+    relay65 cpu-best (old)      334 ms   1053.7 PE-ms  0.93%     37.3
+    relay75 cpu-off (current)   348 ms   1196.0        0.94%     35.3
+    relay75 gpu-off (current)   274 ms    603.3        0.89%     32.6
+
+Kale's "maybe that has changed with prefix related changes, but seems
+unlikely" was right.  It is unchanged within noise on the CPU arm and
+present on the GPU arm too.  Union-find remains tiny in CPU terms --
+4603 PE-ms over the whole CPU run, 4090 on GPU -- so on both arms the drain
+is a dependence chain, not work.
+
+5b.  THE WAVE MAKES THE DRAIN LONGER, NOT SHORTER.
+
+    relay75 cpu-off    (wave off)  drain 348 ms   union-find 1196.0 PE-ms
+    relay75 cpu-wave1  (FOF_WAVE=1) drain 409 ms  union-find 1331.0 PE-ms
+
+    +61 ms of drain, and the wall agrees: relay76 measured +57.4 ms at
+    -E 16 over two reps.
+
+5c.  I OVER-READ THE BANNER, AND THE CORRECTION MATTERS.
+
+relay74 and my first note last night said the wave "found almost nothing to
+compress -- element 0 rewrote 256 parents locally".  THAT READING WAS WRONG.
+In unionFindLib.C, `rewrote` counts ONLY element 0, and only the vertices
+whose parent happens to be on the SAME element; every remote parent goes out
+through wave_need_root_batch and is never counted.  The banner is a tiny
+unrepresentative slice, not a measure of the wave's work.
+
+Measured properly from the trace, the wave does a full pass:
+
+    wave_ EPs          1.02 s busy   414,543 calls   122 PEs
+    insertDataFindBoss 2.84 s        1,143,803 calls
+    union_request      1.51 s           77,495 calls
+
+So it is not idle.  It costs 1022 PE-ms and returns nothing.
+
+5d.  WHY -- AND IT IS NOT ONLY THE POSITION.
+
+The wave's entry methods run in bins 11290..11366, a 77 ms burst.  The drain
+runs 10996..11405.  So the wave fires 294 ms into a 409 ms drain -- about
+72% of the way through it -- and 100% of the wave's CPU lands inside the
+drain window.  The union-find work per 25 ms bucket has already decayed from
+363.6 PE-ms at the start of the drain to 27-53 PE-ms by the time the wave
+runs.  It arrives at the thin end.
+
+BUT THE POSITION IS NOT THE WHOLE STORY, and this is the result I did not
+expect.  relay76 tested the position hypothesis with no code change: -E 0
+turns edge streaming off, moving the entire cascade into the uf2 bracket
+where the wave fires.
+
+    arm        Iter0      walk     uf2      wave delta
+    E16-off   4597.6 ms   0.487 s  0.042 s
+    E16-w1    4655.0      0.491    0.090    +57.4 ms  (+1.25%)
+    E0-off    4701.7      0.272    0.348
+    E0-w1     4730.9      0.267    0.385    +29.2 ms  (+0.62%)
+    E0-w2     4809.5      0.271    0.468   +107.7 ms  (hedge)
+
+    for reference, streaming itself is worth -104.1 ms (E0 - E16 = +104.1)
+
+*** WITH THE WHOLE CASCADE MOVED BEHIND THE BARRIER -- uf2 goes 0.042 ->
+    0.348 s, an eight-fold deeper bracket sitting directly in front of the
+    wave -- THE WAVE STILL COSTS TIME (+29.2 ms) AND STILL REWRITES THE SAME
+    ~259 PARENTS ON ELEMENT 0.  Moving the work to the wave did not give the
+    wave more to do. ***
+
+THE EXPLANATION THAT FITS BOTH ARMS.  The wave fires at the fireUF2Edges
+barrier, which is after edges are SUBMITTED but before the QD that PROCESSES
+them.  So:
+  - at -E 16 the cascade already ran during the walk and the forest is
+    settled and shallow by the time the wave arrives;
+  - at -E 0 the cascade has not run YET -- the edges are only submitted --
+    so the forest is still trivial and there is nothing to compress.
+Either way the wave sees a shallow forest, which is exactly why the count is
+the same in both.  There is no single moment at that barrier when the forest
+is both DEEP and STABLE.
+
+====================================================================
+6.  WHERE THAT LEAVES THE WAVE
+====================================================================
+
+1. The target is real and is worth having.  348 ms of a 4700 ms CPU
+   iteration (7.4%) and 274 ms of a 2670 ms GPU iteration (10.3%), at under
+   1% machine utilisation, in a dependence chain that no rebalancing can
+   touch.  Chain shortening is the right idea.
+2. v1 as written cannot reach it.  Not merely mistimed: at its barrier the
+   forest is shallow under BOTH streaming settings, for two different
+   reasons.  Firing it earlier or later at that barrier will not help.
+3. To hit the drain the wave would have to fire DURING the cascade -- while
+   chains are deep and still forming -- which is precisely where there is no
+   barrier, and is why v1 chose the barrier it did.  A census-free trigger
+   inside the drain (a timer, a depth probe on the first PE to notice a long
+   chain, or a wave fired from the QD's own progress) is the design
+   question, and it is a real one rather than a tuning exercise.
+4. KEEP THE DEFAULT OFF.  Both modes are correct -- every arm EXACT in
+   relay74 and relay76, and the components line bitwise identical -- so the
+   knob costs nothing while the trigger is worked out.
+
+ONE CHAIN OR MANY -- ANSWERED, no job needed (section 2).  It is MANY: 128
+PEs, all engaged for essentially the whole drain, all still working at the
+end, each ~97% idle.  So there is no single critical chain to target and a
+targeted fix is off the table -- a GLOBAL mechanism is the right shape after
+all, which is what the wave is.  What it needs is a trigger that fires while
+those 128 cascades are still deep.

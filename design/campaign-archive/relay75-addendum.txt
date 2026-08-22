@@ -1,0 +1,90 @@
+relay75 ADDENDUM -- "deep and STABLE" is the wrong requirement.
+2026-08-22 08:48.  Corrects section 5 of relay75.txt, which you already have.
+Nothing re-measured; every number in relay75 stands.  This is a correction to
+the REASONING, and it makes the design problem easier, not harder.
+
+--------------------------------------------------------------------
+WHAT relay75 SECTION 5 SAID
+--------------------------------------------------------------------
+
+"There is no single moment at that barrier when the forest is both DEEP and
+STABLE."
+
+Kale asked what "stable" was doing there.  It was doing something I cannot
+defend.
+
+--------------------------------------------------------------------
+WHY IT IS WRONG
+--------------------------------------------------------------------
+
+I meant: the forest must not be substantially rewritten by unions arriving
+after the pass, or the shortening the wave does is not the shortening later
+finds traverse.  The word came from the -E 16 side, where I had written the
+forest is "settled and shallow", and I generalised "settled" to "stable".
+They are not the same idea.
+
+Path compression is not invalidated by later unions.  It degrades one level
+at a time.  If the wave points vertex x directly at root R, and R is later
+unioned under R', a find from x costs TWO hops, not the original chain
+length.  Compression done on a forest that is still changing keeps most of
+its value.  Strict stability is not required.
+
+And relay75 section 6 point 3 already contradicts it: it asks for a trigger
+that fires DURING the cascade, "while chains are deep and still forming".  A
+forest that is still forming is not stable.  Section 5 and section 6 were in
+tension and section 5 is the one that is wrong.
+
+--------------------------------------------------------------------
+WHAT THE REQUIREMENT ACTUALLY IS
+--------------------------------------------------------------------
+
+Two conditions, neither of them stability:
+
+  1. DEEP           -- chains are long at that moment, or there is nothing
+                       to shorten.
+  2. PAYBACK AHEAD  -- enough find traversals are still to come for the pass
+                       to repay its own cost.
+
+The two failure modes at the fireUF2Edges barrier, restated:
+
+  -E 16   the cascade already ran during the walk.  Chains are short AND the
+          traversals that would have benefited are already done.
+          BOTH conditions fail.
+
+  -E 0    the edges are only submitted, not processed.  Condition 2 HOLDS --
+          all the work is still ahead -- but condition 1 fails, the forest is
+          trivial and there is nothing to compress yet.
+
+This is a better account of the relay76 result than the one in section 5: it
+explains why the parent count came out the same (~259) in both arms even
+though the uf2 bracket in front of the wave was eight times deeper at -E 0.
+Depth, not stability, is what was missing there.
+
+--------------------------------------------------------------------
+THE REAL CONCERN THAT THE WORD WAS GESTURING AT
+--------------------------------------------------------------------
+
+Something legitimate is buried in it, but it is about COST, not structure.
+The wave is a full global pass: 414,543 calls, 1.02 s of CPU across 122 PEs,
+measured from the relay65 traces.  That cost is paid whether or not the
+forest is deep.  So firing early into a still-forming forest is not wrong in
+the sense of being undone -- it is wrong in the sense that you may pay a full
+pass for little depth, and then need to fire again.
+
+The constraint is therefore cost per firing and how many firings are needed.
+That argues for a cheaper, partial, or repeatable mechanism rather than for
+one perfectly timed global pass -- and a repeatable cheap pass is a much
+easier thing to trigger than a single correct moment.  The design question in
+relay75 section 6 point 3 stands unchanged; this only removes a constraint I
+had wrongly placed on it.
+
+--------------------------------------------------------------------
+WHAT DOES NOT CHANGE
+--------------------------------------------------------------------
+
+  - The drain: 348 ms CPU / 274 ms GPU, ~0.9% utilisation, 128 PEs engaged,
+    ratio ~100x, a dependence chain rather than work.
+  - The verdict: FOF_WAVE v1 cannot reach it; keep the default OFF.
+  - Both wave modes are correct; all arms EXACT.
+  - The banner trap (element 0, local parents only; the wave really does
+    414,543 calls).

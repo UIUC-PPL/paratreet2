@@ -1,3 +1,16 @@
+*** CORRECTION HEADER, added 2026-08-22 by relay74 (job 5324786).
+    SECTION 3's ATTRIBUTION IS WRONG.  This report credits the
+    component_histogram row's improvement to the PREFIX REMOVAL, reasoning
+    from relay70's broken hash arm (0.497 s) against this report's correct
+    hash arm (0.243 s).  Those two binaries are 3d25e14 and 22efde5 and
+    differ by the SORT-SCAN PAIR PATH as well as by the correctness fix, so
+    the comparison was confounded.
+    A three-point build ladder settles it: the sort path is 118% of the net
+    gain and the prefix removal is -18% of it (it makes the row slightly
+    SLOWER).  See reports/relay74.txt.
+    EVERYTHING ELSE HERE STANDS -- the exactness results, the bitwise
+    dense/hash equivalence, and the walls. ***
+
 relay72 -- PREFIX REMOVAL + DENSE HISTOGRAM, THE FIXED STACK: ALL GREEN.
 Job 5324637, 16 nodes, 2B, 896 PEs.  2026-08-21.
 Re-run of relay70's four arms plus the negative control.

@@ -1,0 +1,185 @@
+relay74 -- ATTRIBUTION LADDER + FIRST 2B ARMS OF THE COMPRESSION WAVE.
+Job 5324786, 16 nodes, 2B, 896 PEs, CPU best (ppn 7, leaf 32).
+2026-08-22.  All nine arms EXACT.
+
+====================================================================
+0.  THE TWO ANSWERS
+====================================================================
+
+*** (1) THE LAPTOP IS RIGHT AND I WAS WRONG.  The histogram row's gain is
+    the SORT+SCAN PAIR PATH, not the prefix removal.  The prefix removal
+    makes that row slightly WORSE.
+
+        component_histogram   A(OLD) 0.422 s   B(MID) 0.4545 s   C(NEW) 0.2445 s
+          prefix effect  B-A = +0.0325 s      the wrong sign
+          sort   effect  C-B = -0.2100 s
+          the sort path is 118% of the net improvement; the prefix
+          removal is -18% of it.
+
+    The same holds on the wall: Iter0 A 4797.9, B 4838.3, C 4554.7 ms, so
+    prefix +40.4 ms and sort -283.6 ms.  THE ENTIRE -6.4% I REPORTED IN
+    relay72 IS THE SORT PATH. ***
+
+*** (2) THE WAVE IS A NO-GO FOR FLIPPING THE DEFAULT.  It is CORRECT --
+    every arm EXACT and the components line bitwise identical across
+    A/B/C/D/E -- but it COSTS time at 2B rather than saving it.
+
+        C  wave off        4554.7 ms      uf2 0.0405 s
+        D  FOF_WAVE=1      4604.8 ms      uf2 0.0860 s   +50.1 ms  +1.10%
+        E  FOF_WAVE=2      5132.6 ms      uf2 0.6210 s  +577.9 ms +12.69%
+
+    The brief asked me to say plainly whether D shows a gain.  It does not.
+    D is a 1.1% LOSS and the hedge is a 12.7% loss. ***
+
+====================================================================
+1.  THE LADDER
+====================================================================
+
+    point  paratreet2  unionfind  md5        what it adds
+    OLD    7c28411     c00032f    b558cc05   (not rebuilt)
+    MID    277ec6d     2ad91a8    1fa46e42   prefix removal + sign fix;
+                                             histogram pair path still the
+                                             unordered_map
+    NEW    e2a877e     2ad91a8    93fda4b3   sort-scan pair path; wave
+                                             available
+
+MID and NEW differ ONLY in paratreet2, so C-B is a clean read of the sort
+path.  unionfind 2ad91a8 on both built points as instructed.  The wave is
+fired from the paratreet2 side (e2a877e), so MID cannot fire it even though
+its unionfind carries the FOF_WAVE knob -- MID is a clean no-wave point and
+its wave_lines count is 0, which the job checked.
+
+GATES, each build: component_count_done > 0, boss_count_prefix == 0, source
+default leaf 32, and the regenerated unionFindLib.decl.h carrying
+`long compNum` with ZERO occurrences of the int form.  Full scrub between
+builds.
+
+-l 32 WAS PASSED EXPLICITLY TO EVERY ARM.  The OLD binary predates 005b76f
+and its default leaf is 12; without the flag arm A would have run a
+different problem and the whole attribution would have been void.  Every arm
+also gated on the leaf the app printed: 32 everywhere.
+
+====================================================================
+2.  THE NUMBERS
+====================================================================
+
+    arm            rep1      rep2      mean      range   component_histogram
+    A OLD        4777.9    4817.8    4797.9     39.9     0.422 / 0.422
+    B MID        4834.3    4842.2    4838.3      7.9     0.454 / 0.455
+    C NEW off    4581.1    4528.3    4554.7     52.8     0.251 / 0.238
+    D wave=1     4591.9    4617.6    4604.8     25.7     0.249 / 0.249
+    E wave=2     5132.6       --     5132.6      --      0.238
+
+READ THE PREFIX EFFECT CAREFULLY.  On the WALL, B-A = +40.4 ms against an
+A-arm spread of 39.9 ms -- the same size.  I will not claim the prefix
+removal is a wall regression on that evidence; the honest statement is
+WALL-NEUTRAL.
+On the HISTOGRAM ROW it is unambiguous: A is 0.422/0.422 and B is
+0.454/0.455, spreads of 0 and 1 ms against a 32.5 ms separation.  The prefix
+removal really does make that row slightly slower, and the sort path really
+does account for more than all of the net gain.
+
+====================================================================
+3.  WHERE THE WAVE'S COST GOES
+====================================================================
+
+    row              C (off)    D (mode 1)   E (mode 2)
+    uf2               0.0405 s   0.0860 s     0.6210 s
+    Tree traversal    968.2 ms   1017.2 ms    1517.0 ms
+    Iter0            4554.7 ms   4604.8 ms    5132.6 ms
+
+The cost lands ENTIRELY in the uf2 row, which is exactly where the wave
+operates: +45.5 ms in mode 1 against a +50.1 ms wall delta, and +580.5 ms in
+mode 2 against a +577.9 ms wall delta.  There is no hidden second-order
+effect; the wave costs what it costs.
+
+IT FIRED, AND IT FOUND ALMOST NOTHING TO DO:
+
+    D  [UnionFindLib] compression wave 1 fired (mode 1);
+       element 0 rewrote 256 parents locally      (259 in rep 2)
+    E  [UnionFindLib] compression wave 1 fired (mode 2);
+       element 0 rewrote 0 parents locally
+
+256 parents rewritten on element 0 at 2 BILLION particles.  Whatever the
+wave is compressing, there is essentially nothing left to compress by the
+time it runs.
+
+*** AND THE TARGET MAY ALREADY BE GONE.  The brief describes the wave's
+    target as "the post-walk union drain, ~150-300 ms of near-idle at 2B".
+    In this build the whole uf2 row is 40.5 ms and uf2_setup is 9 ms.  A
+    150-300 ms drain is not visible in any phase row I have.  Either it was
+    already eliminated -- the prefix removal starts labeling immediately,
+    which is precisely what it was for -- or it lives in idle time that the
+    FOF3STAT rows do not account for.  THE SECOND IS TESTABLE AND I HAVE NOT
+    TESTED IT: it needs a traced arm to see near-idle, which relay65's
+    machinery would produce in one job.  I am not going to assert the drain
+    is gone on the strength of phase rows that were never designed to show
+    idleness. ***
+
+====================================================================
+4.  CORRECTNESS
+====================================================================
+
+All nine measured arms EXACT: components 424,897,832 and max_size
+185,317,566.  The FULL components line is BITWISE IDENTICAL for every pair
+checked:
+
+    C vs D   IDENTICAL      the wave changes nothing
+    C vs E   IDENTICAL      the hedge agrees with direct mode and with off
+    C vs B   IDENTICAL
+    C vs A   IDENTICAL      the whole ladder agrees with the old binary
+
+So the wave in both modes is correct by measurement as well as by
+construction, and the sort path did not perturb the answer.
+
+====================================================================
+5.  WHAT I GOT WRONG, AND WHAT IT INVALIDATES
+====================================================================
+
+relay72 section 3 said the histogram row's improvement "is NOT the dense
+histogram.  It is the prefix removal", reasoning from relay70's broken hash
+arm at 0.497 s against relay72's correct hash at 0.243 s.  THAT COMPARISON
+WAS CONFOUNDED: relay70's binary was 3d25e14 and relay72's was 22efde5, and
+those differ by the sort-scan pair path as well as by the correctness fix.
+The laptop's objection -- that +262,837 phantom labels on 425M is +0.06% and
+cannot halve the row -- was the right objection.
+
+WHAT THIS INVALIDATES:
+  - relay72 section 3's attribution.  The row improvement is the sort path.
+  - relay73 section 2's decomposition, which said 82% of the GPU gain was
+    the histogram row and that the row was the prefix removal.  The 82%
+    arithmetic stands; the attribution of that 82% does not.
+
+WHAT SURVIVES UNTOUCHED:
+  - relay72's exactness result: the fixed stack is green everywhere.
+  - relay73's -9.61% GPU measurement.  It is a paired OLD-vs-NEW comparison
+    and the number is unaffected by which commit inside NEW earns it --
+    though on this evidence it is the sort path there too, and the GPU arm
+    has not been ladder-tested.
+  - relay70's diagnosis of the under-merge and the int truncation.
+
+====================================================================
+6.  RECOMMENDATION
+====================================================================
+
+1. THE SORT+SCAN PAIR PATH IS THE WIN.  It is worth -283.6 ms on the CPU
+   iteration (-5.9% of arm B) and it is the whole of the -6.4% relay72
+   reported.  Keep it.
+2. THE PREFIX REMOVAL DOES NOT PAY FOR ITSELF ON THESE ARMS.  Wall-neutral,
+   and slightly negative on the histogram row.  The brief always said its
+   payoff was the compression wave it enables rather than these arms -- but
+   the wave does not pay either (item 3), so on current evidence the prefix
+   removal has no measured benefit at 2B.  It is not harmful and it is a
+   prerequisite for other work; I am not recommending reverting it, only
+   that it stop being credited with the sort path's gain.
+3. DO NOT FLIP THE WAVE DEFAULT.  Mode 1 costs 1.1%, mode 2 costs 12.7%,
+   and the wave rewrites ~256 parents at 2B.  Both modes are correct, so
+   the knob can stay for further work at other scales.
+4. BEFORE THE WAVE IS ABANDONED, one traced arm would settle whether the
+   150-300 ms near-idle drain it targets still exists at 2B.  If it does
+   not, the wave has nothing to win here and the result is explained; if it
+   does, the wave is firing at the wrong point rather than being a bad idea.
+   One job, relay65's tracing machinery.
+
+Nothing pushed.  paratreet2 main e2a877e, unionfind master 2ad91a8, both
+clean.  FoF3.cpu-prod untouched (md5 b558cc05).

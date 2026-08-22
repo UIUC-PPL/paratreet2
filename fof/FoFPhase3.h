@@ -916,6 +916,9 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // by the drain become depth <= 2). The broadcast and its cascade are
   // plain sends, so the QD below also covers the wave's own completion;
   // no callback is needed and find_components sees a settled forest.
+  // relay78: snapshot the union-find branch census at this barrier, so
+  // walk-concurrent protocol work and the post-walk drain can be told apart.
+  uf_proxy.ufstat_mark();
   {
     static const int wave = [] {
       const char* e = std::getenv("FOF_WAVE");
