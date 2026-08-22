@@ -1,0 +1,141 @@
+relay80/81/82 -- FOF_UF_SIZES ON THE LANDED CODE: the CPU confirmation, the
+GPU arm, and what the traces say the saving actually is.  2026-08-22.
+
+  paratreet2 main   7263ff1     unionfind master db73766
+  WORKING TREES CLEAN -- the local patch was discarded before pulling, so every
+  binary below is the landed code and nothing else.
+
+  jobs     5326867 relay80 (CPU confirmation + GPU arm)
+           5326926 relay81 (four traced arms)
+           5326927 relay82 (CPU, 3 reps each)
+  binaries FoF3.cpu-prod-v79    6ccf74a0fb65408063cd667efb178a06
+           FoF3.gpu-prod-v79    d7635c30affc4be14c0da39334e72468
+           FoF3.cpu-prodtr-v79  22777303bf63b966fb99ecf4e9d8a429
+           FoF3.gpu-prodtr-v79  4062b58854e1ee240d41fd3111f2202b
+  scripts  sbatch/relay80-sizes-gpu-16n.sbatch, relay81-sizes-traces-16n.sbatch,
+           relay82-cpureps-16n.sbatch, scripts/relay81-findonly.py
+
+EVERY ARM OF ALL THREE JOBS IS EXACT, and every knob gate is positive on both
+sides: addsize_SKIPPED == fb2_UNION to the unit in each sizes-off arm,
+addsize_root zero there and nonzero everywhere else, and no wave banner fired
+anywhere (it is parked).
+
+====================================================================
+1.  THE LANDED CODE IS EXACT -- the question Kale asked
+====================================================================
+
+What landed is the relay79 patch pair PLUS local_union's size merges gated
+under the same knob and a prune_components abort under FOF_UF_SIZES=0.  The
+local_union gating is a real code change relative to what relay79 measured,
+and it is semantically inert for FoF3 only if nothing reads sizes.
+
+    relay80 cpu-szOFF   EXACT     relay82 cpu-szOFF x3   EXACT
+    relay80 gpu-szOFF x2 EXACT    relay81 both szOFF arms EXACT
+
+Seven independent sizes-off arms, CPU and GPU, production and traced, all
+EXACT on components AND max_size.  The gating is inert, confirmed.
+
+*** AND THE LANDED FORM IS BETTER THAN MINE.  My relay79 caveat was that
+    local_union still did a direct "size +=", so under the knob the field was
+    INCONSISTENT rather than absent.  Gating it makes the field uniformly
+    unmaintained, which is what makes the prune_components abort a complete
+    guard rather than a partial one. ***
+
+====================================================================
+2.  THE CPU MAGNITUDE -- and a single-rep trap I walked into
+====================================================================
+
+    job      arm         Iter0                          n    delta
+    relay79  on   4629.9 [4625.2..4634.7]               2
+             off  4541.0 [4538.2..4543.7]               2    -88.9  -1.92%
+    relay80  on   4494.3                                1
+             off  4464.8                                1    -29.5  -0.66%
+    relay82  on   4577.7 [4576.3..4578.6]               3
+             off  4467.2 [4450.6..4491.4]               3   -110.5  -2.41%
+
+*** relay80's -0.66% IS THE OUTLIER AND IT IS MY OWN FAULT.  One rep per arm
+    carries no spread information, and its single cpu-szON at 4494.3 ms is
+    faster than EVERY sizes-on rep in relay79 (4625-4635) and relay82
+    (4576-4579).  Worse, my summary line printed "SEPARATED" for two single
+    points, which is vacuous -- two points can never overlap.  Fixed in
+    relay82's script, which now refuses to judge separation below n=2. ***
+
+Taking the two multi-rep jobs, the CPU effect is about -2%.  Note how stable
+the sizes-OFF arm is across three separate allocations -- 4541.0, 4464.8,
+4467.2 -- while sizes-ON wanders; the noise is in the arm being removed.
+
+====================================================================
+3.  THE GPU ARM -- larger than CPU, and my prediction was wrong
+====================================================================
+
+    gpu-szON   2630.9 ms  [2630.9..2630.9]   walk 0.574 s
+    gpu-szOFF  2562.2 ms  [2547.9..2576.5]   walk 0.503 s
+    -68.7 ms   -2.61%     ranges SEPARATED, 2 reps each, both EXACT
+
+I predicted in the job header that the GPU effect might be SMALLER, because
+FOF_GPU_PHASE1 forces peSets=1 (src/common.h) so the GPU arm lacks the ~794k
+same-process unions the PE-set split manufactures on CPU.  THE PREMISE WAS
+WRONG, and the census says why: fb2_UNION is ~427k on GPU against ~437k on
+CPU, nearly the same.  Those 794k same-process unions never used add_size
+MESSAGES at all -- local_union handles them inline -- so removing add_size was
+always about the DISTRIBUTED unions, and those counts barely differ.
+
+====================================================================
+4.  DID THE DRAIN SHRINK, OR ONLY THE QUEUING?  -- the traces
+====================================================================
+
+The open question from relay79.  add_size is fire-and-forget off the find
+dependence chain, so the -2% could have been queuing relief alone.
+
+    arm         drain    uf protocol CPU in it   util    active PEs
+    cpu-szON    311 ms        1015.8 PE-ms       0.62%      34.5
+    cpu-szOFF   255 ms         769.0 PE-ms       0.63%      33.6
+    gpu-szON    248 ms         626.3 PE-ms       0.65%      28.5
+    gpu-szOFF   181 ms         399.2 PE-ms       0.68%      33.3
+
+    CPU drain  -56 ms  (-18%)      GPU drain  -67 ms  (-27%)
+
+*** THE DRAIN ITSELF SHRANK.  And that is not an artefact of how the drain is
+    defined.  The drain is the span of union-find activity, and add_size
+    executions ARE union-find activity, so deleting them could shorten the
+    measured window by construction.  scripts/relay81-findonly.py re-measures
+    with add_size EXCLUDED from the group, i.e. the FIND cascade only --
+    and the drain lengths come out IDENTICAL: 311/255 on CPU, 248/181 on GPU.
+    add_size never extended past the find cascade.  The find cascade genuinely
+    finishes earlier. ***
+
+WHERE THE WALL SAVING COMES FROM, then:
+    GPU  -68.7 ms wall,  -67 ms of it is the drain     -- essentially all
+    CPU  -110.5 ms wall, -56 ms of it is the drain     -- about half, the
+         rest from the walk-concurrent portion of the cascade
+
+*** A LIMIT ON THE CPU-IN-DRAIN COLUMN, stated so nobody over-reads it.  A
+    same-chare add_size is a DIRECT CALL inlined into find_boss2, which runs
+    inside insertDataFindBoss's entry-method execution -- so local add_size
+    work is charged to insertDataFindBoss and is still inside the "find only"
+    numbers.  The DRAIN LENGTHS are clean; the PE-ms columns are not a pure
+    find-versus-add_size split and should not be quoted as one. ***
+
+Whole-run union protocol CPU falls too: CPU 4429.8 -> 3388.0 PE-ms (-23.5%),
+GPU 3960.9 -> 2812.2 (-29.0%).  Walk EP CPU is unchanged in both arms
+(22247.8 vs 22285.4 on CPU), so the walk BRACKET shortens because the
+concurrent cascade finishes sooner, not because the walk itself does less.
+
+====================================================================
+5.  WHERE THE HEADLINES STAND
+====================================================================
+
+    arm   config                                      Iter0
+    GPU   ppn 7, -l 128, fix on, FOF_UF_SIZES=0     2562.2 ms
+    GPU   same, sizes on (today's default)          2630.9 ms
+    CPU   ppn 7, -l 32,  FOF_UF_SIZES=0             4467.2 ms
+    CPU   same, sizes on (today's default)          4577.7 ms
+
+These also confirm the relay73 prediction that landing the prefix removal plus
+the sort path would move the GPU headline to about 2640 ms: gpu-szON measures
+2630.9.  RECOMMENDATION-affinity-fix.md is still stale -- it quotes
+2825-2882 ms GPU and 4785-4811 ms CPU, both from before the prefix/sort landing
+and before this knob.  It needs rewriting against these numbers.
+
+NOT DONE: no GPU rep count beyond 2, and no measurement at any scale other than
+16 nodes / 2B.
