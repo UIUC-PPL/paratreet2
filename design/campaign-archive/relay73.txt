@@ -1,0 +1,92 @@
+relay73 -- THE GPU HEADLINE, PINNED.  Job 5324710, 16 nodes, 2B, 896 PEs.
+2026-08-21.  Three reps, PAIRED against the old binary in one allocation.
+
+====================================================================
+1.  THE NUMBERS
+====================================================================
+
+    arm   rep1      rep2      rep3      mean      range
+    OLD  3003.0    2896.4    2863.8    2921.1    139.2 ms  (4.8%)
+    NEW  2614.8    2650.2    2655.8    2640.3     40.9 ms  (1.5%)
+
+    delta  -280.8 ms   -9.61%
+
+*** THE RANGES DO NOT OVERLAP.  The slowest NEW rep (2655.8) is faster than
+    the fastest OLD rep (2863.8) by 208 ms.  All six arms EXACT, leaf 128
+    on every one. ***
+
+*** AND THE NEW STACK IS 3x MORE REPRODUCIBLE: 1.5% range against 4.8%. ***
+
+WHY THIS IS PAIRED AND NOT COMPARED TO THE RECORDED BASELINE.  The OLD
+binary measured 2863.8-3003.0 ms in THIS job against the 2825-2882 ms band
+I had recorded for it on earlier days -- today's nodes are a little slower.
+Comparing NEW's 2640.3 against the recorded 2825 would have given -6.5%;
+the paired comparison on the same nodes in the same hour gives -9.6%.  The
+paired figure is the one to trust, and the discrepancy is exactly why the
+arms were interleaved rep-major rather than run as two blocks.
+
+    relative gain, paired, 3 reps           -9.61%   <- quote this
+    absolute NEW mean today                 2640.3 ms
+    NEW against the OLD RECORDED band       -6.5% to -8.4%
+
+====================================================================
+2.  WHERE THE 280.8 ms COMES FROM
+====================================================================
+
+    phase                    OLD mean    NEW mean     delta
+    Pre-traversal             795.3 ms    794.5 ms    -0.8      unchanged
+    Tree traversal           1250.9      1006.5      -244.4
+      of which component_histogram
+                              0.412 s     0.211 s    -201.0
+    remainder                                         -35.6
+
+Pre-traversal is identical to within a millisecond, which is the expected
+result -- phase 1 runs on the device and none of this work touches it.  The
+gain is entirely in the traversal, and about 82% of it is the component
+histogram row.
+
+THAT ROW IS THE PREFIX REMOVAL, NOT THE DENSE HISTOGRAM.  relay72 section 3
+established this on the CPU arm by running the hash path and getting the
+same improvement; the mechanism is that the old truncation bug was
+manufacturing 262,837 phantom components, so the histogram had more labels
+to carry.  The dense path is a wash at this scale -- the width guard sends
+it to the sort-scan path.
+
+====================================================================
+3.  WHAT THIS DOES AND DOES NOT LICENSE
+====================================================================
+
+DOES: the fixed stack is worth about -9.6% on the GPU arm at 2B/16 nodes,
+on three interleaved reps with non-overlapping ranges.  That is a solid
+number by the standards this campaign has been using.
+
+DOES NOT: it is not yet a headline, because the code is NOT LANDED --
+paratreet2 22efde5 and unionfind 9cf9964 are pulled and validated here,
+nothing is pushed, and RECOMMENDATION-affinity-fix.md still describes the
+shipped configuration.  When it lands the GPU headline moves from
+2825-2882 ms to about 2640 ms and the recommendation file needs the
+binaries and the numbers updated.
+
+====================================================================
+4.  A DEFECT OF MINE, RECORDED
+====================================================================
+
+The first submission of this job (5324674) died after 50 s with
+"line 70: label: unbound variable" and measured nothing.  Cause:
+
+    local label=$1 bin=$2 log=$OUT/${label}.log      # WRONG
+
+bash expands EVERY argument to `local` before performing ANY of the
+assignments, so ${label} is still unset when $OUT/${label}.log is expanded,
+and `set -u` aborts.  Every earlier job script in this campaign split that
+across two `local` statements, which is why none of them hit it.  Fixed,
+the idiom verified in isolation, and a comment left in the script saying
+why it must stay split.  No measurement was affected -- only a queue wait.
+
+====================================================================
+5.  STATE
+====================================================================
+
+Nothing pushed.  Both trees clean at paratreet2 22efde5 / unionfind
+9cf9964.  Old production binaries untouched, md5s re-verified
+(FoF3.gpu-prod 54a8de35).  Anvil peer: 20071404 / 20072543.

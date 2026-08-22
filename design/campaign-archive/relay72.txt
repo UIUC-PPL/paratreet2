@@ -1,0 +1,166 @@
+relay72 -- PREFIX REMOVAL + DENSE HISTOGRAM, THE FIXED STACK: ALL GREEN.
+Job 5324637, 16 nodes, 2B, 896 PEs.  2026-08-21.
+Re-run of relay70's four arms plus the negative control.
+Production-fabric half; Anvil peer 20071404 / 20072543.
+
+====================================================================
+0.  VERDICT
+====================================================================
+
+*** EVERY ARM EXACT, INCLUDING THE GPU DENSE ARM THAT ABORTED LAST ROUND.
+    All three relay70 failures are gone. ***
+
+    components 424,897,832   max_size 185,317,566   on every arm, and the
+    FULL histogram line is BITWISE IDENTICAL across dense, hash, CPU and
+    GPU -- all 33 fields, every bin.
+
+*** AND IT IS FASTER THAN THE OLD BINARY, which the brief did not predict.
+    CPU iteration 4865.5 -> 4556.3 ms (-6.4%); GPU 2663.1 ms against a
+    2825-2882 baseline (-5.7 to -7.6%). ***
+
+*** BUT THE DENSE HISTOGRAM ITSELF CONTRIBUTES NOTHING AT THIS SCALE.
+    dense 0.2525 s against hash 0.243 s -- indistinguishable.  The whole
+    gain over the old binary's 0.429 s belongs to the PREFIX REMOVAL, not
+    to the dense path.  Section 3. ***
+
+====================================================================
+1.  THE STACK AND THE GATES
+====================================================================
+
+    paratreet2 main 22efde5     unionfind master 9cf9964
+    FoF3.cpu-prod-pr2  md5 2507608b4c811bad2e5531e939d3ac17
+    FoF3.gpu-prod-pr2  md5 1f40e8471e4fea91ee86fd95d389b5af
+    artifact gate: component_count_done 105, boss_count_prefix 0,
+                   FOF_HIST_DENSE 2
+
+Clean rebuild with the same full artifact scrub as relay70 -- every .o, .a
+and every charmc-GENERATED .decl.h/.def.h across paratreet2, unionfind and
+htram, 0 remaining; utility/ left alone.
+
+*** ONE EXTRA GATE THIS ROUND, BECAUSE THE FIX WAS IN A .ci FILE.
+    A .ci change only takes effect if the generated headers are
+    regenerated, and a stale unionFindLib.decl.h would have reproduced the
+    old truncation with no other symptom.  Verified in the regenerated
+    header:
+        void set_component(const uint64_t &arrIdx, long compNum, long compSize)
+    with ZERO occurrences of the int form.  That is the artifact-level
+    check that the scrub actually did its job. ***
+
+====================================================================
+2.  RESULTS
+====================================================================
+
+    arm  what                              leaf  hist  Iter0 ms   verdict
+    0    10k preflight, Lustre copy          --   --   3549 = gold  MATCH
+    W    warm-up (discarded)                 32   dense  4553.2    EXACT
+    A    OLD binary, negative control        32   n/a    4865.5    EXACT
+    1a   CPU best, dense                     32   dense  4561.5    EXACT
+    1b   CPU best, dense                     32   dense  4551.0    EXACT
+    2    CPU best, FOF_HIST_DENSE=0          32   hash   4572.8    EXACT
+    3    GPU best, -l 128, fix on, dense    128   dense  2663.1    EXACT
+
+    "Number of components found" present exactly once in every arm.
+    Arm 3 completed rc=0 -- the FoFPhase1.h:3705 abort is gone.
+
+EXACTNESS EVERYWHERE, and the arm A negative control still EXACT on the
+same nodes in the same job, so the green result is not an artefact of a
+changed machine or harness.  That control is what made last round's
+diagnosis possible and it is worth keeping permanently.
+
+====================================================================
+3.  THE COMPONENT HISTOGRAM -- READ THIS CAREFULLY
+====================================================================
+
+    arm                          component_histogram
+    A   OLD binary                     0.429 s
+    2   NEW, hash (FOF_HIST_DENSE=0)   0.243 s
+    1a  NEW, dense                     0.248 s
+    1b  NEW, dense                     0.257 s
+    3   NEW, dense, GPU                0.212 s
+
+    relay70, BROKEN stack, hash        0.497 s
+    relay70, BROKEN stack, dense       5.500 s
+
+TWO SEPARATE THINGS, and they should not be conflated:
+
+  (a) THE ROW IMPROVED 0.429 -> 0.243 s, -43%.  But the HASH arm gets that
+      too, so it is NOT the dense histogram.  It is the prefix removal:
+      the truncation bug was manufacturing 262,837 phantom components, and
+      more labels meant bigger maps.  With correct labels the hash path is
+      simply doing less work.  Compare relay70's broken hash at 0.497 s
+      against this round's correct hash at 0.243 s -- same code path, half
+      the time, purely because the answer is right.
+
+  (b) THE DENSE PATH IS A WASH AT THIS SCALE.  0.2525 s (mean of 1a/1b)
+      against 0.243 s hash -- 4% apart, and 1a/1b differ from each other by
+      the same amount, so it is inside run-to-run noise.  The width guard
+      is doing exactly what it was built to do: at 2B the order range is
+      too wide for the array, so dense takes the sort-scan path, which
+      performs like the hash path.  Nothing lost, nothing gained.
+
+So the dense histogram is now SAFE at 2B, and it is worth keeping for the
+scales where the array path applies, but it should not be credited with any
+of the improvement measured here.
+
+====================================================================
+4.  WALLS, AGAINST THE BASELINES
+====================================================================
+
+    CPU-only, ppn 7, leaf 32
+      OLD binary, this job          4865.5 ms
+      NEW dense (1a/1b mean)        4556.3 ms      -6.4%
+      NEW hash                      4572.8 ms      -6.0%
+      my standing baseline          4785-4812 ms
+
+    GPU, ppn 7, -l 128, fix on
+      NEW dense                     2663.1 ms
+      my standing baseline          2825-2882 ms   -5.7% to -7.6%
+
+    Tree traversal
+      OLD 1162.0 ms  ->  NEW 966.9 ms   (CPU)      -17%
+      GPU 1037.7 ms  against 1125-1215 previously
+
+THE BRIEF EXPECTED THE PREFIX REMOVAL TO BE WALL-NEUTRAL ("within spread on
+walls; its real payoff is the compression wave it enables").  It is not
+neutral here -- it is worth about 6% on both arms.  Roughly 186 ms of the
+CPU gain is the histogram row (section 3a) and the remainder is spread
+across the iteration.  Single-rep on the GPU arm, two reps on CPU (4561.5
+and 4551.0, 10.5 ms apart), so the CPU number is solid and the GPU number
+should be re-measured before it is quoted as a headline.
+
+*** IT HELD.  relay73 (job 5324710) ran three reps PAIRED against the old
+    binary in one allocation: OLD 2921.1 ms mean, NEW 2640.3 ms mean,
+    -280.8 ms = -9.61%, ranges NON-OVERLAPPING, and the new stack is 3x
+    more reproducible (1.5% against 4.8%).  See reports/relay73.txt. ***
+
+====================================================================
+5.  UNCHANGED FROM relay70
+====================================================================
+
+"Number of components found" still varies run to run -- 642,473 / 641,876 /
+642,142 / 641,293 / 641,970 on CPU, and 263,677 on GPU -- while the
+histogram total is 424,897,832 on every one of them.  As established in
+relay70 section 6 this is PRE-EXISTING (the old binary does it too, 641,876
+here) and is not a regression from any of this work.  It is still measuring
+something other than what its name suggests, and the CPU/GPU disagreement
+is a second oddity, but neither blocks anything.
+
+====================================================================
+6.  TWO COSMETIC DEFECTS IN MY OWN JOB SCRIPT
+====================================================================
+
+Neither affects a result; recording them so the artefact is not misread.
+  - the provenance line inside the job output still says "relay70 prefix
+    removal + dense histogram" -- I retitled the comment header when
+    deriving relay72 from relay70 but not the echoed string.
+  - the peer line names Anvil jobs 20071404 / 20071692; the re-run peer is
+    20071404 / 20072543.
+
+====================================================================
+7.  STATE
+====================================================================
+
+Nothing pushed.  Both trees clean at the requested SHAs (paratreet2
+22efde5, unionfind 9cf9964).  The old production binaries are untouched and
+their md5s re-verified; relay70's binaries (-pr) are kept alongside the new
+ones (-pr2) so that report's artefacts stay unambiguous.
