@@ -467,6 +467,8 @@ text; `-d oct` is the FoF configuration.
 | `FOF_KEEPALIVE` | 1 | keep-alive ring: one raw-Converse message per process per period to its ring successor. Suppresses the LCI idle-stall on InfiniBand (Anvil); fabric-scoped comment in fof/FoF.C. `0` = off (reproduces the raw bug for LCI debugging) |
 | `FOF_KEEPALIVE_MS` | 100 | ring period. 100 = workaround + gap-monitor tripwire; 10 = finer monitor sampling; 1000+ = probe mode (deliberately leaves quiet windows past the ~1 s stall onset — a measurement, no longer a workaround) |
 | `FOF_PROCS_PER_PNODE` | 8 | processes per physical node (block structure for the probe and coordinator layouts) |
+| `FOF_WAVE` | 0 | union-find compression wave: 1 = direct parent rewrites (owner-side, strictly-smaller ancestors only), 2 = hedge mode (redundant `union(p,q)` instead of rewrites; validation arm, +12.7% at 2B). Alone, fires once at the fireUF2Edges barrier — measured useless there (relay74/75: the forest is shallow at that barrier under any `-E`). Experimental |
+| `FOF_WAVE_MS` | 0 | with `FOF_WAVE` set: periodic wave passes every N ms from walk start until labeling, covering the union-cascade drain (334–409 ms at 2B, <1% utilization). Ticks are QD-safe: a pass fires only after a structural union, so a settled forest sends nothing. Both modes exact at all gates; no measured win yet — experimental |
 
 ### Environment knobs — instruments (all report-only)
 
