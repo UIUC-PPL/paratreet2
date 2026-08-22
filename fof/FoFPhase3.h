@@ -892,6 +892,21 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // injection). The lib and its locator registration were set up before
   // the walk.
   fof.fireUF2Edges(uf_proxy, CkCallbackResumeThread());
+  // Compression wave (FOF_WAVE=1 direct / 2 hedge; 0 = off, the default
+  // until validated at scale): fired ONCE, at the natural census-free
+  // milestone — the fireUF2Edges barrier means every PE has submitted its
+  // edges — and before the QD that drains the remaining union cascades,
+  // which is exactly the near-idle tail the wave shortens (chains walked
+  // by the drain become depth <= 2). The broadcast and its cascade are
+  // plain sends, so the QD below also covers the wave's own completion;
+  // no callback is needed and find_components sees a settled forest.
+  {
+    static const int wave = [] {
+      const char* e = std::getenv("FOF_WAVE");
+      return e ? std::atoi(e) : 0;
+    }();
+    if (wave != 0) uf_proxy.compression_wave();
+  }
 #ifdef AGGREGATION
   // htram-aware completion of the union_request cascade: items parked in
   // tram buffers are invisible to RTS-level QD (design note §6.3a), so a
