@@ -1,0 +1,224 @@
+relay70 + relay71 -- PREFIX REMOVAL + DENSE HISTOGRAM: FRONTIER VALIDATION.
+Jobs 5324373 (the four specified arms) and 5324388 (control, separating the
+failures).  16 nodes, 2B, 896 PEs.  2026-08-21.
+Production-fabric half of the two-machine confirmation; Anvil peer jobs
+20071404 / 20071692.
+
+====================================================================
+0.  VERDICT
+====================================================================
+
+*** DO NOT LAND.  All three changes fail on Frontier at 2B.
+
+    (1) THE ANSWER IS WRONG.  components 425,160,669 against a gold of
+        424,897,832 (+262,837); max_size 183,972,966 against 185,317,566
+        (-1,344,600).  Bit-identical across leaf 32 and leaf 128, dense and
+        hash, CPU and GPU -- so it is the PREFIX REMOVAL, and nothing else.
+    (2) THE DENSE HISTOGRAM IS 11x SLOWER, not faster: 5.48-5.52 s against
+        0.48-0.50 s for the hash path, which DOUBLES the CPU iteration.
+    (3) DENSE + GPU ABORTS in the dense path's own precondition.
+
+    The 10k gate PASSES (3549 = gold), so a small-scale test cannot catch
+    any of this. ***
+
+*** AND THE CONTROL IS CLEAN.  The OLD binary (FoF3.cpu-prod, md5 b558cc05)
+    on the same nodes, same job, same hour: EXACT, 424,897,832 /
+    185,317,566, Iter0 4875 ms.  So gold is reproducible today and the
+    regression is in the new code, not in my build, my scrub, or the
+    environment. ***
+
+====================================================================
+1.  THE STACK, AND THE GATES THAT PASSED
+====================================================================
+
+    paratreet2 main 3d25e14      unionfind master bbe0856
+    sign fix 277ec6d: verified an ANCESTOR of HEAD before building
+    FoF3.cpu-prod-pr  md5 031783606f5f0467c8430d9288af14fa
+    FoF3.gpu-prod-pr  md5 1f90c322953894f4b5cf1ffb990dbc68
+
+    artifact gate, both binaries:
+      component_count_done 105 (>0)   boss_count_prefix 0   FOF_HIST_DENSE 1
+
+Clean rebuild with a full artifact scrub: every .o, .a and every
+charmc-GENERATED .decl.h/.def.h removed across paratreet2, unionfind and
+htram (verified 0 remaining), after confirming with `git ls-files` that
+those headers are untracked.  paratreet2/utility/ was NOT scrubbed -- it is
+a separate autotools submodule untouched by these commits and reconfiguring
+it risks a failure unrelated to the test.  App layers re-scrubbed between
+the CPU and GPU builds because GPU=1 changes the compile and there is no
+dependency tracking.
+
+TWO NOTES ON THE BRIEF ITSELF:
+  - merged/unionfind was ALREADY on master (at c00032f), not on
+    fof_with_aggregation at 8933bae.  The 8933bae checkout is
+    gpu-stalls/unionfind, the original study tree, which RESUME says to
+    leave alone and which I did not touch.  Only a fast-forward was needed.
+  - paratreet2 005b76f changed the FoF3 DEFAULT LEAF from 12 to 32, so the
+    CPU arms correctly pass no -l.  Every arm still gates on the leaf size
+    the app PRINTS; a default change is exactly what that gate is for.
+
+====================================================================
+2.  THE WRONG ANSWER, ISOLATED
+====================================================================
+
+    arm  binary        leaf  hist   arm   components    max_size    verdict
+    A    OLD cpu-prod    32  hash   CPU   424,897,832  185,317,566  EXACT
+    B    NEW cpu-pr      32  hash   CPU   425,160,669  183,972,966  DIFFERS
+    C    NEW cpu-pr     128  hash   CPU   425,160,669  183,972,966  DIFFERS
+    D    NEW cpu-pr     128  DENSE  CPU   425,160,669  183,972,966  DIFFERS
+    E    NEW gpu-pr     128  hash   GPU   425,160,669  183,972,966  DIFFERS
+    (relay70 arms 1a/1b/2 at leaf 32, dense and hash: same values again)
+
+The wrong values are IDENTICAL in every new-binary arm -- across leaf size,
+across histogram path, across CPU and GPU.  That rules out the dense
+histogram, the leaf default change and the device path, and leaves the
+prefix removal.
+
+THE TREE'S OWN VERIFIER DOES NOT FIRE.  Arm B ran with FOF_COUNT_VERIFY=1,
+which recomputes per-label counts from the particles and compares against
+the maintained counts.  No mismatch.  So the count bookkeeping is
+consistent with the labels; THE LABELS THEMSELVES ARE WRONG.
+
+WHAT THE DAMAGE LOOKS LIKE -- the component-size histogram, old vs new:
+
+    log2 bin      gold          new         delta
+       0      252,506,722  252,704,747    +198,025    singletons
+       1      133,305,669  133,370,223     +64,554    pairs
+       2       28,366,023   28,369,103      +3,080
+       3        7,115,322    7,113,599      -1,723
+       4        2,181,027    2,179,850      -1,177
+       5          804,120      803,583        -537
+       6..22   (small positive deltas, +23 to +99 each)
+      24,25,27  IDENTICAL
+
+*** THE GIANT COMPONENT SHEDS 1,344,600 PARTICLES AND THEY FRAGMENT INTO
+    262,837 MOSTLY-TINY COMPONENTS -- 198k singletons and 64.5k pairs.
+    Bins 3-5 LOSE components, so some mid-sized components break up too.
+    That is UNDER-MERGING: edges that should join a component are not being
+    applied.  It is not a mis-count and not a classifier problem -- it is
+    lost merges. ***
+
+====================================================================
+3.  THE DENSE HISTOGRAM
+====================================================================
+
+    arm                          component_histogram    Iter0
+    OLD binary, leaf 32                   0.429 s      4875 ms
+    NEW hash,   leaf 32                   0.497 s      4836 ms  (relay70 arm 2)
+    NEW hash,   leaf 128                  0.500 s      7222 ms
+    NEW DENSE,  leaf 32                   5.500 s      9795 ms
+    NEW DENSE,  leaf 128                  5.479 s     12148 ms
+
+Dense is 11x the hash path and DOUBLES the CPU iteration.  The brief
+expected the ~280 ms row to fall to tens of ms; the hash row is 497 ms here
+and dense takes it to 5.5 s.  The local 1M result (5-6 ms against 20-42 ms)
+does not carry to 2B.
+
+LIKELY MECHANISM, from the code rather than from a profile.
+`ensureDenseHist` sizes the array from the PROCESS'S WHOLE PARTICLE ORDER
+RANGE: width = order_hi - order_lo + 1.  At 2B over 128 processes that is
+~15.5M std::atomic<long> per process, ~124 MB, allocated with new[] and
+then zeroed in a SINGLE-THREADED loop under label_shards_init_lock, and
+scanned again on the read side.  The cost is proportional to the order
+RANGE, not to the number of labels -- so it grows with the problem while
+the hash path grows with the (far smaller) label count.  At 1M the range is
+small and dense wins; at 2B the range is the whole process.
+
+DENSE AND HASH ARE EXACTLY EQUIVALENT.  The full FOF3STAT components line
+is BITWISE IDENTICAL between the dense and hash arms -- 277 bytes, 33
+fields, every bin.  They are equally wrong, but the two paths agree
+perfectly, so the dense implementation itself is faithful to the hash one.
+
+====================================================================
+4.  THE DENSE + GPU ABORT
+====================================================================
+
+    Assertion "order >= nb->dense_lo && order < nb->dense_lo + nb->dense_width"
+    failed in fof/FoFPhase1.h line 3705        (rc 134, many tasks)
+
+    dense + GPU   ABORTS        (relay70 arm 3)
+    dense + CPU   runs clean    (relay71 arm D, leaf 128 -- same leaf size)
+    hash  + GPU   runs clean    (relay71 arm E)
+
+So it is the COMBINATION, not the leaf size and not the GPU path alone.
+
+The dense path assumes a positive (untouched) label's low 43 bits are a
+global order INSIDE THIS PROCESS'S SFC range.  Under the GPU phase-1 path
+that assumption does not hold: some positive label carries an order outside
+[dense_lo, dense_lo+dense_width).  Given that the prefix removal changes
+bosses to self-name with their vertexID, a component whose boss lives on
+another process is the obvious candidate -- which would make this the same
+root cause as section 2, seen through a different assertion.
+
+====================================================================
+5.  WALLS, FOR WHAT THEY ARE WORTH ON A WRONG ANSWER
+====================================================================
+
+    CPU, prefix removal, hash path   4836 ms   against old 4842-4875
+                                     -> NEUTRAL, as the brief predicted
+    GPU, prefix removal, hash path   2957 ms   against a 2825-2882 baseline
+                                     -> +2.6% over the top of the band,
+                                        single rep, do not read much into it
+
+The prefix removal is wall-neutral on the CPU arm, which is consistent with
+the brief's expectation that its payoff is the compression wave it enables
+rather than these arms.
+
+====================================================================
+6.  A CORRECTION TO MY OWN FIRST REPORT
+====================================================================
+
+After relay70 I flagged that "Number of components found" varies run to run
+(641,377 / 641,739 / 642,209 / 642,866) and called it a defect of the new
+reduction.  THAT WAS WRONG.  The OLD binary prints the same line and it
+varies there too: 641,448 and 642,306 in two arms of relay71.  The
+non-determinism is PRE-EXISTING and is not introduced by this change.
+
+It is still worth someone's attention -- a component count that moves by
+~1000 between identical runs, and that reads ~641k on CPU against 263,677
+on GPU while the histogram total is 425M, is measuring something other than
+what its name suggests -- but it is not a regression and not a reason to
+hold this branch.
+
+The line appears exactly ONCE per run in every arm, as specified.
+
+====================================================================
+7.  WHAT I WOULD DO NEXT
+====================================================================
+
+1. The under-merge is the only blocker that matters; the other two are
+   performance and a precondition, both downstream of it.
+2. A 10k test cannot find it -- 8 PEs pass, 896 PEs fail.  The cheapest
+   reproducer is likely the smallest node count that still splits the giant
+   component across processes.  I can bisect node count (1, 2, 4, 8 nodes)
+   in one job if that is useful.
+3. FOF_COUNT_VERIFY is already in the tree and is clean, so the instrument
+   to add is one that checks LABEL agreement across processes, not counts.
+4. For the dense histogram, the fix direction is to size the array by the
+   number of distinct local labels rather than by the process's order
+   range, or to keep the hash path at scale and use dense only below a
+   width threshold.
+
+5. IF YOU WANT TO DROP JUST THE PREFIX REMOVAL AND KEEP THE REST, IT IS NOT
+   A MECHANICAL REVERT.  `git revert a9cafb7` on 3d25e14 CONFLICTS in
+   fof/FoFPhase1.h -- 277ec6d, bca2fd0 and 3d25e14 all touch the same
+   region, so the revert needs a real hand-merge of that file.  I did not
+   attempt the merge: resolving it means rewriting the author's code on a
+   guess, and a silently wrong resolution here produces exactly the class of
+   bug under investigation.
+   The clean equivalent, if a confirmation is wanted, is the commit pair
+   immediately before the change -- paratreet2 82c39ce + unionfind c00032f
+   -- which would pin the blame to exactly a9cafb7 + bbe0856.  Arm A already
+   narrows it a long way (7c28411 + c00032f is EXACT, and the twelve commits
+   between that and 82c39ce are documentation, archived relays, the leaf
+   default change and the nChilada reader), so this is confirmation rather
+   than discovery.  One build and one short job; not run.
+
+NOTE: the two halves of the prefix removal must move TOGETHER -- a9cafb7
+changed the fof side to match bbe0856's unionfind API, so neither repo can
+be moved on its own without an API mismatch.
+
+Nothing pushed.  Both trees are at the requested SHAs (paratreet2 3d25e14,
+unionfind bbe0856) and CLEAN; the old binaries are untouched and their md5s
+re-verified.  My own pair-load instrumentation was reverted out of the tree
+before any of this was built, so nothing of mine is in these binaries.
