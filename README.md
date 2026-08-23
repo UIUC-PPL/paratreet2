@@ -442,7 +442,7 @@ the knobs exist for scale tuning, A/B oracles, and diagnostics.
 | `-w` | dual | phase-3 walk: `dual` (requires `-u dist`) or `transposed` (original walk, A/B oracle) |
 | `-m` | 0 | min component size for REPORTING only |
 | `-P` | 0 | periodic box period L (cubic); 0 = open boundaries; requires b < L/2 |
-| `-D` | — | cache share depth override (larger replies, fewer node requests) |
+| `-D` | 3 | cache share depth: levels of descendants (plus leaf particles) shipped with each node-request reply. **Swept at 2B/16 nodes (relay90, all arms exact): the default is already optimal.** D1 4635 ms, D2 4525.7, D3 4553.1, D4 4725.5 — D2/D3 statistically tied, D1 and D4 separated and worse. The invariant that explains it: the walk's *used* node count is ~9.6M at every depth (±1.5%) while total fetches vary 6.2×, so bundling trades wasted bytes against request count, and requests are the expensive term (18.2% of walk wall at 14.9 µs each vs 14.0% for processing replies). **`-D 2` is the memory/bytes choice**: same wall as D3 but half the bytes moved (4.4 GB vs 8.7 GB in the walk window) and ~130 MB/process less resident — untested at 64/128 nodes, where the binding constraint may differ |
 | `-S` | off | single-distribution mode (no Partition array; requires dual walk) |
 | `-C` | off | skip the post-run cache memory accounting (use in traced runs) |
 | `-g` | off | phase-1 fragments histogram (diagnostic pass over all particles) |
