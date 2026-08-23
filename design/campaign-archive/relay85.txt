@@ -1,0 +1,217 @@
+relay85 -- WHERE THE ROOTS OF CROSS-PROCESS COMPONENTS LIVE.  2026-08-22,
+job 5328302, all arms EXACT.  paratreet2 724782d + unionfind cd2d9c8 plus a
+report-only working-tree patch (patches/relay85-{unionfind,paratreet2}.diff,
+NOT pushed).  Binaries FoF3.cpu-prod-v81 3dd519ab5a257a2de2a2392c1d4292fd and
+FoF3.gpu-prod-v81 48e8ddcff19b8eff1b8237edd9781277.
+
+  Kale: "I want the distribution of roots of components that straddle
+  processes, by PEs.  Since union-find makes parent pointers go to smaller
+  numbers, maybe they will all concentrate based on the numbering used (but I
+  see activity in the tail on PEs like 350, 840, 854)."
+
+  ANSWER: THEY DO NOT CONCENTRATE.  125 of 128 chares root straddling
+  components, the distribution is broad with only moderate skew (max/mean
+  4.7x, stdev/mean 0.85), and the top half of chares holds 79% rather than the
+  50% of a flat distribution.  The numbering does NOT pile the roots onto the
+  low chares.
+
+====================================================================
+1.  HALF OF THE QUESTION IS SETTLED BY THE ENCODING, NOT BY MEASUREMENT
+====================================================================
+
+    FoFPhase1.h:124   uf2EncodeTip(process, dense_index)
+                        = (process << kUF2IdxBits) | dense_index
+
+The process index is in the HIGH bits, and find_boss2 refuses to point at a
+larger id (the min-heap rule).  So the root of a component is the MINIMUM id
+in it, and therefore always sits on the LOWEST-NUMBERED PROCESS that owns any
+of its vertices.  That is exact and needs no run.
+
+What it does NOT determine is the shape.  If components straddle only
+NEIGHBOURING processes in the SFC ordering then every chare except the last
+can be the minimum of some straddling set and the distribution is broad; only
+if components straddled far would the mass pile onto low chares.  The
+measurement decides between those, and it comes out broad.
+
+One prediction of the encoding IS visible in the data and confirms the method:
+**chare 127 roots exactly zero straddling components**, because the highest
+chare can never be the minimum of a set that includes a lower one.
+
+====================================================================
+2.  THE DISTRIBUTION
+====================================================================
+
+Measured after labeling: each element dedupes the component labels it holds
+and maps each to its owning chare (the label IS the root's vertexID).  A label
+owned by another chare means this chare holds vertices of a component rooted
+elsewhere.  Summed over chares, that is how much cross-process structure is
+rooted at each chare.
+
+    straddle incidences   264,511 over 128 chares      mean 2,066
+      min 0   p10 456   p25 930   median 1,592   p75 2,827   p90 4,472
+      max 9,678          max/mean 4.7x      stdev/mean 0.85
+      chares rooting any: 125 of 128
+
+    concentration            measured      flat would be
+      top  1 chare              3.7%              0.8%
+      top  8 chares            21.0%              6.2%
+      top 16 chares            34.5%             12.5%
+      top 32 chares            54.4%             25.0%
+      top 64 chares            79.0%             50.0%
+
+    busiest chares (PE = 7 x chare)
+      c48 (PE 336)  9,678     c119 (PE 833) 8,728    c113 (PE 791) 7,501
+      c50 (PE 350)  7,124     c47  (PE 329) 6,583    c108 (PE 756) 5,398
+      c70 (PE 490)  5,253     c49  (PE 343) 5,230
+
+    the empty region
+      c53 51   c54 6   c55 0   c56 0   c57 26   c58 9        c127 0
+
+*** SO IT IS SKEWED BUT NOT CONCENTRATED.  A flat distribution would give
+    every chare 2,066; the real one runs from 0 to 9,678 with a median of
+    1,592.  That is the signature of components straddling their SFC
+    NEIGHBOURS -- every chare gets to be the minimum of the straddles that
+    reach upward from it -- modulated by how much matter sits at each
+    process's boundary.  It is not the signature of a numbering artefact. ***
+
+The contiguous near-empty run at c53-c58 is a spatial feature, not a numbering
+one: six adjacent processes whose domains have almost nothing straddling
+outward.  c127 is the analytic zero from section 1.
+
+====================================================================
+3.  KALE'S PEs 350 / 840 / 854 -- ONE OF THE THREE IS A ROOT HOTSPOT
+====================================================================
+
+    PE 350 = chare 50    7,124 incidences   4th busiest, 3.4x mean
+    PE 840 = chare 120   2,037              essentially the mean (2,066)
+    PE 854 = chare 122     560              well BELOW the mean
+    (PE 833 = chare 119   8,728             2nd busiest, and it is next door
+                                             to 840)
+
+So the tail activity Kale saw is not explained by root ownership alone.  PE 350
+is a genuine root hotspot; PE 840 is average and PE 854 is below average, yet
+both showed tail activity.  That is consistent with what relay84 found: climb
+and label traffic happens wherever the VERTICES are, which is every home PE,
+while root ownership is a separate and much more skewed quantity.  Root
+ownership is part of the story for PE 350 and is not the story for the other
+two.
+
+====================================================================
+4.  AN INVARIANCE WORTH HAVING
+====================================================================
+
+*** THE PER-CHARE VECTOR IS BITWISE IDENTICAL ACROSS EVERY ARM AND REP --
+    CPU and GPU, both reps, 264,511 incidences and the same 128 numbers. ***
+
+That is a real result rather than a formality.  The GPU arm runs with
+FOF_GPU_PHASE1, which forces peSets=1, so phase 1 merges every intra-process
+pair and far fewer vertices reach uf2 at all.  The LOCAL quantities move
+accordingly:
+
+    local roots           CPU 641,908-642,396      GPU 263,677
+    distinct labels held  CPU ~906,400             GPU  528,188
+    labels rooted elsewhere   264,511                   264,511   <-- identical
+
+The cross-process component structure is therefore INDEPENDENT of the PE-set
+split and of the device path: the split changes how much work uf2 is handed
+inside a process, and changes nothing about which components cross process
+boundaries or where they root.  That also means this distribution is a
+property of the decomposition, not of the configuration, and it will not move
+if the sharding or nodegroup design changes.
+
+====================================================================
+5.  WHAT IT MEANS FOR THE DESIGN
+====================================================================
+
+  - There is no root hotspot to relieve.  125 of 128 chares root straddling
+    components and the busiest holds 3.7% of the mass.  A design premised on
+    breaking up a root concentration has nothing to break up.
+  - The drain's ~128 active PEs are active because they are ALL the home PEs,
+    one per process -- not because roots cluster.  relay84 already showed those
+    PEs are keeping up (53% busy in the walk window, 3.7% in the drain).
+  - Combined with relay84, both concurrency arguments for a nodegroup are now
+    closed: not tail concurrency, not receiver queuing, and not root
+    concentration.  The remaining lever is unchanged -- protocol ROUND-TRIP
+    COUNT: fold the two-phase find and kill the 16.5% flips.
+
+NOT MEASURED: how far components straddle (the number of chares each spans).
+The incidence count sums (k-1) over straddling components, so a component
+spanning 3 chares is indistinguishable here from two spanning 2.  If the span
+distribution matters for the design it needs a second census keyed by label.
+
+====================================================================
+6.  KALE'S FOLLOW-UP: COMPARE ONLY THE DENSE BITS?
+====================================================================
+
+"From a systemic imbalance point of view, will it help if we ignore the
+processID (the high order bits) and just consider the dense bits for the '<'
+comparison?  Or are smaller dense IDs located within smaller processIDs based
+on how we number them?  And does this idea have a chance of breaking the
+imbalance (stragglers) of the tail?"
+
+Three answers, and they are all no -- the third one for reasons that are
+already measured rather than argued.
+
+(a) THE DENSE BITS ARE NOT GLOBALLY UNIQUE, SO THIS IS A CORRECTNESS BREAK,
+    NOT A TUNING CHOICE.  FoFPhase1.h:1136:
+
+        long dense_index = (long)uf2_vertices.size();
+        uint64_t encoded = uf2EncodeTip(my_node, dense_index);
+
+    Every process numbers its own vertices 0, 1, 2, ... independently.  Dense
+    index 0 exists on all 128 processes.  Comparing only the low 43 bits
+    therefore produces massive TIES, and the min-heap needs a strict total
+    order.  Look at what find_boss2 would do with a tie between two distinct
+    roots u and v with the same dense index:
+
+        dense(u) > dense(v)  is false     -> not a flip
+        u != v (full ids differ)          -> UNION: u->parent = v
+
+    and the symmetric message does v->parent = u.  **A two-cycle.**  Every
+    subsequent find on that component walks forever.  So a dense-only
+    comparator needs a tiebreak, and any tiebreak is just another total order.
+
+(b) NO, SMALL DENSE INDICES ARE NOT IN SMALL PROCESSES.  The dense index is a
+    per-process bijection over that process's fragments, taken in
+    `frag_counts` map-iteration order -- the comment at :1125 says explicitly
+    it need not even be deterministic across runs.  It carries no spatial and
+    no cross-process meaning.  There is no correlation to exploit.
+
+(c) IT WOULD NOT BREAK THE TAIL, BECAUSE ROOT SKEW IS NOT WHAT MAKES THE TAIL.
+    Suppose the intent is a well-defined randomised order -- hash the full id,
+    which fixes (a) and (b) at a stroke and flattens root ownership from
+    max/mean 4.7x to about 1.0.  It still does not touch the tail:
+
+      - the home PEs are NOT overloaded in the drain.  relay84: 3.7% busy,
+        and 99% of continuous busy runs end within 152 us.  There is no
+        straggler to relieve; they are idle, waiting.
+      - the total union protocol CPU is 3,388 PE-ms for the whole run
+        (relay81, cpu-szOFF).  Even the busiest chare's 3.7% share of the
+        straddle mass is ~125 PE-ms spread across a 255 ms drain.  Perfect
+        balance would move milliseconds.
+      - the drain's wall-to-work ratio is ~280x.  It is round-trip latency in
+        a dependence chain, and rebalancing work never shortens a chain.
+
+*** AND IT WOULD PROBABLY MAKE THE THING WE DO CARE ABOUT WORSE.  A flip
+    happens when find_boss2 reaches a root whose id is LARGER than the
+    incoming boss1 -- the whole two-phase find is discarded and re-issued.
+    Measured today: 89,900 flips against ~455k distributed edges, 16.5%.
+    A randomised order has no reason to favour either root, so the flip
+    probability goes to about 50%.  That is roughly a TRIPLING of flips, each
+    one an extra two-phase find, on the exact quantity relay84 identified as
+    the remaining lever.  The current numbering is not neutral: union_request
+    already orders the two VERTEX ids at submission, and with the process in
+    the high bits plus SFC locality the two ROOT ids inherit some of that
+    order, which is why 16.5% is so far below 50%. ***
+
+THE CONSTRUCTIVE READING.  The useful direction is the opposite of
+randomising: pick an order that makes the FIRST root found more likely to win,
+which drives the flip rate DOWN and removes round trips.  Ordering by
+something correlated with discovery order -- or folding the two phases so the
+question never arises -- both attack round-trip count directly.
+
+CHEAP FALSIFIABLE TEST IF WANTED: a comparator knob (id order vs hashed order)
+and one 16-node job.  PREDICTION: root ownership flattens to max/mean ~1.0,
+fb2_flip rises from 16.5% toward ~50%, and the wall gets WORSE by roughly the
+cost of the extra flips.  If the flip rate does not move, my account of why
+16.5% is below 50% is wrong and worth knowing.

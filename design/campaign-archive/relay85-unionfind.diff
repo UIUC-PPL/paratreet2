@@ -1,0 +1,124 @@
+diff --git a/unionFindLib.C b/unionFindLib.C
+index 67939e2..6b1ce99 100644
+--- a/unionFindLib.C
++++ b/unionFindLib.C
+@@ -1,6 +1,7 @@
+ #include <assert.h>
+ #include "prefixBalance.h"
+ #include "unionFindLib.h"
++#include <unordered_set>
+ 
+ /*readonly*/ CProxy_UnionFindLib _UfLibProxy;
+ /*readonly*/ CProxy_Prefix prefixLibArray;
+@@ -975,6 +976,77 @@ wave_set_root(uint64_t arrIdx, long rootID) {
+  * 
+  * @param cb Callback to be invoked after this function has finished
+  */
++// relay85 -- ROOT OWNERSHIP OF CROSS-PROCESS COMPONENTS.
++// Each element walks its labelled vertices, dedupes the component labels it
++// holds, and maps each label to its owning chare (the label IS the root's
++// vertexID).  A label whose owner is NOT this chare is evidence that the
++// component STRADDLES: this chare holds vertices of a component rooted
++// elsewhere.  Summing those incidences over all chares gives, per chare c,
++// how much cross-process component structure is rooted at c.
++//   buf[0 .. N-1]  remote incidences of components rooted at chare c
++//   buf[N]         local roots on this chare (parent == -1)
++//   buf[N+1]       distinct labels held locally
++//   buf[N+2]       distinct labels held locally that are rooted elsewhere
++void UnionFindLib::
++root_owner_census(CkCallback cb) {
++    rootCensusCb = cb;
++    const int N = CkNumNodes();
++    std::vector<long> buf(N + 3, 0);
++    std::unordered_set<long> labels;
++    long localRoots = 0;
++    forEachVertex([&](unionFindVertex& v, uint64_t) {
++        if (v.parent == -1) localRoots++;
++        if (v.componentNumber >= 0) labels.insert(v.componentNumber);
++    });
++    for (long lab : labels) {
++        int owner = getLocationFromID((uint64_t)lab).first;
++        if (owner >= 0 && owner < N && owner != thisIndex) {
++            buf[owner]++;
++            buf[N + 2]++;
++        }
++    }
++    buf[N]     = localRoots;
++    buf[N + 1] = (long)labels.size();
++    contribute(sizeof(long) * (N + 3), buf.data(), CkReduction::sum_long,
++               CkCallback(CkReductionTarget(UnionFindLib, root_owner_done), thisProxy[0]));
++}
++
++void UnionFindLib::
++root_owner_done(long *v, int n) {
++    const int N = n - 3;
++    long tot = 0, nz = 0, mx = 0; int mxc = -1;
++    for (int c = 0; c < N; c++) {
++        tot += v[c];
++        if (v[c]) nz++;
++        if (v[c] > mx) { mx = v[c]; mxc = c; }
++    }
++    CkPrintf("[ROOTCENSUS] chares %d   straddle incidences %ld   chares rooting any %ld"
++             "   busiest chare %d with %ld\n", N, tot, nz, mxc, mx);
++    CkPrintf("[ROOTCENSUS] local roots total %ld   distinct labels held %ld"
++             "   labels rooted elsewhere %ld\n", v[N], v[N + 1], v[N + 2]);
++    // full per-chare vector, wrapped
++    char line[512]; int off = 0;
++    for (int c = 0; c < N; c++) {
++        if (off == 0) off = snprintf(line, sizeof(line), "[ROOTCENSUS] c%03d:", c);
++        off += snprintf(line + off, sizeof(line) - off, " %ld", v[c]);
++        if ((c % 16) == 15 || c == N - 1) { CkPrintf("%s\n", line); off = 0; }
++    }
++    // cumulative shape: how much of the mass is in the lowest k chares?
++    long cum = 0; int marks[5] = {N/32, N/8, N/4, N/2, N-1};
++    char cline[256]; int co = snprintf(cline, sizeof(cline), "[ROOTCENSUS] cumulative share:");
++    int mi = 0;
++    for (int c = 0; c < N && mi < 5; c++) {
++        cum += v[c];
++        if (c == marks[mi]) {
++            co += snprintf(cline + co, sizeof(cline) - co, "  first %d chares %.1f%%",
++                           c + 1, tot ? 100.0 * cum / tot : 0.0);
++            mi++;
++        }
++    }
++    CkPrintf("%s\n", cline);
++    if (!rootCensusCb.isInvalid()) rootCensusCb.send();
++}
++
+ void UnionFindLib::
+ ufstat_mark() {
+     // relay78: snapshot at the fireUF2Edges barrier. Everything counted so far
+diff --git a/unionFindLib.ci b/unionFindLib.ci
+index 4c5b012..9109655 100644
+--- a/unionFindLib.ci
++++ b/unionFindLib.ci
+@@ -50,6 +50,8 @@ module unionFindLib {
+         entry void compression_wave();
+         entry void wave_arm();
+         // relay78 instrumentation: branch-outcome census.
++        entry void root_owner_census(CkCallback cb);
++        entry [reductiontarget] void root_owner_done(long v[n], int n);
+         entry void ufstat_mark();
+         entry [reductiontarget] void ufstat_done(long v[n], int n);
+         entry void wave_need_root_batch(const std::vector<needBossData> &batch);
+diff --git a/unionFindLib.h b/unionFindLib.h
+index 09e3165..bc771e5 100644
+--- a/unionFindLib.h
++++ b/unionFindLib.h
+@@ -255,6 +255,16 @@ class UnionFindLib : public CBase_UnionFindLib {
+         int b = (steps <= 0) ? 0 : 1 + (63 - __builtin_clzl((unsigned long)steps));
+         ufh_[b > UFH_N - 1 ? UFH_N - 1 : b]++;
+     }
++    // relay85: where do the ROOTS of cross-process components live?  vid =
++    // (process << kUF2IdxBits) | dense_index, and every union points at the
++    // SMALLER id, so the root of a component is the minimum id in it and
++    // therefore always sits on the LOWEST process that owns any of its
++    // vertices.  Whether that concentrates on low chares or spreads depends on
++    // how far components straddle in the SFC ordering -- which is the thing
++    // being measured.
++    CkCallback rootCensusCb;
++    void root_owner_census(CkCallback cb);
++    void root_owner_done(long *v, int n);
+     void ufstat_mark();
+     void ufstat_done(long *v, int n);
+     bool wave_armed_ = false;

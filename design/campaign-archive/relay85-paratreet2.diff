@@ -1,0 +1,17 @@
+diff --git a/fof/FoFPhase3.h b/fof/FoFPhase3.h
+index 0b1bb2c..f7b375b 100644
+--- a/fof/FoFPhase3.h
++++ b/fof/FoFPhase3.h
+@@ -949,6 +949,12 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
+ #endif
+ 
+   uf_proxy.find_components(CkCallbackResumeThread());
++  // relay85: where do the roots of cross-process components live?  Runs after
++  // labeling, so every vertex carries its component label.  Report-only.
++  if (std::getenv("FOF_ROOT_CENSUS")) {
++    CkCallbackResumeThread rc;
++    uf_proxy.root_owner_census(rc);
++  }
+   double t3 = CkWallTimer();
+ 
+   fof.collectUF2Labels(uf_proxy, CkCallbackResumeThread());
