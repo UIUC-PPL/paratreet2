@@ -3479,7 +3479,19 @@ public:
         // a dense serial; the counter contract is about SIGN, not value,
         // so the negated boss tip serves it unchanged. (LONG_MAX-2 guard:
         // the maximal encodable tip would overflow the negation.)
-        CkEnforce(it->second >= 0 && it->second <= (long)(~0UL >> 1) - 2);
+        // Report the offending value, not just that there was one: this
+        // fired twice at 24B particles (jobs 5332555, 5332649) for two
+        // different 32-bit truncations in UnionFindLib::set_component /
+        // insertDataNeedBoss, and each round cost a full-scale run to
+        // narrow down because the bare CkEnforce named no number.
+        if (!(it->second >= 0 && it->second <= (long)(~0UL >> 1) - 2)) {
+          CkPrintf("[%d] applyUF2Labels: label out of range for local_id "
+                   "%llu (rep_label %ld): componentNumber %ld%s\n",
+                   CkMyPe(), (unsigned long long)local_id, (long)rep_label[r],
+                   it->second,
+                   it->second == -1 ? " (== -1, never labeled)" : "");
+          CkAbort("applyUF2Labels: componentNumber outside [0, LONG_MAX-2]");
+        }
         rep_label[r] = -(it->second + 2);
       } // else: untouched fragment keeps its encoded tip
     }
