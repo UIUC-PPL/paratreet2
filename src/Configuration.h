@@ -143,6 +143,19 @@ namespace paratreet {
         // simulation apps byte-identical.
         bool perturb_particles = true;
 
+        // Whether the app needs per-particle velocity and softening. Only
+        // the NChilada loader honours it: there every attribute is its own
+        // file, so vel and soft cost two extra opens per family and roughly
+        // double the bytes read (pos+mass = 16 B/particle, +vel+soft = 32).
+        // Tipsy gets them free -- they are contiguous fields of the same
+        // packed struct -- so that loader is unaffected and the two formats
+        // still produce identical FoF output. False leaves velocity and
+        // softening zeroed (hence a reported kinetic energy of zero), which
+        // is what the NChilada loader already did for a snapshot that
+        // omitted those files. FoF is a pure position/mass analysis and
+        // sets it false; gravity needs soft, so the default is true.
+        bool read_velocity_and_soft = true;
+
         // Single-distribution mode (design/single-distribution-mode.md):
         // no Partition array is created — traversals run from TreePieces
         // (startDual), decomposition computes one set of splitters, and
@@ -219,6 +232,7 @@ namespace paratreet {
             p | dSoft;
             p | linking_length;
             p | perturb_particles;
+            p | read_velocity_and_soft;
             p | single_distribution;
         }
     };

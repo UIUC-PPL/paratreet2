@@ -252,6 +252,8 @@ path is a file or a directory (`src/Reader.C`, the same test ChaNGa uses):
   <dir>/{gas,dark,star}/pos       required per family (also fixes its count)
   <dir>/{gas,dark,star}/mass      required per family
   <dir>/{gas,dark,star}/{vel,soft}  read when present, else defaulted to 0
+                                    (and skipped entirely for an app that
+                                     sets read_velocity_and_soft = false)
   ```
 
   Each field file is `FieldHeader | min | max | numParticles values`, XDR
@@ -263,6 +265,17 @@ path is a file or a directory (`src/Reader.C`, the same test ChaNGa uses):
   Only `pos`, `vel`, `mass` and `soft` are read; the other attributes a
   snapshot may carry (`GasDensity`, `timeform`, ...) have no home in
   ParaTreeT's `Particle` and are ignored.
+
+  An app that does not use velocity or softening says so with
+  `conf.read_velocity_and_soft = false` in `setDefaults` (FoF does), and the
+  loader then never opens those two files even when the snapshot has them.
+  Because NChilada gives every attribute its own file, that halves both the
+  bytes read and the `open()` count per family — `pos` + `mass` is 16 B per
+  particle against 32 B with `vel` and `soft`. The flag has no effect on the
+  Tipsy loader, where all four are fields of the same packed struct and come
+  for free; the two formats therefore still produce identical FoF output.
+  Velocity and softening are left zeroed when not read, so the reported
+  kinetic energy is zero — exactly as for a snapshot that omits the files.
 
 ### Generating datasets
 

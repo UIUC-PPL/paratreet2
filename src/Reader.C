@@ -1,6 +1,7 @@
 #include "TipsyFile.h"
 #include "NChiladaReader.h"
 #include "Reader.h"
+#include "Paratreet.h"   // paratreet::getConfiguration
 #include "Utility.h"
 #include "Modularization.h"
 #include <iostream>
@@ -41,7 +42,7 @@ int64_t overlap(int64_t lo, int64_t hi, int64_t a, int64_t b) {
 /// particle structs: the temporary stays a few MB however large a share of
 /// the snapshot this Reader holds.
 void loadNCFamily(const std::string& dir, Particle::Type type, int64_t start,
-                  int64_t count, Particle* dest) {
+                  int64_t count, Particle* dest, bool read_vel_soft) {
   const int64_t kChunk = 1 << 18;   // particles staged at a time
   std::vector<Vector3D<Real>> vecs;
   std::vector<Real> scalars;
@@ -55,10 +56,15 @@ void loadNCFamily(const std::string& dir, Particle::Type type, int64_t start,
     NChilada::readField(dir + "/pos", s, n, &vecs[0]);
     for (int64_t i = 0; i < n; ++i) p[i].position = vecs[i];
 
-    // Velocity and softening are defaulted rather than required. FoF needs
-    // only positions (and masses for the bounding box), so a snapshot cut
-    // down to those still loads; the reported kinetic energy is then zero.
-    if (NChilada::readOptionalField(dir + "/vel", s, n, &vecs[0])) {
+    // Velocity and softening are skipped outright for an app that declared
+    // it does not need them (config.read_velocity_and_soft; FoF is the
+    // case), and are otherwise defaulted rather than required. Skipping is
+    // worth a branch here only because NChilada stores every attribute in
+    // its own file: not opening vel and soft halves both the bytes read and
+    // the open() count per family. Either way the members end up zeroed
+    // when not read -- Particle leaves both uninitialised, so that is not
+    // optional -- and the reported kinetic energy is then zero.
+    if (read_vel_soft && NChilada::readOptionalField(dir + "/vel", s, n, &vecs[0])) {
       for (int64_t i = 0; i < n; ++i) p[i].velocity = vecs[i];
     } else {
       for (int64_t i = 0; i < n; ++i) p[i].velocity = Vector3D<Real>(0.0);
@@ -68,7 +74,7 @@ void loadNCFamily(const std::string& dir, Particle::Type type, int64_t start,
     NChilada::readField(dir + "/mass", s, n, &scalars[0]);
     for (int64_t i = 0; i < n; ++i) p[i].mass = scalars[i];
 
-    if (NChilada::readOptionalField(dir + "/soft", s, n, &scalars[0])) {
+    if (read_vel_soft && NChilada::readOptionalField(dir + "/soft", s, n, &scalars[0])) {
       for (int64_t i = 0; i < n; ++i) p[i].soft = scalars[i];
     } else {
       for (int64_t i = 0; i < n; ++i) p[i].soft = 0.0;
@@ -113,6 +119,11 @@ void Reader::loadNChilada(const std::string& dirname, const CkCallback& cb) {
 
     particles.resize(n_particles);
 
+    // An app that does not use velocity or softening skips those files
+    // entirely, even when the snapshot has them (see Configuration).
+    const bool read_vel_soft =
+        paratreet::getConfiguration().read_velocity_and_soft;
+
     // Global ordering is gas, then dark, then star -- the Tipsy convention,
     // and what ChaNGa's loadNChilada assumes -- so this branch's slice is a
     // contiguous piece of at most one family each.
@@ -125,19 +136,20 @@ void Reader::loadNChilada(const std::string& dirname, const CkCallback& cb) {
     int64_t off = 0;
     if (n_gas > 0) {
       loadNCFamily(dirname + "/gas", Particle::Type::eGas,
-                   std::max<int64_t>(start_particle, 0), n_gas, &particles[off]);
+                   std::max<int64_t>(start_particle, 0), n_gas, &particles[off],
+                   read_vel_soft);
       off += n_gas;
     }
     if (n_dark > 0) {
       loadNCFamily(dirname + "/dark", Particle::Type::eDark,
                    std::max<int64_t>(start_particle, gas_end) - gas_end, n_dark,
-                   &particles[off]);
+                   &particles[off], read_vel_soft);
       off += n_dark;
     }
     if (n_star > 0) {
       loadNCFamily(dirname + "/star", Particle::Type::eStar,
                    std::max<int64_t>(start_particle, dark_end) - dark_end, n_star,
-                   &particles[off]);
+                   &particles[off], read_vel_soft);
       off += n_star;
     }
     CkAssert(off == n_particles);

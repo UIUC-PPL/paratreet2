@@ -25,6 +25,9 @@ PARATREET_REGISTER_MAIN(ExMain);
     conf.decomp_type = paratreet::DecompType::eOct;
     conf.tree_type = paratreet::TreeType::eOct;
     conf.num_iterations = 1;
+    // FoF links on position alone (mass only feeds the bounding box), so
+    // the NChilada loader never opens vel/ or soft/. Tipsy is unaffected.
+    conf.read_velocity_and_soft = false;
     conf.num_share_nodes = 0;
     conf.cache_share_depth = 3;
     conf.request_pause_interval = 20;

@@ -46,6 +46,12 @@ PARATREET_REGISTER_MAIN(ExMain);
     conf.num_iterations = 1;
     conf.perturb_particles = false; // FoF is static analysis: no kick/
                                     // perturb/rebuild after the iteration
+    conf.read_velocity_and_soft = false; // FoF links on position alone;
+                                    // mass only feeds the bounding box. An
+                                    // NChilada snapshot's vel/ and soft/
+                                    // files are then never opened (Tipsy is
+                                    // unaffected -- there they are fields of
+                                    // the same struct as pos and mass).
     conf.num_share_nodes = 0;
     conf.cache_share_depth = 3;
     conf.request_pause_interval = 20;
