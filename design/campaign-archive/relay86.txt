@@ -1,0 +1,139 @@
+relay86 -- CONTRACT-THEN-GATHER (-u gather) vs -u dist and -u serial.
+2026-08-22, job 5328371.  paratreet2 a65da5a + unionfind cd2d9c8, CLEAN trees.
+Binary FoF3.cpu-prod-v82 d122cdd346117dd3bd4c335debbad70b.
+CPU best: ppn 7, -l 32, -E 16, FOF_UF_SIZES=0.  2 reps each, interleaved.
+
+====================================================================
+1.  THE ALGEBRA GATE -- PASSED, AND IT IS THE STRONGEST RESULT HERE
+====================================================================
+
+All three modes printed a BITWISE IDENTICAL FOF3STAT components line, the full
+27-bucket log2 histogram included, not merely the two gold numbers:
+
+    424897832 max_size 185317566 log2_histogram: 0:252506722 1:133305669
+    2:28366023 3:7115322 4:2181027 ... 24:2 25:3 27:1
+
+*** THE CONTRACTION ALGEBRA HOLDS AT 2B.  design/staged-gather.md argues that
+    min-of-a-component equals the min over its local-subcomponent minima, so
+    per-process contraction composed with the global min-union gives the same
+    root for every tip as the flat union over raw edges.  That argument is now
+    tested at 424,897,832 components and 1.23M edges rather than at 1m, and it
+    reproduces the flat serial labels exactly. ***
+
+====================================================================
+2.  THE WALLS
+====================================================================
+
+    arm            Iter0                      vs dist
+    A  -u dist    4486.6 ms [4465.3..4507.8]
+    B  -u serial  5975.4 ms [5960.1..5990.6]  +1488.8 ms  +33.2%  SEPARATED
+    C  -u gather  4783.5 ms [4780.4..4786.7]  + 297.0 ms  + 6.6%  SEPARATED
+
+    C vs B  -1191.9 ms  -19.9%  SEPARATED
+
+A agrees with the relay82 reference (4467.2 [4450.6..4491.4], 3 reps).
+B reproduces the recorded serial penalty: +33.2% here against the +28% in
+design/phaseab-balancing.md section 38.
+
+PHASE-3 ROWS (seconds), which explain all of it:
+
+    arm   uf2_setup  phase3_walk  edge_gather   uf2    relabel   phase3 total
+    A       0.009      0.397        0.001      0.038   0.125       0.570
+    B       0.000      0.274        0.009      1.197   0.197       1.677
+    C       0.000      0.265        0.018      0.353   0.137       0.773
+
+*** READ THE WALK ROW FIRST.  A's walk is 0.397 s and B's and C's are
+    0.274/0.265.  That gap is not the walk getting faster -- it is A's walk
+    CARRYING THE CONCURRENT UNION CASCADE, which is what streaming buys and
+    what B and C forfeit.  132 ms, close to the ~104 ms relay76 priced it at.
+    A then pays only 0.038 s of post-walk residue.  C wins 132 ms on the walk
+    and loses 315 ms on the serial finisher: net +203 ms in phase 3, and
+    +297 ms on the iteration. ***
+
+====================================================================
+3.  QUESTION 1: DOES CONTRACTION REPAIR SERIAL'S PENALTY?  MOSTLY, YES
+====================================================================
+
+    gathered edges   B  1,227,700 unique        C  487,352 contracted   -60%
+    serial finish    B  1.197 s                 C  0.353 s              -70%
+    penalty vs dist  B  +1488.8 ms  +33.2%      C  +297.0 ms  +6.6%
+
+**Contraction removes 80% of serial's penalty** (1488.8 -> 297.0 ms).  The
+mechanism is exactly the predicted one: retiring the same-process edges the
+PE-set split manufactures, per process, before anything is shipped.  The
+serial finisher is superlinear in its input -- 40% of the edges cost 30% of
+the time -- so the volume cut pays slightly better than proportionally.
+
+THE SPLIT, MEASURED (FOF3STAT gather, both reps):
+
+    local 739,222 / 738,994    cross 495,102 / 495,105    contracted 487,352
+
+Predicted was ~790k local / ~455k cross; measured is 739k / 495k, so local is
+60% rather than the 63.5% relay83 reported.  The two are counting slightly
+different things and neither is wrong: relay83 counted uf2 SUBMISSIONS
+(union_request's same-chare fast path against distributed chains), while this
+counts STAGED EDGES classified by `tip >> kUF2IdxBits` on both endpoints.
+The ~6% gap between them is worth remembering before quoting either as "the"
+local fraction.
+
+====================================================================
+4.  QUESTION 2: DOES C APPROACH OR BEAT A?  APPROACHES, DOES NOT BEAT
+====================================================================
+
+C is +6.6% and the ranges are separated, so this is not a tie.  The accounting
+in section 2 says why, and both halves were predicted:
+
+    forfeits streaming overlap        -132 ms of walk concurrency
+    pays a serial finisher            +315 ms against dist's 0.038 s residue
+
+So gather removes the drain's round-trips -- dist's uf2 residue plus the
+cascade inside its walk -- and replaces them with a 0.353 s serial stage on
+PE 0.  At 2B/16 nodes that trade is a 297 ms loss.  Note the direction of
+scaling: the serial finisher grows with the number of processes while dist's
+cascade does not, so this gap widens with scale, exactly as the design note
+says ("anti-scales with process count by construction").
+
+====================================================================
+5.  QUESTION 3: WHAT THE ROOT-PAIR COLLAPSE BUYS -- ALMOST NOTHING
+====================================================================
+
+    cross 495,102  ->  contracted 487,352      ratio 0.9843
+
+*** THE COLLAPSE REMOVES 1.6%.  That is the number Kale asked for to feed the
+    hierarchical variant, and it is far smaller than the framing assumed. ***
+
+What it means concretely: after each process replaces its locally-owned
+endpoints with their local roots, essentially every cross edge still names a
+DISTINCT pair of roots.  Local components are fine-grained relative to the
+cross edges -- two cross edges from the same process rarely share both
+endpoints' local roots.  There is no redundancy in the cross set to squeeze.
+
+*** AND THIS IS THE PART THAT MATTERS FOR THE HIERARCHICAL VARIANT, STATED
+    CAREFULLY.  C's win over B is NOT the collapse; it is the local/cross
+    split -- 739k edges retired because both endpoints were same-process.
+    Only 7,750 more came off through dedup.  A hierarchical variant would
+    therefore gain from RETIRING EDGES INTERNAL TO A COARSER GROUP (say a
+    node: 8 processes), not from further dedup, and this job does not measure
+    that quantity.  What fraction of the 495k cross-process edges are also
+    cross-NODE is unmeasured and is the number the hierarchical variant lives
+    or dies on.  If most cross-process edges stay within a node, a node-level
+    stage would retire most of them and the remaining gather would be small;
+    if they are mostly cross-node, the hierarchy adds a stage and buys little.
+    That is one cheap census away (classify staged cross edges by
+    tip >> kUF2IdxBits mapped to node) and I have not run it. ***
+
+====================================================================
+6.  WHAT I WOULD SAY ABOUT -u gather
+====================================================================
+
+  - It is CORRECT at 2B, bitwise, and that is a real result for the algebra.
+  - It repairs 80% of serial's penalty and confirms the same-process edge
+    inflation as the cause, which was the diagnosis in relay78 section 11.
+  - It does not beat dist and it is not close enough to be a candidate: +6.6%
+    with separated ranges, and the gap grows with process count.
+  - The collapse it was partly premised on buys 1.6%, so the hierarchical
+    variant needs a different justification than "collapse more" -- it needs
+    the cross-node fraction, which is unmeasured.
+
+NOT MEASURED: any scale other than 16 nodes; the GPU arm; and the cross-node
+fraction of cross-process edges (section 5).

@@ -1,10 +1,30 @@
 # Staged gather (`-u gather`): contract-then-gather UF_2 — experiment spec
 
-2026-08-22. Status: EXPERIMENT, built to understand the variant (Kale). Not a
-commitment: the serial finisher anti-scales with process count by construction
-(the phaseB lesson in degenerate form — re-concentrating scale-growing work),
-and it forfeits streaming's measured −104 ms of overlap (relay76). Measured
-against `-u dist` and `-u serial` in one job before any further discussion.
+2026-08-22. **STATUS: MEASURED AND CLOSED as a performance candidate; kept as a
+correctness/diagnostic instrument.** relay86 at 2B/16 nodes, 2 reps, every mode
+bitwise identical (full 27-bucket histogram):
+
+    -u dist    4486.6 ms      -u gather  4783.5 (+6.6%)     -u serial  5975.4 (+33.2%)
+    phase3:    walk 0.397 / uf2 0.038   |  walk 0.265 / uf2 0.353  |  walk 0.274 / uf2 1.197
+    staged edges: local 739,222   cross 495,102   contracted 487,352
+
+What it established: (1) the contraction algebra below holds at 424,897,832
+components — per-process contraction composed with global min-union reproduces
+the flat serial labels exactly; (2) the same-process edge inflation IS serial's
++33% penalty — retiring it removes 80% of that penalty; (3) the root-pair
+collapse is worth only 1.6% (495,102 -> 487,352), so local components are
+fine-grained relative to cross edges and there is no redundancy to squeeze.
+Why it loses to dist: it forfeits streaming's ~132 ms of walk-concurrent
+cascade AND pays a 0.35 s serial finisher that grows with process count, while
+dist's post-walk residue is 0.038 s. The gap widens with scale by construction.
+
+A hierarchical (node-level) variant would need a different justification than
+"collapse more" — it would live on the cross-NODE fraction of the 495k cross
+edges, which is unmeasured (one cheap census: classify staged cross edges by
+process -> node). Not pursued: the family's ceiling is dist's streaming, which
+it must give up to gather at all.
+
+Original spec follows.
 
 ## Goal and invariant
 
