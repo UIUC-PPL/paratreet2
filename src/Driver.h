@@ -469,7 +469,10 @@ public:
     auto& config = paratreet::getConfiguration();
     CkPrintf("Received data from %d TreeCanopies\n", (int) storage.size());
     // Sort data received from TreeCanopies (by their indices)
+    const double lc_sort_t0 = CkWallTimer();   // relay92: pack build
+    const long lc_raw = (long)storage.size();
     if (!storage_sorted) sortStorage();
+    const double lc_sort_s = CkWallTimer() - lc_sort_t0;
 
     // Find how many should be sent to the caches
     int send_size = storage.size();
@@ -480,6 +483,11 @@ public:
       CkPrintf("Broadcasting every tree canopy because num_share_nodes is unset\n");
     }
 
+    CkPrintf("FOF3STAT loadcache_pack: raw_canopies %ld deduped %ld shipped %d "
+             "sort_s %.4f entry_B %d pack_MB %.2f\n",
+             lc_raw, (long)storage.size(), send_size, lc_sort_s,
+             (int)sizeof(std::pair<Key, SpatialNode<Data>>),
+             send_size * (double)sizeof(std::pair<Key, SpatialNode<Data>>) / 1e6);
     // Send data to caches
     cache_manager.recvStarterPack(storage.data(), send_size, cb);
   }

@@ -61,6 +61,30 @@ public:
   // tuple: sums of {pool_bytes, cached_nodes, cached_leaves,
   // cached_particles, total_bytes} and the max per-process total_bytes
   // (skew).
+  // relay92 loadCache profile.  Recorded in recvStarterPack; read back by a
+  // SEPARATE entry after loadCache has completed, so the measurement never
+  // perturbs loadCache's own reduction.  Unlike the relay89 touch write this
+  // is O(1) per process in a phase measured in SECONDS at 128 nodes, so it is
+  // unconditional rather than compile-time gated.
+  //
+  // NO CROSS-PROCESS TIMESTAMPS ARE USED.  relay84 measured clock offsets of
+  // up to 66 ms between processes, which would swamp the ship term.  Only
+  // per-process DURATIONS are reduced; ship+barrier is left as the residual
+  // against the driver's own total.
+  double lc_install_s = 0.0;
+  long   lc_pack_n = 0;
+  void loadCacheProf(const CkCallback& cb) {
+    double sums[2] = {lc_install_s, (double)lc_pack_n};
+    double mx = lc_install_s, mn = lc_install_s;
+    CkReduction::tupleElement elems[3] = {
+        CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_double),
+        CkReduction::tupleElement(sizeof(double), &mx, CkReduction::max_double),
+        CkReduction::tupleElement(sizeof(double), &mn, CkReduction::min_double)};
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(elems, 3);
+    msg->setCallback(cb);
+    this->contribute(msg);
+  }
+
   void cacheStats(const CkCallback& cb) {
     auto s = core.stats();
     // used_nodes (pool slots incl. PLACEHOLDERS) is reported alongside
@@ -179,11 +203,14 @@ void CacheManager<Data>::recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack
 
   CkAssert(n == 0 || pack[0].first == Key(1));
   std::vector<uint64_t> parked; // starter pack precedes all walks: stays empty
+  const double lc_t0 = CkWallTimer();          // relay92: per-process install
   for (int i = 0; i < n; i++) {
     // uncomment conditional if prefetch() is ever restored
     // if (!local_tps.count(pack[i].first))
     core.installBoundary(CkMyRank(), pack[i], parked);
   }
+  lc_install_s = CkWallTimer() - lc_t0;        // O(n) per process, n ~ canopies
+  lc_pack_n = n;
   if (n == 0) root = local_tps[1];
   CkAssert(root);
   this->contribute(cb);

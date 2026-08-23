@@ -158,6 +158,26 @@ using namespace paratreet;
 
     // Only now ship the starter pack: every canopy annotation is valid.
     proxy_pack.driver.loadCache(CkCallbackResumeThread());
+    {   // relay92: read the per-process install profile back AFTER loadCache
+        // completed, so the measurement cannot perturb it.
+      void* lcres = nullptr;
+      proxy_pack.cache.loadCacheProf(CkCallbackResumeThread(lcres));
+      CkReductionMsg* lcm = (CkReductionMsg*)lcres;
+      CkReduction::tupleElement* le = nullptr; int ln = 0;
+      lcm->toTuple(&le, &ln);
+      if (ln == 3) {
+        const double* sums = (const double*)le[0].data;
+        double mx = *(const double*)le[1].data;
+        double mn = *(const double*)le[2].data;
+        int procs = CkNumNodes();
+        CkPrintf("FOF3STAT loadcache_install: procs %d pack_n %.0f "
+                 "install_sum_s %.4f mean_s %.4f max_s %.4f min_s %.4f "
+                 "max/mean %.2f\n",
+                 procs, sums[1] / procs, sums[0], sums[0] / procs, mx, mn,
+                 sums[0] > 0 ? mx / (sums[0] / procs) : 0.0);
+      }
+      delete[] le; delete lcm;
+    }
     double t3 = CkWallTimer();
     CkPrintf("FOF3STAT time_s: phase1 %.3f tip_encode %.3f fragcount %.3f "
              "upwardPass %.3f loadCache %.3f\n",
