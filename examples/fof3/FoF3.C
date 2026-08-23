@@ -786,7 +786,7 @@ using namespace paratreet;
       CkReduction::tupleElement* elems = nullptr;
       int n_elems = 0;
       msg->toTuple(&elems, &n_elems);
-      CkEnforce(n_elems == 2);
+      CkEnforce(n_elems == 2);  // sums[6] + max_bytes
       const long* sums = (const long*)elems[0].data;
       long max_bytes = *(const long*)elems[1].data;
       int procs = CkNumNodes();
@@ -796,11 +796,12 @@ using namespace paratreet;
       // TreeCache.h:238-239. The label said used_nodes until 2026-08-22.
       CkPrintf("FOF3STAT cache: pool_MB %.1f cached_nodes %ld cached_leaves %ld "
                "cached_particles %ld cached_particle_MB %.1f amplification %.3f "
-               "avg_MB %.1f max_MB %.1f (totals over %d processes)\n",
+               "avg_MB %.1f max_MB %.1f used_nodes %ld placeholders %ld "
+               "(totals over %d processes)\n",
                sums[0] / 1e6, sums[1], sums[2], sums[3],
                sums[3] * (double)sizeof(CachedParticleOf<FragData>::type) / 1e6,
                N > 0 ? sums[3] / N : 0.0, sums[4] / 1e6 / procs,
-               max_bytes / 1e6, procs);
+               max_bytes / 1e6, sums[5], sums[5] - sums[1], procs);
       delete[] elems;
       delete msg;
     }

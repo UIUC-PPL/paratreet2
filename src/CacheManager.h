@@ -63,8 +63,12 @@ public:
   // (skew).
   void cacheStats(const CkCallback& cb) {
     auto s = core.stats();
-    long sums[5] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
-                    s.cached_particles, s.total_bytes};
+    // used_nodes (pool slots incl. PLACEHOLDERS) is reported alongside
+    // cached_nodes (fetched content): their difference is the frontier
+    // placeholder population, which is what makes a deeper -D cost more
+    // requests than it saves (relay91).
+    long sums[6] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
+                    s.cached_particles, s.total_bytes, s.used_nodes};
     CkReduction::tupleElement elems[2] = {
         CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
         CkReduction::tupleElement(sizeof(long), &s.total_bytes,

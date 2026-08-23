@@ -1,0 +1,132 @@
+relay91 -- THE AGGREGATION MEASUREMENT, and the -D 4 anomaly.
+2026-08-22.  No new job for items 1 and 3: analysis of the relay90 traces
+(job 5328919).  Item 2 (-D at 128 nodes) is job 5329100, QUEUED.
+Script scripts/relay91-reqcost.py.
+
+  ITEM 1 ANSWER: **THE IDEA DIES HERE.**  requestNodes costs
+  2.7 us + 0.85 us per node returned.  At the shipping depth the fixed term is
+  18.2% of the call and the pack is 81.8%, so aggregation can address 18.2% of
+  18.2% of walk wall -- about 8 ms of PE time per PE, and less after a 4-item
+  buffer keeps a quarter of the overhead.  By Kale's own criterion that is
+  dominated by the 15.5-node pack.
+
+====================================================================
+1.  THE COST MODEL, AND IT VALIDATES ITSELF ACROSS THE SWEEP
+====================================================================
+
+Pairing needs no cross-PE matching: a requestNodes execution CREATES its
+addCache reply inside its own BEGIN..END block, so one sequential pass over a
+server log pairs them.  Nodes inferred at 214 B/node (relay88).
+
+    duration_us = a + b * nodes_in_reply,  fitted independently per depth
+
+    -D   mean nodes/reply   a (fixed, us)   b (per-node, us)   R^2    mean dur
+     1        1.48             2.585            1.098         0.075     4.21
+     2        4.32             3.074            0.891         0.452     6.92
+     3       14.13             2.655            0.847         0.558    14.62
+     4       18.44             2.872            0.839         0.894    18.34
+
+*** FOUR INDEPENDENT FITS, ACROSS A 12x RANGE OF REPLY SIZE, GIVE THE SAME TWO
+    CONSTANTS: a ~ 2.6-3.1 us and b ~ 0.84-1.10 us/node.  The D=3 fit predicts
+    D=4's mean at 2.655 + 0.847*18.44 = 18.27 us against 18.34 measured, and
+    D=1's at 3.91 against 4.21.  The linear model is right, and the 14.9 us of
+    relay89 decomposes cleanly. ***
+
+(R^2 is low at D=1 only because the reply size barely varies there -- there is
+almost no x to regress against.  The intercept is still consistent.)
+
+ALSO MEASURED, AND IT REMOVES THE OTHER HALF OF KALE'S PROPOSED METHOD:
+**100% of requestNodes executions created a reply, at every depth.**  There are
+no pending-request joins to contrast against -- every request does a full
+lookup-and-pack.  So request coalescing is not happening today at all, which is
+itself the answer to "is there already de-facto aggregation": no.
+
+====================================================================
+2.  WHAT AGGREGATION COULD BUY -- and why that is not enough
+====================================================================
+
+At -D 3, the shipping configuration:
+
+    requestNodes per PE           43.7 ms     = 18.2% of walk wall (relay89)
+    of which the fixed term       18.2%       = 7.95 ms per PE
+    a 4-item buffer removes <=3/4 of that     = 5.96 ms per PE
+    as a share of the walk window (~240 ms)   ~ 2.5%
+    as a share of a 4525 ms iteration         ~ 0.13%, and only if PE time
+                                                converted 1:1 to wall, which
+                                                it does not -- PEs are 53% busy
+
+*** SO THE CEILING IS SINGLE-DIGIT MILLISECONDS ON THE ITERATION.  Not worth a
+    build.  The spread numbers made aggregation VIABLE (median channel fills a
+    4-item buffer in 1.72 ms); this measurement makes it POINTLESS at the
+    depth we ship. ***
+
+*** ONE COMBINATION THE TWO MEASUREMENTS TOGETHER DO SUGGEST, and I flag it as
+    arithmetic rather than a result.  The fixed term's SHARE is not constant --
+    it is 61.5% at -D 1 and 15.7% at -D 4, because the pack grows with depth
+    and the overhead does not.  Total request-serving time per PE:
+
+        -D 1   10,683 req x  4.21 us = 45.0 ms
+        -D 2    5,477 req x  6.92 us = 37.9 ms
+        -D 3    2,951 req x 14.62 us = 43.1 ms
+        -D 4    4,091 req x 18.34 us = 75.0 ms
+
+    At -D 1, aggregation would remove 3/4 of 61.5% of 45.0 ms = 20.8 ms per PE,
+    taking -D 1's request cost to ~24 ms, well BELOW every other depth -- and
+    -D 1 fetches 10.2M nodes instead of 40.7M, wastes 5.5% instead of 76.5%,
+    and holds 628 MB/process instead of 838.  Aggregation is worthless at the
+    depth we ship and would be worth the most at the depth we rejected.
+    THE RISK IS THE SAME BUFFER: -D 1 already has the longest walk (0.580 s
+    against 0.448) because of round trips, and a 4-item buffer adds ~0.65 ms
+    of flush latency per channel at that depth.  Whether that kills it is
+    unmeasured, and it is the only reason I would not simply recommend the
+    pair. ***
+
+====================================================================
+3.  THE -D 4 ANOMALY -- deeper sharing ships INTERIOR STRUCTURE
+====================================================================
+
+Kale's hypothesis was that at depth 4 subtrees bottom out at leaves, so the
+extra depth ships particles rather than nodes.  The decomposition says the
+opposite about which content grows:
+
+                          -D 3           -D 4        ratio
+    interior nodes     11,438,781     35,073,778     x3.07
+    cached leaves      29,295,354     28,355,621     x0.97   (FLAT, slightly down)
+    cached particles  263,143,034    319,046,426     x1.21
+    nodes per request        15.4           17.3
+    requests             2,644,471      3,665,431     x1.39
+
+*** THE EXTRA DEPTH SHIPS INTERIOR NODES, NOT LEAVES AND NOT MAINLY PARTICLES.
+    Interior structure TRIPLES while the leaf population is flat to within 3%.
+    So the shipped subtrees are NOT bottoming out -- they are getting deeper in
+    branch structure, and the branch structure is what nobody examines: `never`
+    rises 76.5% -> 84.7% while `used` stays at ~9.6M. ***
+
+THE SECOND HALF OF THE HYPOTHESIS IS SUPPORTED, and it explains the
+non-monotone request count.  A depth-D slice of an oct tree has a frontier that
+grows with the branch factor per level, and the walk's useful coverage does
+not grow with it -- the working set is fixed at 9.6M nodes (relay90 section 2).
+So going 3 -> 4 multiplies the frontier faster than the coverage it buys, and
+each frontier node is a placeholder that the walk may still have to request.
+Requests rise 39% even though each reply is 12% bigger.
+
+    particles per cached leaf: 8.98 at -D 3, 11.25 at -D 4.  The leaf MIX
+    shifts toward fuller leaves, which is why particles rise 21% on a flat
+    leaf count.
+
+*** AND THE FIELD THAT WOULD SETTLE IT IS THE ONE THE LABELLING BUG HIDES.
+    The placeholder population is exactly `used_nodes` -- "pool slots incl.
+    placeholders", TreeCache.h:237 -- and that is the field FoF3.C:783 packs
+    over with cached_nodes and never reports (relay88 section 2).  Fixed
+    upstream at 6b2b623 for the label; reporting the real used_nodes as well
+    would make this measurable directly instead of inferred. ***
+
+====================================================================
+4.  ITEM 2 -- QUEUED
+====================================================================
+
+Job 5329100, -D 2 vs -D 3 at 128 nodes, 1024 processes, 7168 PEs, 2 reps each
+plus a shakedown arm.  Pending on Resources at submission; 128-node allocations
+queue longer than anything else this campaign has run.  It is the only item
+touching the scaling frontier, so it stays queued rather than being dropped.
+Results to follow separately.
