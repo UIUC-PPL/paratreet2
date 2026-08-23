@@ -791,7 +791,10 @@ using namespace paratreet;
       long max_bytes = *(const long*)elems[1].data;
       int procs = CkNumNodes();
       double N = (double)universe.n_particles;
-      CkPrintf("FOF3STAT cache: pool_MB %.1f used_nodes %ld cached_leaves %ld "
+      // sums[1] is cached_nodes (fetched-content count), NOT used_nodes
+      // (pool slots incl. placeholders) — see CacheManager.h:66 and
+      // TreeCache.h:238-239. The label said used_nodes until 2026-08-22.
+      CkPrintf("FOF3STAT cache: pool_MB %.1f cached_nodes %ld cached_leaves %ld "
                "cached_particles %ld cached_particle_MB %.1f amplification %.3f "
                "avg_MB %.1f max_MB %.1f (totals over %d processes)\n",
                sums[0] / 1e6, sums[1], sums[2], sums[3],

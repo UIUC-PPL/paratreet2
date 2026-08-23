@@ -1,0 +1,144 @@
+relay88 -- CACHE TRAFFIC DURING THE WALK.  2026-08-22, no job: analysis of the
+relay87 arm-B trace (job 5328672, traces/B-tr) plus the application's own
+FOF3STAT cache line.  Script scripts/relay88-cachetraffic.py.
+
+  Kale: the walk is fetch-bound with the balanced group consuming 3-4x the PE
+  time of the skewed one, so characterise the cache traffic before more
+  tie-break work.  The old agenda item "cache-fetch reduction during walk
+  (1.5x walk compute)" was never quantified.
+
+  HEADLINE: **2.64 million fetches moving 8.7 GB in a 290 ms window, and
+  essentially NONE of it is duplicate.**  Both duplicate mechanisms Kale asked
+  about are zero BY CONSTRUCTION, not by luck.  So the lever is not fetching
+  the same thing fewer times -- it is fetching fewer distinct things, or
+  fetching them earlier.  The one quantity still unmeasured is the certificate
+  touch fraction, and that needs instrumentation.
+
+====================================================================
+1.  COUNTS AND BYTES, per PE, over the walk window
+====================================================================
+
+Window bins 10895..11185 (290 ms, the narrow walk window of relay87).  Bytes
+are the BEGIN_PROCESSING msglen field; the executing PE is the FILE, not p[5].
+
+    group          total msgs   total MB    per-PE msgs           per-PE MB
+                                            mean   p90    max     mean  p90   max
+    requestNodes    2,635,020      253.0    2941  4,171  5,405    0.28  0.40  0.52
+    addCache        2,635,019     8716.6    2941  4,278  6,778    9.73 14.28 20.31
+    requestData        82,110        7.9      92    166    344    0.01  0.02  0.03
+    recvTC                  0        0.0
+    pack/unpack             0        0.0
+
+    mean message size: requestNodes 96 B, addCache 3,308 B, requestData 96 B
+    skew: addCache 2.30x msgs, 2.09x bytes    requestNodes 1.84x
+
+*** 8.7 GB IN 290 ms IS 30 GB/s AGGREGATE, about 1.9 GB/s per node.  Against
+    that, the request side is 253 MB -- the traffic is almost entirely the
+    replies.  And note the skew: 2.1-2.3x on cache bytes against 3.89x on walk
+    EPs (relay87).  The dominant consumer is again the more balanced one. ***
+
+The 1:1 ratio between requestNodes and addCache (2,635,020 against 2,635,019 --
+one request still in flight at the window edge) says every request produces
+exactly one reply.  There is no retry or amplification in the protocol itself.
+
+====================================================================
+2.  DISTINCT FETCHED CONTENT -- already reported, and MISLABELLED
+====================================================================
+
+The application already prints this every run and nobody has been reading it:
+
+    FOF3STAT cache: pool_MB 100924.9 used_nodes 40757191 cached_leaves 29315631
+      cached_particles 263289108 cached_particle_MB 6318.9 amplification 0.133
+      avg_MB 837.8 max_MB 1070.0 (totals over 128 processes)
+
+*** A LABELLING BUG, and it matters for anyone reading that line.  FoF3.C:783
+    packs `long sums[5] = {pool_bytes, cached_nodes, cached_leaves,
+    cached_particles, total_bytes}` -- note the SECOND element is
+    **cached_nodes** -- but the printf at :793 labels sums[1] as
+    "used_nodes".  So the 40,757,191 is FETCHED-CONTENT NODES, not pool slots.
+    TreeCache.h:237-238 defines them as different things (used_nodes is "pool
+    slots incl. placeholders") and the real used_nodes is never reported. ***
+
+Derived, per process (128 processes):
+
+    distinct fetched nodes    318,415        fetched bytes    68.1 MB
+    addCache messages          20,586        -> 15.5 nodes per message
+    bytes per distinct node       214 B
+    cached particles        2,057,000        cached-particle bytes  49.4 MB
+
+Amplification 0.133 means the aggregate of all cached particle copies is 13.3%
+of the whole dataset.  Per-process memory skew is mild: max_MB 1070.0 against
+avg_MB 837.8, 1.28x.
+
+====================================================================
+3.  THE DUPLICATE-FETCH FRACTION IS ZERO, BY CONSTRUCTION
+====================================================================
+
+Kale asked for two duplicate mechanisms.  Both are structurally excluded, and
+that is a stronger answer than a small measured number would have been.
+
+(a) SAME KEY FETCHED BY MULTIPLE PEs IN A PROCESS.  CacheManager is a
+    NODEGROUP -- one branch per process, shared by all 7 PEs (`isNodeGroup()`
+    at CacheManager.h:52, and the generated code uses CkSendMsgNodeBranch).
+    A key fetched by one PE is in the shared cache for the other six; a second
+    requester hits it or joins the pending request.  There is no per-PE cache
+    to duplicate into.
+
+(b) REFETCHED ACROSS THE WALK.  **There is no eviction path at all.**  Searching
+    TreeCache.h and CacheManager.h for evict/Evict finds nothing; the only
+    clearing is `destroy()` (TreeCache.h:289), which wipes the pools and
+    lookups wholesale and is called between ITERATIONS.  Within one iteration
+    -- and these runs are `-i 1` -- a fetched node is never dropped, so it can
+    never be refetched.
+
+CONSISTENT WITH THE COUNTS: 20,586 addCache messages per process carrying
+15.5 nodes each is ~319,000 nodes, against 318,415 distinct nodes cached per
+process.  About one fetch per distinct node, which is what (a) and (b) predict.
+
+*** SO THERE IS NO DUPLICATE TRAFFIC TO REMOVE.  A "cache-fetch reduction"
+    cannot come from deduplication.  It has to come from fetching FEWER
+    DISTINCT NODES (better pruning, so the walk asks for less), or from
+    fetching them EARLIER (prefetch, so the 28-34% of wall spent in cache
+    service overlaps something), or from making each node SMALLER (214 B per
+    node today; the cached-particle slimming already took one bite). ***
+
+====================================================================
+4.  THE CERTIFICATE-TOUCH FRACTION -- NOT MEASURED, AND WHAT IT NEEDS
+====================================================================
+
+This is the one part of Kale's request that neither the trace nor the existing
+stats can answer.  The trace carries message counts and sizes but not KEYS, and
+`cacheStats` tallies what is resident, not what was read.
+
+*** IT IS ALSO THE MOST VALUABLE OF THE FOUR.  If a large fraction of those
+    318,415 nodes per process is fetched and then never touched by a
+    certificate, that is a pure pruning defect and it is exactly the "fetch
+    fewer distinct nodes" lever above -- the only lever section 3 leaves open. ***
+
+WHAT IT NEEDS: one counter per cached node (or a bit in the node), set wherever
+a certificate reads it during traversal, tallied in the same post-QD sweep that
+`stats()` already does (TreeCache.h:244 -- it already walks the whole cache
+tree, so the tally costs nothing extra).  Report touched / cached_nodes.  That
+is a small change confined to TreeCache.h plus the read sites in Traverser.h,
+and it is report-only.  I have NOT written it -- it is the obvious next step
+and I would rather it be agreed than guessed at.
+
+====================================================================
+5.  ITEM 2 (per-pair m2) -- SCOPED, NOT RUN
+====================================================================
+
+Not started: item 1 was the priority and this turn went to it.  The scope is
+unchanged from relay87 section 4 and Kale's own note that it is worth ~12 ms on
+the CPU arm, hence the GPU arm where the walk is 2.2x larger:
+
+  - add a per-pair m2 to the pair dump record (today 24 bytes of src, tgt,
+    visits, leafints at s3ab/5324186/pairs-C-raw); m2 is the pool's static
+    expected-pairs estimate, FoFPhase1.h:1022 and :2773
+  - re-run the dump on the GPU arm, then score with relay69-simrules.py
+    against the standing headroom map: current parity 5.22x, best static
+    weight (piece degree) 4.51x, PE-cost oracle 3.57x, LPT bound 2.33x
+
+NOTE FOR WHOEVER RUNS IT: the headroom map above was measured on the CPU arm's
+leafints. The GPU arm will need its own dump and its own map -- the CPU
+numbers are not transferable, which is the same leaf-128-vs-32 confound that
+made relay87 necessary.
