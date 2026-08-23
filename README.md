@@ -84,7 +84,10 @@ target regime.
 
 - The distributed union-find (FoF's UF_2) is the sibling
   [UIUC-PPL/unionfind](https://github.com/UIUC-PPL/unionfind) library
-  (branch `fof_with_aggregation`), checked out **next to** paratreet2
+  (branch **`master`** — the FoF campaign line was merged there in 972f2d2 and
+  development has continued on it; `fof_with_aggregation` is an ancestor of
+  master and is stale, missing `FOF_UF_SIZES` among other things), checked out
+  **next to** paratreet2
   (`../unionfind`), plus [htram](https://github.com/UIUC-PPL/htram) at
   `../htram`. These are needed only for the FoF applications: the core
   toolkit (`src/`) and non-FoF examples build without them. Build unionfind
