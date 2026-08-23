@@ -285,8 +285,9 @@ void CacheManager<Data>::requestNodes(std::pair<Key, int> param) {
 
 template <typename Data>
 void CacheManager<Data>::serviceRequest(Node<Data>* node, int cm_index) {
-  requests_served++;   // relay93 report-only tally
   if (cm_index == this->thisIndex) return; // you'll get it later!
+  requests_served++;   // relay93 report-only tally; counted AFTER the
+                       // self-request early return, which sends nothing
   std::vector<Node<Data>*> sending_nodes;
   std::vector<Particle> sending_particles;
   auto& config = paratreet::getConfiguration();
