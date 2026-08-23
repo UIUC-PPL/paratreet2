@@ -1,0 +1,146 @@
+relay93/94/95 -- THE -s CAP: the scaling stall is broken, and the canopy
+broadcast was shipping 99% waste.  2026-08-23.
+Jobs 5331227, 5331367, 5331402 -- 128 nodes, 2B, 1024 procs, 7168 PEs.
+ALL 32 ARMS EXACT.  Branch relay92-loadcache-profile @ 3548ac3
+(3 commits on origin/main 55f2efc, all report-only).
+
+  HEADLINE: -s 128 takes the 128-node iteration from 1852 ms to 1499 ms, and
+  **128 nodes is now 13.3% FASTER THAN 64** (1499.5 against 1728.9).  The
+  64->128 stall relay92 diagnosed is gone.
+
+====================================================================
+1.  THE SWEEP (relay93, job 5331227, 2 reps; relay94, 5331367, 3 reps)
+====================================================================
+
+    cap      Iter0                  walk   loadCache   source
+    unset   1810.7 / 1852.3        0.417    0.342/0.364  both jobs
+    8192    1685.0                 0.574    0.076
+    2048    1553.7                 0.508    0.028
+    512     1540.8 [1534.6..1551.9] 0.509   0.018        relay94 n=3
+    128     1499.5 [1467.2..1553.6] 0.469   0.016        relay94 n=3  <- BEST
+    1       1600.8 [1494.1..1724.5] 0.563   0.012        relay94 n=3
+    ---
+    64-node reference                                    1728.9
+
+*** THERE IS A GENUINE INTERIOR OPTIMUM AT ~128 AND BOTH ENDS COST.  Too large
+    and the O(P^2) ship dominates (relay92).  Too small and the walk pays:
+    -s 1 is +101 ms against -s 128, almost all of it in the walk (+94 ms), and
+    its spread is 230 ms against 86.  So the pack DOES have a purpose beyond
+    establishing the root -- shipping the top ~2-3 canopy levels eagerly is
+    worth about 100 ms. ***
+
+loadCache falls 0.342 -> 0.015 s, roughly linearly in the cap at large caps
+(4.3x smaller cap gave 4.50x less time) and then flooring at ~12-18 ms, which
+is the payload-independent part.  The P x pack_n model holds where the payload
+dominates and stops mattering once it does not.
+
+*** A relay93 ANOMALY THAT DID NOT SURVIVE.  At n=2, cap 512 read
+    1634.3 [1614.3..1654.3] -- worse than both 2048 and 128 with
+    non-overlapping ranges, and I flagged it as unexplained rather than as a
+    finding.  At n=3 it is 1540.8 [1534.6..1551.9], the tightest arm in the
+    job.  Two reps produced it; the third dissolved it. ***
+
+====================================================================
+2.  WHY IT WORKS -- AND IT IS NOT THE TRADE I EXPECTED
+====================================================================
+
+The prediction on record was that capping trades broadcast bytes for walk
+fetches, with an optimum where they cross.  The fetch side barely moves:
+
+    arm    cached_nodes    requests      canopy_fills   per process
+    unset   131,038,862   12,098,928              0
+    128      95,813,837   12,002,873        347,592          339
+    1        95,504,825   11,974,523        371,745          363
+
+cached_leaves and cached_particles are unchanged to three digits across every
+cap -- the actual DATA fetched never changed.
+
+*** 347,592 CANOPY FILLS ACROSS 1024 PROCESSES IS 339 PER PROCESS.  The
+    uncapped run broadcasts 34,835 canopy entries to every process and each
+    process turns out to need about 339 of them -- UNDER 1%.  This is not a
+    trade between two costs.  It is declining to broadcast a payload that 99%
+    of its recipients never read. ***
+
+AND IT EXPLAINS WHY -s 1 IS WORSE DESPITE ONLY 7% MORE FILLS (371,745 against
+347,592).  The count barely changes; WHICH levels changes.  The top levels are
+wanted by everybody and are served by a handful of canopy chares, so
+withholding them converts a broadcast into a fan-in.  That is a latency and
+contention effect, not a volume one -- which the 230 ms spread on -s 1 shows
+directly.
+
+NOTE ON THE COUNTER, because relay93 got this wrong.  relay93 reported
+"requests flat across every cap", measured with requests_served, which counts
+CacheManager::serviceRequest.  A canopy miss ABOVE the TreePiece level never
+reaches it -- Traverser.h:186 routes those to tc_proxy.requestData, and
+TreeCanopy::requestData calls CacheManager::restoreData directly.  That is
+exactly the traffic the cap redirects.  canopy_fills (branch commit 3548ac3)
+closes the hole; the wall results were never in doubt but the explanation was
+unsupported until now.
+
+====================================================================
+3.  THE TREECANOPY SERIALISATION, CONFIRMED AT 128 NODES (relay95)
+====================================================================
+
+Traced arm at cap 128, 7168 PEs, all present:
+
+    EP                total calls   PEs   busiest PE            window
+    recvTC                 69,670     1   PE0 n=69,670  37.6ms  10543.8-11024.4
+    loadCache                   1     1   PE0           13.7ms
+    recvStarterPack         1,024  1024   PE6543 n=1     0.2ms
+    recvData(canopy)      557,360  7167   PE4697 n=208   0.2ms  10518.8-11024.4
+    upwardPass            243,846  7168   PE126  n=82   17.0ms
+
+*** 69,670 recvTC INVOCATIONS ON PE 0 AND ON NO OTHER PE -- exactly
+    34,835 canopies x 2 accumulation rounds -- spread over a 481 ms window.
+    Alongside it, recvData (the genuine combining reduction) runs 557,360 times
+    across 7,167 PEs at 208 apiece.  One PE doing 69,670 things nobody else
+    does, immediately next to a structure already doing the same traversal in
+    parallel. ***
+
+I OVER-PREDICTED THE COST.  relay92 section 11 estimated ~0.14 s of driver-PE
+time at 128 nodes from a 2 us/invocation assumption; it is 37.6 ms.  So item 2
+is justified on STRUCTURE -- a hand-rolled serial gather beside a working tree
+reduction -- and not on a large measured cost.  Anyone deciding whether to
+build it should weigh 37.6 ms of one PE inside a 481 ms window, not 140 ms.
+
+-s does NOT touch this: the cap applies to send_size in Driver::loadCache,
+AFTER every recvTC has arrived and after sortStorage has sorted all of them.
+The two fixes are independent and item 2 survives the -s result intact.
+
+====================================================================
+4.  PREDICTING THE OPTIMAL -s  (Kale's question, model only -- NOT MEASURED)
+====================================================================
+
+    C_ship(s)  = alpha * P * s          alpha = entry_bytes / B, B ~ 16 GB/s
+    C_lazy(s)  ~ beta * P / s           fan-in on the shallowest withheld
+                                        level: b^d0 chares serving P requesters
+
+Both carry P, so minimising gives  s* = sqrt(beta/alpha)  and **P CANCELS**.
+
+*** THE DISCRIMINATING PREDICTION: if that is right, -s 128 is also optimal at
+    16 and 64 nodes.  If instead the optimum moves as 1/P, the lazy term is a
+    latency CHAIN (~ L log_b(N/s)) rather than a fan-in and the model is wrong.
+    One sweep at 16 and 64 nodes settles it, and it is cheap. ***
+
+ON THE THREE VARIABLES KALE RAISED:
+  PROCESS COUNT   model says no dependence; the alternative says strong
+                  dependence.  This is the cheapest and most discriminating
+                  experiment.
+  DATA SIZE       enters only through canopy depth log_b(N_treepieces), which
+                  does not appear in the fan-in model at all -- only the
+                  shallowest withheld level matters.  So 24B and 80B should
+                  keep roughly the same s* while pack_n itself grows.  That is
+                  the CONVENIENT outcome and therefore the one to distrust.
+  CLUSTERING      the model does NOT capture this and I expect it to be where
+                  the real dependence lives.  Non-uniform density unbalances
+                  the canopy, so a few chares own most of the boundary and the
+                  relevant beta is a TAIL (max_k requests(k) * t_serve), not a
+                  mean.  That pushes s* UP: the more clustered the data, the
+                  more you want to ship eagerly.  The 80M set is the natural
+                  control if its density structure differs.
+
+WHAT WOULD TURN THIS INTO A FORMULA: s* at 16 / 64 / 128 nodes on 2B
+(discriminates the two lazy models), plus the same sweep on 80M (separates size
+from clustering).  Four small jobs and one large one.  I would not ship a
+formula fitted to a single point -- 128 is one optimum, at one scale, on one
+dataset, and nothing yet shows it transfers.
