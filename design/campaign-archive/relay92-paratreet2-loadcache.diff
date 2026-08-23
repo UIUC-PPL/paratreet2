@@ -1,0 +1,120 @@
+diff --git a/examples/fof3/FoF3.C b/examples/fof3/FoF3.C
+index 6e7fa99..e3178fd 100644
+--- a/examples/fof3/FoF3.C
++++ b/examples/fof3/FoF3.C
+@@ -158,6 +158,26 @@ using namespace paratreet;
+ 
+     // Only now ship the starter pack: every canopy annotation is valid.
+     proxy_pack.driver.loadCache(CkCallbackResumeThread());
++    {   // relay92: read the per-process install profile back AFTER loadCache
++        // completed, so the measurement cannot perturb it.
++      void* lcres = nullptr;
++      proxy_pack.cache.loadCacheProf(CkCallbackResumeThread(lcres));
++      CkReductionMsg* lcm = (CkReductionMsg*)lcres;
++      CkReduction::tupleElement* le = nullptr; int ln = 0;
++      lcm->toTuple(&le, &ln);
++      if (ln == 3) {
++        const double* sums = (const double*)le[0].data;
++        double mx = *(const double*)le[1].data;
++        double mn = *(const double*)le[2].data;
++        int procs = CkNumNodes();
++        CkPrintf("FOF3STAT loadcache_install: procs %d pack_n %.0f "
++                 "install_sum_s %.4f mean_s %.4f max_s %.4f min_s %.4f "
++                 "max/mean %.2f\n",
++                 procs, sums[1] / procs, sums[0], sums[0] / procs, mx, mn,
++                 sums[0] > 0 ? mx / (sums[0] / procs) : 0.0);
++      }
++      delete[] le; delete lcm;
++    }
+     double t3 = CkWallTimer();
+     CkPrintf("FOF3STAT time_s: phase1 %.3f tip_encode %.3f fragcount %.3f "
+              "upwardPass %.3f loadCache %.3f\n",
+diff --git a/src/CacheManager.h b/src/CacheManager.h
+index 029cc5e..a469e8f 100644
+--- a/src/CacheManager.h
++++ b/src/CacheManager.h
+@@ -61,6 +61,30 @@ public:
+   // tuple: sums of {pool_bytes, cached_nodes, cached_leaves,
+   // cached_particles, total_bytes} and the max per-process total_bytes
+   // (skew).
++  // relay92 loadCache profile.  Recorded in recvStarterPack; read back by a
++  // SEPARATE entry after loadCache has completed, so the measurement never
++  // perturbs loadCache's own reduction.  Unlike the relay89 touch write this
++  // is O(1) per process in a phase measured in SECONDS at 128 nodes, so it is
++  // unconditional rather than compile-time gated.
++  //
++  // NO CROSS-PROCESS TIMESTAMPS ARE USED.  relay84 measured clock offsets of
++  // up to 66 ms between processes, which would swamp the ship term.  Only
++  // per-process DURATIONS are reduced; ship+barrier is left as the residual
++  // against the driver's own total.
++  double lc_install_s = 0.0;
++  long   lc_pack_n = 0;
++  void loadCacheProf(const CkCallback& cb) {
++    double sums[2] = {lc_install_s, (double)lc_pack_n};
++    double mx = lc_install_s, mn = lc_install_s;
++    CkReduction::tupleElement elems[3] = {
++        CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_double),
++        CkReduction::tupleElement(sizeof(double), &mx, CkReduction::max_double),
++        CkReduction::tupleElement(sizeof(double), &mn, CkReduction::min_double)};
++    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(elems, 3);
++    msg->setCallback(cb);
++    this->contribute(msg);
++  }
++
+   void cacheStats(const CkCallback& cb) {
+     auto s = core.stats();
+     // used_nodes (pool slots incl. PLACEHOLDERS) is reported alongside
+@@ -179,11 +203,14 @@ void CacheManager<Data>::recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack
+ 
+   CkAssert(n == 0 || pack[0].first == Key(1));
+   std::vector<uint64_t> parked; // starter pack precedes all walks: stays empty
++  const double lc_t0 = CkWallTimer();          // relay92: per-process install
+   for (int i = 0; i < n; i++) {
+     // uncomment conditional if prefetch() is ever restored
+     // if (!local_tps.count(pack[i].first))
+     core.installBoundary(CkMyRank(), pack[i], parked);
+   }
++  lc_install_s = CkWallTimer() - lc_t0;        // O(n) per process, n ~ canopies
++  lc_pack_n = n;
+   if (n == 0) root = local_tps[1];
+   CkAssert(root);
+   this->contribute(cb);
+diff --git a/src/Driver.h b/src/Driver.h
+index 9fc17f6..fc89d56 100644
+--- a/src/Driver.h
++++ b/src/Driver.h
+@@ -469,7 +469,10 @@ public:
+     auto& config = paratreet::getConfiguration();
+     CkPrintf("Received data from %d TreeCanopies\n", (int) storage.size());
+     // Sort data received from TreeCanopies (by their indices)
++    const double lc_sort_t0 = CkWallTimer();   // relay92: pack build
++    const long lc_raw = (long)storage.size();
+     if (!storage_sorted) sortStorage();
++    const double lc_sort_s = CkWallTimer() - lc_sort_t0;
+ 
+     // Find how many should be sent to the caches
+     int send_size = storage.size();
+@@ -480,6 +483,11 @@ public:
+       CkPrintf("Broadcasting every tree canopy because num_share_nodes is unset\n");
+     }
+ 
++    CkPrintf("FOF3STAT loadcache_pack: raw_canopies %ld deduped %ld shipped %d "
++             "sort_s %.4f entry_B %d pack_MB %.2f\n",
++             lc_raw, (long)storage.size(), send_size, lc_sort_s,
++             (int)sizeof(std::pair<Key, SpatialNode<Data>>),
++             send_size * (double)sizeof(std::pair<Key, SpatialNode<Data>>) / 1e6);
+     // Send data to caches
+     cache_manager.recvStarterPack(storage.data(), send_size, cb);
+   }
+diff --git a/src/paratreet.ci b/src/paratreet.ci
+index 66e1206..fb9d6ce 100644
+--- a/src/paratreet.ci
++++ b/src/paratreet.ci
+@@ -48,6 +48,7 @@ module paratreet {
+     entry void fireWalkDone();
+     entry void refreshTreePieceCopy(MultiData<Data>);
+     entry void cacheStats(const CkCallback&);
++    entry void loadCacheProf(const CkCallback&);
+     template <typename Visitor>
+     entry void startPrefetch(DPHolder<Data>, CkCallback);
+     entry void startParentPrefetch(DPHolder<Data>, CkCallback);

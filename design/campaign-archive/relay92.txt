@@ -1,0 +1,450 @@
+relay92 part 1 -- -D AT 128 NODES, and what actually scales.
+2026-08-23, job 5329100 (relay91-dsweep-128n), all 5 arms EXACT.
+1024 processes, 7168 PEs, 2B, -l 32, -E 16, FOF_UF_SIZES=0, -u dist.
+Binary FoF3.cpu-prod-v84.  Jobs 5329432 (placeholders + loadCache decomposition
+at 128) and 5329433 (loadCache scale sweep 8/16/64) are still QUEUED.
+
+  THE GATING ANSWER: **TIME STILL BINDS AT 128 NODES.  BYTES AND MEMORY DO
+  NOT.**  -D 3 is nominally FASTER than -D 2 (1735.7 against 1778.2 ms,
+  overlapping), process RSS differs by 67 MB out of 4.2 GB, and the cached
+  particle volume the two arms move differs by 4% rather than the 2.3x it did
+  at 16 nodes.  So the D1+aggregation combination in relay91 section 2 is NOT
+  indicated -- do not build it.
+
+====================================================================
+1.  THE WALLS
+====================================================================
+
+    -D 2   1778.2 ms  [1761.7..1794.7]   walk 0.421 s   loadCache 0.364 s
+    -D 3   1735.7 ms  [1701.3..1770.1]   walk 0.414 s   loadCache 0.323 s
+
+    ranges OVERLAP, as at 16 nodes -- but the sign has flipped: -D 2 was
+    nominally ahead at 16 nodes and is nominally behind here.  Both are ties.
+
+MEMORY, which was -D 2's whole case:
+
+    -D 2   cache avg 207.9 MB/proc   RSS avg 4113.5 MB   cached_particle 10896 MB
+    -D 3   cache avg 271.5 MB/proc   RSS avg 4180.3 MB   cached_particle 11346 MB
+
+*** THE CACHE SAVING SURVIVES (63.6 MB/process) BUT IT IS NOISE AGAINST A
+    4.2 GB RESIDENT SET -- 1.6%.  And the particle volume that differed 2.3x at
+    16 nodes (2793 against 6315 MB) differs by 4% here, because at 1024
+    processes the canopy dominates what gets cached and the depth-3 subtree
+    below it no longer does.  -D 2's case does not survive the scale change. ***
+
+====================================================================
+2.  WHAT SCALES, 16 -> 128 NODES (8x the processes)
+====================================================================
+
+    phase                16n       128n      ratio        verdict
+    phaseA             2.369 s    0.292 s    8.1x         near-perfect
+    phase1 (total)     2.428      0.305      8.0x         near-perfect
+    tip_encode         0.123      0.017      7.2x         good
+    relabel            0.125      0.019      6.6x         good
+    upwardPass         0.260      0.088      3.0x         half
+    component_hist     0.255      0.312      0.8x         FLAT/worse
+    phase3_walk        0.446      0.435      1.03x        see below --
+                                                       work grew 2.285x, so
+                                                       29% efficient, not flat
+    uf2                0.040      0.038      1.05x        flat (tiny)
+    uf2_setup          0.009      0.069      0.13x        7.7x WORSE
+    loadCache          0.011      0.333      0.03x        30x WORSE
+    ------------------------------------------------------------------
+    Iter0              4553       1736       2.62x
+
+*** loadCache IS CONFIRMED AS ANTI-SCALING ON OUR OWN STACK: 30x SLOWER for 8x
+    the processes, 0.24% of the iteration at 16 nodes and 19.2% at 128.  That
+    is the same shape as the recorded 49x from 8 to 128 and it justifies item 2
+    without further argument. ***
+
+*** CORRECTED, 2026-08-23 (Kale): CALLING phase3_walk "FLAT" AGAINST AN 8x
+    EXPECTATION WAS UNFAIR, AND I SHOULD HAVE CHECKED BEFORE SAYING IT.  The
+    walk's work GROWS with process count, because more piece pairs cross a
+    process boundary.  Measured directly:
+
+        FOF3STAT edges emitted    16n 1,234,781    128n 2,821,596    x2.285
+
+    So the walk's output grows as P^0.40 for 8x the processes, and the right
+    yardstick is not 8x but 8/2.285 = 3.5x.
+
+        ideal for the grown work   0.446 x 2.285/8 = 0.127 s
+        achieved                                     0.435 s
+        scaling efficiency         29.3%  (off by 3.41x)
+        what "flat vs 8x" implied  12.8%  -- an overstatement by 2.3x
+
+    The walk is still the largest single term at 128 nodes (25% of the
+    iteration) and 3.4x off its own ideal is still a real scaling problem, but
+    it is a 3.4x problem and not an 8x one. ***
+
+WHERE THE EXTRA EDGES COME FROM, which also says the growth is structural:
+
+    class        16n         128n       ratio   share 16n -> 128n
+    SAME_PROC    739,645    1,572,547   x2.13   59.9% -> 55.7%
+    INTRA_NODE   320,929      721,783   x2.25   26.0% -> 25.6%
+    INTER_NODE   174,207      527,266   x3.03   14.1% -> 18.7%
+
+Inter-node edges grow fastest, as they must -- 8x the processes means far more
+node boundaries -- but the same-process share barely moves (59.9% -> 55.7%)
+because the PE-set split manufactures those per process and the process count
+is what grew.  Nothing here is a defect; it is the surface-to-volume term.
+
+WHAT DOES SURVIVE OF THE ORIGINAL POINT: per-process fetching fell 4.5x (2.06M
+cached particles per process to 0.46M) while the walk time did not move, so
+the walk is still bound by dependence and latency rather than by volume --
+consistent with relay84.  That is why it recovers only 29% of its available
+scaling.
+
+component_histogram also fails to scale (0.255 -> 0.312) and is now 18% of the
+iteration, which nothing in this campaign has looked at.
+
+At 128 nodes the iteration is: walk 25%, loadCache 19%, histogram 18%,
+phase1 18%.  The thing this campaign spent the most effort on -- phase1 -- is
+the one part that already scales perfectly.
+
+====================================================================
+3.  WHAT THIS DECIDES
+====================================================================
+
+  - D1+aggregation: NOT INDICATED.  Kale's rule was that aggregation is worth
+    building only where bytes or memory bind.  At the largest scale we run,
+    they do not: cutting cached bytes (-D 2) buys nothing in time and 1.6% of
+    RSS.  Held in reserve, not built.
+  - loadCache: CONFIRMED as a blocker, 19.2% of the iteration at 128 nodes.
+    Job 5329433 decomposes it; the prediction on record is that the per-process
+    install tracks P and the ship/barrier residual does not dominate.
+  - phase3_walk at scale is a NEW and unclaimed finding, but stated correctly:
+    its work grows 2.285x from 16 to 128 nodes, so it recovers 29% of the
+    scaling available to it rather than 0%.  It is still the largest term at
+    128 nodes (25%) and nothing in this campaign has addressed walk SCALING --
+    everything so far has been constant factors at 16 nodes.
+
+====================================================================
+4.  A WAITER BUG OF MINE, since it nearly caused a false report
+====================================================================
+
+The monitor I armed emitted "ALL THREE JOBS DONE" when only 5329100 had
+finished.  `for j in $remaining` did not word-split the id list, so the loop
+tested the literal string "5329100 5329432 5329433" as one job id, squeue
+failed on it, and the else-branch fired once and exited.  sacct then happily
+printed the FIRST matching record, which made the bogus line look plausible.
+I checked squeue and sacct per id before believing it, and re-armed a waiter
+that iterates literal ids instead of a split string.  Nothing was reported from
+the bad event.
+
+====================================================================
+5.  PART 2 -- job 5329432, the companion at 128 nodes.  THE loadCache
+    PREDICTION IS REFUTED.
+====================================================================
+
+Same scale, v85, so it reports the two fields v84 could not.  All 5 arms EXACT.
+
+    FOF3STAT loadcache_pack:    raw_canopies 69670  deduped 34835  shipped 34835
+                                sort_s 0.0095  entry_B 128  pack_MB 4.46
+    FOF3STAT loadcache_install: procs 1024  pack_n 34835  install_sum_s 45.32
+                                mean_s 0.0443  max_s 0.0668  min_s 0.0391
+                                max/mean 1.51
+    loadCache total 0.357 s
+
+    pack build (sort)      0.0095 s    2.7%
+    per-process install    0.0668 s   18.7%   (worst process; mean 0.0443)
+    ship + barrier         0.2807 s   78.6%   <-- RESIDUAL
+    total                  0.3570 s
+
+*** THE PREDICTION ON RECORD WAS: "install_mean_s should track P roughly
+    linearly and pack_n should track P; ship+barrier should NOT dominate."
+    IT DOES DOMINATE, at 78.6%.  The per-process canopy install is NOT the
+    anti-scaling mechanism.  The collective is. ***
+
+That matters for the fix.  A bounded or lazily-installed canopy -- the remedy
+the install hypothesis pointed at -- would address 18.7% of loadCache at best.
+Kale's other candidate, the collective barrier, is where the time is.
+
+AND BANDWIDTH IS NOT THE CONSTRAINT EITHER.  The pack is 34,835 canopies at
+128 B = 4.46 MB.  Even a naive send to every one of 1024 processes is 4.6 GB
+total, 36 MB per node, against the 1.9 GB/s per node relay88 measured.  So it
+is broadcast latency or the closing reduction over 1024 processes, not volume.
+The 8/16/64 sweep (job 5329722) will show how the residual grows with P.
+
+====================================================================
+6.  PLACEHOLDERS, MEASURED -- and they dominate the pool
+====================================================================
+
+The field relay91 section 3 had to infer, now reported directly:
+
+    arm   cached_nodes     used_nodes        placeholders    ratio
+    D2      95,980,846     813,982,806        718,001,960     7.5x
+    D3     131,004,902   1,074,613,934        943,609,032     7.2x
+
+*** 7.2 PLACEHOLDERS PER CACHED NODE.  88% OF THE POOL BY COUNT, and at
+    ~248 B per slot (266.6 GB / 1.075B slots) about 88% by bytes too.  The
+    frontier population is far larger than the fetched content it surrounds. ***
+
+That is the quantity relay91 section 3 wanted for the -D 4 anomaly and could
+not measure.  It also reframes the cache memory picture: pool_MB 266,618 at
+-D 3 is mostly empty frontier markers, not data.
+
+====================================================================
+7.  A DISAGREEMENT BETWEEN THE TWO 128-NODE JOBS, stated plainly
+====================================================================
+
+    job       D2                          D3
+    5329100   1778.2 [1761.7..1794.7]     1735.7 [1701.3..1770.1]
+    5329432   1762.9 [1755.3..1770.6]     1946.6 [1916.8..1976.3]  SEPARATED
+
+    pooled    D2 1770.6, spread  39 ms    D3 1841.1, spread 275 ms
+
+*** D2 IS REPRODUCIBLE ACROSS BOTH JOBS AND D3 IS NOT.  Four D2 reps span
+    39 ms; four D3 reps span 275 ms and the two jobs order them oppositely.
+    So the section-1 reading of "tied, D3 nominally ahead" was right from ONE
+    job and is not the whole picture from two: at 128 nodes D2 is on average
+    70 ms faster AND far more stable, while D3 is erratic.  I would not claim
+    D2 is faster; I would claim D3 is unpredictable at this scale, which is a
+    different and more useful statement. ***
+
+The gating conclusion in section 3 is unaffected: bytes and memory still do not
+bind (the cache saving is 1.6% of RSS), so D1+aggregation remains not
+indicated.
+
+====================================================================
+8.  A JOB THAT FAILED ON A BUG OF MINE
+====================================================================
+
+Job 5329433 (the 8/16/64 sweep) FAILED after 6 seconds with no log at all.
+
+    local N=$1 T=$((N*8))
+
+Bash expands the arithmetic BEFORE N is assigned, so under `set -u` this is a
+fatal unbound-variable error that exits the shell -- and the `|| true` at the
+call site cannot catch a set -u fatal.  Reproduced in two lines before fixing:
+
+    bash -c 'set -u; f(){ local N=$1 T=$((N*8)); }; f 16'
+      -> environment: N: unbound variable
+
+Fixed to two separate `local` statements and resubmitted as job 5329722.  I had
+also redirected the warm-up to /dev/null, which hid the only diagnostics that
+would have shown this; that is removed too.
+
+STILL PENDING: job 5329722, the 8/16/64 points.  With section 5 in hand the
+question it answers has changed -- it is now "how does the ship+barrier
+residual grow with P", not "does the install track P".
+
+====================================================================
+9.  PART 3 -- job 5329722, the 8/16/64 points.  THE MECHANISM IS THE
+    SHIP, IT IS O(P^2), AND THE FIX IS AN EXISTING UNSET KNOB.
+====================================================================
+
+    nodes  procs   pack_n     MB    sort  inst_max   total  residual   res%
+        8     64    2,393   0.31  0.0006    0.0019   0.004    0.0015  37.5%
+       16    128    4,629   0.59  0.0013    0.0056   0.011    0.0041  37.3%
+       64    512   17,694   2.26  0.0045    0.0305   0.101    0.0660  65.3%
+      128   1024   34,835   4.46  0.0095    0.0668   0.357    0.2807  78.6%
+
+    over 64 -> 1024 processes (16x)
+      pack_n       x 14.56   P^0.97    <- LINEAR IN P
+      install_max  x 35.16   P^1.28
+      loadCache    x 89.25   P^1.62
+      RESIDUAL     x187.13   P^1.89    <- NEARLY P^2
+
+*** THE RESIDUAL IS THE SHIP, NOT THE BARRIER, AND THE EXPONENT PROVES IT.
+    The payload grows linearly with P (pack_n P^0.97, because canopies are per
+    tree piece) and it is sent to P processes, so bytes out of the origin go as
+    P x pack_n ~ P^1.97.  Measured: P^1.89.  A barrier would be P^1.0 or
+    log P and does not fit at all.  This is also consistent with the recorded
+    finding that the runtime broadcast is a SERIAL RAMP from one origin rather
+    than a tree. ***
+
+The residual's SHARE grows with scale too -- 37% at 8 and 16 nodes, 65% at 64,
+79% at 128 -- which is why the mechanism was invisible at the scales this
+campaign has been working at.  loadCache from 8 to 128 nodes is 89x, worse than
+the 49x on record.
+
+*** I MUST CORRECT SECTION 5.  I wrote there that a bounded or lazily-installed
+    canopy "would address 18.7% of loadCache at best", reasoning that it only
+    touches the install.  THAT IS WRONG.  The dominant term is P x pack_n, and
+    bounding the canopy caps pack_n -- which removes one whole factor of P and
+    turns the ship from O(P^2) into O(P).  It attacks the 78.6%, not the
+    18.7%. ***
+
+AND THE KNOB ALREADY EXISTS AND HAS NEVER BEEN SET:
+
+    Driver.h:479   if (config.num_share_nodes > 0 && config.num_share_nodes < send_size)
+                     send_size = config.num_share_nodes;
+                   else
+                     CkPrintf("Broadcasting every tree canopy because num_share_nodes is unset");
+
+    Configuration.h:170   register_field("nShareNodes", "s", num_share_nodes)
+    Main.C:49             conf.num_share_nodes = 0;      <- the default
+
+Every run this campaign has made printed "Broadcasting every tree canopy
+because num_share_nodes is unset" and nobody read it.  `-s N` caps the pack.
+
+ARITHMETIC FOR WHAT IT COULD BUY, clearly marked as arithmetic: capping pack_n
+at the 8-node value (2,393) at 128 nodes is 14.6x less shipped, which on a
+ship-dominated residual would take loadCache from 0.357 s toward ~0.10 s.
+NOT FREE, and that is the point of the knob rather than an oversight: a process
+that does not hold the whole canopy must fetch more during the walk.  The
+experiment is a sweep of -s against walk time, and it is a real trade with both
+sides now instrumented.
+
+====================================================================
+10. AND SCALING HAS ALREADY STOPPED -- 128 NODES IS NOT FASTER THAN 64
+====================================================================
+
+    8 -> 16 nodes (2x):  8977 -> 4598 ms  = 1.95x   near-perfect
+   16 -> 64 nodes (4x):  4598 -> 1729 ms  = 2.66x   fair
+   64 -> 128 nodes (2x): 1729 -> 1771 ms  = 0.98x   NOTHING
+
+*** THE 128-NODE POINT BUYS NOTHING OVER 64.  And loadCache alone accounts for
+    it: it adds 0.256 s between those two points, and without that increase
+    128 nodes would land near 1515 ms against 64 nodes' 1729 -- a real if
+    modest gain instead of none. ***
+
+So loadCache is not merely a growing term, it is precisely what has stalled the
+scaling curve, and the knob that bounds it has been sitting unset in the
+configuration the whole time.  That is the single most actionable finding in
+this report.
+
+====================================================================
+11. TWO CLARIFICATIONS KALE ASKED FOR
+====================================================================
+
+(a) HOW EXACTLY DOES CAPPING pack_n GIVE O(P)?
+
+The residual behaves EXACTLY like "the origin ships the whole pack once per
+destination process".  Test: if that is the mechanism, then
+residual / P / pack_bytes is a BANDWIDTH -- a constant of the machine, not a
+fitted parameter.
+
+    nodes     P     pack_B  residual   per-dest   implied B/W
+        8    64     310000    0.0015     23.4us      13.2 GB/s
+       16   128     590000    0.0041     32.0us      18.4 GB/s
+       64   512    2260000    0.0660    128.9us      17.5 GB/s
+      128  1024    4460000    0.2807    274.1us      16.3 GB/s
+
+*** 13-18 GB/s ACROSS A 16x RANGE OF P AND A 14x RANGE OF PAYLOAD.  That is a
+    constant, and it is a plausible one for a single process pushing through
+    +lci_ndevices 7 with 7 of its 1024 destinations on its own node.  The model
+    is not fitted; it predicts 285.4 ms at 128 nodes against 280.7 measured. ***
+
+So the cost is
+
+    residual  ~  P  x  pack_n  x  128 B  /  B          two factors of P:
+                 ^^^     ^^^^^^                        P destinations, and
+                                                       pack_n itself ~ P
+
+Capping pack_n at a constant K removes the SECOND factor and leaves
+
+    residual  ~  P x K x 128 B / B                     = O(P)
+
+*** SO IT IS O(P), NOT O(1) AND NOT O(log P).  The origin still sends one
+    message per destination; capping only stops each message from growing.
+    Concretely at 128 nodes: 4.46 MB uncapped -> 285 ms, capped at the 8-node
+    pack of 2,393 entries (0.31 MB) -> 20 ms.  That is a 14x cut, and it buys
+    roughly three or four more doublings before the remaining O(P) becomes the
+    blocker again (at 1024 nodes the capped ship is back to ~157 ms). ***
+
+REMOVING THE LAST FACTOR OF P needs a spanning-tree broadcast (O(log P) hops
+instead of P sends from one origin) -- a runtime-level change, and exactly what
+the recorded "broadcast is a serial ramp, not a tree" finding says we do not
+have.  The knob is the cheap fix; the tree is the real one.
+
+(b) IS THE CANOPY COLLECTED ON THE ROOT WITH A CONCAT REDUCTION?
+
+*** NO.  There is no reduction anywhere on the collect side. ***
+
+    TreeCanopy.h:66      d_proxy.recvTC(std::make_pair(this->thisIndex, my_sn));
+    paratreet.ci:161     chare Driver { ... }          <- a SINGLETON chare
+    Driver.h:460         void recvTC(...) { storage.emplace_back(param); }
+
+Every TreeCanopy element sends its own point-to-point message to one chare,
+which appends to a vector.  At 128 nodes that is **69,670 individual entry
+invocations on a single PE** -- 34,835 canopies x 2 accumulation rounds (the
+initial build and TreePiece::upwardPass, which is why raw_canopies is exactly
+twice deduped).
+
+*** SO THE DRIVER IS SERIALISED TWICE, AND I HAVE ONLY MEASURED ONE OF THEM.
+      COLLECT   69,670 point-to-point messages INTO one chare  -- UNMEASURED,
+                and it happens during the tree build and upwardPass, so it is
+                hidden inside phase1, not inside loadCache
+      SHIP       P sends OUT of one chare                      -- measured,
+                78.6% of loadCache ***
+
+PREDICTION, worth one trace and not yet run: at ~2 us per entry invocation the
+collect side is ~0.14 s of driver-PE time at 128 nodes -- the same order as
+loadCache itself, and invisible in the phase rows because it is spread through
+phase1.  It should show as a hot single PE (the Driver's) in a 128-node trace.
+
+AND THE FIX IS ALREADY HALF-BUILT.  TreeCanopy ALREADY aggregates up its own
+tree -- the line right after the recvTC is
+`thisProxy[thisIndex / branch_factor].recvData(my_sn, branch_factor)`.  So the
+canopy tree is being walked upward in parallel AND every node is separately
+messaging the driver.  A concat reduction over the TreeCanopy array, or simply
+taking the result at the canopy root that already exists, would replace 69,670
+serialised messages with one aggregation -- and would also produce the pack
+already deduped, removing the sort and the 2x duplication in one move.
+
+====================================================================
+12. THE RIGHT FRAMING IS AN ALL-GATHER (Kale, 2026-08-23)
+====================================================================
+
+*** COLLECT AND SHIP ARE NOT TWO PROBLEMS.  THEY ARE ONE ALL-GATHER, AND I HAD
+    THE WRONG FRAME.  Section 11 proposed two separate fixes -- a concat
+    reduction inward, a spanning-tree broadcast outward.  Kale's reading is
+    better: every process CONTRIBUTES its canopies and every process NEEDS all
+    of them.  That is an all-gather, and the current implementation routes it
+    through a SINGLETON CHARE -- a gather-to-one followed by a
+    broadcast-from-one, which is the textbook worst way to do it. ***
+
+IT ALSO EXPLAINS THE EXPONENT WITHOUT ANY EXTRA ASSUMPTION.  An all-gather done
+as gather-to-one-then-broadcast-from-one costs P x (total payload) at the
+origin; the payload is itself proportional to P; hence P^2, and section 9
+measured P^1.89.  A proper all-gather is O(total payload) per participant with
+no single serialisation point.
+
+WHY NODE-AWARENESS IS WORTH MORE HERE THAN USUAL.  At 128 nodes there are 1024
+processes on 128 physical nodes, 8 per node.  A two-level all-gather -- shared
+memory within a node, then 128-way across -- cuts wire traffic and per-endpoint
+message count by 8x.  And the payload is SMALL in absolute terms: 4.46 MB
+total, 34,835 entries of 128 B.  **This is not a bandwidth problem, it is a
+topology problem**, which is precisely the case where a node-aware collective
+pays and a bigger pipe does not.
+
+THREE THINGS A CHARM++ IMPLEMENTATION WOULD WANT TO KNOW, all measured:
+
+  1. THE REDUCTION STRUCTURE ALREADY EXISTS.  TreeCanopy aggregates upward on
+     its own tree -- `recvData` runs on 895 of 896 PEs in parallel
+     (TreeCanopy.h, the line right after the recvTC).  Only the COPY to the
+     Driver funnels.  So the inward half is redundant work, not missing work.
+
+  2. THE PAYLOAD ARRIVES IN TWO ROUNDS.  Canopies are sent during the tree
+     build AND again after upwardPass, the second superseding the first --
+     which is why raw_canopies is exactly 2x deduped (69,670 -> 34,835 at 128
+     nodes, 9,258 -> 4,629 at 16).  An all-gather interface must either run
+     twice or defer until the annotations are final.  Today `sortStorage`
+     absorbs it with a stable_sort plus keep-newest dedup, which is also why a
+     proper all-gather would REMOVE the sort: the pack would arrive deduped.
+
+  3. THE ENTRY IS 128 BYTES (std::pair<Key, SpatialNode<Data>>), so the
+     all-gather is a fixed-size-element gather -- the easy case.
+
+WHERE TO SEE IT IN A 16-NODE TRACE (both cpu-szOFF from job 5326926 and R3
+from job 5328919; same EP ids, near-identical pattern):
+
+    EP id  name              calls   PEs   where             first ms  last ms
+      423  buildTree        32,404   896   all                7011.3   7819.7
+      443  recvData         74,064   895   TreeCanopy array   7615.6  10489.3
+      453  recvTC            9,258     1   PE 0 ONLY          7765.1  10489.3
+      236  upwardPass       32,404   896   all               10351.3  10485.4
+      454  loadCache             1     1   PE 0              10489.6  10489.6
+      385  recvStarterPack     128   128   process leaders   10490.9  10495.3
+
+    (cpu-szOFF figures; R3 differs by <1% and ~80 ms of offset)
+
+*** HONEST CAVEAT ABOUT WHAT THE 16-NODE TRACE SHOWS.  At this scale the whole
+    region is ~5 ms of PE-0 time and will look like a thin stipple, not a
+    block.  recvStarterPack is 4.4 ms across all 128 processes because the pack
+    is 0.59 MB.  THE CASE FOR THE ALL-GATHER RESTS ON THE 128-NODE
+    MEASUREMENT -- 78.6% of loadCache and the term that stalled 64->128
+    scaling -- NOT on what the 16-node timeline looks like.  Anyone reviewing
+    the 16-node trace should expect to see the SHAPE (one PE doing 9,258 things
+    nobody else does, spread over 2.7 s) rather than a cost. ***
