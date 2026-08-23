@@ -48,7 +48,7 @@ struct Decomposition: public PUP::able {
 
   virtual void assignKeys(BoundingBox &universe, std::vector<Particle> &particles);
 
-  virtual int getNumParticles(int tp_index) = 0;
+  virtual long getNumParticles(int tp_index) = 0;
 
   virtual int getPartitionHome(int tp_index) = 0;
 
@@ -85,7 +85,7 @@ struct SfcDecomposition : public Decomposition {
 
   virtual Key getTpKey(int idx) override;
   virtual int flush(std::vector<Particle> &particles, const SendParticlesFn &fn) override;
-  virtual int getNumParticles(int tp_index) override;
+  virtual long getNumParticles(int tp_index) override;
   virtual int getPartitionHome(int tp_index) override;
   virtual void countAssignments(const std::vector<GenericSplitter>& states, const std::vector<Particle>& particles, Reader* reader, const CkCallback& cb, bool weight_by_partition) override;
   virtual int findSplitters(BoundingBox &universe, CProxy_Reader &readers, int min_n_splitters) override;
@@ -137,7 +137,7 @@ struct BinaryDecomposition : public Decomposition {
 
   Key getTpKey(int idx) override;
   int flush(std::vector<Particle> &particles, const SendParticlesFn &fn) override;
-  int getNumParticles(int tp_index) override;
+  long getNumParticles(int tp_index) override;
   int getPartitionHome(int tp_index) override;
   int findSplitters(BoundingBox &universe, CProxy_Reader &readers, int min_n_splitters) override;
   void doSplit(const std::vector<GenericSplitter>& splits, Reader* reader, const CkCallback& cb) override;

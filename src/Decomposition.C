@@ -83,7 +83,7 @@ int SfcDecomposition::flush(std::vector<Particle> &particles, const SendParticle
   return flush_count;
 }
 
-int SfcDecomposition::getNumParticles(int tp_index) {
+long SfcDecomposition::getNumParticles(int tp_index) {
   return splitters[tp_index].n_particles;
 }
 
@@ -210,7 +210,11 @@ int SfcDecomposition::serialFindSplitters(BoundingBox &universe, CProxy_Reader &
   }
   std::sort(keys.begin(), keys.end());
 
-  int decomp_particle_sum = 0;
+  // 64-bit, to match universe.n_particles (and the %ld below). NOTE: the
+  // ki / ki_next indices in this loop are still int, so the SFC path is
+  // limited past 2^31 particles for other reasons; oct is the decomposition
+  // that was fixed for the 24B/58B snapshots.
+  long decomp_particle_sum = 0;
 
   saved_n_total_particles = universe.n_particles;
   long threshold = saved_n_total_particles / min_n_splitters;
@@ -235,7 +239,7 @@ int SfcDecomposition::serialFindSplitters(BoundingBox &universe, CProxy_Reader &
 
   // Check if decomposition is correct
   if (decomp_particle_sum != universe.n_particles) {
-    CkPrintf("SFC Decomposition failure: only %d particles out of %d decomposed",
+    CkPrintf("SFC Decomposition failure: only %ld particles out of %ld decomposed\n",
              decomp_particle_sum, universe.n_particles);
     CkAbort("SFC Decomposition failure -- see stdout");
   }
@@ -387,7 +391,7 @@ int OctDecomposition::findSplitters(BoundingBox &universe, CProxy_Reader &reader
       Key from = keys.get(2*i);
       Key to = keys.get(2*i+1);
 
-      int n_particles = counts[i];
+      long n_particles = counts[i];
       if (n_particles > threshold) {
         // Create *branch_factor* more splitter key pairs to go one level deeper.
         // Leading zeros will be removed in Reader::count() to enable
@@ -444,7 +448,7 @@ int OctDecomposition::findSplitters(BoundingBox &universe, CProxy_Reader &reader
 
   // Check if decomposition is correct
   if (decomp_particle_sum != universe.n_particles) {
-    CkPrintf("Decomposition failure: only %d particles out of %d decomposed",
+    CkPrintf("Decomposition failure: only %ld particles out of %ld decomposed\n",
              decomp_particle_sum, universe.n_particles);
     CkAbort("Decomposition failure -- see stdout");
   }
@@ -483,7 +487,7 @@ int BinaryDecomposition::flush(std::vector<Particle> &particles, const SendParti
   return particles.size();
 }
 
-int BinaryDecomposition::getNumParticles(int tp_index) {
+long BinaryDecomposition::getNumParticles(int tp_index) {
   return bins_sizes[tp_index];
 }
 
