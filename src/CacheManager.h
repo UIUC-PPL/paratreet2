@@ -96,9 +96,9 @@ public:
     // which both funnel through serviceRequest. Needed to price the -s cap:
     // capping the canopy trades broadcast bytes for on-demand fetches, and
     // this is the other side of that trade.
-    long sums[7] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
+    long sums[8] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
                     s.cached_particles, s.total_bytes, s.used_nodes,
-                    requests_served};
+                    requests_served, canopy_fills};
     CkReduction::tupleElement elems[2] = {
         CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
         CkReduction::tupleElement(sizeof(long), &s.total_bytes,
@@ -144,6 +144,12 @@ public:
   // would put a lock prefix on the request path for a counter nobody acts on
   // during the run.
   long requests_served = 0;
+  // Canopy fills arriving via restoreData, i.e. the arm that BYPASSES
+  // serviceRequest entirely (Traverser.h:186 -> TreeCanopy::requestData ->
+  // restoreData when the canopy sits ABOVE the TreePiece level). Counting
+  // only serviceRequest made the -s sweep blind to exactly the traffic the
+  // cap redirects.
+  long canopy_fills = 0;
   void recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack, int n, CkCallback);
   void addCache(MultiData<Data>);
   void receiveTreePiece(MultiData<Data>, PPHolder<Data>);
@@ -291,6 +297,7 @@ void CacheManager<Data>::serviceRequest(Node<Data>* node, int cm_index) {
 
 template <typename Data>
 void CacheManager<Data>::restoreData(std::pair<Key, SpatialNode<Data>> param) {
+  canopy_fills++;   // relay94 report-only tally, see the note on the member
   std::vector<uint64_t> parked;
   Node<Data>* node = core.installBoundary(CkMyRank(), param, parked);
   process(node, parked);
