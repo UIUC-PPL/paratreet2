@@ -125,6 +125,12 @@ RISES from 76.4 s at 128 nodes to 101.3 s at 256, and romulus25's from
 65.3 to 84.4. Past ~1024 processes the decomposition is the thing to fix,
 not the walk.
 
+**SUPERSEDED for the iteration, later the same day.** The 128->256
+iteration regression above was the uncapped canopy starter pack, and `-s`
+removes it -- tuned, 256 nodes is the FASTEST point on cosmo25 (5.35 s).
+See "Tuning" below. The decomposition knee is NOT addressed by any of
+those flags and stands as written.
+
 ### Open: memory jumps at 256 nodes
 
 maxRSS/process falls smoothly with scale and then jumps at 2048 processes:
@@ -143,6 +149,92 @@ in the 512-node `_pmi2_kvs_fence` overflow decodes independently to 69.2
 B/entry. So the KVS costs 0.54 GB at 256 nodes, not tens of GB. Cause not
 yet identified; it does not affect correctness and at 72-80% of a node it
 did not threaten the budget.
+
+**Partly reduced by the post-pull commits.** The control run (new binary,
+no flags) reads 34368 MB PE0 / 33.7 GB MaxRSS at 256 nodes against the
+pre-pull 45984 MB / 45.2 GB -- a 25% cut for free. The STEP itself
+survives: 128n control is 13326 MB and 256n control is 34368 MB, still a
+2.6x jump across one doubling. And `-D 2` pushes it back up (44.9 GB,
+"COST" under Tuning below), so the step is worth understanding before
+`-D` is adopted at this width.
+
+## Tuning: `-s` / `-D` / `FOF_UF_SIZES` (2026-08-23, later the same day)
+
+Three settings were recommended for the 24B runs. All three are EXACT --
+every run below returns 6730729617 / max_size 2214117459, unchanged.
+
+  - `-s N`  caps the tree-canopy starter pack (`num_share_nodes`).
+  - `-D N`  cache share depth (`cache_share_depth`, default 3).
+  - `FOF_UF_SIZES=0` skips union-find size bookkeeping FoF never reads.
+
+### Method: control for the binary, not just the flags
+
+The first comparison ran tuned points on the post-pull binary against
+baselines from the PRE-pull binary, so binary and flags moved together.
+That is not attributable. A CONTROL was run -- post-pull binary, no flags
+-- at 128 and 256 nodes, and every claim below is control-vs-tuned on the
+SAME binary.
+
+The control was worth the two jobs: it showed the new commits change
+iteration time by <=2% (7.98->8.12 at 128n, 8.28->8.31 at 256n), i.e. they
+supply the CAPABILITY and the flag is what engages it, while load and
+decomposition moved 30-56% between binaries and I/O runs -- so those
+columns could not have carried an attribution at all.
+
+### Result: the win is real and grows with process count
+
+cosmo25 iteration 0, control vs `-s 128 -D 2` + `FOF_UF_SIZES=0`:
+
+    nodes   control   tuned    flags alone
+       64    11.20*   10.98        -2.0%
+      128     8.12     7.02       -13.5%
+      256     8.31     5.35       -35.6%
+    (*64n is the pre-pull baseline; no 64n control was run.)
+
+**This removes the 256-node regression.** Untuned, 128->256 nodes COSTS
+3.7% (design section above). Tuned, 128->256 GAINS 23.8%, and 256 nodes
+is now the fastest point measured on this snapshot.
+
+The mechanism is visible in `loadcache_pack`. Uncapped, `raw_canopies`
+DOUBLES with node count -- 35120 (64n), 69462 (128n), 136588 (256n) --
+and the pack is broadcast to every process, which is the O(P^2). Capped
+at `-s 128` it is CONSTANT at 1170 at every scale, and `shipped` is
+exactly the cap. Broadcast volume at 256 nodes falls from 8.74 MB x 2048
+processes (~17.9 GB) to 0.02 MB x 2048 (~41 MB).
+
+### `FOF_UF_SIZES=0` propagation is CHECKED, not assumed
+
+The library reads it per-process, so a failure to propagate is silent --
+the run keeps doing the bookkeeping and merely looks 2% slower. The sbatch
+now asserts the census identity and prints UFSIZES_CHECK PASS/FAIL:
+
+    addsize_root    == 0
+    addsize_SKIPPED == fb2_UNION   (exactly)
+
+PASS at all three tuned points (8015981 == 8015981 at 256n).
+
+### COST: process memory goes UP, and the cache counters hide it
+
+Same binary, 256 nodes, control vs tuned:
+
+    pool_MB          793537 -> 331178   -58%
+    max_MB            607.6 ->  344.4   -43%
+    placeholders      2.83B ->  1.20B   -58%
+    requests          30.9M ->  37.5M   +21%
+    MaxRSS/process   33.7GB -> 44.9GB   +33%   <-- UP
+
+Every cache-accounting number improves as advertised while ACTUAL RSS
+rises 11 GB per process. The likely mechanism is `-D 2`: halving the
+bundle depth raises the request count 21%, and outstanding requests carry
+runtime buffer state the cache pool does not count. At 128 nodes the two
+are level (13.87 vs 13.97 GB), so the cost appears at the same scale the
+benefit does.
+
+This matters because memory, not time, sets the minimum node count. Do not
+read `pool_MB`/`max_MB` as a memory saving without checking sacct MaxRSS
+alongside. `-s` and `-D` have not been separated yet; `-s` is the one with
+the O(P^2) argument behind it and `-D` is the likelier source of the
+memory, so the next pair to run is `-s 128` alone vs `-s 128 -D 2`.
 
 ## The 512-node point: BLOCKED by LCI's bootstrap, not by FoF
 
@@ -183,6 +275,28 @@ node), and it is a LAUNCH ceiling. Ways past it, in rough order of value:
      under the ceiling, but changes the shape and is not comparable to the
      points above.
 
+### `--mpi=pmi2` clears the bootstrap and destroys the network
+
+Frontier offers `none`, `pmi2` and `cray_shasta`. The harness has always
+used `cray_shasta` -- which is WHY `_pmi2_kvs_fence` appears: that is
+CRAY's PMI (the `[PE_n]:` prefix is Cray PMI's format), supplied by the
+cray_shasta plugin. The untried option is therefore `pmi2`, i.e. Slurm's
+own PMI2 server.
+
+It works, and it is unusable. At 2 nodes, same binary, identical HAPI
+config:
+
+    plugin         load ms   decomp ms   iter0 ms
+    cray_shasta      10.98       26.01      31.10
+    pmi2            111.97      772.02    2747.93
+
+10x / 30x / 88x. A uniform slowdown across unrelated phases points at
+transport, and the likely mechanism is that `--network=job_vni` (Slingshot
+VNI allocation) is coupled to cray_shasta, so LCI loses CXI. NOT YET
+CONFIRMED -- the provider probe is still owed. What is established is that
+`pmi2` trades the 4096-rank ceiling for a 30-90x network penalty, so it
+does not make 512 nodes usable even though it launches.
+
 ## Reproducing
 
     cd /lustre/orion/csc710/scratch/rrao/bigscale
@@ -194,3 +308,17 @@ node), and it is a LAUNCH ceiling. Ways past it, in rough order of value:
 `DSET=cosmo2b` runs the 1.98B tipsy set as a regression gate: it sits
 below 2^31, so no width defect can fire there, and its answer
 (424897832 / max_size 185317566) must never change.
+
+Tuning knobs (all unset = the historical shape, so the table above
+reproduces): `SCAP` -> `-s`, `DEPTH` -> `-D`, `UFSIZES=0` ->
+`FOF_UF_SIZES=0` with the census assertion, `MPITYPE` -> the srun `--mpi`
+plugin, `BOOTSTRAP=tcp` -> LCI's own TCP rendezvous, `KVS_FORCE` -> pin
+`PMI_MAX_KVS_ENTRIES` for memory probes. E.g. the 256-node tuned point:
+
+    sbatch --nodes=256 --export=ALL,DSET=cosmo25,PPN=7,LEAF=128,NDEV=7,\
+      POLL=1,ITERS=1,SCAP=128,DEPTH=2,UFSIZES=0 run_fof3_bigscale.sbatch
+
+**Always run a no-flag CONTROL on the same binary before attributing a
+change to a flag.** Two separate wrong conclusions in this campaign came
+from comparing across binaries (the timing attribution, and a "memory
+saving" that is actually a 33% memory INCREASE).
