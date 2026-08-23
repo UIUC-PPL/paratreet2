@@ -1,0 +1,67 @@
+diff --git a/unionFindLib.C b/unionFindLib.C
+index 67939e2..84d5e27 100644
+--- a/unionFindLib.C
++++ b/unionFindLib.C
+@@ -174,7 +174,30 @@ static const char* UFS_NAMES[] = {
+     "fb2_climb_remote", "fb2_climb_local",
+     "fb2_UNION", "fb2_SAMEROOT_discard", "fb2_flip",
+     "addsize_root", "addsize_forward", "local_union",
+-    "sc_sent", "sc_applied", "sc_rejected_stale", "addsize_SKIPPED" };
++    "sc_sent", "sc_applied", "sc_rejected_stale", "addsize_SKIPPED",
++    "edge_SAME_PROC", "edge_INTRA_NODE", "edge_INTER_NODE" };
++
++// relay87 CROSS-NODE CENSUS.  relay86 s5 showed the root-pair collapse buys
++// only 1.6%, so a hierarchical gather cannot be justified by "collapse more" --
++// its only remaining justification is retiring edges internal to a coarser
++// group.  The physical node is the natural next level: it is where the
++// interconnect changes (NIC -> shared memory), and 128 -> 16 is a real step
++// short of serial's 1.  So classify every SUBMITTED edge by its two endpoints'
++// owning processes: same process, different process / same physical node, or
++// different node.
++//   TRAP: in Charm SMP CkMyNode() is the PROCESS, not the physical node
++//   (CkNumNodes() == 128 here == 16 physical x 8).  A physical node is not a
++//   Charm entity and must be built from the launch geometry, so the divisor
++//   comes from FOF_PROCS_PER_PNODE (the existing knob, default 8) and is only
++//   valid because the job launches --ntasks-per-node=8 --distribution=block:block.
++static int procsPerPhysNode() {
++    static const int v = [] {
++        const char* e = getenv("FOF_PROCS_PER_PNODE");
++        int x = e ? atoi(e) : 8;
++        return x > 0 ? x : 8;
++    }();
++    return v;
++}
+ 
+ // relay79: the union-find `size` field is DEAD in FoF3 -- the app seeds it,
+ // the library maintains it through add_size, set_component propagates it, and
+@@ -300,6 +323,17 @@ union_request(uint64_t v, uint64_t w) {
+ // ANCHOR_ALGO guard: both algo variants provide a two-arg union_request.
+ void UnionFindLib::
+ union_requests(const std::vector<UFEdge>& edges) {
++    // relay87: classify each SUBMITTED edge exactly once.  Counting here and
++    // not in union_request is deliberate -- union_request recurses on a flip
++    // and would double count the same edge.
++    const int ppn_node = procsPerPhysNode();
++    for (const auto& e : edges) {
++        const int pa = getLocationFromID(e.a).first;
++        const int pb = getLocationFromID(e.b).first;
++        if (pa == pb)                              ufs_[15]++;
++        else if (pa / ppn_node == pb / ppn_node)   ufs_[16]++;
++        else                                       ufs_[17]++;
++    }
+     for (const auto& e : edges) union_request(e.a, e.b);
+ }
+ 
+diff --git a/unionFindLib.h b/unionFindLib.h
+index 09e3165..742d044 100644
+--- a/unionFindLib.h
++++ b/unionFindLib.h
+@@ -241,7 +241,7 @@ class UnionFindLib : public CBase_UnionFindLib {
+     // same-root?). Branch-outcome census, summed over the array and printed
+     // once. UFS_MARK is taken at the fireUF2Edges barrier so walk-concurrent
+     // work and the post-walk drain can be separated.
+-    enum { UFS_N = 15 };
++    enum { UFS_N = 18 };
+     long ufs_[UFS_N] = {0};
+     long ufs_mark_[UFS_N] = {0};
+     // Local climb-hop histogram (sharding measurement, 2026-08-22): log2

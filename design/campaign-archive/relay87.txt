@@ -1,0 +1,164 @@
+relay87 -- DOES THE PE-SET SPLIT CARRY THE WALK IMBALANCE?  Plus the held
+cross-node edge census, folded in.  2026-08-22, job 5328672, all arms EXACT.
+paratreet2 a65da5a (7573ce6 is docs-only) + unionfind cd2d9c8 + census patch
+(patches/relay87-unionfind.diff, NOT pushed).
+FoF3.cpu-prod-v83 7fc5795f7c3d9288a498b9877603fd98,
+FoF3.cpu-prodtr-v83 73e929bc36e2bf7cec8029ed86980a3c.
+
+  THE ANSWER: **A is NOT less imbalanced than B.  It is very slightly worse.**
+  4.00x against 3.89x max/mean on walk EPs, with four of the top five hotspot
+  PEs identical between the arms and the top two identical in order.  By Kale's
+  own decision rule that closes the within-process walk phase: the local-local
+  pairs do not carry the skew, so a phase that pools only them cannot reach it,
+  and the m2-weighted static tie-break becomes the priority.
+
+====================================================================
+1.  THE CONFOUND IS GONE AND THE ANSWER FLIPS THE OTHER WAY
+====================================================================
+
+Kale's local comparison had the GPU arm at 5.93x against the CPU arm's 3.98x,
+suggesting MORE imbalance without local-local pairs -- but leaf 128 vs 32
+confounded it.  Arm A holds everything fixed and turns off only the split.
+
+    per-PE busy, WALK EPs, narrow window (to walk CPU 99%)
+
+    arm                          mean   median    p90     max   MAX/MEAN
+    A  FOF_PE_SETS=1 (OFF)       23.3     20.6    47.6    93.2    4.00x
+    B  defaults (AUTO, sets=7)   24.3     21.3    49.2    94.5    3.89x
+
+*** REMOVING THE LOCAL-LOCAL PAIRS DOES NOT REDUCE THE IMBALANCE.  It nudges
+    it up.  The skew lives in the cross-process pairs, which a within-process
+    phase cannot touch by construction. ***
+
+TOP-5 WALK-EP PEs, and this is the clincher:
+
+    A  PE342  PE419  PE361  PE825  PE754
+    B  PE342  PE419  PE825  PE754  PE292
+    (and the earlier cpu-szOFF trace, different job, different day:
+       PE419  PE342  PE825  PE754  PE292)
+
+Four of five are shared between A and B, the top two are identical in order,
+and the same set recurs in a trace from a different job.  **The straggler is a
+fixed property of the decomposition, not of the split.**  Kale's hypothesis
+from the cpu-best/gpu-best pair is confirmed on a controlled comparison.
+
+WALLS, for completeness (2 reps each):
+    A  5144.4 ms [5131.5..5157.3]      B  4507.7 ms [4471.4..4544.0]
+    A - B = +636.7 ms, +14.1%.  The split is worth 14% and turning it off to
+    measure imbalance costs that; it is not a candidate configuration.
+
+====================================================================
+2.  THE WALK PHASE IS FETCH-BOUND -- CONFIRMED
+====================================================================
+
+    per-PE busy, narrow window, share of window wall
+
+    arm   WALK EPs                    CACHE EPs
+          mean%   max%   MAX/MEAN     mean%   max%   MAX/MEAN
+    A     10.2    40.7     4.00x      34.0    64.4     1.89x
+    B      8.4    32.6     3.89x      27.7    57.7     2.08x
+
+*** CACHE SERVICE IS 28-34% OF WALL AND WALK EPs ARE 8-10%.  Kale's reading
+    (33-35% vs 7.6-10.7% on the cpu-best traces) reproduces on the current
+    stack. The walk phase is fetch-bound: three to four times as much PE time
+    goes to serving and unpacking remote tree data as to the traversal itself. ***
+
+AND NOTE WHICH ONE IS BALANCED.  The cache group's max/mean is 1.89-2.08x
+against the walk group's 3.89-4.00x.  The big consumer is the even one; the
+skewed one is the small one.  That caps what any walk-pair rebalancing can buy
+and is consistent with Kale's own ~74 ms bound on the worst PE.
+
+*** A METHOD NOTE THAT MATTERS FOR COMPARING TO EARLIER FIGURES.  The
+    share-of-wall numbers depend entirely on the window.  Over the FULL
+    walk-active span the same data reads walk 4.7% / cache 15.3%; over the
+    NARROW window (to walk-99%) it reads 8.6% / 28.4%.  Kale's figures are the
+    narrow ones.  scripts/relay87-walkbalance.py prints both so neither can be
+    quoted ambiguously. ***
+
+====================================================================
+3.  THE CROSS-NODE CENSUS (held from 19:30, folded in as asked)
+====================================================================
+
+Every SUBMITTED edge classified by its two endpoints' owning processes.
+Counted in union_requests, not union_request, because a flip recurses and would
+double count.  Node = process / 8, valid only because this job launches
+--ntasks-per-node=8 --distribution=block:block.
+
+    arm   edge_SAME_PROC   edge_INTRA_NODE   edge_INTER_NODE
+    B        739,044           320,912           174,203
+    A              0           315,784           171,568
+
+*** OF THE 495,115 CROSS-PROCESS EDGES, 64.8% ARE INTRA-NODE (320,912) AND
+    35.2% ARE INTER-NODE (174,203).  A node-level stage could retire nearly
+    two thirds of them, leaving 174k to gather instead of 487k -- a 2.8x
+    reduction in the final serial input. ***
+
+TWO GATES THE CENSUS PASSED, both free:
+  - Arm A reports edge_SAME_PROC = 0 EXACTLY.  With the split off there are no
+    same-process pairs by construction, so this is the census checking itself.
+  - Arm A's total edges = 315,784 + 171,568 = **487,352**, which is EXACTLY
+    relay86's contracted count (495,102 -> 487,352) from a completely separate
+    code path.  Contracting away the split's same-process edges recovers
+    precisely the edge set you would have had without the split.  Two
+    independent measurements, same integer.
+  - And B's 739,044 same-process matches relay86's staged local 739,222 to
+    within the run-to-run variation in emitted edges.
+
+WHAT IT MEANS FOR THE HIERARCHICAL VARIANT, as arithmetic and not as a result:
+relay86 measured -u gather at +297 ms against dist with a 0.353 s serial
+finisher on 487k edges.  A node-level stage feeding 174k instead would scale
+that finisher to roughly 0.10-0.13 s (the finisher is superlinear, so the low
+end), saving ~0.22-0.25 s and landing gather at about +50 to +70 ms against
+dist -- before charging the node stage itself.  So the hierarchy closes most of
+the remaining gap and still does not open one.  NOT MEASURED.
+
+====================================================================
+4.  THE m2 SCORING -- BLOCKED, AND HERE IS WHAT IT NEEDS
+====================================================================
+
+*** THE m2 WEIGHTS CANNOT BE SCORED FROM THE EXISTING DUMP.
+    scripts/relay69-simrules.py reads s3ab/5324186/pairs-C-raw, whose record is
+    24 bytes of (src, tgt, visits, leafints) -- no m2.  m2 is the pool's static
+    expected-pairs estimate (rho_a * rho_b * V_int * V_ball, FoFPhase1.h:1022
+    and :2773), computed for phaseB, and it is not in this dump.  Scoring it
+    needs a per-pair m2 added to the dump and one run. ***
+
+What I could do for free is re-score the rules the dump DOES support, which
+bounds what any tie-break can win:
+
+    MEASURED (what actually ran)         max/mean  5.22x   top100 31.4%
+    current: parity of index sum         max/mean  5.22x   top100 31.4%
+    hash coin, w=1                       max/mean  4.97x
+    weighted, w=piece degree             max/mean  4.51x
+    weighted, w=piece cost               max/mean  4.62x
+    weighted, w=PE cost (ORACLE)         max/mean  3.57x
+    whole-pair greedy LPT (bound)        max/mean  2.33x
+    sub-pair splitting (bound)           max/mean  2.12x
+    heaviest single pair = 47.2% of the ideal per-PE load; none exceed it
+
+Read that as the headroom map.  The current rule is exactly the measured
+assignment (5.22x), the best STATIC weight in hand is piece degree at 4.51x --
+14% off the current max/mean -- the oracle reaches 3.57x, and the achievable
+bound is 2.33x.  So static weights capture roughly a third of the available
+imbalance reduction, and no single pair is big enough to be the obstacle.
+m2 is the natural candidate to beat piece degree because it is the same
+quantity the pool already trusts (0.87 R2 at 2B), but it has to be dumped
+before it can be scored.
+
+====================================================================
+5.  WHERE THIS LEAVES KALE'S PROPOSAL
+====================================================================
+
+  - The within-process walk phase is NOT indicated.  A ~ B (4.00x vs 3.89x)
+    says the local-local pairs are not where the skew is, so pooling and
+    balancing them cannot reach it -- and the phase would additionally give up
+    the latency hiding it currently provides by filling fetch waits, which
+    section 2 shows is where most of the PE time actually goes.
+  - The m2-weighted static tie-break is the indicated next step, per Kale's own
+    rule, and it is one dump-and-score away rather than a build.
+  - The straggler PEs are stable across arms and across jobs, so a STATIC
+    remedy is the right shape -- the skew is not something that moves run to
+    run and needs dynamic balancing.
+
+NOT MEASURED: any scale other than 16 nodes; the GPU arm; the node-level stage
+of section 3; and m2 itself.
