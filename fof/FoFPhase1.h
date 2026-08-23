@@ -3373,6 +3373,17 @@ public:
   // this process's UnionFindLib array element (UFNodeMap placement); other
   // PEs of the process no-op (barrier still closes via contribute).
   void initUF2(CProxy_UnionFindLib uf_proxy, const CkCallback& cb) {
+    // Bound the PROCESS side of the tip encoding. The index side is
+    // enforced in applyTipEncoding (<= kUF2IdxMask); this side had
+    // nothing, and above 2^kUF2ProcBits processes the node bits overflow
+    // into the sign bit of the long group_number and silently INVERT the
+    // touched/untouched sign contract applyUF2Labels depends on -- a
+    // wrong answer, not a crash. Production runs 1024 processes, so this
+    // is 1024x of headroom; it is here because every defect in the
+    // 2026-08-23 series was silent, and a silent encoding overflow is the
+    // one that would be hardest to attribute.
+    // (design/width-audit-2026-08-23.md item 8.)
+    CkEnforce(CkNumNodes() < (1 << paratreet::kUF2ProcBits));
     if (CkMyPe() == CkNodeFirst(CkMyNode())) {
       UnionFindLib* lib = uf_proxy[CkMyNode()].ckLocal();
       CkEnforce(lib != nullptr); // must be true on the element's home PE
