@@ -1,0 +1,149 @@
+relay89 -- CACHE-TOUCH CENSUS, and the htram request-spread check.
+2026-08-22.  Job 5328854 (touch census), plus trace analysis of the relay87
+arm-B trace for the spread.  All arms EXACT.
+Patch patches/relay89-paratreet2-cachetouch.diff, NOT pushed.
+Binaries FoF3.cpu-touch-v84 03fc8f246ba2d604cc1c2fe0c04ba908 (-DFOF_CACHE_TOUCH=1)
+         FoF3.cpu-prod-v84  88b5169143c8e57acfdcc7636fd955bd (same patch, no flag)
+
+====================================================================
+1.  THE TOUCH CENSUS -- 76.5% OF FETCHED NODES ARE NEVER EXAMINED
+====================================================================
+
+    FOF3STAT cache_touch: nodes 40,710,543  never 31,149,891 (76.5%)
+                          pruned 0 (0.0%)   used 9,560,652 (23.5%)
+    FOF3STAT cache_touch_depth: canopy(<=3) 73,302  never 82.2% used 17.8%
+                                deep 40,637,241     never 76.5% used 23.5%
+
+Both reps agree to three digits (31,149,891 and 31,152,155 never, on node
+counts differing by 3,664).  The instrumented and plain binaries both EXACT.
+
+*** THREE QUARTERS OF EVERY BYTE FETCHED IS NEVER LOOKED AT.  8.7 GB moves in
+    the walk window (relay88); on this split about 6.7 GB of it is data no
+    certificate ever asks about. ***
+
+====================================================================
+2.  BUT pruned = 0 EXACTLY, AND THAT CHANGES THE READING
+====================================================================
+
+Kale asked for three states precisely so a pruning DEFECT could be told from
+correct pruning.  The middle category came back empty -- not small, exactly
+zero, in both reps and in the canopy split too.  I did not expect that and it
+deserves the scrutiny rather than a footnote.
+
+THE ENCODING IS WHAT KALE ASKED FOR.  touch_state is a monotone raise:
+0 = never examined, 1 = examined by a certificate that PRUNED, 2 = descended
+into or particles read.  So "pruned" survives only for a node that was
+examined by at least one pair and descended by NONE.  The category is
+recoverable; it is genuinely empty.
+
+*** THE READING THAT FITS: PRUNING HAPPENS BEFORE THE FETCH, NOT AFTER.  A node
+    is fetched because a traversal committed to descending into its parent, so
+    every node the walk actually ASKS about is one it goes on to use.  A node
+    the certificate would reject is rejected at its parent and never requested.
+    That is why the middle state is empty.
+
+    WHICH MEANS THE 76.5% IS NOT A PRUNING DEFECT.  IT IS PREFETCH OVERSHOOT.
+    relay88 measured 15.5 nodes per addCache reply -- replies ship a subtree,
+    not a node.  At 23.5% used that is about 3.6 useful nodes per 15.5 shipped.
+    The lever is therefore the BUNDLE (cache share depth -D, currently 3), not
+    the certificate. ***
+
+HONEST LIMIT ON THAT CLAIM.  It rests on my instrumentation returning a true
+zero rather than missing the state-1 write, and the state-2 writes clearly
+work (23.5% is non-zero and stable).  The check that would settle it costs one
+run: count the doOpen calls that return FALSE with a cached target, as a raw
+counter independent of the per-node state.  If that counter is also ~0,
+pruning-before-fetch is confirmed; if it is large, my state-1 write is being
+lost and the never/used split still stands but the interpretation does not.
+I have NOT run that check.
+
+====================================================================
+3.  THE COST OF THE INSTRUMENTATION -- why the gate was the right call
+====================================================================
+
+    T  -DFOF_CACHE_TOUCH=1   4578.1 ms [4572.0..4584.2]
+    P  same patch, no flag   4491.7 ms [4465.7..4517.6]
+    +86.4 ms, +1.9%
+
+Kale's insistence on a compile-time gate rather than an env check is vindicated
+at 1.9% -- an env branch on that path would have cost something similar and
+would have shipped.  The plain binary's cache_touch line is correctly ABSENT
+(the tally is zero, so FoF3.C suppresses it), which the job gated on both ways.
+
+NOTE ON THE PATCH: MAKE_OPTS has to reach src/, fof/ AND examples/fof3/,
+because Node carries the field -- building only some layers with the flag is an
+ODR violation on the Node layout.  build-v84.sh passes it to all three.
+The write is a plain non-atomic byte and the comment in Node.h says why: every
+writer only raises, nothing clears during the walk, so a lost update can only
+under-report.
+
+====================================================================
+4.  THE htram REQUEST-SPREAD CHECK -- THE PREMISE IS WRONG, TWICE
+====================================================================
+
+From the arm-B trace, inverting BEGIN_PROCESSING (p[5] is the source, the
+executing PE is the file) to get each requester's spread of servers:
+
+    DISTINCT DESTINATION PROCESSES per requesting PE (of 128)
+      min 1   p10 3   median 6   p90 10   max 17
+    share of a PE's requests on its top-k destinations
+      top-1  median 52.1%   top-4  median 97.1% (min 59.0%)   top-8  median 100%
+
+*** REQUESTS DO NOT SPREAD OVER 127 PROCESSES.  The median PE talks to SIX, and
+    four destinations carry 97% of its traffic.  The walk's spatial locality
+    concentrates exactly as Kale's alternative supposed, so the "4-item buffer
+    takes ~50 ms to fill" arithmetic does not hold. ***
+
+    per (source PROCESS -> dest PROCESS) channel -- a nodegroup aggregator's
+    granularity, since the cache is per process:
+      1,795 channels   median 2.32 req/ms  -> a 4-item buffer fills in 1.72 ms
+      p90 15.89 req/ms -> 0.25 ms          busiest pair 54.81 req/ms -> 0.07 ms
+    per (requesting PE -> dest process): median 0.55 req/ms -> 7 ms to fill
+
+So at process granularity buffering fills in under 2 ms typically; at per-PE
+granularity it is 7 ms and still too slow.  If aggregation is built it belongs
+on the nodegroup, not per PE.
+
+*** AND THE SECOND HALF OF THE PREMISE IS ALSO WRONG, IN THE OTHER DIRECTION.
+    Kale noted the request side is only 253 MB of 8.7 GB so the ceiling is
+    small.  That is true of BYTES and false of TIME:
+
+      requestNodes  43.7 ms per PE mean, 18.2% of window wall, max/mean 2.17x
+      addCache      33.5 ms per PE mean, 14.0% of window wall
+      otherCache     2.3 ms per PE mean,  1.0%
+
+    SERVING REQUESTS COSTS MORE PE TIME THAN PROCESSING THE FILLS -- 43.7
+    against 33.5 ms -- at 14.9 us per request served.  Bytes are a bad proxy
+    here.  The ceiling is a share of 18.2% of wall, not of 2.9% of bytes. ***
+
+WHAT THAT DOES NOT SAY: most of those 14.9 us is presumably the lookup and
+packing of 15.5 nodes, which aggregation does not remove -- it batches the
+message, not the per-key work.  I have not separated per-message overhead from
+per-key work, so the addressable fraction of the 18.2% is unmeasured.  The
+honest summary is that the concentration objection to aggregation is dead, the
+bytes objection is the wrong metric, and the real question is now the
+per-message overhead share -- which is a different measurement.
+
+====================================================================
+5.  ITEM 3 (m2 dump on the GPU arm) -- NOT RUN
+====================================================================
+
+Items 1 and 2 took the turn.  Scope unchanged from relay87 section 4: add a
+per-pair m2 to the dump record (today 24 bytes of src, tgt, visits, leafints at
+s3ab/5324186/pairs-C-raw), re-run on the GPU arm, score with
+relay69-simrules.py -- and the GPU arm needs its OWN headroom map, since the
+CPU one (current 5.22x, piece degree 4.51x, oracle 3.57x, LPT bound 2.33x) was
+measured on CPU leafints and does not transfer.
+
+====================================================================
+6.  WHAT I WOULD DO NEXT, IN ORDER
+====================================================================
+
+1. The one-run check in section 2 (raw count of pruning doOpen calls with a
+   cached target).  It decides whether the 76.5% is prefetch overshoot or a
+   pruning defect, and those have opposite remedies.
+2. If overshoot: sweep the cache share depth (-D).  It is an existing knob,
+   the measurement is a wall sweep, and the trade is fetched bytes against
+   message count -- both of which relay88 and relay89 now quantify.
+3. Only then the aggregation question, and only after measuring the
+   per-message overhead share of requestNodes' 14.9 us.

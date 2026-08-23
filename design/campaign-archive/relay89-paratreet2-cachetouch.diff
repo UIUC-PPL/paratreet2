@@ -1,0 +1,216 @@
+diff --git a/examples/fof3/FoF3.C b/examples/fof3/FoF3.C
+index c273e89..3df39fa 100644
+--- a/examples/fof3/FoF3.C
++++ b/examples/fof3/FoF3.C
+@@ -798,6 +798,30 @@ using namespace paratreet;
+                sums[3] * (double)sizeof(CachedParticleOf<FragData>::type) / 1e6,
+                N > 0 ? sums[3] / N : 0.0, sums[4] / 1e6 / procs,
+                max_bytes / 1e6, procs);
++      // relay89 touch census. All zero unless the binary was built
++      // -DFOF_CACHE_TOUCH=1, so the line is printed only when it has content.
++      // never = fetched and no certificate ever examined it (a PREFETCH
++      // defect); pruned = examined and correctly rejected (the cache doing
++      // its job); used = descended into or particles read. Split canopy/deep
++      // at the cache share depth (-D) because the two have different prefetch
++      // implications.
++      long tn = sums[5], tp = sums[6], tu = sums[7];
++      long dn = sums[8], dp = sums[9], du = sums[10];
++      long tot = tn + tp + tu + dn + dp + du;
++      if (tot > 0) {
++        long anever = tn + dn, apruned = tp + dp, aused = tu + du;
++        CkPrintf("FOF3STAT cache_touch: nodes %ld  never %ld (%.1f%%)  "
++                 "pruned %ld (%.1f%%)  used %ld (%.1f%%)\n",
++                 tot, anever, 100.0*anever/tot, apruned, 100.0*apruned/tot,
++                 aused, 100.0*aused/tot);
++        long ct = tn+tp+tu, dt = dn+dp+du;
++        CkPrintf("FOF3STAT cache_touch_depth: canopy(<=%d) %ld never %.1f%% "
++                 "pruned %.1f%% used %.1f%%  |  deep %ld never %.1f%% "
++                 "pruned %.1f%% used %.1f%%\n",
++                 paratreet::getConfiguration().cache_share_depth,
++                 ct, ct? 100.0*tn/ct:0.0, ct? 100.0*tp/ct:0.0, ct? 100.0*tu/ct:0.0,
++                 dt, dt? 100.0*dn/dt:0.0, dt? 100.0*dp/dt:0.0, dt? 100.0*du/dt:0.0);
++      }
+       delete[] elems;
+       delete msg;
+     }
+diff --git a/src/CacheManager.h b/src/CacheManager.h
+index f1391b1..b057df8 100644
+--- a/src/CacheManager.h
++++ b/src/CacheManager.h
+@@ -62,9 +62,11 @@ public:
+   // cached_particles, total_bytes} and the max per-process total_bytes
+   // (skew).
+   void cacheStats(const CkCallback& cb) {
+-    auto s = core.stats();
+-    long sums[5] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
+-                    s.cached_particles, s.total_bytes};
++    auto s = core.stats(paratreet::getConfiguration().cache_share_depth);
++    long sums[11] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
++                     s.cached_particles, s.total_bytes,
++                     s.t_never, s.t_pruned, s.t_used,
++                     s.d_never, s.d_pruned, s.d_used};
+     CkReduction::tupleElement elems[2] = {
+         CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
+         CkReduction::tupleElement(sizeof(long), &s.total_bytes,
+diff --git a/src/Node.h b/src/Node.h
+index a69a4c1..694dc69 100644
+--- a/src/Node.h
++++ b/src/Node.h
+@@ -226,6 +226,24 @@ public:
+     CachedBoundary
+   };
+ 
++#if FOF_CACHE_TOUCH
++  // relay89 CACHE-TOUCH CENSUS (report-only; -DFOF_CACHE_TOUCH=1, separate
++  // binary). Three states, not one, because a single "touched" fraction
++  // conflates a pruning DEFECT with correct pruning:
++  //   0 = never examined by any certificate
++  //   1 = examined and PRUNED (fetched, looked at, correctly rejected)
++  //   2 = DESCENDED INTO, or its particles were read
++  //
++  // PLAIN NON-ATOMIC BYTE, DELIBERATELY. The cache is a nodegroup shared by
++  // the 7 PEs of a process, so this field is written concurrently. Every
++  // writer only ever RAISES the value (markTouch in Traverser.h) and nothing
++  // clears it during the walk, so the race is benign: a lost update can only
++  // UNDER-report, never corrupt and never over-report. A single byte cannot
++  // tear. Making it atomic would put a lock prefix on the hottest path in the
++  // traversal, which is precisely what the compile-time gate exists to avoid.
++  mutable unsigned char touch_state = 0;
++#endif
++
+   Node(int _depth, int _n_children, Node* _parent, Type _type, Key _key, int _tp_index, int _cm_index)
+     : SpatialNode<Data>(_depth, (_n_children > 0) ? -1 : 0),
+       n_children(_n_children),
+diff --git a/src/Traverser.h b/src/Traverser.h
+index 170a6f2..7f07712 100644
+--- a/src/Traverser.h
++++ b/src/Traverser.h
+@@ -31,10 +31,24 @@ inline auto maybeSetKeys(V& v, Key s, Key t, int)
+ template <typename V>
+ inline void maybeSetKeys(V&, Key, Key, long) {}
+ 
++// relay89 cache-touch census. Monotone raise only -- see the race note on
++// Node::touch_state. Compiled out entirely unless -DFOF_CACHE_TOUCH=1.
++#if FOF_CACHE_TOUCH
++template <typename N>
++inline void markTouch(const N* n, unsigned char st) {
++  if (n && n->touch_state < st) n->touch_state = st;
++}
++#define FOF_TOUCH(n, st) markTouch((n), (unsigned char)(st))
++#else
++#define FOF_TOUCH(n, st) ((void)0)
++#endif
++
+ template <typename Visitor, typename Node, typename StatCollector>
+ inline bool doOpen(Visitor& v, Node* source, Node* target, StatCollector* stats) {
+   maybeSetKeys(v, source->key, target->key, 0); // no-op unless v opts in
+   auto should_open = v.open(*source, *target);
++  FOF_TOUCH(source, should_open ? 2 : 1);
++  FOF_TOUCH(target, should_open ? 2 : 1);
+ #if COUNT_INTERACTIONS
+   stats->countOpen(should_open);
+ #endif
+@@ -45,6 +59,7 @@ template <typename Visitor, typename Node, typename StatCollector>
+ inline void doLeaf(Visitor& v, Node* source, Node* target, StatCollector* stats) {
+   maybeSetKeys(v, source->key, target->key, 0); // no-op unless v opts in
+   v.leaf(*source, *target);
++  FOF_TOUCH(source, 2); FOF_TOUCH(target, 2);   // particles read
+ #if COUNT_INTERACTIONS
+   stats->countLeafInts(source->n_particles * target->n_particles);
+ #endif
+@@ -53,6 +68,7 @@ inline void doLeaf(Visitor& v, Node* source, Node* target, StatCollector* stats)
+ template <typename Visitor, typename Node, typename StatCollector>
+ inline void doNode(Visitor& v, Node* source, Node* target, StatCollector* stats) {
+   v.node(*source, *target);
++  FOF_TOUCH(source, 2); FOF_TOUCH(target, 2);   // node data read
+ #if COUNT_INTERACTIONS
+   stats->countNodeInts(target->n_particles);
+ #endif
+@@ -61,6 +77,8 @@ inline void doNode(Visitor& v, Node* source, Node* target, StatCollector* stats)
+ template <typename Visitor, typename Node, typename StatCollector>
+ inline bool doCell(Visitor& v, Node* source, Node* target, StatCollector* stats) {
+   auto should_open = v.cell(*source, *target);
++  FOF_TOUCH(source, should_open ? 2 : 1);
++  FOF_TOUCH(target, should_open ? 2 : 1);
+ #if COUNT_INTERACTIONS
+   stats->countOpen(should_open);
+ #endif
+diff --git a/src/TreeCache.h b/src/TreeCache.h
+index c9bee36..bfd8d52 100644
+--- a/src/TreeCache.h
++++ b/src/TreeCache.h
+@@ -240,8 +240,14 @@ public:
+     long cached_leaves = 0;
+     long cached_particles = 0;
+     long total_bytes = 0;
++    // relay89 touch census over CACHED nodes only, split canopy/deep at the
++    // cache share depth (-D). These stay ZERO unless the binary was built
++    // -DFOF_CACHE_TOUCH=1; the fields and their plumbing are unconditional so
++    // that the instrumented and timing binaries share one reduction shape.
++    long t_never = 0,  t_pruned = 0,  t_used = 0;      // canopy (depth <= D)
++    long d_never = 0,  d_pruned = 0,  d_used = 0;      // deep   (depth >  D)
+   };
+-  Stats stats() {
++  Stats stats(int canopy_depth = 3) {
+     Stats s;
+     for (auto& p : pools) {
+       s.pool_bytes += (long)p->allocatedBytes();
+@@ -249,7 +255,7 @@ public:
+     }
+     // Tally by traversing the cache tree itself (leaf_lookup is not
+     // populated on every fetch path). Post-quiescence single reader — safe.
+-    tallyCache(root, s.cached_nodes, s.cached_leaves, s.cached_particles);
++    tallyCache(root, s, canopy_depth);
+     // Cached-particle bytes use the ACTUAL stored type (CachedParticle —
+     // see design/cached-particle-slimming.md), so this directly shows the
+     // slimming saving.
+@@ -260,25 +266,41 @@ public:
+   // Recursive tally over the cache tree: fetched (Cached*) nodes, cached
+   // remote leaves, and their copied particles. Descends everywhere — local
+   // subtrees can hang below cached boundary nodes and vice versa.
+-  void tallyCache(Node<Data>* n, long& cached_nodes, long& cached_leaves_n,
+-                  long& cached_particles) {
++  // relay89: the touch tally rides along on the sweep stats() already does,
++  // so it costs nothing extra -- this recursion walks the whole cache tree
++  // either way.
++  void noteTouch(Node<Data>* n, Stats& s, int canopy_depth) {
++#if FOF_CACHE_TOUCH
++    const bool canopy = (n->depth <= canopy_depth);
++    switch (n->touch_state) {
++      case 0:  (canopy ? s.t_never  : s.d_never)++;  break;
++      case 1:  (canopy ? s.t_pruned : s.d_pruned)++; break;
++      default: (canopy ? s.t_used   : s.d_used)++;   break;
++    }
++#else
++    (void)n; (void)s; (void)canopy_depth;
++#endif
++  }
++
++  void tallyCache(Node<Data>* n, Stats& s, int canopy_depth) {
+     if (n == nullptr) return;
+     switch (n->type) {
+       case Node<Data>::Type::CachedRemoteLeaf:
+-        cached_nodes++;
+-        cached_leaves_n++;
+-        if (n->n_particles > 0) cached_particles += n->n_particles;
++        s.cached_nodes++;
++        s.cached_leaves++;
++        if (n->n_particles > 0) s.cached_particles += n->n_particles;
++        noteTouch(n, s, canopy_depth);
+         return;
+       case Node<Data>::Type::CachedRemote:
+       case Node<Data>::Type::CachedBoundary:
+-        cached_nodes++;
++        s.cached_nodes++;
++        noteTouch(n, s, canopy_depth);
+         break;
+       default:
+         break;
+     }
+     for (int i = 0; i < n->n_children; i++)
+-      tallyCache(n->getChild(i), cached_nodes, cached_leaves_n,
+-                 cached_particles);
++      tallyCache(n->getChild(i), s, canopy_depth);
+   }
+ 
+   void addDisplacedLeaf(int lane, Node<Data>* leaf) {
