@@ -1,0 +1,183 @@
+====================================================================
+relay96 -- THE DISCRIMINATING -s SWEEP AT 16 AND 64 NODES
+          BOTH MODELS FOR s* ARE REFUTED
+====================================================================
+Date        2026-08-23
+Jobs        5331703 (2B)   5331704 (80M)   both COMPLETED
+Scale       one 64-node allocation, srun --nodes= selecting 16 or 64
+Binary      FoF3.cpu-prod-v88  md5 0ac0c6e141f541f4da186cc7e75a73fa
+Refs        paratreet2 main 52decf6, CLEAN
+            unionfind  cd2d9c8 + the relay87 cross-node census patch
+                       (report-only, UNCOMMITTED, present in every arm)
+Script      sbatch/relay96-ssweep-scale.sbatch
+Datasets    2B  /lustre/orion/csc710/proj-shared/cosmo25cmb.768g2_dm.001024
+            80M /lustre/orion/csc710/proj-shared/lambb.00500
+Config      -d oct -u dist -c stats -l 32 -i 1 -E 16 -D 3
+            +ppn 7 +pemap (7 of 8 per L3) +lci_ndevices 7
+            FOF_UF_SIZES=0.  3 reps per arm plus a DISCARDED warm-up.
+
+GATES RUN HERE (Frontier, mine):     2B at 16 and 64 nodes, all 32 arms.
+GATES HELD BY THE LAPTOP (Kale's):   small-scale multi-process exactness.
+No traces were taken.  Nothing was pushed.
+
+EXACTNESS
+  2B   all 32 arms EXACT against the known gold
+       components 424897832, max_size 185317566.
+  80M  31 MATCH + 1 REF.  JUDGMENT CALL, STATED PLAINLY: there is no known
+       gold for lambb.00500, so the warm-up was taken as the reference (REF)
+       and every later arm gated as bitwise-identical to it (MATCH).  That
+       proves the caps are SELF-CONSISTENT on this dataset; it does not prove
+       the answer is right.  If a gold for lambb.00500 exists on the laptop,
+       send it and I will re-gate.
+  Zero gate failures in either job.
+
+SECOND JUDGMENT CALL: -l 32 was used for 80M because it is the measured CPU
+optimum for 2B (relay62).  I have NO evidence it is 80M's optimum.  Every 80M
+number below is therefore valid as an A/B across caps at fixed leaf, and
+should NOT be read as 80M's best achievable time.
+
+====================================================================
+1.  WHAT WAS BEING TESTED
+====================================================================
+relay93/94/95 showed -s 128 broke the 64->128 scaling stall at 128 nodes.
+That left one question: WHERE IS THE OPTIMUM CAP s*, and does it move with P?
+
+Two models were on the record BEFORE the run, which is the only reason this
+run can settle anything:
+
+  FAN-IN model (mine).  The cost being capped is the per-process install of
+  the starter pack, P x pack_n.  pack_n itself grows with P, so capping
+  removes one factor of P.  The right cap is the number of canopy levels the
+  walk actually needs, which is a property of the TREE, not of P.
+  PREDICTION: s* is P-INDEPENDENT.  cap 128 should win at every scale.
+
+  CHAIN model (the alternative).  The cap should track the per-process share
+  of the canopy, which falls as P rises.
+  PREDICTION: s* moves as 1/P -- roughly 1024 at 16 nodes, 256 at 64, 128
+  at 128.
+
+I said before the run that P-independence was the CONVENIENT outcome and
+therefore the one to distrust.  That caution turned out to be worth having.
+
+====================================================================
+2.  RESULTS -- 2B
+====================================================================
+  16 nodes    Iter0 ms  [range]              walk s  loadCache  canopy_fills
+    U          4576.2   [4569.6..4586.6]     0.434    11.0 ms            0   BEST
+    2048       4634.7   [4601.9..4658.7]     0.497     6.0 ms       11,967
+    512        4642.3   [4616.1..4661.4]     0.493     3.0 ms       25,751
+    128        4646.5   [4610.8..4673.0]     0.501     2.0 ms       32,387
+    32         4591.3   [4581.0..4605.6]     0.463     2.0 ms       35,334
+
+  64 nodes
+    U          1764.8   [1753.0..1771.9]     0.409   102.0 ms            0
+    2048       1723.6   [1670.9..1771.7]     0.459    15.3 ms      121,536  overlaps U
+    512        1761.0   [1753.2..1767.5]     0.499     9.0 ms      147,473
+    128        1824.2   [1808.3..1842.8]     0.547     7.7 ms      161,155  WORST
+    32         1745.1   [1717.6..1772.1]     0.486     6.0 ms      168,738
+
+  128 nodes (relay93/94, same binary family): pack 34,835, best cap 128 at
+  1499.5 ms -- capping clearly wins there.
+
+====================================================================
+3.  BOTH MODELS ARE REFUTED
+====================================================================
+FAN-IN is dead.  It predicted cap 128 best at every scale.  At 16 nodes
+UNCAPPED is best and every cap is worse; at 64 nodes cap 128 is the WORST
+arm in the sweep.  A model that names the worst arm as the winner is not
+salvageable by tuning.
+
+CHAIN is dead too.  It predicted a clean 1024 / 256 / 128 progression.  The
+16-node curve is not monotone in the cap at all (32 is better than 128, 512
+and 2048), and at 64 nodes the nominal winner 2048 OVERLAPS the uncapped
+control [1670.9..1771.7] vs [1753.0..1771.9].  There is no ordered
+progression to fit.
+
+I am retracting the fan-in model rather than repairing it.  P does not
+cancel, and it does not scale as 1/P.
+
+====================================================================
+4.  WHAT THE DATA DOES SUPPORT -- A CROSSOVER, NOT AN OPTIMUM
+====================================================================
+The shape that survives is not "pick s*" but "cap or do not cap":
+
+  the COST of capping is roughly SCALE-INDEPENDENT.  Capping makes the walk
+  materialise the top canopy levels lazily; the walk penalty is 30-140 ms on
+  2B and 2-9 ms on 80M, and it does not grow much with P.
+
+  the BENEFIT of capping is bounded by the loadCache it removes, and that
+  grows steeply: 11 ms (16n), 102 ms (64n), 357 ms (128n) on 2B, close to
+  P^1.6 as relay92 measured.
+
+  cap when the loadCache saving exceeds the walk penalty.
+
+  scale        loadCache   walk penalty   predicted net   measured net
+  2B  @ 16n      11 ms        +29 ms         -20 ms        +15  (a LOSS)
+  2B  @ 64n     102 ms        +50 ms         +37 ms         -41  (a wash)
+  80M @ 16n      13 ms         +2 ms          +9 ms         -11
+  80M @ 64n     126 ms         +5 ms        +112 ms        -117
+
+The SIGNS match at all four points and the magnitudes are close at three.
+The crossover sits near 64 nodes on 2B, which is exactly where the sweep is
+ambiguous -- the model and the ambiguity agree.
+
+CAUTION ON THIS MODEL.  It is a post-hoc fit to four points, from the same
+run that killed the two pre-registered models.  It has not predicted
+anything yet.  It should be treated as a hypothesis for the 24B/80B runs to
+attack, not as a result.
+
+====================================================================
+5.  THE 80M RESULT -- SIZE MATTERS, THROUGH A ROUTE I DID NOT EXPECT
+====================================================================
+  16 nodes    Iter0 ms  [range]           walk s  loadCache  canopy_fills
+    U           248.1  [245.5..249.7]     0.056    13.0 ms            0
+    2048        238.7  [235.1..241.8]     0.057     6.0 ms        9,389
+    512         238.9  [235.7..241.2]     0.057     3.0 ms       22,667
+    128         237.9  [235.1..240.2]     0.057     2.0 ms       29,886
+    32          237.2  [233.1..239.2]     0.058     2.0 ms       32,498   BEST, -4.4%
+
+  64 nodes
+    U           379.0  [373.9..383.8]     0.034   126.0 ms            0
+    2048        274.2  [272.9..275.6]     0.043    15.7 ms      103,864
+    512         261.6  [258.9..263.3]     0.039     9.0 ms      128,608   BEST, -31.0%
+    128         272.6  [266.9..282.0]     0.043     8.0 ms      142,844
+    32          266.9  [262.0..271.1]     0.040     6.0 ms      149,382
+
+THE KEY NUMBER.  loadCache at 64 nodes is 102 ms on 2B and 126 ms on 80M --
+essentially the SAME ABSOLUTE COST for a dataset 25x smaller.  loadCache
+depends on P, NOT on N.  As a share of the iteration that is 5.8% on 2B and
+33.2% on 80M.
+
+The consequence is visible directly: 80M at 64 nodes UNCAPPED (379.0 ms) is
+SLOWER than at 16 nodes (248.1 ms).  Negative scaling.  Capping recovers most
+of it (261.6 ms).  A smaller dataset hits the canopy wall at a much lower node
+count, because the wall is set by process count while everything else shrinks
+with N.
+
+ON CLUSTERING, HONESTLY.  I predicted before the run that clustering, not
+size, was where the real dependence would live.  Size is what showed up.  I
+cannot separate the two with one alternative dataset -- 80M differs from 2B in
+both size and structure -- so I have NO evidence about clustering either way,
+and the clustering prediction is neither confirmed nor refuted.  It is
+untested.
+
+====================================================================
+6.  CONSEQUENCE FOR ITEM 3 (the collect gate)
+====================================================================
+The composition argument for item 3 assumed s* was P-independent, so that a
+fixed depth cut would give a P-independent collected count.  That assumption
+is refuted and CANNOT be carried into the depth gate's justification.
+
+Item 3 survives anyway, on a different and better argument: it attacks the
+COLLECT, whose cost is O(P) point-to-point messages into a singleton chare
+regardless of what the walk needs.  That is a structural defect and does not
+depend on where s* is.  See relay97, which measures it.
+
+====================================================================
+7.  WHAT I WOULD NOT CLAIM
+====================================================================
+  - No s* formula.  The run was designed to produce one and instead removed
+    two candidates.  Predicting s* for 24B/80B is not currently possible.
+  - The crossover model is a fit, not a prediction.
+  - 80M's absolute times are at an unvalidated leaf size.
+  - Nothing here says anything about clustering.

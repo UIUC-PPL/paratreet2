@@ -1,67 +1,67 @@
-# uploads/ — 2026-08-23 12:05
+# uploads -- 2026-08-23, the -s scaling test and the canopy collect gate
 
-**START HERE: `relay93.txt`** — jobs 5331227 / 5331367 / 5331402, 128 nodes,
-**all 32 arms EXACT**. Code is on a branch (below); this folder is findings only.
+Two studies, both finished, both with every arm exactness-gated.
+Nothing was pushed. No traces were taken.
 
-## The stall is broken
+## Read in this order
 
-    cap      Iter0                  walk   loadCache
-    unset   1810.7 / 1852.3        0.417   0.342/0.364
-    2048    1553.7                 0.508   0.028
-    512     1540.8 [1534.6..1551.9] 0.509  0.018
-    128     1499.5 [1467.2..1553.6] 0.469  0.016   <- BEST
-    1       1600.8 [1494.1..1724.5] 0.563  0.012
-    64-node reference 1728.9
+1. **relay96.txt** -- the discriminating `-s` sweep at 16 and 64 nodes, on 2B
+   and on 80M. Jobs 5331703 / 5331704, both COMPLETED, 64 arms, zero gate
+   failures. **Both pre-registered models for s* are refuted**, including
+   mine. Replaced by a crossover hypothesis, flagged as a post-hoc fit that
+   has predicted nothing yet.
 
-**128 nodes is now 13.3% faster than 64.** Genuine interior optimum at ~128:
-too large and the O(P²) ship dominates, too small and the walk pays — `-s 1` is
-+101 ms with a 230 ms spread against 86.
+2. **relay97.txt** -- item 3, your `canopy-collect-gate` f9faa0f, measured at
+   128 nodes. Job 5332618, COMPLETED, all 9 runs EXACT.
+   **recvTC 69,670 -> 1,170 exactly as your arithmetic predicted; sort_s
+   9.73 -> 0.10 ms; Iter0 -8.3%, G faster 3 of 3 with separated ranges.**
+   I under-predicted this at ~3% and say so in section 3.
 
-## It is not the trade I predicted
+## Supporting files
 
-    arm     cached_nodes    requests    canopy_fills   per process
-    unset    131,038,862  12,098,928             0
-    128       95,813,837  12,002,873       347,592          339
-    1         95,504,825  11,974,523       371,745          363
+- `relay96-ssweep-scale.sbatch` -- the sweep, `DS` selects the dataset, one
+  64-node allocation covers both scales via `srun --nodes=`.
+- `relay97-collectgate-128n.sbatch` -- the A/B, including the run-time
+  arm-identity gate on `raw_canopies`.
+- `build-v89.sh` -- builds BOTH arms in one pass at 1040b63, asserts exactly
+  one file differs between the refs and that the two binaries differ by md5.
 
-`cached_leaves` and `cached_particles` unchanged to three digits across every
-cap. **347,592 fills over 1024 processes is 339 per process — the uncapped run
-broadcasts 34,835 canopy entries to every process and each needs about 1% of
-them.** Not a trade between two costs; declining to broadcast waste.
+## Three things to look at first
 
-And `-s 1` is worse on only 7% more fills, so it is *which* levels, not how
-many — the top levels are wanted by everyone and served by a handful of chares,
-which turns a broadcast into a fan-in.
+- **relay96 §3.** My fan-in model named cap 128 as the winner at every scale.
+  At 64 nodes cap 128 is the *worst* arm measured. Retracted, not repaired.
+- **relay97 §3.** The gate is worth 134.8 ms but `loadCache`'s own timer moved
+  only 9.7 ms. ~125 ms of the gain is outside the phase being measured, and
+  it is 3.6x the PE-0 CPU that relay93's trace attributed to recvTC. I have
+  candidates but no measurement. A traced rep of both arms would settle it --
+  on your word only.
+- **relay97 §4.** The unset controls MU and GU are identical code paths and
+  differ by 68.8 ms. That is the 128-node noise floor, measured rather than
+  assumed. Single-rep deltas below ~70 ms mean nothing.
 
-## TreeCanopy serialisation confirmed at 128 nodes
+## Judgment calls I made, stated so you can overrule them
 
-    recvTC             69,670 calls   1 PE (PE 0)   37.6 ms, over a 481 ms window
-    recvData(canopy)  557,360 calls   7,167 PEs     208 apiece
+- **80M has no known gold.** I gated its 32 arms as bitwise-identical to the
+  warm-up (31 MATCH + 1 REF). That proves self-consistency across caps, not
+  correctness. Send a gold for `lambb.00500` and I will re-gate.
+- **80M was run at `-l 32`**, the measured CPU optimum for *2B*. No evidence
+  it is 80M's optimum. Its cross-cap A/Bs stand; its absolute times do not.
+- **relay97 rebuilt both arms at 1040b63** rather than reusing v88, because
+  main moved (9798a06, "avoid unnecessary reads for fof", touches Reader.C).
+  So relay97's absolute walls are not comparable to relay93/94/96.
+- **Clustering is untested.** I predicted it, size is what appeared, and one
+  alternative dataset cannot separate the two. Neither confirmed nor refuted.
 
-One PE doing 69,670 things nobody else does, beside a tree reduction already
-running in parallel. **But I over-predicted the cost** — relay92 §11 said ~0.14 s
-from a 2 µs/invocation assumption; it is 37.6 ms. Item 2 is justified on
-structure, not on a large measured cost, and you should weigh it that way.
+## Running now
 
-## Two corrections of mine
+Job **5333391** `relay98-collectgate-64n` -- the same A/B at 64 nodes, where
+relay96 found capping to be a wash. If the collect gate is worth ~130 ms
+there too, 64 nodes becomes a capping win and the relay96 crossover moves.
+Reported separately when it lands.
 
-relay93's cap-512 anomaly **did not survive** a third rep (1634.3 → 1540.8, now
-the tightest arm). And relay93's "requests flat" was measured on the wrong arm —
-`requests_served` misses the `restoreData` path, which is exactly what the cap
-redirects; `canopy_fills` fixes it.
+## Merge decision waiting on you
 
-## §4 answers your `-s` formula question
-
-Model only, not measured: both cost terms carry P, so **P cancels** and
-`s* = sqrt(β/α)`. The discriminating test is cheap — if that holds, `-s 128` is
-also optimal at 16 and 64 nodes; if the optimum moves as 1/P, the lazy term is a
-latency chain and the model is wrong. Clustering is where I expect real
-dependence and the model does not capture it.
-
-## Files
-
-    relay93.txt                 the above in full
-    relay93-ssweep-128n.sbatch  the -s sweep
-    relay94-s1-128n.sbatch      -s 1 and the 512 recheck
-    relay95-canopy-128n.sbatch  canopy_fills + the 128-node trace
-    build-v87.sh                the binaries
+`canopy-collect-gate` f9faa0f does what its commit message claims, holds
+exactness at 128 nodes on 2B, and its no-op-when-unset guarantee is verified.
+Its own commit message says NOT FOR MAIN until the 16/64-node sweeps land --
+they have now landed (relay96).

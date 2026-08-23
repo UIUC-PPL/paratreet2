@@ -62,6 +62,14 @@ void TreeCanopy<Data>::recvProxies(TPHolder<Data> tp_holder, int tp_index_,
 // power of branch_factor therefore keeps a whole number of levels and cannot
 // drop anything the ship would have used before it uses everything above it.
 //
+// The complete-tree count of what a given limit keeps, (b^(d+1)-1)/(b-1), is
+// an UPPER BOUND, exact only while every kept level is full. The canopy is
+// not always complete: at 64 nodes a -s 2048 limit kept 6,754 elements
+// against the formula's 9,362, because its deepest kept level was only 68%
+// populated (relay98 §2). Shallow caps are exact at both scales measured
+// (-s 128 keeps 585 x 2 = 1,170 at 64 AND 128 nodes) because depths 0..3 are
+// full there. Erring low is the safe direction; see the note below.
+//
 // Under-collecting is a PERFORMANCE question, not a correctness one: a
 // process that lacks a canopy entry fetches it during the walk (verified on
 // the laptop — exact at every cap down to -s 1). Unset (-s 0) keeps today's

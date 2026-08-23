@@ -1,0 +1,188 @@
+====================================================================
+relay98 -- THE COLLECT GATE AT 64 NODES
+          IT IS WORTH 42 ms, NOT 130.  AND MY WHOLE-LEVELS
+          ARITHMETIC WAS WRONG, CAUGHT BY THE RUN GATE.
+====================================================================
+Date        2026-08-23
+Job         5333391  COMPLETED  (64 nodes, 512 procs, 3584 PEs, 2B)
+Script      sbatch/relay98-collectgate-64n.sbatch
+Arms        M  FoF3.cpu-prod-v89main  d6de5990214a9a91f7e66d0709229172
+                 paratreet2 main               1040b63
+            G  FoF3.cpu-prod-v89gate  7998f8943c3ae2ed4bff00e03bacc26e
+                 paratreet2 canopy-collect-gate f9faa0f
+            Same two binaries as relay97, unchanged.  unionfind cd2d9c8 +
+            relay87 census (UNCOMMITTED), byte-identical in both arms.
+Config      -d oct -u dist -c stats -l 32 -i 1 -E 16 -D 3, +ppn 7,
+            +lci_ndevices 7, FOF_UF_SIZES=0
+EXACTNESS   all 13 runs EXACT (424897832 / 185317566).  Zero failures.
+No traces.  Nothing pushed.
+
+NOTE: canopy-collect-gate has since been merged to main as 8e4da9e.  This
+report measures f9faa0f, which is the same change.
+
+====================================================================
+1.  THE ANSWER TO THE QUESTION ASKED
+====================================================================
+"If the collect gate is worth ~130 ms at 64 nodes too, 64 nodes turns from a
+tie into a capping win and the crossover moves down."
+
+IT IS NOT WORTH ~130 ms AT 64 NODES.  It is worth 42 ms at -s 128 and
+nothing at -s 2048.
+
+  all n from ONE allocation, so these comparisons are internally valid
+  arm                    Iter0 ms   [range]              vs uncapped
+  MU + GU  uncapped n=2   1810.4    [1806.6..1814.2]        --
+  M128  main  -s 128 n=3  1750.2    [1716.8..1796.9]      -60.2
+  G128  gate  -s 128 n=3  1708.2    [1691.1..1733.1]     -102.2
+  M2048 main  -s 2048 n=2 1710.3    [1705.0..1715.6]     -100.1
+  G2048 gate  -s 2048 n=2 1717.4    [1682.9..1751.9]      -93.0
+
+  THE GATE'S OWN CONTRIBUTION (G - M, same cap, paired, order alternated)
+   -s 128    rep1  -3.8   rep2  -25.7   rep3  -96.5    mean  -42.0 ms  -2.4%
+             G faster 3 of 3, BUT THE RANGES OVERLAP
+             (G's worst 1733.1 is above M's best 1716.8)
+   -s 2048   rep1 -22.1   rep2  +36.3                  mean   +7.1 ms
+             no effect, wrong sign, n=2
+
+  MECHANISM, unambiguous either way:
+   -s 128    raw_canopies 35,388 -> 1,170   sort_s 4.47 -> 0.10 ms
+             loadCache 8.0 -> 3.0 ms
+   -s 2048   raw_canopies 35,388 -> 6,754   sort_s 4.40 -> 0.90 ms
+             loadCache 15.0 -> 12.0 ms
+
+WHY LESS THAN AT 128 NODES.  The collect is 35,388 messages here against
+69,670 there -- half the messages, but the gain falls from 134.8 to 42.0 ms,
+a factor of 3.2.  The cost of the serial fan-in grows faster than the message
+count, which is the same anti-scaling relay92 measured for loadCache overall.
+That is consistent, and it means the gate is worth MORE at 256 and 512 nodes
+than either measurement here, not less.
+
+CONCLUSION FOR THE CROSSOVER.  The gate does NOT move the crossover much at
+64 nodes, because in this allocation capping ALREADY wins without it
+(-60.2 ms), and the gate adds a smaller second increment.  The advice for 24B
+should rest on the 128-node trend and on section 3 below, not on this 42 ms.
+
+====================================================================
+2.  MY WHOLE-LEVELS ARITHMETIC WAS WRONG.  THE RUN GATE CAUGHT IT.
+====================================================================
+I predicted the -s 2048 collect would be 9,362 raw.  It is 6,754.  The gate
+I wrote into the script fired on every G2048 rep:
+
+  !!! GATE ARM collected 6754, whole-levels predicts 9362
+
+The code is correct; my prediction was not.  I computed the kept level count
+from a COMPLETE tree: -s 2048 -> want 14,337 -> limit 32,768 -> depths 0..4
+= 1+8+64+512+4096 = 4,681 elements.  THE CANOPY IS NOT COMPLETE.  Only 3,377
+elements with index < 32,768 exist at 64 nodes, so depth 4 is 2,792 of a
+possible 4,096 -- 68% populated.
+
+At -s 128 the prediction 1,170 was exact, at 64 AND at 128 nodes, because
+depths 0..3 (585) ARE full at both scales.
+
+CONSEQUENCE FOR THE COMMIT MESSAGE.  The whole-levels formula gives an UPPER
+BOUND on what is collected, exact only while every kept level is full.  For
+a deep cap on a sparse canopy the real collect is smaller than the formula
+says -- which is conservative in the safe direction, but the number in the
+commit message should be read as a bound, not a prediction.
+
+This is also the argument for keying such gates to a predicted VALUE rather
+than a threshold.  A "raw < 10000" check would have passed silently and I
+would have reported 6,754 as if I had expected it.
+
+====================================================================
+3.  A DISAGREEMENT WITH relay96 THAT MATTERS MORE THAN THE 42 ms
+====================================================================
+relay96 (job 5331703) and relay98 (job 5333391) disagree on the SIGN of
+cap-128-versus-uncapped at 64 nodes, on the same dataset and the same flags:
+
+                         uncapped        cap 128         cap 128 is
+  relay96, job 5331703    1764.8          1824.2          +59.4 WORSE
+  relay98, job 5333391    1810.4          1750.2          -60.2 BETTER
+
+Both jobs have tight, SEPARATED within-job ranges.  They are not sloppy
+measurements; they disagree.
+
+IT IS NOT THE BUILD.  I suspected 9798a06 ("avoid unnecessary reads for
+fof").  It is not: that commit gates `read_velocity_and_soft` in the NCHILADA
+loader only, and our 2B input (cosmo25cmb.768g2_dm.001024) is a single Tipsy
+file, where the README states and the code confirms the flag has no effect.
+v88 and v89main are behaviourally identical on this input.
+
+WHAT IT IS, most likely: run-to-run allocation variance.  Neither job used
+the core-thief fix (both are --cpus-per-task=14 with no FOF_HELPER_CPUS), and
+the campaign's own note records a 2-4% spread for unfixed arms.  2-4% of
+1780 ms is 36-71 ms, which is the size of BOTH disagreements.
+
+WHAT THIS CORRECTS IN relay96.  Section 3 of relay96 -- both models refuted --
+STANDS: it rests on within-allocation comparisons (16 nodes: uncapped best,
+every cap worse; 64 nodes: cap 128 the worst arm), and relay98 reproduces the
+ordering of the caps among themselves.  What is weaker than I wrote is
+section 4's 64-node row.  I labelled it "a wash" and it is worse than a wash:
+THE SIGN IS NOT REPRODUCIBLE ACROSS ALLOCATIONS.  The crossover is near 64
+nodes, but "near" is now bounded by a systematic of the same size as the
+effect, and no 64-node number should be used to place it precisely.
+
+If the README's crossover rule was written from relay96, it is still right in
+shape.  It should not be trusted to a resolution finer than ~4% at any scale
+where the predicted saving is that small.
+
+TO SETTLE IT PROPERLY: a single allocation containing uncapped and cap 128
+with 5+ interleaved reps, WITH the core-thief fix applied (--core-spec=0
+--cpus-per-task=16, FOF_HELPER_CPUS=0,8,...,56), which the campaign measured
+at <1% spread instead of 2-4%.  I have not run it; say if it is worth a slot.
+
+====================================================================
+3b. ADDED AFTER WRITING: A THIRD MEASUREMENT, AND A RETRACTION
+====================================================================
+relay99 (job 5333830, the traced pair) carried an UNTRACED pair alongside the
+traced arms, as a check on tracing overhead.  That pair is a third independent
+measurement of the same quantity, and it does not agree either:
+
+  job            scale   n   gate's wall value
+  5332618 r97    128 n   3   -134.8 ms   ranges separated
+  5333391 r98     64 n   3    -42.0 ms   ranges overlap
+  5333830 r99    128 n   1    -14.8 ms   M 1486.5, G 1471.7
+
+relay99's MAIN arm (1486.5) lands almost exactly on relay97's GATE arm
+(1484.6).  That whole allocation ran fast.  The difference between the jobs is
+larger than the difference between the arms inside either of them.
+
+WHAT REPRODUCES, EVERY TIME, IN ALL FOUR JOBS:
+  raw_canopies  69,670 -> 1,170   (35,388 -> 1,170 at 64 nodes)
+  sort_s          9.8  -> 0.1 ms
+  loadCache        16  -> 6 ms
+WHAT DOES NOT REPRODUCE: the wall.
+
+I AM RETRACTING relay97's -8.3% AS A NUMBER.  It should not go into the README
+and should not be quoted.  The change is still worth having -- it removes
+68,500 messages from one PE, shrinks the sort 97-fold, cuts memory, and cannot
+be slower than not doing it -- but its wall value is somewhere between about
+15 and 135 ms and this campaign has not measured it to better than that.
+
+This also means section 1 above should be read carefully: "42 ms, not ~130"
+compares against a 130 that I no longer stand behind.  The 42 ms itself is a
+3-rep paired mean with OVERLAPPING ranges, so it is weak evidence too.  The
+honest summary of the gate at 64 nodes is: mechanism certain, wall unresolved.
+
+THE FIX IS ALREADY RUNNING.  relay101 (job 5333878) applies the core-thief fix
+(--core-spec=0 --cpus-per-task=16, FOF_HELPER_CPUS), which the campaign
+measured at <1% arm spread against 2-4% unfixed, and prints a spread column
+per arm.  If the spread collapses, this disagreement is explained and future
+-s numbers are worth something.  If it does not, no -s figure should be quoted
+finer than 4% at any scale.
+
+====================================================================
+4.  NEGATIVE CONTROL AND MEMORY
+====================================================================
+With -s unset the gate is a no-op again: MU and GU both collect 35,388, ship
+17,694, loadCache 111 and 103 ms, canopy_fills 0.  They differ by 7.6 ms --
+a much smaller floor than the 68.8 ms seen at 128 nodes, but n=1 each.
+
+Memory, capped versus uncapped (a property of -s, NOT of the gate), totals
+over 512 processes:
+    pool_MB        141,400  (-s 128)  143,450  (-s 2048)  161,240  (unset)
+    placeholders   501.8 M            509.2 M             573.1 M
+    install_sum_s    0.058             0.912              11.28  PE-seconds
+-s 128 removes 71 M placeholders and 20 GB of pool against uncapped, and cuts
+the install from 11.3 to 0.06 PE-seconds.  The proportions match 128 nodes;
+the absolute saving is smaller because there are half as many processes.

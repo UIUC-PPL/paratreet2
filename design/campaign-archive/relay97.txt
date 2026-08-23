@@ -1,0 +1,169 @@
+====================================================================
+relay97 -- ITEM 3: THE CANOPY COLLECT GATE, MEASURED AT 128 NODES
+          IT WORKS, AND BY MORE THAN THE MECHANISM I COSTED
+====================================================================
+Date        2026-08-23
+Job         5332618  COMPLETED  (128 nodes, 1024 procs, 7168 PEs, 2B)
+Script      sbatch/relay97-collectgate-128n.sbatch
+Build       merged/build-v89.sh  (builds BOTH arms in one pass)
+Branch      canopy-collect-gate  f9faa0f  "canopy collect: gate the
+            driver-send on -s, not just the ship"  -- Kale's commit,
+            src/TreeCanopy.h only, +37/-1.  NOT MERGED.
+Arms        M  FoF3.cpu-prod-v89main  d6de5990214a9a91f7e66d0709229172
+                 paratreet2 main               1040b63
+            G  FoF3.cpu-prod-v89gate  7998f8943c3ae2ed4bff00e03bacc26e
+                 paratreet2 canopy-collect-gate f9faa0f
+            unionfind cd2d9c8 + relay87 cross-node census (UNCOMMITTED),
+            byte-identical in both arms.
+Config      -s 128 -d oct -u dist -c stats -l 32 -i 1 -E 16 -D 3
+            +ppn 7 +pemap (7 of 8 per L3) +lci_ndevices 7, FOF_UF_SIZES=0
+
+GATES RUN HERE (Frontier, mine): 128-node 2B exactness on all 9 runs.
+GATES HELD BY THE LAPTOP (Kale's): the small-scale multi-process exactness
+  already reported in the commit message (1m at 16x1 and 4x4, 8m-uniform,
+  16m, at -s 8 / 128 / 1 and uncapped, all EXACT).
+EXACTNESS: all 9 runs EXACT -- components 424897832, max_size 185317566.
+No traces were taken.  Nothing was pushed.
+
+BUILD NOTE THAT LIMITS WHAT MAY BE COMPARED.  main moved under us since v88:
+  52decf6 -> 9798a06  Ritvik Rao, "avoid unnecessary reads for fof"
+                      (Reader.C, Configuration.h, both Main.C)
+          -> 1040b63  README only
+The branch is based on 1040b63, and 9798a06 changes the reader, so BOTH arms
+were rebuilt at 1040b63 rather than reusing v88 as the control.  The A/B
+inside this job is clean.  The ABSOLUTE walls are NOT comparable to
+relay93/94/96 and must not be subtracted from them.
+
+====================================================================
+1.  WHAT THE GATE DOES, AND WHY THE WALK CANNOT SEE IT
+====================================================================
+Kale's catch: -s caps what Driver::loadCache SHIPS but not what it COLLECTS.
+Every TreeCanopy element messaged the driver regardless, so all of them
+arrived and were sorted before anything was capped.  relay93's trace found
+69,670 recvTC invocations ON PE 0 AND ON NO OTHER PE -- 34,835 canopies x 2
+accumulation rounds -- inside a 481 ms window.
+
+f9faa0f gates the driver-send on the same -s, keeping WHOLE LEVELS: the
+smallest b^(d+1) with (b^(d+1)-1)/(b-1) >= num_share_nodes.  At -s 128 with
+branch factor 8 that is want=897 -> limit=4096, i.e. indices < 4096 =
+depths 0..3 = 1+8+64+512 = 585 elements, x2 rounds = 1,170 sends.
+
+THE SHIP IS UNCHANGED, AND THAT IS WHAT MAKES THIS A CLEAN A/B.  sortStorage
+sorts by key, the element index IS the prefix-coded key, so the shipped
+prefix is the 128 smallest indices -- all of which are below 4096 and are
+therefore still collected.  Both arms ship the same 128 entries and the walk
+sees the same starter cache.  Any Iter0 difference is the COLLECT alone.
+
+That is not just an argument; it is confirmed in the data.  canopy_fills --
+the count of canopy entries the walk had to fetch because they were not in
+the starter pack -- is 347,600 in the M arm and 347,603 in the G arm.  Three
+apart in 347 thousand.  The walk is doing the same work.
+
+====================================================================
+2.  RESULTS
+====================================================================
+  arm             Iter0 ms  [range]            loadCache   sort_s   raw_canopies
+  M  main -s128    1619.4   [1548.7..1683.9]    15.7 ms   9.73 ms       69,670
+  G  gate -s128    1484.6   [1447.1..1526.3]     6.0 ms   0.10 ms        1,170
+
+  paired by rep (order alternated so drift cannot favour one arm):
+    rep 1   M 1683.887   G 1447.060    -236.8 ms
+    rep 2   M 1548.720   G 1526.267     -22.5 ms
+    rep 3   M 1625.599   G 1480.595    -145.0 ms
+    mean                               -134.8 ms   -8.3%   G faster 3 of 3
+  The RANGES SEPARATE: G's worst rep (1526.3) beats M's best (1548.7).
+
+(1) raw_canopies 69,670 -> 1,170, EXACTLY the whole-levels prediction
+    (deduped 585 = 1+8+64+512, times two accumulation rounds).  This is the
+    recvTC count Kale asked to watch.
+(2) sort_s 9.73 ms -> 0.10 ms, a factor of 97.  Kale's reasoning was right:
+    storage now ARRIVES small instead of being trimmed after the fact.
+(3) loadCache phase timer 15.7 -> 6.0 ms.
+
+NOTE ON HOW recvTC WAS COUNTED: no trace was needed.  raw_canopies in the
+existing FOF3STAT loadcache_pack line IS the recvTC count -- it is
+storage.size() read before dedup, and every log in the campaign shows
+raw = 2 x deduped exactly.  This also served as the ARM-IDENTITY GATE, which
+matters because canopyCollectLimit is `static inline` in a header and is
+inlined away at -O; nm reports 0 symbols in BOTH binaries, so the artifact
+gate is advisory and raw_canopies is the only thing that proves which code
+ran.
+
+====================================================================
+3.  I UNDER-PREDICTED THE GAIN, AND THE GAP IS NOT EXPLAINED
+====================================================================
+Before the run I put ~3% on the record and warned it might not separate.  It
+is 8.3% and it separates cleanly.  That prediction was wrong and the reason
+is worth stating.
+
+loadCache's own timer moved only 9.7 ms.  Iter0 moved 134.8 ms.  ABOUT 125 MS
+OF THE GAIN IS OUTSIDE THE PHASE BEING MEASURED, and it is 3.6x the 37.6 ms
+of PE-0 CPU that relay93's trace attributed to recvTC.
+
+The explanation that fits: recvTC arrives during the canopy upward pass,
+BEFORE loadCache is entered, so the phase timer never contained it.  PE 0 is
+the driver PE; its lateness delays loadCache's start, which delays the ship,
+which delays everything after it.  My ~3% estimate was built on the traced
+EP time and inherited its blind spot.
+
+WHY 3.6x AND NOT 1x IS NOT SETTLED.  Candidates, none measured here:
+  - Charm's traced EP duration excludes receive-side runtime cost (message
+    allocation, unpacking, scheduling), so 37.6 ms was always a floor.
+  - 69,670 messages converging on ONE process contend for that process's
+    poll threads (+lci_ndevices 7) and can delay unrelated traffic in it,
+    including walk requests.
+  - Queueing delay ahead of the driver rather than CPU time in it.
+What would settle it is a traced rep of BOTH arms comparing the window
+before loadCache.  Traces are on demand only, so I have not taken one --
+say the word if you want it.
+
+I am reporting -8.3% as measured and the MECHANISM as partly unexplained.
+The two should not be conflated.
+
+====================================================================
+4.  NEGATIVE CONTROL, AND THE NOISE FLOOR IT REVEALED
+====================================================================
+  arm            Iter0 ms   loadCache   raw     shipped   canopy_fills
+  MU  main -s U   1798.1     315.0 ms   69,670   34,835        0
+  GU  gate -s U   1729.3     309.0 ms   69,670   34,835        0
+
+With -s unset the gate is a documented no-op, and it is: identical collect,
+identical ship, identical loadCache, canopy_fills 0 in both.  CONFIRMED.
+
+MU and GU are therefore IDENTICAL CODE PATHS -- and they differ by 68.8 ms.
+That is a free measurement of the noise floor at 128 nodes: SINGLE-REP DELTAS
+BELOW ~70 MS MEAN NOTHING HERE.  The -134.8 ms result clears it as a 3-rep
+paired mean with separated ranges, but the per-rep spread (-236.8 to -22.5)
+is wide and the exact magnitude should not be defended.
+
+====================================================================
+5.  A SECONDARY FINDING NOBODY ASKED FOR -- THE CAP SAVES MEMORY
+====================================================================
+This is a property of -s, NOT of the collect gate.  Capped arms (M and G
+alike) against the uncapped controls, totals over 1024 processes:
+
+    pool_MB          187,657   vs   266,615      -79 GB
+    cached_nodes      95.8 M   vs   131.0 M
+    used_nodes       756 M     vs  1075 M
+    placeholders     660 M     vs   943 M       -283 M
+    install_sum_s      0.116   vs    45.53      PE-seconds
+
+The uncapped starter pack manufactures 283 MILLION extra placeholder nodes
+across the job, and 45.5 PE-seconds go into installing it.  -s was adopted
+for the scaling stall; it is also a large memory reduction, which matters for
+24B/80B where memory, not time, may be the binding constraint.
+
+====================================================================
+6.  RECOMMENDATION
+====================================================================
+The branch does what its commit message claims, the whole-levels arithmetic
+lands on the predicted number exactly, exactness holds at 128 nodes on 2B,
+and the no-op-when-unset guarantee is verified.  From here it is a merge
+decision, not a measurement one.
+
+The one thing that would strengthen it is the 64-node scale, where relay96
+found capping to be a WASH (U 1764.8 vs 2048 1723.6, overlapping).  The
+collect gate adds a saving that costs the walk NOTHING, so if it is worth
+~130 ms there too, 64 nodes turns from a tie into a capping win and the
+relay96 crossover moves.  That run is submitted as job 5333391
+(relay98-collectgate-64n) and will be reported separately.
