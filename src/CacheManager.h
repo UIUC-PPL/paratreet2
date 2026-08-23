@@ -91,8 +91,14 @@ public:
     // cached_nodes (fetched content): their difference is the frontier
     // placeholder population, which is what makes a deeper -D cost more
     // requests than it saves (relay91).
-    long sums[6] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
-                    s.cached_particles, s.total_bytes, s.used_nodes};
+    // requests_served: every node fetch this process ANSWERED, from both
+    // entry points (CacheManager::requestNodes and TreePiece::requestNodes),
+    // which both funnel through serviceRequest. Needed to price the -s cap:
+    // capping the canopy trades broadcast bytes for on-demand fetches, and
+    // this is the other side of that trade.
+    long sums[7] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
+                    s.cached_particles, s.total_bytes, s.used_nodes,
+                    requests_served};
     CkReduction::tupleElement elems[2] = {
         CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
         CkReduction::tupleElement(sizeof(long), &s.total_bytes,
@@ -132,6 +138,12 @@ public:
   void startParentPrefetch(DPHolder<Data>, CkCallback);
   void requestNodes(std::pair<Key, int>);
   void serviceRequest(Node<Data>*, int);
+  // relay93: report-only request tally, read back through cacheStats.
+  // Plain long, not atomic: serviceRequest runs on the nodegroup branch and
+  // a lost increment can only UNDER-report a diagnostic. Making it atomic
+  // would put a lock prefix on the request path for a counter nobody acts on
+  // during the run.
+  long requests_served = 0;
   void recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack, int n, CkCallback);
   void addCache(MultiData<Data>);
   void receiveTreePiece(MultiData<Data>, PPHolder<Data>);
@@ -267,6 +279,7 @@ void CacheManager<Data>::requestNodes(std::pair<Key, int> param) {
 
 template <typename Data>
 void CacheManager<Data>::serviceRequest(Node<Data>* node, int cm_index) {
+  requests_served++;   // relay93 report-only tally
   if (cm_index == this->thisIndex) return; // you'll get it later!
   std::vector<Node<Data>*> sending_nodes;
   std::vector<Particle> sending_particles;
