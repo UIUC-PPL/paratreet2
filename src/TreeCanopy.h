@@ -50,6 +50,37 @@ void TreeCanopy<Data>::recvProxies(TPHolder<Data> tp_holder, int tp_index_,
   d_proxy = dp_holder.proxy;
 }
 
+// Collect-side companion to the -s cap (num_share_nodes). Driver::loadCache
+// caps what it SHIPS, but every canopy element messages the driver
+// regardless, so all of them arrive and are sorted before anything is
+// capped — 34,835 x 2 = 69,670 point-to-point messages onto one PE at 128
+// nodes (relay95), of which the shipped prefix is a few hundred.
+//
+// The element index IS the prefix-coded key (parent = index / branch_factor),
+// and Driver::sortStorage sorts by key, so the shipped prefix is exactly the
+// smallest indices — i.e. the shallowest levels. Keeping only indices below a
+// power of branch_factor therefore keeps a whole number of levels and cannot
+// drop anything the ship would have used before it uses everything above it.
+//
+// Under-collecting is a PERFORMANCE question, not a correctness one: a
+// process that lacks a canopy entry fetches it during the walk (verified on
+// the laptop — exact at every cap down to -s 1). Unset (-s 0) keeps today's
+// behaviour: no gate, every canopy reports.
+static inline uint64_t canopyCollectLimit(int branch_factor) {
+  const long n = paratreet::getConfiguration().num_share_nodes;
+  if (n <= 0 || branch_factor < 2) return 0;   // unset: collect everything
+  // Keep whole levels: the smallest power of b whose complete-tree prefix
+  // (b^(d+1)-1)/(b-1) is at least n, i.e. b^(d+1) >= n*(b-1)+1.
+  const uint64_t want = (uint64_t)n * (uint64_t)(branch_factor - 1) + 1;
+  uint64_t limit = 1;
+  while (limit < want) {
+    const uint64_t next = limit * (uint64_t)branch_factor;
+    if (next < limit) return 0;               // overflow: collect everything
+    limit = next;
+  }
+  return limit;                                // keep indices < limit
+}
+
 template <typename Data>
 void TreeCanopy<Data>::recvData(SpatialNode<Data> child, int branch_factor) {
   // Starting a fresh accumulation round: clear data left from the
@@ -63,7 +94,12 @@ void TreeCanopy<Data>::recvData(SpatialNode<Data> child, int branch_factor) {
   // If data from all children has been received, send the accumulated data
   // to Driver and to the parent TreeCanopy
   if (++recv_count == branch_factor) {
-    d_proxy.recvTC(std::make_pair(this->thisIndex, my_sn));
+    // Only the levels the ship can actually use are collected (see
+    // canopyCollectLimit). The upward aggregation below is UNGATED — it is
+    // how data reaches the root and must run for every element.
+    const uint64_t collect_limit = canopyCollectLimit(branch_factor);
+    if (collect_limit == 0 || (uint64_t)this->thisIndex < collect_limit)
+      d_proxy.recvTC(std::make_pair(this->thisIndex, my_sn));
 
     if (this->thisIndex == 1) {
       //cm_proxy.restoreData(std::make_pair(1, data));
