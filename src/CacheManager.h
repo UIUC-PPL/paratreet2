@@ -61,14 +61,44 @@ public:
   // tuple: sums of {pool_bytes, cached_nodes, cached_leaves,
   // cached_particles, total_bytes} and the max per-process total_bytes
   // (skew).
+  // relay92 loadCache profile.  Recorded in recvStarterPack; read back by a
+  // SEPARATE entry after loadCache has completed, so the measurement never
+  // perturbs loadCache's own reduction.  Unlike the relay89 touch write this
+  // is O(1) per process in a phase measured in SECONDS at 128 nodes, so it is
+  // unconditional rather than compile-time gated.
+  //
+  // NO CROSS-PROCESS TIMESTAMPS ARE USED.  relay84 measured clock offsets of
+  // up to 66 ms between processes, which would swamp the ship term.  Only
+  // per-process DURATIONS are reduced; ship+barrier is left as the residual
+  // against the driver's own total.
+  double lc_install_s = 0.0;
+  long   lc_pack_n = 0;
+  void loadCacheProf(const CkCallback& cb) {
+    double sums[2] = {lc_install_s, (double)lc_pack_n};
+    double mx = lc_install_s, mn = lc_install_s;
+    CkReduction::tupleElement elems[3] = {
+        CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_double),
+        CkReduction::tupleElement(sizeof(double), &mx, CkReduction::max_double),
+        CkReduction::tupleElement(sizeof(double), &mn, CkReduction::min_double)};
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(elems, 3);
+    msg->setCallback(cb);
+    this->contribute(msg);
+  }
+
   void cacheStats(const CkCallback& cb) {
     auto s = core.stats();
     // used_nodes (pool slots incl. PLACEHOLDERS) is reported alongside
     // cached_nodes (fetched content): their difference is the frontier
     // placeholder population, which is what makes a deeper -D cost more
     // requests than it saves (relay91).
-    long sums[6] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
-                    s.cached_particles, s.total_bytes, s.used_nodes};
+    // requests_served: every node fetch this process ANSWERED, from both
+    // entry points (CacheManager::requestNodes and TreePiece::requestNodes),
+    // which both funnel through serviceRequest. Needed to price the -s cap:
+    // capping the canopy trades broadcast bytes for on-demand fetches, and
+    // this is the other side of that trade.
+    long sums[8] = {s.pool_bytes, s.cached_nodes, s.cached_leaves,
+                    s.cached_particles, s.total_bytes, s.used_nodes,
+                    requests_served, canopy_fills};
     CkReduction::tupleElement elems[2] = {
         CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_long),
         CkReduction::tupleElement(sizeof(long), &s.total_bytes,
@@ -108,6 +138,18 @@ public:
   void startParentPrefetch(DPHolder<Data>, CkCallback);
   void requestNodes(std::pair<Key, int>);
   void serviceRequest(Node<Data>*, int);
+  // relay93: report-only request tally, read back through cacheStats.
+  // Plain long, not atomic: serviceRequest runs on the nodegroup branch and
+  // a lost increment can only UNDER-report a diagnostic. Making it atomic
+  // would put a lock prefix on the request path for a counter nobody acts on
+  // during the run.
+  long requests_served = 0;
+  // Canopy fills arriving via restoreData, i.e. the arm that BYPASSES
+  // serviceRequest entirely (Traverser.h:186 -> TreeCanopy::requestData ->
+  // restoreData when the canopy sits ABOVE the TreePiece level). Counting
+  // only serviceRequest made the -s sweep blind to exactly the traffic the
+  // cap redirects.
+  long canopy_fills = 0;
   void recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack, int n, CkCallback);
   void addCache(MultiData<Data>);
   void receiveTreePiece(MultiData<Data>, PPHolder<Data>);
@@ -179,11 +221,14 @@ void CacheManager<Data>::recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack
 
   CkAssert(n == 0 || pack[0].first == Key(1));
   std::vector<uint64_t> parked; // starter pack precedes all walks: stays empty
+  const double lc_t0 = CkWallTimer();          // relay92: per-process install
   for (int i = 0; i < n; i++) {
     // uncomment conditional if prefetch() is ever restored
     // if (!local_tps.count(pack[i].first))
     core.installBoundary(CkMyRank(), pack[i], parked);
   }
+  lc_install_s = CkWallTimer() - lc_t0;        // O(n) per process, n ~ canopies
+  lc_pack_n = n;
   if (n == 0) root = local_tps[1];
   CkAssert(root);
   this->contribute(cb);
@@ -240,6 +285,7 @@ void CacheManager<Data>::requestNodes(std::pair<Key, int> param) {
 
 template <typename Data>
 void CacheManager<Data>::serviceRequest(Node<Data>* node, int cm_index) {
+  requests_served++;   // relay93 report-only tally
   if (cm_index == this->thisIndex) return; // you'll get it later!
   std::vector<Node<Data>*> sending_nodes;
   std::vector<Particle> sending_particles;
@@ -251,6 +297,7 @@ void CacheManager<Data>::serviceRequest(Node<Data>* node, int cm_index) {
 
 template <typename Data>
 void CacheManager<Data>::restoreData(std::pair<Key, SpatialNode<Data>> param) {
+  canopy_fills++;   // relay94 report-only tally, see the note on the member
   std::vector<uint64_t> parked;
   Node<Data>* node = core.installBoundary(CkMyRank(), param, parked);
   process(node, parked);

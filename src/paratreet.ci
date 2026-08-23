@@ -48,6 +48,7 @@ module paratreet {
     entry void fireWalkDone();
     entry void refreshTreePieceCopy(MultiData<Data>);
     entry void cacheStats(const CkCallback&);
+    entry void loadCacheProf(const CkCallback&);
     template <typename Visitor>
     entry void startPrefetch(DPHolder<Data>, CkCallback);
     entry void startParentPrefetch(DPHolder<Data>, CkCallback);
