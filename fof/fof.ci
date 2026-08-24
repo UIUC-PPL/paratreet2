@@ -29,12 +29,6 @@ module fof {
     entry void reset(const CkCallback&);
     entry void fragmentHistogram(const CkCallback&);
     entry void redundancyHistogram(const CkCallback&);
-    // Step 4 (distributed UF_2, -u dist): builds the owner-encoded tip
-    // namespace (node << 40 | dense_index) from frag_counts (already
-    // populated by countFragments) and the UF_2 vertex array to hand to
-    // UnionFindLib. See fof/FoFPhase1.h "Tip encoding" and design/step4.md.
-    // Must run after countFragments, before applyTipEncoding.
-    entry void computeTipEncoding(const CkCallback&);
     // Stage 3 of design/relabel-representative.md: receive this process's
     // slice of the phase-3 label map (keys owner-sharded by processor 0),
     // store it once per process, and trigger applySliceOnPE on each of the
@@ -124,17 +118,16 @@ module fof {
     // representative granularity and contribute to the global reduction.
     entry void applySliceOnPE(const CkCallback&);
     // Cluster-assessment entries (see the "Testing on a cluster" section of
-    // the top-level README): distributed tip-sentinel check, per-PE memory
+    // the top-level README): per-PE memory
     // reduction, and the distributed component-histogram gather used by the
     // fof3 harness's stats mode (no full particle gather).
-    entry void verifyTips(long n_total, const CkCallback&);
     entry void memoryStats(const CkCallback&);
     entry void depositLabelCounts(const CkCallback&);
     entry void histogramShard(int min_component_size, const CkCallback&);
     entry void collectTouchedCounts(const CkCallback&);
     // Distributed UF_2 (step 4; encoded tips required — see design/step4.md).
     // applyTipEncoding: owner-writes rewrite of this PE's particles' tips
-    // through the node's encode map (built by FoFPhase1Node::computeTipEncoding).
+    // (enumeration-free: uf2EncodeTip of the raw tip, sparse-uf2 2026-07-25).
     entry void applyTipEncoding(const CkCallback&);
     // initUF2: wire the process-local UnionFindLib element (vertex array
     // handoff + getLocationFromID registration). Real work happens only on

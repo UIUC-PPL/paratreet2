@@ -1025,8 +1025,11 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
 #endif
   if (uf2_stream_batch > 0)
     fof.enableUF2Streaming(uf_proxy, uf2_stream_batch, CkCallbackResumeThread());
+#ifdef CONCURRENT_COMPRESSION_WAVE
   // Arm periodic compression waves (FOF_WAVE mode + FOF_WAVE_MS period;
-  // both must be set). v2 of the wave trigger: relay74/75 showed the
+  // both must be set). Compile-gated with the library (refuted for FoF at
+  // 2B — relay74/76/77; the unionfind build must define the same flag).
+  // v2 of the wave trigger: relay74/75 showed the
   // single post-flush wave below can never help — at that barrier the
   // forest is shallow under both -E settings — while the drain it
   // targets (334-409 ms at 2B, 128 PEs ~97% idle) runs DURING the
@@ -1041,6 +1044,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     }();
     if (wave_ms > 0) uf_proxy.wave_arm();
   }
+#endif
 
   // The boundary walk: identical to v1/3a. Tips are already encoded (see
   // precondition above), so the edges FoFEdgeVisitor buffers into edge_buf3
@@ -1152,17 +1156,15 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // injection). The lib and its locator registration were set up before
   // the walk.
   fof.fireUF2Edges(uf_proxy, CkCallbackResumeThread());
-  // Compression wave (FOF_WAVE=1 direct / 2 hedge; 0 = off, the default
-  // until validated at scale): fired ONCE, at the natural census-free
+#ifdef CONCURRENT_COMPRESSION_WAVE
+  // Compression wave (FOF_WAVE=1 direct / 2 hedge; 0 = off): fired ONCE,
+  // at the natural census-free
   // milestone — the fireUF2Edges barrier means every PE has submitted its
   // edges — and before the QD that drains the remaining union cascades,
   // which is exactly the near-idle tail the wave shortens (chains walked
   // by the drain become depth <= 2). The broadcast and its cascade are
   // plain sends, so the QD below also covers the wave's own completion;
   // no callback is needed and find_components sees a settled forest.
-  // relay78: snapshot the union-find branch census at this barrier, so
-  // walk-concurrent protocol work and the post-walk drain can be told apart.
-  uf_proxy.ufstat_mark();
   {
     static const int wave = [] {
       const char* e = std::getenv("FOF_WAVE");
@@ -1170,6 +1172,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     }();
     if (wave != 0) uf_proxy.compression_wave();
   }
+#endif
 #ifdef AGGREGATION
   // htram-aware completion of the union_request cascade: items parked in
   // tram buffers are invisible to RTS-level QD (design note §6.3a), so a

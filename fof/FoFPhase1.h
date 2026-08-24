@@ -92,9 +92,11 @@ namespace paratreet {
 
 // Step 4 (distributed UF_2, design/step4.md "Tip encoding"): owner-encoded
 // vertex namespace for UF_2. A process-level tip is renumbered to
-// (owning_process << kUF2IdxBits) | dense_index, where dense_index is a
-// per-process-dense enumeration of that process's own fragments (assigned by
-// FoFPhase1Node::computeTipEncoding). Because the encoding happens BEFORE
+// (owning_process << kUF2IdxBits) | local_id — since sparse-uf2 (2026-07-25)
+// the local id is the RAW tip (the min-order particle's global order),
+// rewritten enumeration-free by applyTipEncoding; the per-process-dense
+// enumeration path (computeTipEncoding) was removed as dead in the 2026-08
+// campaign cleanup. Because the encoding happens BEFORE
 // upwardPass/loadCache/the phase-3 walk, every particle copy the walk reads
 // (local or cache-shipped) already carries the encoded value, so
 // FoFEdgeVisitor needs no changes: the (g, f) pairs it emits are already
@@ -140,25 +142,6 @@ inline std::pair<int, uint64_t> uf2LocationFromID(uint64_t vid) {
 // ring-message gap counters (the no-tracing stall monitor). Called from
 // phase3Stats, once per process.
 void fofKeepAliveGapsPrint(void);
-
-// Fair phaseB work division (design/phase1-scaling.md, 2026-07-25): each
-// unordered TreePiece pair spanning two PEs of a process is walked by
-// exactly one of the two, chosen by one bit of a symmetric mix of the two
-// TreePiece ROOT KEYS (stable Morton keys — identical on both sides, so
-// both PEs agree without communication; pointers would vary under ASLR).
-// TreePiece granularity splits every PE pair's ~64 TreePiece pairs about in
-// half with density mixing — the lower-PE-walks-everything rule gave PE i
-// of an N-PE process N-1-i partner PEs (triangular; ~11x phaseB skew in
-// the 80M logs). The emitted edge SET is unchanged (merge unions are
-// idempotent to the cross-walker duplicates that already existed).
-inline int phaseBWalker(Key ka, Key kb, int p, int q) {
-  uint64_t lo = std::min<uint64_t>(ka, kb), hi = std::max<uint64_t>(ka, kb);
-  uint64_t h = lo * 0x9E3779B97F4A7C15ull;
-  h ^= hi + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
-  h *= 0xBF58476D1CE4E5B9ull;
-  h ^= h >> 31;
-  return (h & 1) ? std::min(p, q) : std::max(p, q);
-}
 
 // Component-wise gap distance squared between two axis-aligned boxes
 // (0 if they overlap). Space.h has no box-box version of this, so it
@@ -395,15 +378,6 @@ public:
   std::unordered_map<long, long> tip_map;   // PE-tip -> process-level tip
   std::unordered_map<long, long> frag_counts; // process-level tip -> exact size
 
-  // Step 4 (distributed UF_2): built by computeTipEncoding() from
-  // frag_counts (so it must run after countFragments). encode_map maps this
-  // process's own process-level tips to their encoded UF_2 vertex ids
-  // (paratreet::uf2EncodeTip); uf2_vertices is the vertex array handed to
-  // UnionFindLib::initialize_vertices by index (dense_index == its position
-  // here) -- UnionFindLib mutates componentNumber/parent/size IN PLACE in
-  // this same storage, so applyUF2Labels reads results straight out of it.
-  std::unordered_map<long, long> encode_map; // process-level tip -> encoded tip
-  std::vector<unionFindVertex> uf2_vertices; // dense path only (unused by sparse-uf2)
   // Lazy-mode label readback buffer (collectUF2Labels -> applyUF2Labels):
   // localId -> componentNumber for every touched vertex of this process.
   std::unordered_map<uint64_t, long> uf2_labels;
@@ -1068,8 +1042,6 @@ public:
     edges.clear();
     tip_map.clear();
     frag_counts.clear();
-    encode_map.clear();
-    uf2_vertices.clear();
     uf2_labels.clear();
     global_slice.clear();
     steal_pool.clear();
@@ -1122,32 +1094,6 @@ public:
   // Step 4 (distributed UF_2): build the owner-encoded tip namespace from
   // frag_counts (must run after countFragments has populated it for every
   // PE of this process). One execution per process (nodegroup broadcast).
-  // Enumeration order (map iteration) only needs to be a bijection per
-  // process -- it does not need to be deterministic across runs: UF_2's
-  // resulting componentNumber values are arbitrary serial ids regardless
-  // (design/step4.md; the harness canonicalizes by min order per label
-  // group, not by raw label value).
-  void computeTipEncoding(const CkCallback& cb) {
-    encode_map.clear();
-    uf2_vertices.clear();
-    uf2_vertices.reserve(frag_counts.size());
-    int my_node = CkMyNode();
-    for (auto& kv : frag_counts) {
-      long dense_index = (long)uf2_vertices.size();
-      uint64_t encoded = paratreet::uf2EncodeTip(my_node, dense_index);
-      encode_map.emplace(kv.first, (long)encoded);
-      unionFindVertex v;
-      v.vertexID = encoded;
-      v.parent = -1;
-      v.process_tip = -1;
-      v.componentNumber = -1;
-      v.componentSize = -1;
-      v.size = kv.second; // fragment size (particle count), not the default 1
-      uf2_vertices.push_back(std::move(v));
-    }
-    this->contribute(cb);
-  }
-
   // Fragment-size histogram, step 2 of 2 (see paratreet::FoFFragmentHistogram
   // and design note §6.3e). One execution per process (nodegroup broadcast),
   // after the countFragments barrier: log2-bin the exact fragment sizes and
@@ -3776,22 +3722,6 @@ public:
     this->contribute(cb);
   }
 
-  // Distributed tip-sentinel check: every registered (TreePiece-owned)
-  // particle must hold a valid tip, i.e. a global particle order in
-  // [0, n_total). Phase 1 writes every registered particle, so an
-  // out-of-range value means some copy was never touched. Runs on each PE
-  // over its own particles (no gather), so it stays affordable at any N —
-  // the fof3 harness runs it in both check modes.
-  void verifyTips(long n_total, const CkCallback& cb) {
-    for (auto& s : treepieces) {
-      for (int i = 0; i < s.n; i++) {
-        long tip = s.parts[i].group_number;
-        CkEnforce(tip >= 0 && tip < n_total);
-      }
-    }
-    this->contribute(cb);
-  }
-
   // Per-PE memory usage (CmiMemoryUsage, bytes), tuple reduction:
   //   [0] min over PEs (long), [1] sum over PEs (long; avg at the consumer),
   //   [2] max over PEs (long).
@@ -4903,17 +4833,10 @@ FoFFragmentHistogram runFoFFragmentHistogram(CProxy_FoFPhase1<Data> fof,
   return h;
 }
 
-// Distributed tip-sentinel check (see FoFPhase1::verifyTips). Blocks until
-// every PE has checked its registered particles; a bad tip trips CkEnforce
-// on the owning PE. Same threaded-context requirements as runFoFPhase1.
-template <typename Data>
-void runFoFVerifyTips(CProxy_FoFPhase1<Data> fof, long n_total) {
-  fof.verifyTips(n_total, CkCallbackResumeThread());
-}
-
-// Step 4 counterpart of runFoFVerifyTips: checks the owner-encoded UF_2
-// invariant (FoFPhase1::verifyEncodedTips) instead of the [0, n_total)
-// particle-order sentinel, which encoded tips do not satisfy.
+// Distributed tip-sentinel check for encoded tips: checks the owner-encoded
+// UF_2 invariant (FoFPhase1::verifyEncodedTips). Blocks until every PE has
+// checked its registered particles; a bad tip trips CkEnforce on the owning
+// PE. Same threaded-context requirements as runFoFPhase1.
 template <typename Data>
 void runFoFVerifyEncodedTips(CProxy_FoFPhase1<Data> fof) {
   fof.verifyEncodedTips(CkCallbackResumeThread());

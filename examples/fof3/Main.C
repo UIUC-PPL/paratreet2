@@ -61,6 +61,12 @@ PARATREET_REGISTER_MAIN(ExMain);
   void ExMain::main(CkArgMsg* m) {
     peanoKey = 3;
 
+    // The UF_2 tip encoding carries the owning process in kUF2ProcBits bits
+    // (FoFPhase1.h); beyond 2^20 processes ids silently collide. Debug-build
+    // guard only (CkAssert is compiled out under --with-production): 2^20
+    // processes is not a realistic configuration to pay a check for.
+    CkAssert(CkNumNodes() <= (1 << paratreet::kUF2ProcBits));
+
     // App-specific command-line arguments; everything framework-registered
     // (-f -d -t -i ... ; see paratreet::Configuration::register_fields) was
     // consumed and removed from argv by Configuration::parse before this
