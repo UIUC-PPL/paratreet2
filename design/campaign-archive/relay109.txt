@@ -1,0 +1,94 @@
+====================================================================
+relay109 -- WHERE THE HELPER DAMAGE LANDS.  IT IS A UNIFORM TAX,
+          AND THE WALK IS THE PHASE THAT SUFFERS LEAST.
+====================================================================
+Date        2026-08-24
+Job         5337328  COMPLETED.  7 runs, ALL EXACT (424897832 / 185317566).
+            128 nodes, 1024 processes, 2B, GPU codepath, 4m15s of allocation.
+Script      sbatch/relay109-nvss-perphase-128n.sbatch
+Binary      FoF3.gpu-prod-v91, paratreet2 main b0f04fc
+Config      -s 128, -l 128, ppn 7, no --core-spec.  N and S differ in ONE
+            environment variable and nothing else.
+  N = affinity fix OFF (FOF_NO_AFFINITY_FIX=1).  ROCm helper threads inherit
+      the firing PE's single-CPU pin and preempt it.
+  S = affinity fix ON, default SMT-sibling form.
+  Every arm's placement was read back from the binary's own
+  "[fofgpu] affinity fix active (SMT siblings)" / "off (as intended)" line.
+
+NOTE ON SCOPE: Kale said afterwards that this run seemed unnecessary.  It had
+already completed by then.  Recorded here because it answers the question that
+was ranked first, and because the allocation was spent either way.
+
+====================================================================
+1.  ARM MEANS
+====================================================================
+  N  n=3  Iter0 2475.8 ms [2376.4..2628.3]   walk 0.706 s [0.545..0.864]
+  S  n=3  Iter0  960.0 ms [ 922.2.. 992.1]   walk 0.468 s [0.430..0.500]
+
+Roughly 2.6x slower without the fix, consistent with relay108's 2.7x.
+Quoted at that precision deliberately: one job, n=3, and relay98 concluded
+this campaign cannot resolve walls better than about 4%.
+
+====================================================================
+2.  THE ANSWER -- PER PHASE, N MINUS S
+====================================================================
+  phase                  N mean   S mean    delta   ratio   share
+  uf2                     0.332    0.037   +0.295    9.1x   24.9%
+  phase3_walk             0.706    0.457   +0.248    1.5x   20.9%
+  upwardPass              0.173    0.034   +0.139    5.1x   11.7%
+  uf2_setup               0.196    0.069   +0.127    2.8x   10.7%
+  component_histogram     0.224    0.112   +0.112    2.0x    9.5%
+  edge_gather             0.108    0.005   +0.103   21.6x    8.7%
+  relabel                 0.078    0.019   +0.059    4.1x    5.0%
+  loadCache               0.052    0.006   +0.046    8.7x    3.9%
+  tip_encode              0.040    0.017   +0.023    2.3x    1.9%
+  tip_sentinel            0.030    0.009   +0.021    3.4x    1.8%
+  phase1                  0.121    0.107   +0.013    1.1x    1.1%
+
+  positive deltas sum to 1.187 s
+  Iteration 0 gap is 1515.8 ms, so the reported phases cover 78% of it.
+  THE REMAINING ~330 ms IS OUTSIDE EVERY PHASE THE BINARY TIMES AND THIS RUN
+  DOES NOT NAME IT.
+
+====================================================================
+3.  WHAT THE SHAPE MEANS
+====================================================================
+EVERY phase is hit.  The damage is not concentrated anywhere; it is a tax on
+the whole iteration.
+
+AND THE RELATIVE ORDERING IS INVERTED FROM THE ABSOLUTE ONE.  The short
+phases suffer worst as multiples -- edge_gather 21.6x, uf2 9.1x, loadCache
+8.7x -- while phase3_walk, by far the longest phase, is only 1.5x.
+
+That is the signature of a FIXED-SIZE PREEMPTION rather than a proportional
+slowdown: a helper stealing ~16 ms slices costs a 5 ms phase everything and a
+460 ms phase relatively little.  It matches the 16.006 ms kernel-preemption
+slice the campaign already measured in the QD-settle work, and it is why the
+fix is worth so much more at 128 nodes than the 16-node -22.8% suggested --
+at scale there are more short phases and more synchronisation points for a
+fixed stall to land on.
+
+RECONCILING THIS WITH THE EXPECTATION.  Kale's expectation was that the helper
+bit hardest during the treewalk.  In ABSOLUTE terms the walk is indeed the
+single largest contributor at 20.9% of the damage -- but only because it is
+the longest phase.  Per unit of time spent in it, the walk is the phase that
+suffers LEAST.  Both readings are true and they are not in conflict; the
+report says so because "it bites the treewalk" would be a misleading summary
+of this table.
+
+====================================================================
+4.  A BUG OF MINE THAT MADE THIS RERUN NECESSARY
+====================================================================
+relay108 passed "r$r" as the log label for all four arms of a rep, so all four
+wrote to the SAME $OUT/r$r.log and only the last arm of each rep survived.
+The .dat files were keyed by arm, which is why relay108's SUMMARY is intact --
+but per-phase data existed for one N rep, two B6 reps, and NO S rep.  The
+comparison could not be made from disk.  relay109 puts the arm in the label
+and also appends every time_s line to phases-N.txt / phases-S.txt.
+
+A SECOND ONE, SMALLER: the per-phase table was supposed to print inside the
+job.  My edit to the summary block did not match the target text and I did not
+verify it before submitting, so the job printed relay108's old summary legend
+instead.  The table above was computed afterwards from the phases-*.txt files
+the run did write correctly.  Nothing was lost, but the job did not do what
+its own script said it would.

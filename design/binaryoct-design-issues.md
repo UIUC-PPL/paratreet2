@@ -94,3 +94,46 @@ but make the opening decision **three levels at a time**, so certificates are
 still evaluated on cubic boxes with an eight-way fan-out — which would keep
 oct's pruning quality and effective traversal depth while paying binary's
 much smaller frontier.
+
+## The dilution cost is now MEASURED, not just argued (2026-08-24, relay110)
+
+The premise above — that a pool diluted with full-size placeholders costs
+real time — was an inference when this note was written. It has since passed
+the discriminating test, on the GPU arm at 2B/128 nodes:
+
+    cap U -> 128:  leaf_visits -0.067%   prunes_negative -0.15%
+                   same_frag BYTE-IDENTICAL   edges_emitted identical
+                   requests -0.8%   ->   phase3_walk -16.4%
+
+**Same work, 16.4% less time.** Capping removes ~77 MB of pool per process
+and 291M placeholder nodes across the job, and the walk does measurably the
+same traversal in measurably less time. Every explanation resting on extra
+fetches, extra misses or extra traversal is dead — requests are flat on BOTH
+the GPU and CPU paths (-0.8%, -0.7%), so there is no extra miss traffic.
+
+Still inference: that the residue is cache/TLB locality specifically. "Same
+work, less time" is consistent with several memory-side stories and this
+evidence cannot separate them. PAPI (TOT_INS flat as control, L3_TCM and
+TLB_DM as signal) would name it; parked on a charm toolchain blocker.
+
+WHY THE CPU SIGN DIFFERS, a reading consistent with the numbers and not yet
+tested. Capping removes the same absolute number of canopy entries on both
+paths (fills +347,600 CPU, +343,844 GPU), but the pack is a much larger
+FRACTION of the GPU's cache, because the GPU walk fetches less to begin with
+(487k edges against CPU's 1.24M, leaf 128 against 32):
+
+    pack share of the uncapped pool:   GPU 51.8%   CPU 29.6%   (1.75x)
+
+So both arms pay the same fill cost and both get dilution relief, but the
+GPU's relief is 1.75x larger relative to its pool and outweighs the cost,
+while the CPU's does not. Same two competing effects, different balance.
+
+CONSEQUENCE FOR THIS DOCUMENT: the placeholder count is worth attacking, and
+there are two independent levers that compose — eBinaryOct cuts the frontier
+~7x (this note), and slim placeholders cut what remains by most of its bytes.
+A placeholder is a full `FullNode`: fixed-size pool slot, and because it is
+built with `n_particles = -1` the constructor gives it a full BRANCH_FACTOR
+children array (8 atomic pointers, 64 B) that is initialised to null and
+never written — `installSubtree` builds a NEW node and `swapIn` replaces the
+placeholder wholesale. At ~248 B/slot that is ~26% of every placeholder, and
+at 128 nodes uncapped roughly 60 GB of null pointers across the job.

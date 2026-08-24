@@ -1,0 +1,124 @@
+====================================================================
+relay110 -- WHY CAPPING IS FREE ON THE GPU WALK.  SAME WORK,
+          16.4% FASTER.  THE DILUTION READING SURVIVES ITS TEST.
+          PAPI PARKED, AND WHY.
+====================================================================
+Date        2026-08-24
+Source      NO NEW JOB.  Every number below is read out of relay106
+            (job 5335375) and relay97 (job 5332618), both already reported.
+Test        Kale's, 2026-08-24, sharpened: if capping helps the GPU walk by
+            reducing POOL DILUTION rather than refill latency, the walk should
+            do THE SAME WORK and do it faster.  The work counters are already
+            printed, so the test costs nothing.
+
+====================================================================
+1.  THE WORK COUNTERS.  FLAT.
+====================================================================
+relay106, GPU, 128 nodes, 2B, -l 128:
+
+  cap    leaf_visits   avg/PE   prunes neg    suppression  same_frag   walk s
+  U        9,907,448   1382.2   107,511,209    2,970,595    193,151    0.477
+  2048     9,901,754   1381.4   107,354,295    2,830,177    193,151    0.485
+  512      9,900,825   1381.3   107,324,876    2,796,512    193,151    0.439
+  128      9,900,835   1381.3   107,347,576    2,814,561    193,151    0.399
+  32       9,901,062   1381.3   107,314,058    2,782,988    193,151    0.431
+
+  leaf_visits, uncapped -> cap 128:  -0.067%
+  prunes negative:                   -0.15%
+  same_frag:                         BYTE-IDENTICAL in every arm
+  edges_emitted:                     166.0 avg in every arm, max 2647-2649
+  per-PE distribution:               max leaf_visits 14,360 -> 14,351
+  phase3_walk:                       -16.4%
+
+SAME WORK.  FASTER.  That is the prediction the dilution reading made, and it
+is what the data shows.
+
+ONE COUNTER MOVES: suppression, -5.25%.  It is 2.8% of prunes and it moves
+toward LESS work when capped, so it cannot manufacture a 16% gain -- but it is
+the only work counter that is not flat and it should not be omitted.
+
+CAVEAT ON prunes: this campaign already established that the prunes counter is
+a monotone-max artifact (313M prunes against 40.7M nodes, relay78 era).  The
+work evidence here rests on leaf_visits and the balance distribution, which
+are ordinary counters; prunes is quoted as corroboration only.
+
+====================================================================
+2.  THE SUPPORTING NUMBERS, AND THE CPU CONTRAST
+====================================================================
+  capping U -> 128     pool_MB    placeholders   requests   canopy_fills   walk
+  GPU (relay106)        -51.8%       -53.9%        -0.8%      +343,844    -16.4%
+  CPU (relay97)         -29.6%       -30.0%        -0.7%      +347,600    +31.1%
+
+REQUESTS ARE FLAT ON BOTH PATHS.  Misses do not change when capping, on GPU or
+CPU.  That removes the refill-latency explanation from the other side as well:
+there is no extra miss traffic to be latent about.
+
+Placeholders are 85.0% of used nodes uncapped and 81.3% capped (GPU).  The
+uncapped pack costs ~77 MB more pool per process and 291 M more placeholder
+nodes across the job, allocated interleaved with content.
+
+Uncapped requests: GPU 6,168,760 against CPU 12,109,437, a ratio of 0.51 --
+consistent in direction with the GPU walk being thinner (487k edges against
+CPU's 1.24M, leaf 128), though a factor of two is a moderate difference, not
+an order of magnitude.  I am not going to call that "far below".
+
+THE CPU CONTRAST IS THE PART I CANNOT CLOSE.  The CPU gets the same KIND of
+pool relief (-29.6%) and the same flat requests, yet its walk gets 31% WORSE.
+The only quantity that rises on both paths is canopy_fills, and it rises by
+nearly the same ABSOLUTE amount (347,600 CPU, 343,844 GPU).  So whatever the
+CPU pays for those fills, the GPU does not -- or the GPU's larger dilution
+relief (-51.8% against -29.6%) simply outweighs it.  This report does not
+decide between those, and neither does any measurement currently on disk.
+CAVEAT: the CPU +31.1% rests on relay97's uncapped arm at n=1.  The reproducible
+CPU walk penalty is relay96's 64-node sweep, n=3, 0.409 -> 0.547 s.
+
+====================================================================
+3.  WHAT IS ESTABLISHED, AND WHAT IS STILL INFERENCE
+====================================================================
+ESTABLISHED: the GPU walk does the same work when capped and takes 16.4% less
+time.  Whatever the mechanism, it is NOT that capping changes what the walk
+does.  Any explanation resting on extra fetches, extra misses, or extra
+traversal is dead.
+
+STILL INFERENCE: that the remaining cause is cache/TLB locality from a smaller,
+less diluted pool.  It is the reading that fits, it made a prediction that
+held, and no competing reading has been offered -- but "same work, less time"
+is consistent with several memory-side stories and this evidence cannot
+separate them.  It should be written as a well-supported reading, not as a
+measured mechanism.
+
+====================================================================
+4.  PAPI: PARKED, AND EXACTLY WHERE
+====================================================================
+The measurement that would NAME the mechanism is a traced pair carrying
+PAPI_TOT_INS (control, should be flat), PAPI_L3_TCM and PAPI_TLB_DM (signal).
+Parked on Kale's instruction after three configure failures.  State on disk so
+resuming is cheap:
+
+  merged/build-charm-papi.sh   the build, gated so it cannot waste a compile
+  merged/charm-papi/           a 463 MB copy of charm-prodtr @ 90ef159b9,
+                               configured, NOT built.  charm-prodtr untouched.
+
+  FAILURE 1  gated on PAPI_DIR; the OLCF module sets OLCF_PAPI_ROOT.  Mine.
+  FAILURE 2  `module load papi/7.1.0 2>&1 | tail -1` -- `module` is a shell
+             FUNCTION, so a pipeline runs it in a SUBSHELL and every setenv is
+             discarded.  The load reports success and changes nothing.  Mine.
+             WORTH KNOWING BEYOND THIS SCRIPT: build-v88 through v91 all use
+             the same piped pattern for their main module load, so those loads
+             have most likely been doing nothing.  Those builds are correct
+             only because cmake is handed absolute compiler paths and the login
+             environment already carries the rest.  Nothing to fix
+             retroactively; the module block is not doing what it looks like.
+  FAILURE 3  THE REAL BLOCKER.  charm's own feature test fails:
+               src.c:3:10: fatal error: papi.h: No such file or directory
+             cmake/detect-features-c.cmake:244 uses a bare
+             check_c_source_compiles with CMAKE_C_FLAGS "" -- it consults
+             neither CMAKE_PREFIX_PATH nor any find_package, so gcc never looks
+             in the module's spack tree.  Fixable by passing
+             -DCMAKE_C_FLAGS="-I$PAPI_DIR/include" and matching link flags.
+
+  NOT VERIFIED BEYOND THAT: whether charm's PAPI support is wired for the
+  RECONVERSE machine layer at all.  conv-mach-papi.sh exists in the tree, which
+  is encouraging and is not evidence.  The honest estimate is a toolchain task,
+  not the "traced pair, no new infrastructure" it looked like at the outset --
+  which is why parking it was the right call.
