@@ -1,0 +1,152 @@
+====================================================================
+relay101 -- THE -s SWEEP ON THE GPU CODEPATH.  PARTIAL: 4 OF 16 ARMS.
+          CAPPING IS WORTH -35.9% AND HALF THE MEMORY.
+          THE JOB TIMED OUT BECAUSE I SIZED IT FROM CPU TIMINGS.
+====================================================================
+Date        2026-08-23
+Job         5333878  TIMEOUT at 01:30:10 (19:53:39).  4 of 16 arms completed,
+            every one of them EXACT.  The data below is sound; the job is not.
+Script      sbatch/relay101-gpu-ssweep-128n.sbatch
+Binary      FoF3.gpu-prod-v91  dc3650e0ea9585713ed5b8e39242eb2b
+Refs        paratreet2 main b0f04fc (clean) -- includes 8e4da9e (the merged
+            collect gate) AND the width audit, which touches FoFPhase1.h,
+            Decomposition.{C,h}, Splitter.h.  NEW BASELINE: v88/v89 walls do
+            NOT transfer to it.
+            unionfind cd2d9c8 + the relay87 census patch (unlanded).
+Scale       128 nodes, 1024 processes, 7168 PEs, 2B
+Config      GPU codepath (PARATREET_DEVICE_TREE=1, FOF_GPU_PHASE1=1),
+            -l 128 (GPU optimum; printed value gated), -d oct -u dist -D 3
+            -E 16, +ppn 7, +lci_ndevices 7, FOF_UF_SIZES=0,
+            core-thief fix on (--core-spec=0 --cpus-per-task=16,
+            FOF_HELPER_CPUS=0,8,...,56)
+EXACTNESS   all 4 arms EXACT (424897832 / 185317566).
+
+====================================================================
+1.  THE RESULT
+====================================================================
+  cap     Iter0 ms   loadCache   phase3_walk   pool_MB    raw_canopies   fills
+  U        1372.4     396 ms       0.371 s     157,694       69,670          0
+  2048      891.2      21 ms       0.351 s      80,534        8,528    293,229
+  512       879.6       9 ms       0.379 s      77,042        1,170    323,747
+  (warm-up, uncapped, DISCARDED: 1389.7 ms -- consistent with cU-r1)
+
+  CAPPING IS WORTH -35.9% ON GPU (879.6 against 1372.4) AND HALVES MEMORY
+  (157.7 GB -> 77.0 GB of pool across 1024 processes).
+
+n=1 PER ARM, AND THAT LIMITATION IS REAL -- but the gap is 493 ms against a
+noise floor of 2-4%, i.e. ~55 ms at this wall.  The direction and the rough
+size are not in doubt; the difference between 2048 and 512 (11.6 ms) IS inside
+the noise and no ordering between them should be claimed.
+
+PREDICTION CONFIRMED.  The script put on record, before the run, that capping
+should win by MORE on GPU than on CPU, because loadCache is HOST-side work
+that the device path does not touch while the GPU arm roughly halves the
+iteration.  Measured: loadCache uncapped is 396 ms of a 1372 ms iteration --
+28.9%.  On CPU at 128 nodes the best cap was worth -14% to -23% (relay93/94);
+here it is -35.9%.
+
+Note the walk does NOT pay for it: phase3_walk is 0.371 / 0.351 / 0.379 s
+across the three caps -- flat within noise, even though canopy_fills rises
+from 0 to 323,747.  On the GPU path the lazy canopy refill is essentially
+free, which is the opposite of the CPU picture where capping cost the walk
+30-140 ms.  That is why the GPU crossover is so much more favourable, and it
+is the part of this result I would most want a second rep to confirm.
+
+====================================================================
+2.  WHAT THIS MEANS FOR RITVIK'S 24B AND 56B RUNS
+====================================================================
+This is the concrete recommendation item 3 was after, and it is stronger than
+the CPU extrapolation would have been:
+
+  ON THE GPU PATH AT 128 NODES, RUNNING UNCAPPED COSTS ABOUT A THIRD OF THE
+  ITERATION AND TWICE THE MEMORY.  He is at 256 and 512 nodes, where loadCache
+  is larger still, because relay96 established that it tracks P and not N.
+
+CAVEATS THAT MUST TRAVEL WITH THAT SENTENCE:
+  - measured on 2B, not on 24B or 56B
+  - measured at 128 nodes, not 256 or 512
+  - -l 128 is the GPU leaf optimum for 2B; I have no evidence it is right for
+    his datasets, the same gap flagged for -l 32 on 80M
+  - his leaf size and decomposition are unknown to me (his sbatch is not
+    readable), so the RATIO between caps transfers, not the absolute times
+  - n=1 per arm
+The direct measurement at his scale (relay102) has NOT been made -- see below.
+
+====================================================================
+3.  WHY THE JOB DIED.  MY ERROR, AND IT IS A SIZING ERROR.
+====================================================================
+Every GPU rep took 937-1274 SECONDS of srun wall while Iteration 0 was
+1372 ms.  About 19 minutes per rep is spent OUTSIDE the iteration.  The same
+dataset at the same 128 nodes on CPU takes about 30 s per rep end to end.
+I sized a 1:30 job for 16 reps from the CPU timings, so it completed 4.
+
+Two consequences, both mine to own:
+  - relay101 needs re-running for reps 2 and 3 and the 128/32 arms.
+  - relay102 (24B at 256 nodes, job 5333879) also timed out having produced
+    NOTHING: its first 491 GB read did not complete in 2413 s.  Resubmitting
+    it now would just buy another timeout.
+
+I ALSO MISSED THE TIMEOUT FOR 95 MINUTES.  Both jobs hit the wall at 19:53
+and I did not look until Kale asked at 21:28, leaving the queue empty.  A
+persistent job monitor is now armed (scripts/jobwatch.sh) that emits on every
+terminal state including TIMEOUT and FAILED, on Kale's instruction that this
+be routine for every submitted job.
+
+====================================================================
+4.  THE DIAGNOSIS.  IT IS THE SBATCH HEADER, NOT THE GPU.
+====================================================================
+Chased over three jobs.  Every hypothesis I offered was wrong until the last.
+
+relay103 (5334873), a 2x2 of CPU/GPU against helper pinning:
+  A cpu  978 s   C gpu 1401 s      (labelled "helpers off" -- SEE THE
+  B cpu 1015 s   D gpu 1216 s       CORRECTION BELOW; they were not off)
+ALL FOUR SLOW.  Not the GPU codepath, not FOF_HELPER_CPUS.
+
+CORRECTION TO MY OWN LABELS.  I called the A/C cells "helpers off".  They
+were not.  Unsetting FOF_HELPER_CPUS leaves the built-in affinity fix ACTIVE
+in its SMT-SIBLING form, because FOF_NO_AFFINITY_FIX was never set.  So
+relay103 compared CCD-FIRST pinning against SMT-SIBLING pinning:
+    CPU  ccd-first 1737 ms  vs  smt-sibling 1745 ms   0.5% better
+    GPU  ccd-first  969 ms  vs  smt-sibling 1015 ms   4.5% better
+The CCD-first variant DOES help the iteration, and more on GPU than on CPU.
+It simply cannot pay for ~1100 s of startup at 128 nodes.
+THE GENUINE NO-FIX ARM (FOF_NO_AFFINITY_FIX=1) HAS NEVER BEEN RUN AT 128
+NODES, so the case the fix exists for -- a ROCm helper occupying a whole PE
+through the treewalk -- is still unmeasured at this scale.
+AND THAT 2x2 WAS WEAKER THAN I DESCRIBED IT.  The core-thief fix is TWO
+things -- an ALLOCATION (--core-spec=0 --cpus-per-task=16) and an ENV VAR
+(FOF_HELPER_CPUS).  The allocation half is set in the sbatch header, so it was
+present in all four cells; I varied only the env var.  It excluded two things
+and nothing else.
+
+relay104 (5335196), a ladder from the known-good configuration:
+  A v89main l32  pmi 4M    49 s FAST   (reproduces relay97/99)
+  B v89main l32  pmi 16M   26 s FAST   -> PMI_MAX_KVS_ENTRIES is not it
+  C v89main l128 pmi 4M    29 s FAST   -> the leaf is not it
+  D v91cpu  l32  pmi 4M    31 s FAST   -> the b0f04fc binary is not it
+  E v91cpu  l128 pmi 16M   32 s FAST   -> nor all three together
+ALL FIVE FAST.  The machine is not it either: A reproduced 49 s at 22:53, and
+a direct Lustre probe from the login node gave 3.3 GB/s single-stream across
+three offsets with the project queue empty.  The Ritvik-congestion story I
+floated on timing alone is dead.
+
+WHAT IS LEFT is the one variable neither job could vary, because it lives in
+the sbatch header rather than the srun line: --core-spec=0 --cpus-per-task=16.
+relay103 had it in every cell (all slow); relay104 in none (all fast).  It is
+the only difference between relay104-E at 32 s and relay103-A at 978 s.
+Job 5335233 (relay105) carries that header with relay104-A's otherwise
+known-good configuration, and separates the cpuset width from --core-spec by
+running one arm at srun --cpus-per-task=14 inside the same allocation.
+
+IF CONFIRMED, IT REACHES PAST THIS JOB.  The campaign records the core-thief
+fix as -22.8% at ppn 7 -- MEASURED AT 16 NODES.  Nothing has checked its cost
+at 128.  Every relay script has printed a per-rep seconds column and I read it
+as harmless launch overhead: 27-50 s on CPU, and nobody asked why it was 27-50
+and not 5.  At 1274 s it stopped being ignorable.  relay103 was the first
+report in this campaign to print wall-minus-iteration at all.
+
+WHAT IT DOES NOT TOUCH.  Section 1 stands unchanged.  Every arm inside
+relay101 saw the same machine and the same header, so the -35.9% and the
+memory halving are internally valid.  It is the SIZING that broke, not the
+science.
+

@@ -1,0 +1,104 @@
+====================================================================
+relay108 -- HELPER PLACEMENT AT 128 NODES.  THE AFFINITY FIX IS WORTH
+          -63%, NOT -22.8%.  THE DEDICATED CORE BUYS NOTHING.
+====================================================================
+Date        2026-08-24
+Job         5336620  COMPLETED.  13 runs, ALL EXACT (424897832 / 185317566).
+            (5335749 was the same job and died in 1 s on every arm -- I had
+            dropped the LD_LIBRARY_PATH export when writing the script fresh.
+            An ldd preflight gate now aborts on the batch node instead.)
+Script      sbatch/relay108-helper-placement-128n.sbatch
+Binary      FoF3.gpu-prod-v91, paratreet2 main b0f04fc, GPU codepath
+Scale       128 nodes, 1024 processes, 2B, -s 128, -l 128
+Allocation  --cpus-per-task=14, NO --core-spec.  THE OS CORE STAYS RESERVED,
+            per Kale 2026-08-24.  Every arm's placement was read back from the
+            binary's own "[fofgpu] affinity fix active (...)" line and gated.
+
+  arm  ppn  helper placement          PEs
+  N     7   FOF_NO_AFFINITY_FIX=1     7168   verified "off (as intended)"
+  S     7   SMT siblings (default)    7168   verified "(SMT siblings)"
+  D6    6   FOF_HELPER_CPUS=7,15,..   6144   verified "(FOF_HELPER_CPUS)"
+  B6    6   SMT siblings              6144   verified "(SMT siblings)"
+
+====================================================================
+1.  RESULTS
+====================================================================
+  arm  n   walk s   [range]           Iter0 ms   [range]
+  N    3   0.725   [0.531..0.853]      2471.3   [2214.3..2644.4]
+  S    4   0.426   [0.356..0.512]       914.1   [ 840.3..1000.3]
+  D6   3   0.374   [0.354..0.397]       860.2   [ 847.1.. 879.9]
+  B6   3   0.365   [0.350..0.373]       857.8   [ 829.5.. 899.4]
+
+====================================================================
+2.  THE AFFINITY FIX IS WORTH -63% AT 128 NODES.  SOLID.
+====================================================================
+N against S: 2471.3 -> 914.1 ms, a 63.0% reduction, with COMPLETELY
+SEPARATED ranges (N's best 2214.3 is 2.2x S's worst 1000.3).  The walk goes
+0.725 -> 0.426 s, a 41% reduction.
+
+THE CAMPAIGN'S NUMBER WAS -22.8%, MEASURED AT 16 NODES.  At 128 nodes the
+damage is nearly three times worse in relative terms.  This is the first time
+the genuine no-fix case has been run at this scale -- relay103's cells that I
+labelled "helpers off" were actually SMT-sibling pinning, so what had been
+compared until now was two GOOD placements against each other.
+
+AND IT NEEDS NO SLURM CHANGE.  Every arm here ran with the OS core reserved
+and --cpus-per-task=14.  The SMT-sibling derivation is automatic at ppn 7.
+--core-spec=0 is not merely unnecessary, it is a ~1100 s startup tax
+(relay105) buying a placement worth nothing extra (section 3).
+
+====================================================================
+3.  KALE'S ppn 6 PROPOSAL: IT WORKS, BUT NOT FOR THE PROPOSED REASON
+====================================================================
+The proposal was to run 6 PEs per process and leave the 7th physical core
+free for the helpers explicitly.  The controlled comparison is D6 against B6,
+which holds the ppn 6 PE loss constant and varies ONLY whether the helper is
+named onto that spare core:
+
+    D6 (dedicated core)  860.2 ms [847.1..879.9]   walk 0.374
+    B6 (SMT siblings)    857.8 ms [829.5..899.4]   walk 0.365
+
+NO DIFFERENCE.  2.4 ms apart on heavily overlapping ranges.  THE DEDICATED
+CORE BUYS NOTHING over the SMT siblings the fix already derives by itself.
+
+That is a clean null result and it is worth having: it means the explicit
+FOF_HELPER_CPUS route -- and therefore the whole --core-spec=0 apparatus it
+was invented to serve -- is unnecessary whenever an SMT sibling is free.
+Reserve it for ppn 13/14, where the fix DECLINES because every sibling is
+itself a PE, which is exactly the case it was originally written for.
+
+====================================================================
+4.  AN UNEXPECTED RESULT: ppn 6 MAY BEAT ppn 7 DESPITE 14% FEWER PEs
+====================================================================
+    S  (ppn 7, 7168 PEs)  914.1 ms [840.3..1000.3]   walk 0.426 [0.356..0.512]
+    B6 (ppn 6, 6144 PEs)  857.8 ms [829.5.. 899.4]   walk 0.365 [0.350..0.373]
+
+ppn 6 is 6.2% faster on the mean while running 14% fewer PEs, and its spread
+is far tighter (walk range 0.023 s against 0.156 s).
+
+I AM NOT CLAIMING IT.  The Iter0 ranges OVERLAP (840.3..899.4), n is 3-4, and
+relay106 measured ppn 7 at 896.7 ms [894.8..898.5] in a different allocation,
+between the two.  What IS solid is the tightness: the ppn 6 arms are far more
+reproducible than the ppn 7 arm in the same job.
+
+HYPOTHESIS, NOT MEASURED: this job runs +lci_ndevices 7 +backend_poll_thread 1,
+so there are 7 poll threads per process.  At ppn 7 the PEs occupy all seven
+cores and the poll threads must share; at ppn 6 one physical core is free for
+them regardless of where the helper lands.  If that is right the benefit is
+about the POLLERS, not the GPU helpers, and it would apply on CPU too.  That
+is a testable claim -- a ppn 6 / ppn 7 pair on the CPU codepath would settle
+it -- and it should not be repeated as fact until someone runs it.
+
+====================================================================
+5.  WHERE THE DAMAGE ACTUALLY LANDS -- MOSTLY NOT IN THE WALK
+====================================================================
+Kale's expectation was that the helper bit hardest during the treewalk.  The
+walk does worsen: 0.426 -> 0.725 s, +0.299 s, +70%.  But Iteration 0 worsens
+by +1557 ms, so THE WALK ACCOUNTS FOR ONLY ABOUT A FIFTH OF THE TOTAL DAMAGE.
+phase1 barely moves (0.107 -> 0.113-0.116 s).
+
+So something else in the iteration absorbs the remaining ~1.25 s, and this run
+does not say what.  The obvious candidates are the union-find drain and the
+phases the FOF3STAT time_s line already reports; I have NOT broken it down and
+will not guess.  A per-phase comparison of one N rep against one S rep would
+answer it directly from data already being printed.

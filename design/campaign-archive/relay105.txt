@@ -1,0 +1,96 @@
+====================================================================
+relay105 -- --core-spec=0 COSTS ~1100 s OF STARTUP PER RUN AT 128
+          NODES AND BUYS NOTHING.  A STANDING RECOMMENDATION IS WRONG.
+====================================================================
+Date        2026-08-23 / 24
+Jobs        5334873 (relay103), 5335196 (relay104), 5335233 (relay105)
+            all COMPLETED, all arms EXACT
+Scale       128 nodes, 1024 processes, 2B
+
+This is separated from relay101 because it changes a standing recommendation
+and can be acted on without reading the -s work at all.
+
+====================================================================
+1.  THE MEASUREMENT
+====================================================================
+Identical configuration -- v89main, -l 32, PMI 4194304, -s 128, CPU, no
+helper pinning -- run with and without the two Slurm header directives:
+
+  header                              wall     Iteration 0
+  --cpus-per-task=14 (no core-spec)     49 s      1514.9 ms   relay104-A
+  --core-spec=0 --cpus-per-task=16    1122 s      1516.9 ms   relay105-P
+  ... same header, srun --cpus-per-task=14
+                                      1184 s      1539.9 ms   relay105-Q
+
+BOTH core-spec arms slow, so it is --core-spec=0 ITSELF and not the cpuset
+width.  AND ITERATION 0 IS UNCHANGED across all three: 1514.9 / 1516.9 /
+1539.9 ms.  The directive costs ~1100 s per run and changes the computation
+by nothing measurable.
+
+Confirmed by construction afterwards: relay106, same binary and dataset and
+node count as the timed-out relay101, differing only in dropping that header,
+ran every rep in 28-30 s against relay101's 937-1274 s.
+
+====================================================================
+2.  WHY IT WAS THERE, AND WHY THAT WAS A MISREADING
+====================================================================
+The campaign's note recorded the core-thief fix as
+"--core-spec=0 --cpus-per-task=16 + FOF_HELPER_CPUS=0,8,...,56".
+
+Kale, 2026-08-24: "I never thought not leaving one core for the OS was ever
+an option.  The only idea was give the GPU helper threads wide enough of a
+cpuset that it does not occupy the core of the PE that fired the kernel."
+
+The code agrees with him.  fof/gpu/FoFDevice.cpp:1050-1098 does exactly one
+thing: if this PE is pinned to a SINGLE cpu, widen the helper's cpuset so HIP
+threads cannot inherit that core.  Its own decline warning names the right
+answer first -- "Either leave one CPU per process unpinned, or run with
+--core-spec=0 and set FOF_HELPER_CPUS to the reserved cores."
+
+--core-spec=0 entered as the ppn 13/14 ESCAPE HATCH, where every SMT sibling
+is itself a PE and the fix has no landing zone left.  It then got written
+into the note as though it were the fix.  It never was.
+
+====================================================================
+3.  AND THE FIX DOES NOT NEED IT.  relay108 SETTLES THAT.
+====================================================================
+At ppn 6, with the ppn 6 PE loss held constant, naming a dedicated core
+against letting the fix derive SMT siblings:
+    dedicated core   860.2 ms [847.1..879.9]
+    SMT siblings     857.8 ms [829.5..899.4]
+2.4 ms apart, overlapping.  The dedicated core buys NOTHING.
+
+Meanwhile the fix itself is worth -63% at 128 nodes with fully separated
+ranges (relay108: 2471.3 -> 914.1 ms), and it achieves that with the OS core
+reserved and --cpus-per-task=14.
+
+====================================================================
+4.  WHAT TO CHANGE
+====================================================================
+  - Do NOT put --core-spec=0 in a Slurm header above ~16 nodes.  Leave both
+    FOF_HELPER_CPUS and FOF_NO_AFFINITY_FIX unset at ppn 7; the SMT-sibling
+    derivation is automatic, needs no Slurm change, and is worth -63%.
+  - Reserve the explicit FOF_HELPER_CPUS route for ppn 13/14, where the fix
+    prints DECLINED because no sibling is free.
+  - The campaign's -22.8% is a 16-NODE number and understates the fix badly
+    at 128.
+  - paratreet2 README line 524 currently tells the reader to add
+    "--core-spec=0 --cpus-per-task=16" at ppn 13/14.  That advice is still
+    correct FOR ppn 13/14, but the line should carry the startup cost so
+    nobody applies it at scale without knowing.  I have NOT edited it --
+    that is a laptop-side change and it is one line.
+
+====================================================================
+5.  THE COST OF FINDING THIS, AND THE HABIT THAT HID IT
+====================================================================
+Two jobs died by timeout (5333878 relay101, 5333879 relay102 -- the latter
+produced nothing at all) and three diagnostic jobs were needed.  I also left
+the queue empty for 95 minutes because nothing was watching; a persistent job
+monitor is now armed on every submission.
+
+THE HABIT: every relay script has printed a per-rep seconds column since this
+campaign began.  It read 27-50 s on CPU and nobody, me included, ever asked
+why it was not 5.  relay103 was the FIRST report here to print
+wall-minus-iteration.  A 30x regression sat entirely outside the timed region
+and was invisible for as long as only phase timers were read.
+Report the WALL next to the phase timer, always.
