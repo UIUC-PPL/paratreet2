@@ -275,27 +275,65 @@ node), and it is a LAUNCH ceiling. Ways past it, in rough order of value:
      under the ceiling, but changes the shape and is not comparable to the
      points above.
 
-### `--mpi=pmi2` clears the bootstrap and destroys the network
+### `--mpi=pmi2` does not run a parallel job at all
 
 Frontier offers `none`, `pmi2` and `cray_shasta`. The harness has always
 used `cray_shasta` -- which is WHY `_pmi2_kvs_fence` appears: that is
 CRAY's PMI (the `[PE_n]:` prefix is Cray PMI's format), supplied by the
-cray_shasta plugin. The untried option is therefore `pmi2`, i.e. Slurm's
-own PMI2 server.
+cray_shasta plugin. The untried option was `pmi2`, i.e. Slurm's own PMI2
+server.
 
-It works, and it is unusable. At 2 nodes, same binary, identical HAPI
-config:
+It launches, it prints the right answer, and it is worthless. Under
+`--mpi=pmi2` LCI's bootstrap gives **every process rank 0 and world size
+1**. Each task then runs the entire application independently as a
+singleton. Probe 5334243 (2 nodes, 16 tasks, `LCI_LOG_LEVEL=info`):
 
-    plugin         load ms   decomp ms   iter0 ms
-    cray_shasta      10.98       26.01      31.10
-    pmi2            111.97      772.02    2747.93
+    plugin         distinct ranks in log   "Loading input data" prints
+    cray_shasta    16  (0..15)             1
+    pmi2           1   (all tasks rank 0)  16
 
-10x / 30x / 88x. A uniform slowdown across unrelated phases points at
-transport, and the likely mechanism is that `--network=job_vni` (Slingshot
-VNI allocation) is coupled to cray_shasta, so LCI loses CXI. NOT YET
-CONFIRMED -- the provider probe is still owed. What is established is that
-`pmi2` trades the 4096-rank ceiling for a 30-90x network penalty, so it
-does not make 512 nodes usable even though it launches.
+and the earlier 2-node timing probe 5334056 printed `components: 33933`
+**17 times** -- once per singleton, plus the summary. The answer looked
+correct precisely BECAUSE each process solved the whole problem alone.
+
+This retracts two earlier claims in this file's history:
+
+  - The "10x / 30x / 88x slowdown" (load 111.97 ms, decomp 772.02 ms,
+    iter0 2747.93 ms vs cray_shasta's 10.98 / 26.01 / 31.10) is NOT a
+    network penalty. It is 16 copies of the full problem contending for
+    one node's cores, memory bandwidth and GPUs.
+  - The suspected mechanism -- `--network=job_vni` being coupled to
+    cray_shasta so LCI loses CXI -- is REFUTED. Both plugins select the
+    identical fabric:
+
+        Domain name: cxi0        (both)
+        Provider name: cxi       (both)
+        Protocol: FI_PROTO_CXI   (both)
+        MR mode provided: [FI_MR_ALLOCATED, FI_MR_PROV_KEY, FI_MR_ENDPOINT]
+        Thread mode: FI_THREAD_SAFE
+        Control/Data progress: FI_PROGRESS_MANUAL
+
+    Slingshot is fine under pmi2. The bootstrap is what is broken.
+
+Consequence for the 512-node question: **`pmi2` cannot answer it.** A
+world-size-1 process never publishes the O(rank_n^2) KVS entries, so it
+cannot exercise the ceiling that blocks 512 nodes -- and 4096 singletons
+each loading the full 24B-particle snapshot would OOM immediately. A
+512-node `MPITYPE=pmi2` job was submitted on the strength of the earlier
+wrong reading and cancelled unrun (5337608) once the probe was read.
+
+So the 512-node blocker stands exactly where it did: LCI's bootstrap
+publishes rank_n^2 KVS entries, Cray PMI's fence cannot gather that many
+at 4096 ranks, the tcp backend's single-master rendezvous does not
+complete, and Slurm's PMI2 does not bootstrap LCI at all. The fix belongs
+upstream in the bootstrap's O(rank_n^2) alltoall, not in a launcher flag.
+
+**Method note.** `pmi2` passed a correctness check (right component
+count) and a smoke run while being completely non-parallel. Component
+counts are invariant to process count BY DESIGN in this code, so they
+cannot detect a job that failed to form. Rank identity has to be checked
+directly -- distinct ranks in the log, or a single print of a
+once-per-job line.
 
 ## Reproducing
 
