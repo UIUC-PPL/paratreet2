@@ -4,9 +4,14 @@
 A hygiene pass followed — read `design/debris-audit-2026-08.md` for the full
 dispositions. Code-relevant summary:
 
-- unionfind `d601b6d` (master): compression wave compile-gated under
+- unionfind `7794336` (master): compression wave compile-gated under
   `CONCURRENT_COMPRESSION_WAVE` (default OFF — `unionFindVertex` shrinks
   120 → 80 B); UFSTAT branch census and climb-hop histogram DELETED.
+  NOTE: this sits ON TOP of Ritvik's 08-23 width/iterator fixes
+  (00397f3..5e94077 — the >2^31 `arrIdx` truncation behind the 24B
+  under-merge, and the lazy_store mutation-during-iteration skips), so
+  these sanity runs cover his fixes and the cleanup together. His
+  `wave_pass` iterator fix is preserved inside the wave gate.
 - paratreet2 `2b55923` (main): dead dense tip-enumeration path removed
   (`computeTipEncoding`/`encode_map`/`uf2_vertices`), `verifyTips`/
   `phaseBWalker` removed, wave glue gated, debug-only 2^20-process
