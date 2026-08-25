@@ -322,6 +322,31 @@ each loading the full 24B-particle snapshot would OOM immediately. A
 512-node `MPITYPE=pmi2` job was submitted on the strength of the earlier
 wrong reading and cancelled unrun (5337608) once the probe was read.
 
+### `PMI_MAX_KVS_ENTRIES` is exhausted as a variable (2026-08-24)
+
+The cap was swept across its whole viable range at 4096 ranks. LCI publishes
+rank_n^2 = 4096^2 = 16,777,216 entries, which splits the range in two and
+leaves no working value anywhere in it:
+
+    cap           x rank_n^2   outcome
+    4,194,304        0.25      _pmi2_add_kvs: segment not large enough
+    8,388,608        0.50      _pmi2_add_kvs: segment not large enough
+    16,777,216       1.00      _pmi2_kvs_fence: malloc failed (-1972027392)
+    20,971,520       1.25      _pmi2_kvs_fence: malloc failed (-1972027392)
+    33,554,432       2.00      _pmi2_kvs_fence: malloc failed (-1972027392)
+
+Below rank_n^2 the publish cannot store the entries. At or above it the fence
+overflows -- and the byte count is IDENTICAL across a 2x span of the cap,
+including at the exact minimum. -1972027392 is a signed-32-bit wrap of
+2,322,939,904 bytes (2.32 GB).
+
+This is stronger than the earlier "not tunable" claim, which rested on two
+points that were both well above the minimum. The fence is sized by KVS
+CONTENT, the content is fixed by rank_n^2, and the cap cannot influence it in
+either direction. Raising `PMI_MAX_KVS_ENTRIES` is not a partial fix or a
+fix that ran out of headroom; it is not a lever at all.
+(jobs 5333507, 5339400, 5339401, 5333839, 5333628.)
+
 So the 512-node blocker stands exactly where it did: LCI's bootstrap
 publishes rank_n^2 KVS entries, Cray PMI's fence cannot gather that many
 at 4096 ranks, the tcp backend's single-master rendezvous does not
