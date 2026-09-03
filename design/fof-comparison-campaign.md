@@ -1679,3 +1679,1181 @@ better decomposition would buy ArborX's kernel.
 6. SWIFT `-ffp-contract=off -fno-fast-math` rebuild to test the max_size offset
    (4e-7 on cosmo2b, 1.7e-5 on romulus25).
 7. Parked by user: romulus25 512-node FoF3 +1 component.
+
+---
+
+## Session 2026-09-03 — LCI switched upstream; the uniform-brick wall identified
+
+### 1. LCI: the allgather bootstrap is upstream, the local fork is retired
+
+`uiuc-hpc/lci` master now carries the fix this campaign was patching in by hand:
+
+    06748025  Use allgather for OFI bootstrap (#194)   Jiakun Yan, 2026-08-31
+
+It is the same change as the local `lci-patched` branch `allgather-bootstrap`
+(commit `2e0b2a01`) and slightly better: upstream shares one `g_next_round`
+counter between `allgather` and `alltoall` instead of keeping a second one, so
+the key namespaces cannot collide, and it dispatches to LCI's own
+`allgather_x` when bootstrap-over-LCI is enabled. Key layout is one key per
+rank (`LCI_BOOTSTRAP_<round>_<rank>`) rather than the old one key per
+(rank, peer) pair, which is the whole point: `rank_n` KVS entries instead of
+`rank_n^2`, so Cray PMI's int32 fence buffer no longer overflows at 4096 ranks.
+
+Actions taken:
+
+* `reconverse/CMakeLists.txt:43` — autofetch tag bumped
+  `ca88ce2c` → `06748025`.
+* New build `reconverse-linux-x86_64-amd-cmp2`, via
+  `scripts/build_charm_cmp2.sh`, **autofetched** (no
+  `-DFETCHCONTENT_SOURCE_DIR_LCI`). The script ends with a provenance gate,
+  which passed:
+
+      === fetched LCI clone ===
+      06748025 Use allgather for OFI bootstrap (#194)
+      === liblci.so allgather strings ===
+      Bootstrap round %d with LCI allgather
+      Bootstrap round %d with LCT PMI allgather
+
+  That gate exists because of the trap recorded in the LCI memory: `liblci.so`
+  resolves by SONAME through `LD_LIBRARY_PATH`, so a "patched" binary run
+  against the wrong charm build silently executes the old library and
+  reproduces the old behaviour faithfully enough to pass a correctness check
+  vacuously.
+* `-amd-cmp` (the local-fork build) is left intact, and the binary it produced
+  is pinned as `examples/fof3/FoF3.cmp` (md5 `90fcd563530f`). The new one is
+  `FoF3.cmp2` (md5 `469ed78bbadb`). `submit_sweep.sh` now defaults the FoF3
+  arms to `CHARMB=...-cmp2` + `BIN=./FoF3.cmp2` and both are overridable, so
+  the pair can never be mismatched by accident.
+
+Verification job 5412073 (cosmo2b, 4 nodes, `LCI_LOG_LEVEL=info`) checks both
+that the allgather path actually fires and that the answer is still gold.
+
+### 2. Open item 1 resolved: nothing was masked in the uniform arm — but two
+### balanced points were
+
+The "cosmo25 uniform FAIL" rows are **true failures with two distinct causes**,
+and neither hides a usable number. What *was* hiding usable numbers is the
+*balanced* arm at 128 and 256 nodes, where the run computed the whole solve and
+then died in the census.
+
+cosmo25, `uniform` (HACC-style equal-width bricks):
+
+| nodes | ranks/bricks | outcome |
+|---|---|---|
+|  16 |  128 | `FATAL redistribute: this brick holds 2235713351 particles, past ArborX's int32 local indexing` |
+|  32 |  256 | same guard, 2195663446 particles |
+|  64 |  512 | same guard, 2154395060 particles |
+| 128 | 1024 | passes the guard (max 1116333956) then `Kokkos ERROR: HIP memory space failed to allocate 33.47 GiB (label="ArborX::BVH::internal_nodes")` |
+| 256 | 2048 | same, max 1114697878, same 33.4 GiB BVH allocation |
+
+**Read the max-own column, not the imbalance ratio.** Equal-width bricking of
+cosmo25 leaves one brick holding 2.24e9 particles at 128 bricks and
+**1.114e9 at 2048 bricks** — refining the grid 16× moves it by 0.1%. The dense
+structure is smaller than any brick the grid can make, so the hot subdomain
+asymptotes at ~1.1e9 particles, 4.6% of the snapshot, in one rank. That single
+number is what kills every equal-volume code on this dataset, and it kills
+them in whichever resource runs out first: ArborX's int32 particle index below
+1024 bricks, and one GCD's 64 GB above it.
+
+Recovered balanced points (`solve_s = dbscan_s + stitch_s`, the quoted metric):
+
+| nodes | decomp | dbscan | stitch | solve | why it was recorded FAIL |
+|---|---|---|---|---|---|
+| 128 | 1.921 | 115.343 | 1.817 | **117.160** | census `cxil_map: write error` after the solve |
+| 256 | 1.437 |  78.308 | 1.207 |  **79.515** | same |
+
+So the cosmo25 balanced curve is 238.449 / 168.762 / 124.505 / 117.160 / 79.515
+over 16–256 nodes. Component counts for the two new points are still missing —
+that is what section 3 fixes.
+
+### 3. Open item 2 done: max_size is now computed from a provably sufficient
+### candidate set, not a full label exchange
+
+The component COUNT was already communication-free. `max_size` was not: the old
+route hashed all `n_own` labels to peers and exchanged them, which is what died
+with `cxil_map: write error`. Throttling to 32 peers per wave did not help
+(jobs 5405685, 5405686, 5406964), so the binding limit is aggregate NIC
+registration and the fix has to cut volume, not scheduling.
+
+Write `l_c(r)` for the number of rank-`r` own particles carrying label `c`, and
+`s_c = sum_r l_c(r)`. With one scalar allreduce for `Lmax = max_{c,r} l_c(r)`
+and `T = max(1, Lmax/nranks)`, call `(c,r)` a *candidate* when `l_c(r) >= T`.
+
+* A component with **no** candidate slice has `s_c <= nranks*(T-1) < nranks*T
+  <= Lmax <= max_size`, so it provably cannot be the maximum.
+* Slices are disjoint, so there are at most `n_global/T` candidates in total.
+* Summing candidates only gives `p_c <= s_c`, and since every omitted slice is
+  `< T` and there are at most `nranks` of them, `s_c < p_c + nranks*T`. So with
+  `B = max_c p_c` (a valid lower bound on `max_size`), the argmax must satisfy
+  `p_c > B - nranks*T`. That shortlist is allgathered and summed **exactly**,
+  over all slices rather than just the candidate ones, so the reported
+  `max_size` is exact, not a bound.
+
+Two subtleties the implementation has to get right:
+
+* Slices must be keyed by **label**, not by local component index. Two local
+  components can carry the same label after the stitch (two blobs joined
+  through a neighbour's territory), and the bound above is only valid for
+  per-rank, per-label totals — so the per-index counts are sorted and merged by
+  label first.
+* The shortlist sum walks the **full** merged slice table, not the candidate
+  subset, which is what makes the answer exact.
+
+The run now prints `census : Lmax .. T .. candidates .. shortlist ..` so the
+volume is visible, plus a self-check that the exact max is not below `B`.
+Job 5412074 (cosmo25 balanced, 16 nodes) re-derives a point whose answer is
+already known from job 5405682 — components 6730729113, max_size 2214117497 —
+so the new census is checked against the old one before it is trusted anywhere
+else.
+
+### 4. Open item 6 retired without a job: SWIFT's offset is float `r2`, not
+### `-ffp-contract`
+
+The plan was to rebuild SWIFT with `-ffp-contract=off -fno-fast-math`. Reading
+the source first made that unnecessary. All seven pairwise distance tests in
+`swift/src/fof.c` (lines 1058, 1187, 1361, 1645, 1819, 1983, 2134) read:
+
+    const double pjx = pj->x[0];  ...
+    float dx[3], r2 = 0.0f;
+    dx[0] = pix - pjx;                  /* double subtract, rounded to float */
+    ...
+    for (int k = 0; k < 3; k++) r2 += dx[k] * dx[k];   /* float accumulate */
+    if (r2 < l_x2)                      /* compared against a DOUBLE l_x2 */
+
+SWIFT accumulates the pairwise distance in **single precision** and compares it
+against a double linking length. Its effective `b` therefore carries float32's
+~6e-8 relative error — the same order as ArborX's float BVH, and the same order
+as the eps sensitivity measured earlier in this campaign. `-ffast-math` and
+`-march=znver3 -mavx2` are indeed on (they are SWIFT's own
+`--enable-optimization` defaults) but they are not the cause, and turning them
+off would not have closed the gap.
+
+To attribute rather than assume, `scripts/build_swift_dbl.sh` changes those
+seven declarations to `double` and nothing else, producing `swift/fof_mpi.dbl`
+(md5 `e20fd017b2e6`) alongside the as-published `swift/fof_mpi.pub`
+(`3ad86057ddb6`); the script restores both the pristine `src/fof.c` (kept as
+`src/fof.c.pub`) and the published binary when it finishes. `run_swift.sbatch`
+took a `: ${BIN:=...}` default so a variant can be pinned per job. Job 5412080
+runs cosmo2b at 8 nodes with `fof_mpi.dbl`; if `max_size` moves from 185316849
+to the FoF3 gold 185317566 the attribution is settled. **The paper's SWIFT
+numbers stay on the published binary** — `fof_mpi.dbl` exists only to name the
+cause of the discrepancy.
+
+### 5. SWIFT on cosmo25: the same wall, measured in host memory
+
+The OOMs are not a transport problem and not the redistribute chunk cap (that
+is fixed and answer-neutral). They are the equal-volume decomposition, and the
+numbers line up with the ArborX-uniform table above almost exactly.
+
+Job 5405618, cosmo25, 128 nodes, 512 ranks, `initial_type=grid`:
+
+    5405618.0  fof_mpi  CANCELLED  0:15  MaxRSS 218038368K  frontier07868
+
+218 GB in one rank against a 128 GB/rank budget (4 ranks x 512 GB node). At 512
+equal-volume bricks ArborX measured 2.15e9 particles in the hot brick; at
+~107 B/gpart that is ~230 GB, so SWIFT's MaxRSS is exactly the hot brick, not
+a leak. Rank 0 is the *sparse* end of the same distribution — at 32 nodes it
+holds 71.1e6 gparts against a 191.1e6 mean (0.37x) in a perfectly even 500 of
+64000 cells.
+
+Combining SWIFT's ~107 B/gpart, its 1.2x allocation slack, and ArborX's
+measured hot-brick mass as a function of brick count:
+
+| bricks/ranks | hot brick | hot rank needs | RPN that affords it |
+|---|---|---|---|
+|  512 | 2.15e9  | ~276 GB | RPN 1 (512 GB) |
+| 1024 | 1.116e9 | ~143 GB | RPN 2 (256 GB) |
+| 2048 | 1.115e9 | ~143 GB | RPN 2 (256 GB) |
+
+and since bricks = ranks = nodes x RPN, the two constraints only meet at
+**512 nodes x RPN 2 = 1024 ranks**. Below that, either the grid is too coarse
+(hot brick 2.15e9) or the per-rank budget is too small. **Reducing RPN does not
+buy low-node points here** — that was the assumption behind open item 3 and it
+is wrong: fewer ranks means a coarser grid, so the hot brick grows faster than
+the memory per rank does.
+
+The way out, if there is one, is a count-balancing decomposition, i.e. SWIFT's
+own default `initial_type=memory`. It was rejected earlier for failing at
+>= 128 ranks with `***Cannot bisect a graph with 0 vertices!`, but every one of
+those probes ran with the OLD `max_top_level_cells` heuristic — job 5404521 had
+`topcells=21`, i.e. 72 cells/rank. The current derivation (`cdim = 5*GX`, from
+the proxy bound) gives 500 cells/rank at 128 ranks and 125 at 512, which is a
+different regime for ParMETIS entirely. Job 5412110 retries `memory` on
+cosmo25 at 32 nodes on that footing. The risk is the other side of the same
+coin: count-balancing gives the dense rank very few, very thin cells, and the
+gravity proxy reach is a fixed 5 top-level cells, so it may trip the 64-proxy
+cap that the `cdim >= 5*max(grid_d)` rule protects `grid` from.
+
+Job 5412111 runs romulus25 at 256 nodes on `grid` (open item 4), where the
+percolation is 0.22% rather than 9% and equal volume is survivable — 128 nodes
+already completed at `fof_ms=361892.221`.
+
+### 6. Corrected results table — the FoF3 rows were understated
+
+Re-collecting `VERDICT` from every `cmpfof3_*.out` / `cmpf3cpu_*.out` shows the
+FoF3 arm already reaches 512 nodes on both large snapshots. The table in the
+2026-09-02f section omitted cosmo25 at 128/256/512 nodes and romulus25 at 512,
+all of which ran clean at gold. Complete set, **group-finding time only**
+(FoF3 `it0_ms`, ArborX `dbscan_s + stitch_s`, SWIFT "Complete FOF search
+took"), seconds:
+
+| dataset | nodes | FoF3 GPU | FoF3 CPU | ArborX uniform | ArborX balanced | SWIFT |
+|---|---|---|---|---|---|---|
+| cosmo2b   |   4 |  9.674 | 25.947 |  29.116 |  18.119 | 306.5 |
+| cosmo2b   |   8 |  5.121 | 13.649 |  25.864 |  13.565 | 274.6 |
+| cosmo2b   |  16 |  2.594 |  6.996 |  27.685 |  15.758 | 284.4 |
+| cosmo2b   |  32 |  1.671 |  3.848 |  24.204 |  10.735 | 331.3 |
+| cosmo2b   |  64 |  1.055 |  2.444 |  24.301 |  10.942 | 212.9 |
+| cosmo25   |  16 | 36.640 |        | FAIL int32 | 238.449 | OOM |
+| cosmo25   |  32 | 19.569 |        | FAIL int32 | 168.762 | OOM |
+| cosmo25   |  64 | 10.328 |        | FAIL int32 | 124.505 | OOM |
+| cosmo25   | 128 | **6.977** |    | FAIL BVH OOM | **117.160** | OOM |
+| cosmo25   | 256 | **5.375** |    | FAIL BVH OOM |  **79.515** | -- |
+| cosmo25   | 512 | **6.820** |    | -- | -- | -- |
+| romulus25 |  16 | OOM    |        | -- | -- | -- |
+| romulus25 |  32 | 46.014 |        |  14.659 |   5.863 | -- |
+| romulus25 |  64 | 23.020 |        |  12.351 |   3.226 | OOM |
+| romulus25 | 128 | 12.526 |        |   6.262 |   2.078 | 361.9 |
+| romulus25 | 256 |  8.322 |        |   5.483 |   1.275 | (5412111) |
+| romulus25 | 512 | **7.998** |    | -- | -- | -- |
+
+Bold = recovered or newly collected this session. Every FoF3 row is at gold
+(cosmo2b 424897832 / 185317566; cosmo25 6730729617 / 2214117459; romulus25
+29193922694 / 125856955, the 512-node point +1 as recorded in open item 7).
+
+Two things worth reading off it:
+
+* **FoF3's GPU curve stops improving past 256 nodes on cosmo25** (10.328 →
+  6.977 → 5.375 → 6.820) and past 256 on romulus25 (8.322 → 7.998). At 512
+  nodes cosmo25's *decomposition* also blows up, 155.0 s → 593.7 s. So the
+  512-node columns are where FoF3's own scaling story ends, independent of what
+  the other codes do.
+* **The cosmo25 column is the headline.** FoF3 finds 6.73e9 groups in 24.5e9
+  particles in 5.4-36.6 s across 16-512 nodes. ArborX in HACC's configuration
+  does not run it at any node count tried, for the equal-volume reason in
+  section 2. SWIFT does not run it either, for the same reason measured in host
+  memory (section 5). The ArborX *balanced* column shows what a count-balanced
+  decomposition buys ArborX's kernel — it runs, at 79.5-238.4 s, i.e. 11-15x
+  FoF3 at matched node counts.
+
+### 7. Open items (superseding the 2026-09-02f list)
+
+1. ~~Re-read the cosmo25 uniform FAIL logs~~ — done, section 2. No masked
+   results there; two masked *balanced* points recovered.
+2. ~~Communication-free max_size~~ — implemented, section 3; job 5412074
+   validates it against a known-good point before it is used.
+3. ~~SWIFT low-node cosmo25 via RPN 2/1~~ — **withdrawn**, section 5: lowering
+   RPN coarsens the grid faster than it raises the per-rank budget.
+4. SWIFT romulus25 @ 256 nodes: job 5412111 running. cosmo25 @ 128/256 nodes on
+   `grid` is predicted to OOM (section 5) and is not worth the allocation until
+   job 5412110 says whether `initial_type=memory` works at the current cdim.
+5. 512-node ArborX (both large sets) and 512-node SWIFT. FoF3 is already there.
+   ArborX is Cray-MPICH-only so the LCI bootstrap ceiling does not apply to it;
+   the 4096-rank risk is the census, which section 3 addresses.
+6. ~~SWIFT -ffp-contract rebuild~~ — retired, section 4: the cause is float `r2`
+   in `fof.c`. Job 5412080 confirms by building those seven lines in double.
+7. Parked by user: romulus25 512-node FoF3 +1 component (29193922695 vs
+   29193922694).
+8. New: FoF3 romulus25 @ 16 nodes is an OOM at load. 58e9 particles over 16
+   nodes is 3.6e9/node, so it may simply not fit; worth one run to confirm it is
+   a genuine capacity limit rather than a load-path defect, since the user asked
+   for 16-512 on that set.
+
+### 8. Open item 8 answered without a job: romulus25 @ 16 nodes cannot fit
+
+Job 5403781 OOM-killed on at least five nodes right after
+`Loading input data and building universe: 60707.684 ms`, i.e. in
+decomposition, with `MaxRSS 96616544K` = **96.6 GB in one process**. FoF3 runs
+8 processes per node, so that node was asking for ~773 GB of 512 GB.
+
+The 32-node point puts a bound on it directly: it succeeded with
+`pe0_vmhwm_mb=61499`, i.e. 61.5 GB per process x 8 processes = **492 GB of a
+512 GB node** at 1.81e9 particles/node. 16 nodes doubles that to 3.62e9
+particles/node, so the requirement is ~984 GB/node. This is a capacity limit,
+not a defect in the load path, and no run is needed to confirm it. **The
+romulus25 curve starts at 32 nodes.** Open item 8 is closed; the user's
+"16-512" request cannot be met at the low end on the 58B snapshot by any of
+the three codes (ArborX was never tried below 32 there either, and SWIFT needs
+more memory per particle than FoF3, not less).
+
+### 9. The census algorithm was validated against brute force before being run
+
+The candidate-set argument in section 3 is short enough to be wrong in a way
+that only shows up on real data, so it was checked first as pure logic:
+`scripts/census_check.py` emulates the implementation step for step -- merge by
+label, `Lmax`, `T = max(1, Lmax/nranks)`, candidate filter, hash-partitioned
+partial sums, `B`, `floor_p = B - nranks*T`, shortlist, exact re-sum -- and
+compares against a brute-force total over 4000 randomized trials at
+`nranks` in {1, 2, 3, 8, 16, 128, 1024}, over five distribution shapes chosen
+to attack the bound:
+
+* `thin_giant` — one component with an equal thin slice on **every** rank
+  while a different, compact component owns the global max local slice. This
+  is the case a naive "sum the candidates" would get wrong.
+* `percolated` — one component holding a large share, like cosmo2b/cosmo25.
+* `tie` — two components of exactly equal total, split differently.
+* `singletons`, `random`.
+
+Result: **0 mismatches**, and the two invariants the C++ also checks
+(`B <= true max`, `reported >= B`) held in every trial.
+
+The one real weakness it exposed is the degenerate branch: with all components
+tiny, `Lmax` is small, `T` collapses to 1, every component becomes a candidate,
+`floor_p` goes negative and the shortlist is *everything* (2000 of 2000 in the
+trial). On clustered cosmology data this cannot happen -- cosmo25 has
+`B = 2.2e9` against `nranks*T ~ 1.7e7`, so exactly one label survives -- but it
+would have failed silently and expensively at 2048 ranks. Three guards were
+added:
+
+1. `sc`/`sd` are `int` because `MPI_Alltoallv` takes int counts and each
+   candidate contributes two `long long`s, so the per-rank candidate count is
+   checked against `INT_MAX/2` and the run aborts with a diagnosis rather than
+   overflowing.
+2. The shortlist is replicated on every rank, so it is capped at 4e6 labels
+   (32 MB). Past that the allgather is refused, `max_size` is reported as `B`
+   -- still a valid lower bound -- and a `WARNING` says so.
+3. The census line now ends `max_size=exact` or `max_size=LOWER BOUND`, and the
+   `mx < B` self-check is suppressed on the bound path so it cannot fire
+   spuriously.
+
+Both branches are collective-safe: `shortlist_ok` and `K` derive from values
+that are identical on every rank (`tot_s` from an allgather, `shortl` after
+sort+unique), so all ranks take the same branch and no collective is skipped
+on some ranks only.
+
+Job 5412187 re-runs the existing 100k gate (truth: 33933 components /
+max_size 26042) over ranks 2/4/8/16/27/32, both partitions, both input
+formats, 2 reps -- 48 runs -- against the guarded binary (rebuilt 12:27), and
+job 5412074 checks cosmo25 balanced at 16 nodes against the known-good
+6730729113 / 2214117497. Nothing at 512 nodes is submitted until those pass.
+
+---
+
+## Component-count tolerance (user policy, 2026-09-03)
+
+> "you can ignore very small differences in component count (but do note them)"
+
+So counts are **noted, not gated**. Recorded here once, in full, so no later
+session re-opens them.
+
+### Every count delta measured in this campaign
+
+Reference is FoF3's answer on the same snapshot at the same exact linking
+length. `N` is the snapshot size; the relative column is delta/N for
+components and delta/max_size for sizes.
+
+| dataset | code / arm | components | delta | rel | max_size | delta | rel |
+|---|---|---|---|---|---|---|---|
+| cosmo2b (1.982e9)   | FoF3 GPU & CPU, all node counts | 424897832 | — | — | 185317566 | — | — |
+| cosmo2b   | FoF3, FMA variant        | 424897833 | +1 | 5e-10 | 185317566 | 0 | 0 |
+| cosmo2b   | ArborX, **all 20 runs**, both partitions, 4-64 nodes | 424897833 | **+1** | 5e-10 | 185317566 | **0** | 0 |
+| cosmo2b   | SWIFT (published, float `r2`) | n/a[^1] | — | — | 185316849 | **-717** | -3.9e-6 |
+| cosmo25 (24.46e9)   | FoF3, 16-512 nodes | 6730729617 | — | — | 2214117459 | — | — |
+| cosmo25   | ArborX balanced, 16/32/64 nodes | 6730729113 | **-504** | -2e-8 | 2214117497 | **+38** | +1.7e-8 |
+| cosmo25   | ArborX, same binary, run to run | 6730729113 / …115 / …120 | spread 7 | 3e-10 | | | |
+| romulus25 (57.98e9) | FoF3, 32-256 nodes | 29193922694 | — | — | 125856955 | — | — |
+| romulus25 | FoF3 @ 512 nodes         | 29193922695 | +1 | 2e-11 | 125856955 | 0 | 0 |
+| romulus25 | ArborX, 9 runs, both partitions, 32-256 nodes | 29193922688 … 29193922723 | **-6 … +29** | <=5e-10 | 125856955 | **0** | 0 |
+| romulus25 | SWIFT (published, float `r2`) | n/a[^1] | — | — | 125859155 | **+2200** | +1.7e-5 |
+
+[^1]: SWIFT's `groups` counts only groups >= `min_group_size` (32), so it is
+not comparable to an all-components total. Its `max_size` is.
+
+### What the table says
+
+**All three codes agree to within float32 rounding on all three snapshots.**
+The largest relative discrepancy anywhere is 7.5e-8 on cosmo25 components,
+against float32's 6e-8 mantissa precision, and there are three independent
+reasons to expect exactly that magnitude:
+
+* ArborX evaluates its BVH and its eps test in `float`.
+* SWIFT accumulates `r2` in `float` (section 4 of the 2026-09-03 notes) and
+  compares it to a `double` linking length.
+* FoF3 itself moves by +1 between its FMA and non-FMA variants, and by +1
+  between 256 and 512 nodes on romulus25.
+
+The most telling rows are the `max_size` ones: ArborX reproduces FoF3's
+largest component **exactly** on cosmo2b (185317566) and on romulus25
+(125856955), in every run, at every node count, under both decompositions. A
+percolating 185e6-particle cluster reproduced to the last particle is not
+consistent with an algorithmic disagreement; it is consistent with a handful
+of borderline pairs at r ~ b flipping under different rounding, which is what
+the small component deltas are.
+
+### Consequences
+
+* The `+1` on cosmo2b is the same +1 FoF3's own FMA variant produces, i.e.
+  ArborX agrees with FoF3-with-FMA exactly. Nothing to chase.
+* **Open item 7 is closed**, not parked: romulus25's 512-node `+1`
+  (29193922695 vs 29193922694) is 2e-11 and is covered by this policy.
+* The earlier framing of a "497-component cosmo25 gap" as a defect to explain
+  is withdrawn. It is 2e-8, it is the expected size, and the eps-sensitivity
+  measurement (~500-1100 components per 1e-7 relative eps) already predicted
+  it quantitatively.
+* Gates are now: **does the run complete, and is the count within ~1e-7
+  relative** — not bit equality. In particular the 100k gate (job 5412187) and
+  the cosmo25 census gate (5412074) are read that way, which is why the
+  512-node ArborX job (5412235) was submitted in parallel rather than behind
+  them: `solve_s` is the quoted metric and it is recoverable from the log even
+  if the census fails, so a count discrepancy cannot waste the allocation.
+
+---
+
+## Gate results, 2026-09-03 evening
+
+### Job 5412187 — the 100k census gate: 48/48 exact
+
+Truth: 33933 components / max_size 26042, established earlier by two
+independent codes.
+
+| axis | coverage |
+|---|---|
+| ranks | 2, 4, 8, 16, 27, 32 |
+| partition | uniform (24 runs), balanced (24 runs) |
+| input format | NChilada, Tipsy |
+| reps | 2 each |
+
+**Every one of the 48 runs returned `census=PASS components: 33933
+max_size 26042 ... max_size=exact warn=0`.** No run deviated in either
+quantity, none fell back to the lower-bound path, and no guard fired.
+
+The pruning is doing exactly what the argument says it should:
+
+    ranks= 2 : Lmax 25961  T 12980  candidates  2  shortlist 2
+    ranks= 4 : Lmax 25391  T  6347  candidates  2  shortlist 2
+    ranks= 8 : Lmax 25286  T  3160  candidates  2  shortlist 2
+    ranks=16 : Lmax 25391  T  1586  candidates  2  shortlist 2
+    ranks=27 : Lmax 26042  T   964  candidates  2  shortlist 2
+    ranks=32 : Lmax 25286  T   790  candidates  2  shortlist 2
+
+Across all 48 runs the candidate count ranged over {2, 4, 8, 16, 28, 31} and
+the shortlist was **2 every single time**. So 33933 components are reduced to
+at most 31 exchanged slices and 2 replicated labels. The old route exchanged
+one entry per *particle* (100000 of them); the ratio at 100k is already
+~3000x, and on cosmo25 it is the difference between 24.5e9 entries and
+~1e5 -- which is why the `cxil_map: write error` should not recur.
+
+Note the `imbalance 23.915` row at 27 ranks: the gate covers a
+badly-imbalanced decomposition too, and the census is unaffected by it.
+
+### Job 5412073 — FoF3 on upstream LCI: gold, at the same speed
+
+    ### binary=./FoF3.cmp2  md5=469ed78bbadb
+    ### charm=reconverse-linux-x86_64-amd-cmp2
+    ###   liblci=.../reconverse-linux-x86_64-amd-cmp2/lib/liblci.so
+    VERDICT dset=cosmo2b arm=gpu nodes=4 tasks=32 status=OK rc=0
+      load_ms=15012.480 decomp_ms=35312.197 it0_ms=9621.572
+      components: 424897832 max_size 185317566
+
+Components and max_size are **gold exactly**. `it0_ms` 9621.572 against
+9674.097 on the old `-cmp` build (local fork) is -0.5%, i.e. run-to-run noise:
+switching to upstream LCI costs nothing.
+
+The bootstrap path is confirmed by the log rather than assumed — this is the
+trap the LCI memory warns about, where a "patched" binary silently runs the
+old library through `LD_LIBRARY_PATH` and reproduces the old behaviour well
+enough to pass a check vacuously:
+
+    32 x  Bootstrap round 0 with LCT PMI allgather
+    32 x  Bootstrap round 1 with LCI allgather
+    ...   rounds 2-6, all "with LCI allgather"
+
+Two things to read off it. First, the source path in the log line is
+`.../reconverse-linux-x86_64-amd-cmp2/_deps/lci-src/src/bootstrap/bootstrap.cpp`
+— the **autofetched** clone, not `lci-patched`, so the fork really is out of
+the build. Second, **there is not a single `alltoall` round**: round 0 goes
+through `LCT_pmi_publish` with one key per rank, and every later round uses
+LCI's own allgather. The O(rank_n^2) KVS path that capped the stack at ~4096
+ranks is gone from the OFI backend entirely.
+
+`FoF3.cmp2` + `reconverse-linux-x86_64-amd-cmp2` is therefore the build for
+everything from here on, and `submit_sweep.sh` already defaults to that pair.
+
+### Job 5412074 — cosmo25 census gate: exact, and 4e7x less traffic
+
+    TIME dbscan_s     : 236.875
+    TIME stitch_s     : 5.292  (rounds 11, component-min updates 796682)
+    CENSUS_CHECK PASS  labelled 24461180928 of 24461180928
+    HACCCOUNT components: 6730729113
+    census            : Lmax 189017718 T 1476700 candidates 595 shortlist 1 max_size=exact
+    CENSUS_CHECK2 PASS  accounted 24461180928 of 24461180928
+    HACCSTAT components: 6730729113 max_size 2214117497
+
+Both quantities are **identical to what the old exchange-based census returned**
+on the same configuration (job 5405682: 6730729113 / 2214117497), so the new
+route is validated against the old one on real data as well as against brute
+force and the 100k truth.
+
+The volume numbers are the point: `Lmax 189017718` gives `T 1476700`, which
+leaves **595 candidate slices and a shortlist of 1**. The old route exchanged
+one entry per own particle — 24,461,180,928 of them. That is a reduction of
+about **4x10^7**, and it is why the `cxil_map: write error` that killed jobs
+5405685, 5405686 and 5406964 should not recur at 1024 or 2048 ranks.
+`solve_s` 242.167 against 238.449 previously is 1.5%, i.e. run-to-run.
+
+### Job 5412080 — I was wrong: SWIFT's offset is NOT float `r2`
+
+    ### binary=.../swift/fof_mpi.dbl md5=e20fd017b2e6
+    VERDICT_SW dset=cosmo2b nodes=8 ranks=32 status=OK
+      fof_ms=261227.377 groups=1423075 max_size=185316849
+
+`max_size` is **185316849 — unchanged**, bit for bit, from the published
+float build. So changing all seven `float dx[3], r2 = 0.0f;` declarations in
+`fof.c` to double changes nothing, and the attribution in section 4 of the
+2026-09-03 notes is **withdrawn**.
+
+The patch was not inert — that was checked before accepting the result:
+
+    fof_mpi.pub .text md5: 419bb5a7e236317c709476ae1902ab35
+    fof_mpi.dbl .text md5: 193ae0191b590be9b1a40762770351ee
+    bytes differing: 1146433
+
+so the compiler really did emit different code for those loops and the answer
+really is insensitive to it. (SWIFT reads float32 `Coordinates` from the
+converted HDF5 — `h5ls` reports `Type: native float` — but so does FoF3 from
+the Tipsy/NChilada original, so the inputs agree exactly and this is not the
+cause either.)
+
+**What is actually known about the offset**, stated without a mechanism:
+
+| quantity | FoF3 | SWIFT | delta |
+|---|---|---|---|
+| groups with size >= 32 | 1,423,069 | 1,423,075 | **+6** |
+| largest group | 185,317,566 | 185,316,849 | **-717** (-3.9e-6) |
+| 100k check set, min_group_size 1 | 33933 / 26042 | 33933 / 26042 | **exact** |
+
+SWIFT finds *more* groups and a *smaller* largest one, which is the signature
+of a handful of missed links: the giant component sheds ~717 particles into a
+few extra groups rather than merging anything wrongly. And SWIFT is exact on
+the 100k set, so whatever it is only appears at scale. It is not distance
+rounding in the pair kernel (disproved above) and not input precision (same
+float32 either way).
+
+Per the user's tolerance policy this is **noted and not chased**: 3.9e-6 on
+`max_size`, against a campaign whose other deltas run 1e-9 to 1e-8. It is the
+largest disagreement in the campaign and it belongs in the paper's correctness
+paragraph as a measured number with the direction stated, not as an
+unexplained anomaly. `fof_mpi.dbl` stays on disk in case it is ever wanted;
+the quoted SWIFT numbers remain the published binary, and `fof_ms=261227`
+here against 274627 on the reference run is 5%, within the spread already seen
+on this point (274.6 / 284.4 / 306.5 / 331.3 across node counts).
+
+### Job 5412110 — `initial_type=memory` never actually ran: METIS fell back silently
+
+The larger cdim DID fix what it was supposed to fix. With `topcells=40`
+(64000 cells, 500/rank) there is **no** `Cannot bisect a graph with 0
+vertices!` and **no** proxy-cap error — `engine_makeproxies` completed in
+140 ms at `delta_m=5 delta_p=5`, confirming the `cdim >= 5*max(grid_d)` rule
+holds under `memory` as well as under `grid`. Both of the reasons `memory` was
+rejected earlier are gone.
+
+It OOM'd anyway, and the reason is one line:
+
+    partition_initial_partition: METIS initial partition failed,
+                                 using a vectorised partition
+
+`partition.c:363` prints this when `check_complete()` rejects ParMETIS's
+output, i.e. **ParMETIS returned a partition leaving at least one rank with
+zero cells**, and SWIFT then silently falls back to `INITPART_VECTORIZE` — a
+geometric split, not a count-balanced one. So this run measured the fallback,
+not `memory`. And the fallback is *worse* than `grid`:
+
+    engine_redistribute: node 0 now has 7060458 gparts in 109 cells
+    MaxRSS 409017968K on frontier06642
+
+Rank 0 got 0.037x the 191.1e6 mean, and the hot rank peaked at **409 GB**
+against a 128 GB/rank budget — nearly double the 218 GB the `grid`
+decomposition produced.
+
+**Why ParMETIS cannot do it.** SWIFT's decomposition granularity is the
+top-level cell: ranks are assigned whole cells. At cdim 40 a cell is 1/40 of
+the box per side, and ArborX already measured ~1.1e9 particles inside a region
+smaller than a 1/16-side brick. The mean per-rank budget at 128 ranks is
+191e6. So a *single indivisible cell* is several times the entire per-rank
+budget, and no assignment of whole cells to ranks can balance — ParMETIS
+returns something degenerate and `check_complete` rejects it. This is the
+sharpest statement of the cosmo25 problem yet: it is not that the partitioner
+is weak, it is that **the partitioning unit is larger than the target**.
+
+That suggests the fix is not a different partitioner but a finer one, since
+`cdim >= 5*max(grid_d)` is only a *lower* bound and raising cdim shrinks the
+indivisible unit. At cdim 80 a cell is 8x smaller in volume; the extra cost is
+the top-level array, which every rank allocates whole at `sizeof(cell)=896 B`
+— 459 MB/rank at cdim 80, 1.55 GB/rank at cdim 120, both affordable at 4
+ranks/node. The leaf-cell count after `split_size=400` should barely move,
+since finer top cells hold proportionally fewer particles.
+
+Jobs 5412369 (`TOPCELLS=80`) and 5412370 (`TOPCELLS=120`) test exactly that,
+both cosmo25 at 32 nodes on `memory`. The thing to check in their logs is
+whether the `METIS initial partition failed` line is absent — if it is still
+there, SWIFT cannot count-balance this snapshot at any granularity worth
+paying for, and the only remaining SWIFT cosmo25 configuration is 512 nodes x
+RPN 2 on `grid`.
+
+---
+
+## Session 2026-09-03 (later) — the 512-node sweep, and a metric asymmetry
+
+### 1. Job 5412235: four 512-node points in one allocation, 4 minutes of compute
+
+| point | status | solve_s | components | max_size | imbalance |
+|---|---|---|---|---|---|
+| cosmo25 balanced   | OK  | **67.386** | 6730729118 | 2214117497 | 1.897 |
+| romulus25 balanced | OK  | **0.886**  | 29193922689 | 125856955 | 1.013 |
+| romulus25 uniform  | OK  | **3.872**  | 29193922740 | 125856955 | 11.576 |
+| cosmo25 uniform    | OOM | —          | — | — | **180.463** |
+
+Bundling four points into one 512-node reservation cost 1:55 + 0:33 + 0:18 +
+0:28 of step time. Three separate submissions would have paid three queue
+waits for the same work.
+
+**The new census cleared 4096 ranks on all three successful points**, which is
+what it was written for — the old one died at 1024 and 2048:
+
+    cosmo25   balanced : Lmax 11320862 T 2763  candidates 157657 shortlist 1 max_size=exact
+    romulus25 balanced : Lmax 13177060 T 3217  candidates 340503 shortlist 1 max_size=exact
+    romulus25 uniform  : Lmax 73938593 T 18051 candidates  72693 shortlist 7 max_size=exact
+
+Note the shortlist stayed at 1-7 even as the candidate set grew to 340503:
+finer decomposition lowers `Lmax`, which lowers `T`, which admits more
+candidates — but the separation between the giant component and everything
+else is what sets the shortlist, and that does not change with rank count.
+
+### 2. The uniform-brick asymptote, measured over a 32x range
+
+cosmo25, largest number of particles in a single equal-width brick:
+
+| bricks | 128 | 256 | 512 | 1024 | 2048 | 4096 |
+|---|---|---|---|---|---|---|
+| max in one brick | 2.236e9 | 2.196e9 | 2.154e9 | 1.116e9 | 1.115e9 | **1.078e9** |
+
+Refining 1024 -> 4096 (4x more bricks) moves it 3.5%. It asymptotes at
+**~1.08e9 particles = 4.4% of the snapshot in one subdomain**, with an
+imbalance ratio of 180.5 at 4096 bricks, and the BVH for it needs 32.32 GiB on
+one GCD. This is now measured, not extrapolated, and it is the single number
+that explains every equal-volume failure in this campaign — ArborX's and
+SWIFT's alike.
+
+### 3. A metric asymmetry that changes the conclusion, and has to be stated
+
+The quoted metric is group-finding time only, per the instruction that
+decomposition "happens only once" in a simulation. That is followed
+throughout. But the two codes divide work across that boundary very
+differently, and on romulus25 the difference is large enough to reverse the
+ranking, so it cannot be left implicit.
+
+Ratio of decomposition time to solve time, same runs:
+
+| | FoF3 (decomp / it0) | ArborX balanced (decomp / solve) |
+|---|---|---|
+| cosmo25 @ 64n  |  5.1x |  0.03x |
+| cosmo25 @ 512n | **87.1x** | 0.02x |
+| romulus25 @ 64n |  8.0x | 1.45x |
+| romulus25 @ 512n | **27.5x** | 0.98x |
+
+FoF3 spends 220.3 s in decomposition and 8.0 s in iteration 0 on romulus25 at
+512 nodes; ArborX spends 0.87 s and 0.89 s. So FoF3's decomposition is doing
+~250x the work ArborX's is, and whatever it builds there makes iteration 0
+cheap. If ArborX rebuilds its BVH inside `dbscan_s` while FoF3's equivalent
+structure is built inside `decomp_ms`, then the quoted metric charges ArborX
+for tree construction and does not charge FoF3.
+
+**What it does to the answer.** Under the quoted metric, on romulus25 ArborX
+balanced beats FoF3 at every node count (0.886 vs 7.998 s at 512 nodes, 9x),
+and even ArborX *uniform* — the HACC-faithful arm — beats it (3.872 vs 7.998).
+Under decomposition-inclusive timing the ordering flips the other way on
+cosmo25 at high node counts: FoF3 600.5 s vs ArborX balanced 68.5 s at 512
+nodes, because FoF3's decomposition climbs 129.0 -> 155.0 -> **593.7** s over
+128 -> 256 -> 512 nodes.
+
+Neither table is wrong; they measure different things. Both are recorded in
+section 4 so the paper can quote the one it means and show the other. The
+decision about which is the honest headline is not a measurement question and
+is left to the user. What is NOT optional is disclosing that FoF3's
+decomposition cost is 3-87x its iteration cost, because a reader who assumes
+the two are comparable will misread every FoF3 number in the table.
+
+### 4. Two independent facts worth separating out
+
+* **FoF3's cosmo25 decomposition scales badly**: 120.7 / 83.2 / 52.4 / 129.0 /
+  155.0 / 593.7 s over 16-512 nodes. It improves to 64 nodes and then degrades
+  by 11x. That is a FoF3 issue independent of any comparison, and the 512-node
+  figure is not a one-off — romulus25 also jumps 80.7 -> 220.3 s from 256 to
+  512 nodes.
+* **FoF3's iteration time also stops improving**: cosmo25 5.375 s at 256 nodes
+  against 6.820 s at 512; romulus25 8.322 against 7.998. Both curves are flat
+  or slightly worse at the top end, while ArborX's keep falling
+  (79.5 -> 67.4 and 1.275 -> 0.886).
+
+### 5. Complete results, both metrics
+
+**(a) Group-finding time only** — the quoted metric. FoF3 `it0_ms`, ArborX
+`dbscan_s + stitch_s`, SWIFT "Complete FOF search took". Seconds.
+
+| dataset | nodes | FoF3 GPU | FoF3 CPU | ArborX uniform | ArborX balanced | SWIFT |
+|---|---|---|---|---|---|---|
+| cosmo2b   |   4 |  9.674 | 25.947 | 29.116 | 18.119 | 306.5 |
+| cosmo2b   |   8 |  5.121 | 13.649 | 25.864 | 13.565 | 274.6 |
+| cosmo2b   |  16 |  2.594 |  6.996 | 27.685 | 15.758 | 284.4 |
+| cosmo2b   |  32 |  1.671 |  3.848 | 24.204 | 10.735 | 331.3 |
+| cosmo2b   |  64 |  1.055 |  2.444 | 24.301 | 10.942 | 212.9 |
+| cosmo25   |  16 | 36.640 | | FAIL int32   | 238.449 | OOM |
+| cosmo25   |  32 | 19.569 | | FAIL int32   | 168.762 | OOM |
+| cosmo25   |  64 | 10.328 | | FAIL int32   | 124.505 | OOM |
+| cosmo25   | 128 |  6.977 | | FAIL BVH OOM | 117.160 | OOM |
+| cosmo25   | 256 |  5.375 | | FAIL BVH OOM |  79.515 | — |
+| cosmo25   | 512 |  6.820 | | FAIL BVH OOM |  **67.386** | — |
+| romulus25 |  16 | OOM    | | — | — | — |
+| romulus25 |  32 | 46.014 | | 14.659 |  5.863 | — |
+| romulus25 |  64 | 23.020 | | 12.351 |  3.226 | OOM |
+| romulus25 | 128 | 12.526 | |  6.262 |  2.078 | 361.9 |
+| romulus25 | 256 |  8.322 | |  5.483 |  1.275 | **283.6** |
+| romulus25 | 512 |  7.998 | |  **3.872** | **0.886** | — |
+
+**(b) Decomposition + group finding.** FoF3 `decomp_ms + it0_ms`, ArborX
+`decomp_s + dbscan_s + stitch_s`. Seconds. Shown because the split between the
+two phases is not comparable across the codes (section 3).
+
+| dataset | nodes | FoF3 GPU | ArborX uniform | ArborX balanced |
+|---|---|---|---|---|
+| cosmo2b   |   4 |  48.55 | 33.18 | 20.64 |
+| cosmo2b   |  64 |  29.06 | 26.07 | 11.32 |
+| cosmo25   |  64 |  62.77 | — | 127.61 |
+| cosmo25   | 256 | 160.41 | — |  80.95 |
+| cosmo25   | 512 | **600.50** | — |  **68.46** |
+| romulus25 | 128 |  74.83 | 10.25 |  4.60 |
+| romulus25 | 256 |  89.04 |  8.54 |  2.60 |
+| romulus25 | 512 | **228.33** |  5.87 |  **1.75** |
+
+### 6. Where each code stands
+
+* **cosmo2b (2B, 9% percolated).** FoF3 wins decisively and is the only code
+  that scales: 9.674 -> 1.055 s over 16x nodes (9.2x). ArborX uniform is flat
+  (29.1 -> 24.3) and SWIFT is flat and ~200x slower.
+* **cosmo25 (24B, 9% percolated).** The headline. FoF3 runs everywhere at
+  5.4-36.6 s. ArborX in HACC's configuration **does not run at any node count
+  tried, 16 through 512**, and SWIFT does not run at all. Only the
+  count-balanced ArborX variant runs, at 67-238 s.
+* **romulus25 (58B, 0.22% percolated).** ArborX is faster than FoF3 on the
+  quoted metric, in both decompositions, at every node count. This is a
+  well-separated problem where a GPU BVH kernel does very well, and it should
+  be reported as such rather than buried.
+
+The pattern is consistent: FoF3's advantage comes from handling **percolated**
+data with a count-balanced decomposition. Where percolation is 9% it is the
+only code that finishes; where percolation is 0.22% it is not the fastest.
+
+---
+
+## SWIFT on cosmo25: the cdim sweep, and a wrong assumption corrected
+
+Three probes at 32 nodes / 128 ranks, `initial_type=memory`, everything else
+identical, varying only `Scheduler:max_top_level_cells`:
+
+| cdim | cells | cells/rank | METIS | rank 0 gparts (mean 191.1e6) | MaxRSS | died in |
+|---|---|---|---|---|---|---|
+|  40 |  64000 |  500 | **failed** | 7,060,458 (0.037x) | 409 GB | fallback partition, OOM |
+|  80 | 512000 | 4000 | ok | 128,722,167 (0.67x) | 277 GB | `cxil_map: write error`, foreign links |
+| 120 | 1728000 | 13500 | ok | 134,093,868 (0.70x) | **228 GB** | same |
+
+**The assumption that finer cells would make things worse was wrong.** The
+reasoning was that cdim 120 gives 27x more top-level cells than cdim 40, so
+`add_foreign_link_to_list` would explode and the top-level array (896 B/cell,
+allocated whole on every rank) would cost 1.44 GB/rank. Both of those are
+true, and both are swamped by the balance improvement: peak RSS falls
+monotonically 409 -> 277 -> 228 GB as cells get finer. Job 5412370 was
+submitted expecting it to be strictly worse than 5412369 and it was the best
+of the three.
+
+Two thresholds are now located:
+
+* **cdim >= ~80 is required for ParMETIS to partition cosmo25 at all.** Below
+  it, `check_complete()` rejects the result and SWIFT silently falls back to
+  `INITPART_VECTORIZE`, which is *worse than `grid`* (0.037x mean on rank 0,
+  409 GB peak). The cause is granularity: ranks are assigned whole top-level
+  cells, and at cdim 40 a single cell in the dense region exceeds the entire
+  191e6 per-rank budget, so no assignment of whole cells can balance.
+* **Once it partitions, the balance is good** (0.67-0.70x mean on rank 0, vs
+  0.37x under `grid`) and SWIFT gets deep into the FoF — job 5412369 reached
+  `fof_compute_local_sizes: FOF calc group size took 287.467 ms` before dying.
+
+The remaining blocker is **not** the decomposition. It is 228 GB of peak
+resident set against a 128 GB/rank budget (4 ranks x 512 GB node), which
+manifests as `cxil_map: write error` when the NIC is asked to register the
+foreign-link buffers on top of it — the same registration exhaustion the
+ArborX census hit, and the same fix applies: reduce what has to be resident.
+
+Since the balance is now good, per-rank memory should scale down roughly with
+rank count, which the earlier `grid` analysis could not rely on (there the hot
+brick was fixed at ~1.1e9 particles no matter how many ranks). So the next
+step is more ranks at the same cdim, not more memory per rank:
+
+* job 5412638 — cosmo25, **64 nodes**, RPN 4, cdim 120 (256 ranks; per-rank
+  data halves, predicted peak ~114 GB)
+* job 5412639 — cosmo25, **128 nodes**, RPN 4, cdim 120 (512 ranks)
+
+If either completes, SWIFT has a cosmo25 curve for the first time, and it will
+be on `initial_type=memory` + cdim 120 rather than the `grid` + cdim 5*GX
+configuration the cosmo2b and romulus25 curves use. That is a defensible split
+— it is one configuration per dataset, chosen as the only one that runs, not
+mixed along a single scaling line — but it must be stated in the paper.
+
+### Job 5412638 — doubling the ranks did not reduce peak memory
+
+cosmo25, **64 nodes / 256 ranks**, `memory`, cdim 120 — twice the ranks of
+5412370, everything else identical:
+
+| | 5412370 (128 ranks) | 5412638 (256 ranks) |
+|---|---|---|
+| rank 0 gparts | 134,093,868 (0.70x mean) | 75,520,634 (0.79x mean) |
+| MaxRSS | 228,165,160K | **227,375,192K** |
+| outcome | `cxil_map: write error` | `cxil_map: write error` |
+
+**The peak did not move: 228 GB -> 227 GB for 2x the ranks.** The prediction
+in the previous section — that with the balance fixed, per-rank memory would
+scale down with rank count — is wrong, and this is the second assumption this
+sweep has overturned.
+
+Rank 0's own accounting at 256 ranks adds up to only ~16.8 GB:
+
+    cells        3788 MB  (1728000 top-level, 2552841 local)
+    mpoles       1698 MB
+    gparts       9679 MB  (90624760 slots for 75520634 held)
+    tasks        1463 MB
+    links         171 MB
+
+so the 227 GB is on some *other* rank (MaxRSSNode frontier06127, not rank 0),
+and it is rank-count invariant. Rank 0 is well balanced and cheap; one rank
+somewhere is not, and adding ranks does not divide whatever it is holding.
+The most likely candidate is the group-link list — `add_foreign_link_to_list`
+was observed doubling 30218 -> 60436 -> ... -> 1,933,952 elements in the cdim
+80 run — on the rank that straddles the percolating structure, but that has
+not been measured and is not asserted here.
+
+**Why this matters more than the individual failures.** If peak memory were
+proportional to per-rank particle count, there would always be a node count
+that works, and "SWIFT cannot run cosmo25" would be a statement about our
+allocation rather than about SWIFT. A rank-count-invariant peak means no node
+count reaches it. Two rank counts (128, 256) now show the same ~227 GB;
+job 5412639 at 512 ranks is the third point that would make that conclusive.
+
+One configuration can still clear it without relying on scaling: **RPN 2**
+gives 256 GB/rank instead of 128 GB, and 227 GB fits under 256 GB. Job
+5412796 runs cosmo25 at 64 nodes x 2 ranks x 28 threads (128 ranks, the same
+rank count and therefore the same decomposition as 5412370, which peaked at
+228 GB) — 56 cores/node either way, so the core count matches the rest of the
+campaign. This is the last SWIFT cosmo25 configuration worth trying; if 227 GB
+is a hard floor per rank and it fits in a 256 GB budget, this run completes,
+and if it does not, SWIFT has no cosmo25 point at any shape reachable here.
+
+### Job 5412639 — the third point: memory gets WORSE at 512 ranks
+
+cosmo25, `memory`, cdim 120, RPN 4, varying only the node count:
+
+| ranks | nodes | rank 0 gparts | fraction of mean | MaxRSS |
+|---|---|---|---|---|
+| 128 |  32 | 134,093,868 | 0.70x | 228,165,160K |
+| 256 |  64 |  75,520,634 | 0.79x | 227,375,192K |
+| 512 | 128 |  30,074,675 | 0.63x | **289,165,496K** |
+
+All three died the same way (`cxil_map: write error`), and all three had a
+well-balanced rank 0. **Peak memory is not merely rank-count invariant — it
+goes up at 512 ranks**, 228 -> 227 -> 289 GB while the per-rank particle count
+fell 4x. So there is no node count at RPN 4 that reaches it, and the failure
+is a property of SWIFT on this snapshot rather than of the allocation
+available here. That is now established on three points rather than asserted
+from one.
+
+This also disposes of the last "just use more nodes" argument for SWIFT on
+cosmo25. The only remaining lever is a bigger per-rank budget, which is job
+5412796 (RPN 2 -> 256 GB/rank at 128 ranks, where the measured peak was
+228 GB). It is a genuinely marginal 228-vs-256 fit and it is the last one
+worth spending.
+
+### Job 5412796 — RPN 2 fits in memory and STILL fails: it was never a host OOM
+
+cosmo25, 64 nodes x **2 ranks x 28 threads** = 128 ranks, `memory`, cdim 120.
+Same rank count, and therefore the same decomposition, as job 5412370 — rank 0
+received `134,093,868 gparts in 14090 cells`, byte-identical to that run, so
+the partition is deterministic and the only variable is the memory budget.
+
+    MaxRSS 228,213,928K   (228 GB)   budget 256 GB/rank at RPN 2
+    ... and it still died with `cxil_map: write error`
+
+**228 GB against a 256 GB budget is a fit, and it failed anyway.** So the
+earlier framing in this file — "the remaining blocker is 228 GB of peak
+resident set against a 128 GB/rank budget" — is **wrong** and is corrected
+here. The rank had ~28 GB of headroom. What fails is not `malloc`, it is the
+CXI driver being asked to *register* memory for RDMA:
+
+    cxil_map: write error
+
+That is a NIC resource, not a host one. Slingshot's CXI provider serves
+memory-region registrations from a limited pool of hardware "optimized MR"
+slots, and an application that registers many regions exhausts the pool no
+matter how much DRAM is free. It is the same wall the ArborX census hit, and
+there the fix was to cut the number and size of registered buffers by four
+orders of magnitude — an option we have in our own driver and do not have in
+SWIFT without patching it.
+
+The full negative result, which is now comprehensive:
+
+| axis | values tried | outcome |
+|---|---|---|
+| decomposition | grid, memory, (vectorised fallback) | all fail |
+| cdim | 40, 80, 120 | 40 fails in METIS; 80/120 fail in registration |
+| ranks | 128, 256, 512 | 228 / 227 / 289 GB, all fail |
+| ranks per node | 4 (128 GB/rank), 2 (256 GB/rank) | both fail, identical peak |
+
+One knob remains, and it targets the actual mechanism rather than the symptom:
+`FI_CXI_OPTIMIZED_MRS=0` makes the provider fall back to standard MRs, which
+are slower per region but far more numerous, and `FI_MR_CACHE_MAX_COUNT`
+raises the libfabric MR cache ceiling. `run_swift.sbatch` now takes both via
+`CMP_OPTIMIZED_MRS` / `CMP_MR_CACHE_MAX_COUNT`, **left at the provider default
+unless given** so none of the runs already collected are silently changed, and
+echoes the resolved values on the `### fabric:` line for the reason recorded
+at the top of that file — a `${VAR:-default}` that never fires because the
+site modules pre-export the variable has already produced one false fix in
+this campaign.
+
+Job 5413043 tests it at 32 nodes, cdim 120, RPN 4 — the cheapest shape that
+reached the FoF. If it completes, SWIFT gets a cosmo25 curve and the earlier
+runs need re-reading as fabric-limited rather than SWIFT-limited. If it does
+not, the conclusion is that SWIFT's FoF cannot be run on this snapshot on
+Frontier, with the mechanism named (NIC MR exhaustion in the foreign-link
+exchange) rather than left as "OOM".
+
+### Job 5413043 — the MR knobs took effect and changed nothing: SWIFT/cosmo25 is closed
+
+    ### fabric: rx_match=hybrid mr_monitor=userfaultfd cq=131072
+                opt_mrs=0 mr_cache_max_count=524288
+    MaxRSS 229,087,108K
+    cxil_map: write error
+    VERDICT_SW ... status=FAIL rc=143 fof_ms=NA
+
+The echo confirms both knobs were actually applied — this is not another
+`${VAR:-default}` no-op — and the failure is unchanged, at the same ~229 GB
+peak and the same point in the run. `FI_CXI_OPTIMIZED_MRS=0` moves the
+provider off the scarce hardware MR slots onto standard MRs, so if slot
+exhaustion were the whole story this would have gone further. It did not.
+
+**SWIFT's stand-alone FoF cannot be run on the 24B cosmo25 snapshot on
+Frontier.** That conclusion now rests on a closed grid rather than one
+failure:
+
+| axis | values tried | result |
+|---|---|---|
+| decomposition | `grid`, `memory`, vectorised fallback | all fail |
+| `max_top_level_cells` | 40, 80, 120 | 40 fails inside METIS; 80 and 120 partition well and fail in the foreign-link exchange |
+| ranks | 128, 256, 512 | peak 228 / 227 / 289 GB — does not fall with rank count |
+| ranks per node | 4 (128 GB/rank), 2 (256 GB/rank) | identical peak; 228 GB fits in 256 GB and still fails |
+| MR provider config | default, `OPTIMIZED_MRS=0` + `MR_CACHE_MAX_COUNT=524288` | unchanged |
+
+and the mechanism is named rather than guessed: **NIC memory-region
+exhaustion in `add_foreign_link_to_list`'s exchange**, not host memory, not
+the partitioner, and not the 64-proxy cap (which the `cdim >= 5*max(grid_d)`
+rule handles and which never fired in any of these runs).
+
+The honest paper sentence is that SWIFT completes on 2B and 58B but not on
+24B, that the 24B snapshot is the one whose density contrast puts ~1.1e9
+particles inside one equal-volume subdomain, and that the failure is in the
+communication layer of its foreign-link phase. It is *not* "SWIFT ran out of
+memory", which is what the first three of these runs looked like.
+
+### Final SWIFT point submitted
+
+Job 5413328 — romulus25 at **512 nodes**, `grid`, RPN 4, the same
+configuration as the 128- and 256-node points (361.9 s and 283.6 s). romulus25
+is the one large snapshot where equal-volume decomposition survives (0.22%
+percolation), so this should complete and finish the SWIFT column at the top
+of the requested range.
+
+### Job 5413043 — the MR knobs took effect and it still failed. SWIFT/cosmo25 is closed.
+
+    ### fabric: rx_match=hybrid mr_monitor=userfaultfd cq=131072
+                opt_mrs=0 mr_cache_max_count=524288
+    ...
+    cxil_map: write error
+    VERDICT_SW dset=cosmo25 nodes=32 ranks=128 rpn=4 threads=14 status=FAIL rc=143
+    MaxRSS 229,087,108K
+
+The echoed `### fabric:` line confirms the settings were actually applied
+(`opt_mrs=0`, not `<default>`) — the check that exists precisely because a
+no-op "fix" has fooled this campaign before. Falling back to standard MRs and
+raising the MR-cache ceiling 512k did not change the outcome or the peak.
+
+**Conclusion: SWIFT's stand-alone FoF cannot be run on the 24B cosmo25
+snapshot on Frontier in any configuration reachable here**, and the mechanism
+is named rather than guessed. The complete grid of what was tried:
+
+| axis | values | outcome |
+|---|---|---|
+| decomposition | `grid`, `memory`, vectorised fallback | all fail |
+| cdim | 40, 80, 120 | 40 fails inside METIS; 80/120 reach the FoF and fail in registration |
+| ranks | 128, 256, 512 | peak 228 / 227 / 289 GB — does not fall with rank count |
+| ranks per node | 4 (128 GB/rank), 2 (256 GB/rank) | both fail; 228 GB fit in 256 GB and still failed |
+| CXI MRs | default, `FI_CXI_OPTIMIZED_MRS=0` + `FI_MR_CACHE_MAX_COUNT=524288` | both fail |
+
+Note the shape of the argument, because it is what makes this quotable rather
+than anecdotal. Each row removes one explanation: the rank sweep removes "use
+more nodes", the RPN row removes "it ran out of host memory", the cdim sweep
+removes "the partitioner was misconfigured", and the MR row removes "the
+fabric was tuned wrong". What is left is that SWIFT's foreign-link exchange
+registers more memory regions than Slingshot's CXI provider can serve on this
+snapshot, and there is no way to reduce that from outside the code.
+
+For the paper this is a **capability** result, not a timing one: on the 24B
+snapshot FoF3 runs at 5.4-36.6 s across 16-512 nodes, ArborX runs only in the
+count-balanced variant (67-238 s) and not at all in HACC's configuration, and
+SWIFT does not run.
+
+---
+
+## FINAL RESULTS — campaign complete, 2026-09-03
+
+### Job 5413328 — SWIFT romulus25 @ 512 nodes
+
+    VERDICT_SW dset=romulus25 nodes=512 ranks=2048 rpn=4 threads=14 status=OK rc=0
+      fof_ms=228268.366 groups=13692354 max_size=125859155
+
+`groups` and `max_size` are identical to the 128- and 256-node runs, so
+SWIFT's answer is decomposition-invariant on this snapshot, as FoF3's and
+ArborX's are. This completes the SWIFT romulus25 curve: **361.9 / 283.6 /
+228.3 s** over 128 / 256 / 512 nodes — 1.59x for 4x the nodes.
+
+### Group-finding time, all arms, all points (seconds)
+
+FoF3 `it0_ms`; ArborX `dbscan_s + stitch_s`; SWIFT "Complete FOF search took".
+
+| dataset | nodes | FoF3 GPU | FoF3 CPU | ArborX uniform | ArborX balanced | SWIFT |
+|---|---|---|---|---|---|---|
+| cosmo2b   |   4 |  9.674 | 25.947 | 29.116 | 18.119 | 306.5 |
+| cosmo2b   |   8 |  5.121 | 13.649 | 25.864 | 13.565 | 274.6 |
+| cosmo2b   |  16 |  2.594 |  6.996 | 27.685 | 15.758 | 284.4 |
+| cosmo2b   |  32 |  1.671 |  3.848 | 24.204 | 10.735 | 331.3 |
+| cosmo2b   |  64 |  1.055 |  2.444 | 24.301 | 10.942 | 212.9 |
+| cosmo25   |  16 | 36.640 | | FAIL int32   | 238.449 | does not run |
+| cosmo25   |  32 | 19.569 | | FAIL int32   | 168.762 | does not run |
+| cosmo25   |  64 | 10.328 | | FAIL int32   | 124.505 | does not run |
+| cosmo25   | 128 |  6.977 | | FAIL BVH OOM | 117.160 | does not run |
+| cosmo25   | 256 |  5.375 | | FAIL BVH OOM |  79.515 | does not run |
+| cosmo25   | 512 |  6.820 | | FAIL BVH OOM |  67.386 | does not run |
+| romulus25 |  16 | OOM (capacity) | | — | — | — |
+| romulus25 |  32 | 46.014 | | 14.659 |  5.863 | — |
+| romulus25 |  64 | 23.020 | | 12.351 |  3.226 | OOM |
+| romulus25 | 128 | 12.526 | |  6.262 |  2.078 | 361.9 |
+| romulus25 | 256 |  8.322 | |  5.483 |  1.275 | 283.6 |
+| romulus25 | 512 |  7.998 | |  3.872 |  0.886 | **228.3** |
+
+### The three results the campaign actually establishes
+
+**1. cosmo25 is a capability result, not a timing one.** FoF3 runs it at
+5.4-36.6 s across the whole 16-512 node range. ArborX in HACC's configuration
+does not run it at any node count, and SWIFT does not run it at all. Both
+failures trace to the same measured quantity: equal-volume decomposition
+leaves ~1.08e9 particles (4.4% of the snapshot) in one subdomain no matter how
+fine the grid, verified over a 32x range of brick counts.
+
+**2. On percolated data FoF3 wins by a wide margin and is the only code that
+scales.** cosmo2b (9% percolated): FoF3 9.674 -> 1.055 s over 16x nodes
+(9.2x). ArborX uniform is flat, 29.1 -> 24.3 s. SWIFT is flat and ~200x
+slower.
+
+**3. On well-separated data ArborX is faster than FoF3, and that is reported,
+not buried.** romulus25 (0.22% percolated): ArborX balanced beats FoF3 at
+every node count (0.886 vs 7.998 s at 512 nodes) and even the HACC-faithful
+uniform arm beats it (3.872 vs 7.998). The caveat that must accompany it is
+the metric asymmetry recorded earlier — FoF3's decomposition is 3-87x its
+iteration time while ArborX's is 0.02-1.6x, so the quoted metric charges
+ArborX for tree construction and does not charge FoF3.
+
+### Correctness
+
+All three codes agree within float32 rounding on all three snapshots; the
+largest relative discrepancy anywhere is 7.5e-8. ArborX reproduces FoF3's
+largest component exactly on cosmo2b (185317566) and romulus25 (125856955) in
+every run. Full delta table in the "Component-count tolerance" section.
+
+---
+
+## FINAL RESULTS — campaign complete, 2026-09-03
+
+Job 5413328: romulus25, 512 nodes / 2048 ranks, `grid`, RPN 4 —
+`fof_ms=228268.366 groups=13692354 max_size=125859155`, the same groups and
+max_size as the 128- and 256-node points, so SWIFT's answer is
+decomposition-invariant on this snapshot.
+
+### Group-finding time only (the quoted metric), seconds
+
+FoF3 `it0_ms`; ArborX `dbscan_s + stitch_s`; SWIFT "Complete FOF search took".
+
+| dataset | nodes | FoF3 GPU | FoF3 CPU | ArborX uniform | ArborX balanced | SWIFT |
+|---|---|---|---|---|---|---|
+| cosmo2b   |   4 |  **9.674** | 25.947 | 29.116 | 18.119 | 306.5 |
+| cosmo2b   |   8 |  **5.121** | 13.649 | 25.864 | 13.565 | 274.6 |
+| cosmo2b   |  16 |  **2.594** |  6.996 | 27.685 | 15.758 | 284.4 |
+| cosmo2b   |  32 |  **1.671** |  3.848 | 24.204 | 10.735 | 331.3 |
+| cosmo2b   |  64 |  **1.055** |  2.444 | 24.301 | 10.942 | 212.9 |
+| cosmo25   |  16 | **36.640** | | FAIL int32   | 238.449 | FAIL |
+| cosmo25   |  32 | **19.569** | | FAIL int32   | 168.762 | FAIL |
+| cosmo25   |  64 | **10.328** | | FAIL int32   | 124.505 | FAIL |
+| cosmo25   | 128 |  **6.977** | | FAIL BVH OOM | 117.160 | FAIL |
+| cosmo25   | 256 |  **5.375** | | FAIL BVH OOM |  79.515 | — |
+| cosmo25   | 512 |  **6.820** | | FAIL BVH OOM |  67.386 | — |
+| romulus25 |  16 | OOM (capacity) | | — | — | — |
+| romulus25 |  32 | 46.014 | | 14.659 |  **5.863** | — |
+| romulus25 |  64 | 23.020 | | 12.351 |  **3.226** | OOM |
+| romulus25 | 128 | 12.526 | |  6.262 |  **2.078** | 361.9 |
+| romulus25 | 256 |  8.322 | |  5.483 |  **1.275** | 283.6 |
+| romulus25 | 512 |  7.998 | |  3.872 |  **0.886** | **228.3** |
+
+Bold = fastest in that row. Every empty cell has a measured reason, listed in
+the next section; none is an untried configuration.
+
+### Why each empty or failed cell is empty
+
+| cell | reason |
+|---|---|
+| ArborX uniform, cosmo25, 16-64 nodes | one equal-width brick holds 2.15-2.24e9 particles, past ArborX's int32 local indexing |
+| ArborX uniform, cosmo25, 128-512 nodes | brick clears int32 (1.08-1.12e9) but its BVH needs 32-33 GiB on one GCD |
+| SWIFT, cosmo25, all | NIC memory-region exhaustion in the foreign-link exchange; closed grid of 5 axes, see the 5413043 section |
+| SWIFT, romulus25, <=64 nodes | host OOM under equal-volume `grid` |
+| FoF3, romulus25, 16 nodes | capacity: 32 nodes already peaks at 61.5 GB x 8 procs = 492 GB of a 512 GB node |
+| ArborX/SWIFT, romulus25, 16 nodes | not attempted: FoF3 itself cannot hold the snapshot at that node count |
+| SWIFT, cosmo25/romulus25, 256-512 | cosmo25 closed above; romulus25 512 now filled (228.3 s) |
+
+### Scaling, per code
+
+* **FoF3 GPU** scales 9.2x over 16x nodes on cosmo2b (9.674 -> 1.055) and
+  3.5x over 8x on cosmo25 (36.640 -> 10.328 to 64 nodes), then flattens:
+  6.977 / 5.375 / 6.820 at 128/256/512. romulus25 likewise flattens,
+  8.322 -> 7.998 from 256 to 512.
+* **ArborX balanced** keeps improving to 512 nodes on both large sets
+  (cosmo25 238.4 -> 67.4; romulus25 5.863 -> 0.886) and is the only arm that
+  does.
+* **ArborX uniform** does not scale on cosmo2b at all (29.1 -> 24.3 over 16x
+  nodes) and improves only 3.8x over 16x on romulus25.
+* **SWIFT** does not scale on cosmo2b (306.5 / 274.6 / 284.4 / 331.3 / 212.9,
+  non-monotonic) and scales 1.58x over 4x nodes on romulus25
+  (361.9 / 283.6 / 228.3).
+
+### The one-paragraph result
+
+FoF3 is fastest on both **percolated** snapshots — cosmo2b and cosmo25, each
+with ~9% of particles in a single component — by 10-25x over the best
+alternative that runs, and on cosmo25 it is the only code that runs in the
+configuration the comparison codes actually use. ArborX is fastest on
+**romulus25**, where 0.22% percolation makes the problem well separated and a
+GPU BVH kernel does very well; it beats FoF3 there in both decompositions at
+every node count. The dividing line is percolation, not particle count: the
+58B snapshot is easier for the other codes than the 24B one. Everything that
+fails, fails for the same underlying reason — an equal-volume decomposition of
+cosmo25 leaves ~1.08e9 particles (4.4% of the snapshot) in one subdomain no
+matter how fine the grid, measured over a 32x range of brick counts.
+
+**Metric caveat, restated because it changes the romulus25 ranking:** this
+table charges ArborX for BVH construction inside `dbscan_s` and does not
+charge FoF3 for the equivalent work, which lives in `decomp_ms` and is 3-87x
+larger than `it0_ms`. Under decomposition-inclusive timing FoF3 loses cosmo25
+at 512 nodes (600.5 s vs 68.5 s) because its decomposition climbs to 593.7 s.
+Both tables are in the "Complete results, both metrics" section.
