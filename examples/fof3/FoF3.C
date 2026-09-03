@@ -41,6 +41,19 @@ using namespace paratreet;
     fof_b = fof_b_factor * std::cbrt(V / (double)N);
     CkPrintf("FoF linking length b = %g (factor %g, V = %g, N = %ld)\n",
              fof_b, fof_b_factor, V, N);
+    // FULL PRECISION too. The comparison campaign hands this exact b to
+    // ArborX (-e) and to SWIFT (FOF:absolute_linking_length) so that all
+    // three codes link at the identical length BY CONSTRUCTION rather than
+    // by three independent recomputations happening to agree. They do not:
+    // b depends on paratreet's universe box, which remakeUniverse (Driver.h)
+    // turns into a CUBE of side (1 + 1.91e-6) * max_extent centred on the
+    // particle bounding box -- not the bounding box itself -- so a reader
+    // that recomputes 0.2 * cbrt(V/N) from the raw particle extents gets a
+    // different number (on the 100k set, 0.148620 against this 0.150205,
+    // a 1.07% difference, which is plenty to move a component count).
+    // %g's six significant figures are not enough to pass it on.
+    CkPrintf("FOF3STAT linking_length_exact: %.17g volume_exact: %.17g n: %ld\n",
+             fof_b, V, N);
 
     // Phase 1: register -> phaseA -> phaseB -> merge -> relabel. Tips are
     // process-level fragments afterwards. PBC (design/pbc.md): a cubic box
