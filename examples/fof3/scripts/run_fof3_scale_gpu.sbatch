@@ -75,7 +75,7 @@ export PMI_MAX_KVS_ENTRIES=4194304
 # the 16-node job adds a verify arm that turns the full per-particle gate
 # back on.
 
-INPUT=/lustre/orion/csc710/scratch/rrao/cosmo25cmb.768g2_dm.001024
+INPUT=/lustre/orion/csc710/proj-shared/cosmo25cmb.768g2_dm.001024
 PPN=14
 NDEVICES=7
 PEMAP=1-7,65-71,9-15,73-79,17-23,81-87,25-31,89-95,33-39,97-103,41-47,105-111,49-55,113-119,57-63,121-127

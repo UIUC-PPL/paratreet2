@@ -78,7 +78,7 @@ export FOF_GPU_PHASE1=1
 
 cd /ccs/home/rrao/paratreet2/examples/fof3
 
-INPUT=/lustre/orion/csc710/scratch/rrao/cosmo25cmb.768g2_dm.001024
+INPUT=/lustre/orion/csc710/proj-shared/cosmo25cmb.768g2_dm.001024
 PPN=14
 NDEVICES=7
 # 56 entries = 4 processes x 14 PEs, no PU above 63, no multiple of 8.

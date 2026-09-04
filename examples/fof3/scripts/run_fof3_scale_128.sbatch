@@ -29,7 +29,7 @@ export LCI_ATTR_BACKEND=ofi
 export FI_CXI_RX_MATCH_MODE=hybrid
 export PMI_MAX_KVS_ENTRIES=4194304
 
-INPUT=/lustre/orion/csc710/scratch/rrao/cosmo25cmb.768g2_dm.001024
+INPUT=/lustre/orion/csc710/proj-shared/cosmo25cmb.768g2_dm.001024
 PPN=14
 NDEVICES=7
 

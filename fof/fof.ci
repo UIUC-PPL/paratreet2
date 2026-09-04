@@ -62,6 +62,10 @@ module fof {
     entry void probeAck(int target, double t0);
     entry void probeXfer(int from, double t0, const std::vector<char>&);
     entry void probeXferAck(double t0, long bytes);
+    // Stage 3 of the distributed component histogram, routed form: receive
+    // the (label, partial_count) pairs whose component BOSS this process
+    // owns. See FoFPhase1::scatterTouchedCounts for the routing rule.
+    entry void recvTouchedCounts(const std::vector<std::pair<long, long> >&);
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
@@ -125,6 +129,13 @@ module fof {
     entry void depositLabelCounts(const CkCallback&);
     entry void histogramShard(int min_component_size, const CkCallback&);
     entry void collectTouchedCounts(const CkCallback&);
+    // Routed replacement for collectTouchedCounts (FOF_HIST_ROUTED, default
+    // on): scatterTouchedCounts sends each touched partial to the process
+    // owning that component's boss tip; binTouchedCounts sums and bins the
+    // slice that landed here and contributes the SAME 6-element tuple
+    // histogramShard does, so the driver just adds the two.
+    entry void scatterTouchedCounts(const CkCallback&);
+    entry void binTouchedCounts(int min_component_size, const CkCallback&);
     // Distributed UF_2 (step 4; encoded tips required — see design/step4.md).
     // applyTipEncoding: owner-writes rewrite of this PE's particles' tips
     // (enumeration-free: uf2EncodeTip of the raw tip, sparse-uf2 2026-07-25).

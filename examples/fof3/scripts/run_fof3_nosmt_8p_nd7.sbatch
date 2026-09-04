@@ -108,7 +108,7 @@ export FOF_GPU_PHASE1=1
 
 cd /ccs/home/rrao/paratreet2/examples/fof3
 
-INPUT=/lustre/orion/csc710/scratch/rrao/cosmo25cmb.768g2_dm.001024
+INPUT=/lustre/orion/csc710/proj-shared/cosmo25cmb.768g2_dm.001024
 PPN=7
 # 7 == PPN: one LCI device per PE, the maximum this shape can ask for.
 # 8 procs x 7 devices = 56 contexts/node, the ceiling that is known to fit

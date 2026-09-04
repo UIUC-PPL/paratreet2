@@ -400,6 +400,17 @@ public:
   };
   std::vector<std::unique_ptr<LabelShard>> label_shards;
   std::mutex label_shards_init_lock;
+  // Landing buffer for the ROUTED stage 3 (FoFPhase1::scatterTouchedCounts).
+  // Holds the (label, partial_count) pairs, from any process, whose
+  // component boss this process owns. Cleared in histogramShard, which is
+  // separated from the first send by that stage's global reduction -- so
+  // every clear happens before any send, and no arrival can be lost.
+  std::mutex touched_in_lock;
+  std::vector<std::pair<long, long>> touched_in;
+  void appendTouchedIn(const std::vector<std::pair<long, long>>& v) {
+    std::lock_guard<std::mutex> g(touched_in_lock);
+    touched_in.insert(touched_in.end(), v.begin(), v.end());
+  }
   void ensureLabelShards(int n) {
     std::lock_guard<std::mutex> g(label_shards_init_lock);
     if ((int)label_shards.size() != n) {
@@ -1214,6 +1225,10 @@ public:
   // Phase 2b: replace this process's endpoint of each cross edge with its
   // local root and hand the edge to the other endpoint's owner. Plain sends
   // only; the driver closes this step with CkWaitQD.
+  void recvTouchedCounts(const std::vector<std::pair<long, long>>& v) {
+    appendTouchedIn(v);
+  }
+
   void routeCrossEdges() {
     const int me = CkMyNode();
     const int n_procs = CkNumNodes();
@@ -3909,6 +3924,14 @@ public:
     int my_shard = CkMyRank();
     auto* nb = node_proxy.ckLocalBranch();
     touched_totals_.clear();
+    // Reset the routed stage-3 landing buffer. Safe here and NOT in
+    // scatterTouchedCounts: this stage ends in a global reduction, so every
+    // process has cleared before any process sends. Clearing in the scatter
+    // would race a peer whose message is already in flight.
+    if (my_shard == 0) {
+      std::lock_guard<std::mutex> g(nb->touched_in_lock);
+      nb->touched_in.clear();
+    }
     // 2 x (64 bins + count + max): totals then survivors.
     long bins[64] = {0}, sbins[64] = {0};
     long n = 0, maxs = 0, sn = 0, smaxs = 0;
@@ -3982,6 +4005,88 @@ public:
     this->contribute(touched_totals_.size() * sizeof(std::pair<long, long>),
                      touched_totals_.data(), CkReduction::concat, cb);
     touched_totals_.clear();
+  }
+
+  // ROUTED stage 3 (design: this replaces the concat-to-PE-0 above, which
+  // made PE 0 sum a 6.5M-entry unordered_map alone while every other PE
+  // idled -- 2.04 s of dead air at 128 nodes on romulus25, measured by
+  // summary trace, and GROWING with process count because the concat gets
+  // bigger. The old path stays reachable as FOF_HIST_ROUTED=0.)
+  //
+  // Routing rule: a TOUCHED label is -(bossTip + 2) and bossTip is an
+  // encoded UF_2 vertex id, (owner << kUF2IdxBits) | local. So the process
+  // owning a component's boss is a pure bit-shift on the label -- no
+  // directory, no all-to-all, the same Option-C routing routeCrossEdges
+  // uses for cross edges. Every partial of one component therefore lands on
+  // exactly ONE process, which can sum and bin it without talking to anyone.
+  void scatterTouchedCounts(const CkCallback& cb) {
+    const int n_procs = CkNumNodes();
+    std::vector<std::vector<std::pair<long, long>>> out(n_procs);
+    for (auto& p : touched_totals_) {
+      // histogramShard files only negatives here, so the decode is total.
+      const long boss = -p.first - 2;
+      const int owner = (int)((uint64_t)boss >> paratreet::kUF2IdxBits);
+      if (owner < 0 || owner >= n_procs) {
+        // Name the value: a bad owner means the label is not an encoded
+        // tip, which is a sign-contract or truncation bug upstream, and a
+        // bare abort here would cost a full-scale run to narrow down (the
+        // lesson of jobs 5332555/5332649, see applyUF2Labels).
+        CkPrintf("[%d] scatterTouchedCounts: label %ld -> boss %ld -> owner "
+                 "%d outside [0, %d)\n", CkMyPe(), p.first, boss, owner,
+                 n_procs);
+        CkAbort("touched label does not decode to a valid owner process");
+      }
+      out[owner].push_back(p);
+    }
+    touched_totals_.clear();
+    for (int p = 0; p < n_procs; p++)
+      if (!out[p].empty()) node_proxy[p].recvTouchedCounts(out[p]);
+    this->contribute(cb);
+  }
+
+  // Sum and bin this PE's share of what landed. Every PE of the process
+  // scans the landing buffer and keeps the labels hashing to its own shard
+  // -- the same partition rule histogramShard uses inside a process, so all
+  // partials of one label are summed by exactly one PE and the total is
+  // complete. Contributes the SAME 6-element tuple histogramShard does
+  // (contract clause 3: every PE contributes exactly once, empty or not).
+  void binTouchedCounts(int min_component_size, const CkCallback& cb) {
+    auto* nb = node_proxy.ckLocalBranch();
+    const int nsh = CkNodeSize(CkMyNode());
+    const int me = CkMyRank();
+    long bins[64] = {0}, sbins[64] = {0};
+    long n = 0, maxs = 0, sn = 0, smaxs = 0;
+    std::vector<std::pair<long, long>> mine;
+    for (auto& p : nb->touched_in)
+      if ((int)(labelShardMix(p.first) % (uint64_t)nsh) == me)
+        mine.push_back(p);
+    std::sort(mine.begin(), mine.end(),
+              [](const std::pair<long, long>& a,
+                 const std::pair<long, long>& b) { return a.first < b.first; });
+    for (size_t i = 0; i < mine.size();) {
+      const long label = mine[i].first;
+      long total = 0;
+      for (; i < mine.size() && mine[i].first == label; i++)
+        total += mine[i].second;
+      const int bin = 63 - __builtin_clzl((unsigned long)total);
+      bins[bin]++; n++;
+      if (total > maxs) maxs = total;
+      if (total >= (long)min_component_size) {
+        sbins[bin]++; sn++;
+        if (total > smaxs) smaxs = total;
+      }
+    }
+    CkReduction::tupleElement tuple[] = {
+      CkReduction::tupleElement(sizeof(bins), bins, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &n, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &maxs, CkReduction::max_long),
+      CkReduction::tupleElement(sizeof(sbins), sbins, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &sn, CkReduction::sum_long),
+      CkReduction::tupleElement(sizeof(long), &smaxs, CkReduction::max_long)
+    };
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tuple, 6);
+    msg->setCallback(cb);
+    this->contribute(msg);
   }
 
   // Owner-writes relabel through the global tip -> root map computed by the
@@ -4925,8 +5030,61 @@ FoFComponentHistogram runFoFComponentHistogram(CProxy_FoFPhase1<Data> fof,
     delete msg;
   }
 
-  // Stage 3: cross-process summing of the touched components only
-  // (~per-process #touched pairs; 7,029 labels total at 80M P=8).
+  // Stage 3: cross-process summing of the touched components only.
+  //
+  // The original design note said "~per-process #touched pairs; 7,029
+  // labels total at 80M P=8" and concat-gathered them all to PE 0. That
+  // assumption does not survive a percolated snapshot at width: romulus25
+  // has 3.7M touched components at 32 nodes and 6.5M at 128, and the count
+  // GROWS with process count, so the concat grows too. A summary trace of
+  // job 5421066 caught the consequence exactly -- during 2.04 s of the
+  // census, PE 0 was 91.9% busy building its unordered_map and all 7,167
+  // other PEs were idle.
+  //
+  // ROUTED path (default): send each partial to the process owning that
+  // component's boss tip, sum and bin it there, and fold in one more
+  // 6-tuple. FOF_HIST_ROUTED=0 restores the concat path for A/B.
+  static const bool routed = [] {
+    const char* e = std::getenv("FOF_HIST_ROUTED");
+    return !e || std::atoi(e) != 0;   // default ON
+  }();
+  if (routed) {
+    // Sub-timers: the routed path has three distinct costs (route+send,
+    // the delivery barrier, sum+bin) and they scale differently, so a
+    // single component_histogram number cannot say which one to attack.
+    const double cs0 = CkWallTimer();
+    fof.scatterTouchedCounts(CkCallbackResumeThread());
+    // Delivery barrier. The reduction above orders the SENDS, not the
+    // arrivals; this is the same idiom runFoFPhase3Staged uses after
+    // routeCrossEdges. (If QD turns out to cost more than the serial
+    // section it replaced, the counted-receive alternative is a
+    // CkNumNodes()-long count reduction -- measure before building it.)
+    const double cs1 = CkWallTimer();
+    CkWaitQD();
+    const double cs2 = CkWallTimer();
+    void* result = nullptr;
+    fof.binTouchedCounts(min_component_size, CkCallbackResumeThread(result));
+    CkPrintf("FOF3STAT time_s: census_scatter %.3f census_qd %.3f "
+             "census_bin %.3f\n", cs1 - cs0, cs2 - cs1,
+             CkWallTimer() - cs2);
+    CkReductionMsg* msg = (CkReductionMsg*)result;
+    CkReduction::tupleElement* elems = nullptr;
+    int n_elems = 0;
+    msg->toTuple(&elems, &n_elems);
+    CkEnforce(n_elems == 6);
+    const long* tb = (const long*)elems[0].data;
+    const long* sb = (const long*)elems[3].data;
+    for (int i = 0; i < 64; i++) { h.bins[i] += tb[i]; h.surviving_bins[i] += sb[i]; }
+    h.n_components += *(const long*)elems[1].data;
+    const long mx = *(const long*)elems[2].data;
+    if (mx > h.max_size) h.max_size = mx;
+    h.surviving_count += *(const long*)elems[4].data;
+    const long smx = *(const long*)elems[5].data;
+    if (smx > h.surviving_max_size) h.surviving_max_size = smx;
+    delete[] elems;
+    delete msg;
+    return h;
+  }
   {
     void* result = nullptr;
     fof.collectTouchedCounts(CkCallbackResumeThread(result));

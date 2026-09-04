@@ -103,7 +103,7 @@ export FOF_GPU_PHASE1=1
 
 cd /ccs/home/rrao/paratreet2/examples/fof3
 
-INPUT=/lustre/orion/csc710/scratch/rrao/cosmo25cmb.768g2_dm.001024
+INPUT=/lustre/orion/csc710/proj-shared/cosmo25cmb.768g2_dm.001024
 PPN=7
 # 4, NOT the 7 every previous script used, and this is a hang not a tuning
 # knob. CommBackendLCI2::initThread assigns thread t to device

@@ -44,7 +44,7 @@ export LCI_ATTR_BACKEND=ofi
 export FI_CXI_RX_MATCH_MODE=hybrid
 export PMI_MAX_KVS_ENTRIES=32768
 
-INPUT=/lustre/orion/csc710/scratch/rrao/cosmo25cmb.768g2_dm.001024
+INPUT=/lustre/orion/csc710/proj-shared/cosmo25cmb.768g2_dm.001024
 PPN=14
 # 8 procs/node x lci_ndevices contexts share one NIC. At ndevices=14 (=112 total
 # contexts/node) LCI's memory registration hits ENOSPC during init. Halved to 7
