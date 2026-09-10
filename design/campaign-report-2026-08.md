@@ -131,6 +131,15 @@ a threshold, or a wrong prediction passes silently; and small-scale
 
 ## 4. Open, and deliberately parked
 
+**As of 2026-09-10 the live agenda lives in GitHub issues, not in this
+file.** Filed so far: paratreet2 #3 (the affinity fix's silent no-op),
+#4 (`loadCache` anti-scaling — the whole 64→128 regression), #5 (the
+phase-3 walk's 5.22x imbalance and the weighted-coin rule); charm #3972
+(GPU helper threads inheriting PE affinity), #3973 (`hapi_memory_daemon`
+spin loops); reconverse #216 (`CmiOnCore` stub). New agenda items should
+be filed as issues; this section is the historical record of what was
+parked at the campaign's close, not a to-do list.
+
 Placeholder representation (a placeholder is a full `FullNode`, including an
 8-pointer children array that is never written — ~26% of every slot);
 `eBinaryOct` to cut the frontier ~7× (`design/binaryoct-design-issues.md`);

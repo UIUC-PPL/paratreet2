@@ -73,6 +73,15 @@ agent produces that matters must be committed the same day.
 
 ## 4. Open items, in rough priority order
 
+**Superseded in part, 2026-09-10: the agenda now lives in GitHub issues.**
+paratreet2 #3 (affinity fix silent no-op — item 1 below), #4 (`loadCache`
+anti-scaling), #5 (phase-3 walk imbalance); charm #3972 (GPU helper-thread
+affinity inheritance), #3973 (`hapi_memory_daemon` spin loops); reconverse
+#216 (`CmiOnCore` stub). Going forward, file agenda items as issues rather
+than adding them to documents. Items 2, 3 and 5 below are not yet issues
+because they are pending other people's reports rather than actionable
+work.
+
 1. **LIVE BUG, undecided.** The GPU affinity fix declines SILENTLY when a
    PE's mask is not exactly one CPU (`fof/gpu/FoFDevice.cpp:1053`,
    `CPU_COUNT(&save) != 1 → return`). That is precisely the
