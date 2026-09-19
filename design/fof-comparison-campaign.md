@@ -2727,17 +2727,17 @@ FoF3 `it0_ms`; ArborX `dbscan_s + stitch_s`; SWIFT "Complete FOF search took".
 
 | dataset | nodes | FoF3 GPU | FoF3 CPU | ArborX uniform | ArborX balanced | SWIFT |
 |---|---|---|---|---|---|---|
-| cosmo2b   |   4 |  9.674 | 25.947 | 29.116 | 18.119 | 306.5 |
-| cosmo2b   |   8 |  5.121 | 13.649 | 25.864 | 13.565 | 274.6 |
-| cosmo2b   |  16 |  2.594 |  6.996 | 27.685 | 15.758 | 284.4 |
-| cosmo2b   |  32 |  1.671 |  3.848 | 24.204 | 10.735 | 331.3 |
-| cosmo2b   |  64 |  1.055 |  2.444 | 24.301 | 10.942 | 212.9 |
-| cosmo25   |  16 | 36.640 | | FAIL int32   | 238.449 | does not run |
-| cosmo25   |  32 | 19.569 | | FAIL int32   | 168.762 | does not run |
-| cosmo25   |  64 | 10.328 | | FAIL int32   | 124.505 | does not run |
-| cosmo25   | 128 |  6.977 | | FAIL BVH OOM | 117.160 | does not run |
-| cosmo25   | 256 |  5.375 | | FAIL BVH OOM |  79.515 | does not run |
-| cosmo25   | 512 |  6.820 | | FAIL BVH OOM |  67.386 | does not run |
+| cosmo2b   |   4 |  9.674 | 26.218 | 29.116 | 18.119 | 306.5 |
+| cosmo2b   |   8 |  5.121 | 13.759 | 25.864 | 13.565 | 274.6 |
+| cosmo2b   |  16 |  2.594 |  6.971 | 27.685 | 15.758 | 284.4 |
+| cosmo2b   |  32 |  1.671 |  3.773 | 24.204 | 10.735 | 331.3 |
+| cosmo2b   |  64 |  1.055 |  2.211 | 24.301 | 10.942 | 212.9 |
+| cosmo25   |  16 | 36.640 | 101.328 | FAIL int32   | 238.449 | does not run |
+| cosmo25   |  32 | 19.569 |  51.751 | FAIL int32   | 168.762 | does not run |
+| cosmo25   |  64 | 10.328 |  27.004 | FAIL int32   | 124.505 | does not run |
+| cosmo25   | 128 |  6.977 |  15.405 | FAIL BVH OOM | 117.160 | does not run |
+| cosmo25   | 256 |  5.375 | not run | FAIL BVH OOM |  79.515 | does not run |
+| cosmo25   | 512 |  6.820 | not run | FAIL BVH OOM |  67.386 | does not run |
 | romulus25 |  16 | OOM (capacity) | | — | — | — |
 | romulus25 |  32 | 46.014 | | 14.659 |  5.863 | — |
 | romulus25 |  64 | 23.020 | | 12.351 |  3.226 | OOM |
@@ -2789,17 +2789,17 @@ FoF3 `it0_ms`; ArborX `dbscan_s + stitch_s`; SWIFT "Complete FOF search took".
 
 | dataset | nodes | FoF3 GPU | FoF3 CPU | ArborX uniform | ArborX balanced | SWIFT |
 |---|---|---|---|---|---|---|
-| cosmo2b   |   4 |  **9.674** | 25.947 | 29.116 | 18.119 | 306.5 |
-| cosmo2b   |   8 |  **5.121** | 13.649 | 25.864 | 13.565 | 274.6 |
-| cosmo2b   |  16 |  **2.594** |  6.996 | 27.685 | 15.758 | 284.4 |
-| cosmo2b   |  32 |  **1.671** |  3.848 | 24.204 | 10.735 | 331.3 |
-| cosmo2b   |  64 |  **1.055** |  2.444 | 24.301 | 10.942 | 212.9 |
-| cosmo25   |  16 | **36.640** | | FAIL int32   | 238.449 | FAIL |
-| cosmo25   |  32 | **19.569** | | FAIL int32   | 168.762 | FAIL |
-| cosmo25   |  64 | **10.328** | | FAIL int32   | 124.505 | FAIL |
-| cosmo25   | 128 |  **6.977** | | FAIL BVH OOM | 117.160 | FAIL |
-| cosmo25   | 256 |  **5.375** | | FAIL BVH OOM |  79.515 | — |
-| cosmo25   | 512 |  **6.820** | | FAIL BVH OOM |  67.386 | — |
+| cosmo2b   |   4 |  **9.674** | 26.218 | 29.116 | 18.119 | 306.5 |
+| cosmo2b   |   8 |  **5.121** | 13.759 | 25.864 | 13.565 | 274.6 |
+| cosmo2b   |  16 |  **2.594** |  6.971 | 27.685 | 15.758 | 284.4 |
+| cosmo2b   |  32 |  **1.671** |  3.773 | 24.204 | 10.735 | 331.3 |
+| cosmo2b   |  64 |  **1.055** |  2.211 | 24.301 | 10.942 | 212.9 |
+| cosmo25   |  16 | **36.640** | 101.328 | FAIL int32   | 238.449 | FAIL |
+| cosmo25   |  32 | **19.569** |  51.751 | FAIL int32   | 168.762 | FAIL |
+| cosmo25   |  64 | **10.328** |  27.004 | FAIL int32   | 124.505 | FAIL |
+| cosmo25   | 128 |  **6.977** |  15.405 | FAIL BVH OOM | 117.160 | FAIL |
+| cosmo25   | 256 |  **5.375** | not run | FAIL BVH OOM |  79.515 | — |
+| cosmo25   | 512 |  **6.820** | not run | FAIL BVH OOM |  67.386 | — |
 | romulus25 |  16 | OOM (capacity) | | — | — | — |
 | romulus25 |  32 | 46.014 | | 14.659 |  **5.863** | — |
 | romulus25 |  64 | 23.020 | | 12.351 |  **3.226** | OOM |
@@ -2857,3 +2857,128 @@ charge FoF3 for the equivalent work, which lives in `decomp_ms` and is 3-87x
 larger than `it0_ms`. Under decomposition-inclusive timing FoF3 loses cosmo25
 at 512 nodes (600.5 s vs 68.5 s) because its decomposition climbs to 593.7 s.
 Both tables are in the "Complete results, both metrics" section.
+
+---
+
+## Session 2026-09-19: the FoF3 CPU-only arm extended to cosmo25
+
+### Why the cosmo25 CPU rows were empty
+
+Not a failure — they were never submitted. The CPU arm was scoped to the
+SWIFT comparison (`SWIFT is CPU-only` section above): it exists to give a
+like-for-like number against a code with no GPU FoF. SWIFT produces a number
+only on cosmo2b and on romulus25 at >= 128 nodes, and it does not run on
+cosmo25 at all, so there was no column to compare against and no CPU points
+were taken there. Nothing in the harness ever blocked it: `submit_sweep.sh`'s
+`fof3cpu` arm has no dataset restriction, and cosmo25 is not a capacity
+problem for it (the GPU arm ran from 16 nodes at 52 GB/proc, and the CPU arm
+drops the flattened device tree, so it needs less).
+
+For the CPU-optimisation paper that scoping is stale, so the arm is now run
+on cosmo25 at 16-128 nodes. 256 and 512 are deliberately NOT run, to
+preserve allocation.
+
+### Three Frontier modules were retired, and it cost eight allocations
+
+The first resubmission (jobs 5512027-34) failed at every node count with
+
+    ./FoF3: error while loading shared libraries: libamdhip64.so.6
+
+The cause is in the `.err` file, not the `.out`:
+
+    Lmod has detected the following error: These module(s) or extension(s)
+    exist but cannot be loaded as requested: "hwloc/2.11.1", "python/3.13.0",
+    "darshan-runtime", "cmake/3.30.5"
+
+**Lmod aborts the ENTIRE compound `module load` when any one member is
+missing.** `rocm/6.2.4` sat eleven names later on the same continued line, so
+it never loaded, and the CPU arm still links HIP even with `FOF_GPU_PHASE1`
+unset — "CPU-only" does not exempt it from needing ROCm. hwloc/2.11.1,
+cmake/3.30.5 and python/3.13.0 were retired from the site some time after
+2026-09-03; every script in this campaign carried them.
+
+What made it cost eight jobs instead of one is that **the harness detected it
+and launched anyway**. The pre-flight printed
+
+    ### unresolved libs:
+    	libamdhip64.so.6 => not found
+
+and then called `srun`. Fixed in `run_fof3.sbatch`, `run_fof3_sum.sbatch` and
+`test_census_ab.sbatch` (backup `run_fof3.sbatch.bak.20260919`):
+
+* the module load is split — a REQUIRED compound load ending at `rocm/6.2.4`,
+  then `tmux`/`hsi`/`lfs-wrapper`/`DefApps`/`darshan-runtime` loaded
+  individually and best-effort, so one retired convenience module can never
+  again take ROCm down with it;
+* `hwloc` is dropped entirely. It is not needed: the binary's RPATH still
+  resolves `libhwloc.so.15` from the spack tree on disk, with no module;
+* `### rocm=$ROCM_PATH` is echoed and asserted non-empty;
+* the unresolved-libs check now `exit 3`s instead of reporting. An unresolved
+  shared library is never survivable, and at 512 nodes that check is worth
+  ~1000 node-hours.
+
+This is the third instance in this campaign of the same class of bug — a
+check that reports instead of enforcing, or a value assumed rather than
+echoed. The `${VAR:-default}` no-op and the shared GCD wrapper were the
+others.
+
+### FoF3 CPU-only on cosmo25 (jobs 5512057-60)
+
+Binary `./FoF3` md5 dc613091e434 (the routed-census build), charm
+`reconverse-linux-x86_64-amd-cmp2`. **Every point returns 6730729617 /
+2214117459**, identical to the GPU arm and to the gold answer.
+
+| nodes | GPU it0 (s) | CPU-only it0 (s) | ratio |
+|---|---|---|---|
+|  16 | 36.640 | **101.328** | 2.77 |
+|  32 | 19.569 |  **51.751** | 2.64 |
+|  64 | 10.328 |  **27.004** | 2.61 |
+| 128 |  6.977 |  **15.405** | 2.21 |
+
+The GPU is worth 2.2-2.8x, the same band as cosmo2b's 2.3-2.7x, so the
+device's value is dataset-independent on the percolated snapshots.
+
+**The CPU arm scales BETTER than the GPU arm.** cosmo25 over 8x nodes:
+101.328 -> 15.405 is **6.58x**, against the GPU arm's 36.640 -> 6.977 =
+5.25x. Same on cosmo2b over 16x: 11.86x CPU against 9.17x GPU. The reason is
+that the GPU arm's fixed per-process costs (device tree flatten and upload)
+do not shrink with node count, so they become a larger share of a smaller
+`it0` — the same mechanism that makes the GPU curve flatten at 128-512 nodes.
+For a CPU-only paper this is the better story, not a weaker one.
+
+`component_histogram` is 3.358 / 1.760 / 0.988 / 0.473 s at 16/32/64/128,
+and the routed stage 3 inside it is **4 ms flat** at every node count
+(`census_scatter 0.002 census_qd 0.000 census_bin 0.002`). What remains is
+stages 1+2, which scale cleanly.
+
+### cosmo2b CPU re-baselined on the same binary (jobs 5512052-56)
+
+Re-run so the CPU column is one code version rather than two. All five return
+424897832 / 185317566.
+
+| nodes | campaign (`FoF3.cmp2`) | routed (`./FoF3`) | delta |
+|---|---|---|---|
+|  4 | 25.947 | 26.218 | +1.0% |
+|  8 | 13.649 | 13.759 | +0.8% |
+| 16 |  6.996 |  6.971 | -0.4% |
+| 32 |  3.848 |  3.773 | -1.9% |
+| 64 |  2.444 |  **2.211** | **-9.5%** |
+
+The first four are allocation noise (`load_ms` and `decomp_ms` moved 6-10% in
+the same runs). The 64-node point is not: -9.5% is the routed census, and the
+gradient across the column is the expected signature — the serial gather cost
+grows with process count, so the fix is worth nothing at 32 processes and
+9.5% at 512. This is the cheapest confirmation in the campaign that the
+census fix is real and not a romulus25 artifact.
+
+### CPU-only group-finding time, both datasets (seconds)
+
+| dataset | 4 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| cosmo2b | 26.218 | 13.759 | 6.971 | 3.773 | 2.211 | — |
+| cosmo25 | — | — | 101.328 | 51.751 | 27.004 | 15.405 |
+
+romulus25 has no CPU arm at any node count, for the same original reason. It
+is the one dataset where the CPU number would be least flattering, and if the
+paper claims a CPU result across the suite it is the obvious gap to be asked
+about.
