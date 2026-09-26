@@ -123,6 +123,10 @@ inline int peSetsMode() {
   }();
   return v;
 }
+// The helpers below call CkMyNode/CkNodeSize/CkNodeFirst and exist only
+// in Charm builds; the standalone (non-Charm) tree/cache core build never
+// needs them (they are FoF PE-set policy, not cache code).
+#ifdef __CHARMC__
 // Sets active on THIS process (1 = no split here).
 // FOF_PE_SETS_NODES is a comma-separated victim LIST — the whole point of a
 // mechanism with no per-process cost is that it can treat the top N processes
@@ -197,6 +201,7 @@ inline bool peSetKeepLocalPair(int src_piece, int tgt_piece) {
   return a != b;
 }
 
+#endif // __CHARMC__
 }  // namespace paratreet
 
 #endif // PARATREET_COMMON_H_

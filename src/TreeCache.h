@@ -25,9 +25,18 @@
 // Phase-3 goal (not yet): no Charm dependency in this header. For now the
 // moved code keeps CkAbort/CkEnforce and the framework Configuration read
 // in the collect path was lifted to a parameter (share_depth).
+//
+// SPLIT (2026-09-26, branch treecache-traits): the node-type-independent
+// part — root, park/install contract, atomic publication (swapIn) — lives
+// in TreeCacheCore<Traits> (TreeCacheCore.h) and is what a second
+// application (ChaNGa) instantiates over its own node type. This class is
+// paratreet2's binding: NodeTraits<Data> over Node<Data>, plus everything
+// that knows what a paratreet2 node is (pools, registries, prefetch,
+// partial-subtree construction, cached particles).
 
 #include "common.h"
 #include "Node.h"
+#include "TreeCacheCore.h"
 
 #include <list>
 #include <map>
@@ -110,77 +119,37 @@ private:
   typename std::list<PoolElem>::iterator curr;
 };
 
+// paratreet2's binding of the node-independent core (TreeCacheCore.h) to
+// Node<Data>: static inline forwarders only, so the instantiation compiles
+// to the same code as the pre-traits direct member access.
 template <typename Data>
-class TreeCache {
+struct NodeTraits {
+  using Node = ::Node<Data>;
+  using Key = ::Key;
+  static Key key(const Node* n) { return n->key; }
+  static Node* parent(const Node* n) { return n->parent; }
+  static Node* exchangeChild(Node* parent, int which, Node* child) {
+    return parent->exchangeChild(which, child);
+  }
+  static std::atomic<void*>& parkedHead(Node* n) { return n->parked_head; }
+};
+
+template <typename Data>
+class TreeCache : public TreeCacheCore<NodeTraits<Data>> {
 public:
+  using Core = TreeCacheCore<NodeTraits<Data>>;
+  using typename Core::ParkResult;
+  using Core::park;
+  using Core::swapIn;
+  using Core::closeParkedList;
+  using Core::root;
+  using Core::branch_factor;
   using CachedP = typename CachedParticleOf<Data>::type;
   using NodeLookup = std::unordered_map<Key, Node<Data>*>;
-
-  // ---- park / install (phase 2 of the extraction design) ----
-  // A walker that must wait for a node's data PARKS an opaque value on the
-  // placeholder; install() (the swapIn drain) returns every parked opaque
-  // EXACTLY ONCE to the caller, which owns scheduling the resumptions. The
-  // race between a late park and the install is closed here — against
-  // install's atomic publication — by closing the list with a sentinel:
-  // a park that finds the sentinel returns AlreadyInstalled and the caller
-  // proceeds as if the data had been present (the lost-wakeup fix,
-  // provided once here instead of re-solved by every client).
-  struct ParkedEntry {
-    uint64_t opaque;
-    ParkedEntry* next;
-  };
-  static void* closedSentinel() {
-    static char sentinel_storage;
-    return (void*)&sentinel_storage;
-  }
-  enum class ParkResult { Parked, AlreadyInstalled };
-
-  ParkResult park(Node<Data>* slot, uint64_t opaque) {
-    // Consecutive-duplicate suppression, matching the old Resumer
-    // waiting-list behavior: one walker sweeping many payloads against the
-    // same placeholder parks once (a racing other-lane entry in between
-    // just costs a duplicate resumption, which the traverser tolerates).
-    void* head = slot->parked_head.load();
-    if (head != closedSentinel() && head != nullptr &&
-        ((ParkedEntry*)head)->opaque == opaque)
-      return ParkResult::Parked;
-    auto* entry = new ParkedEntry{opaque, nullptr};
-    while (true) {
-      head = slot->parked_head.load();
-      if (head == closedSentinel()) {
-        delete entry;
-        return ParkResult::AlreadyInstalled;
-      }
-      entry->next = (ParkedEntry*)head;
-      if (slot->parked_head.compare_exchange_weak(head, (void*)entry))
-        return ParkResult::Parked;
-    }
-  }
-
-private:
-  // Close a displaced placeholder's parked list and collect the opaques.
-  // Exactly-once: the exchange with the sentinel wins against concurrent
-  // parks (they either landed before — collected here — or see the
-  // sentinel and self-handle).
-  static void drainParked(Node<Data>* displaced, std::vector<uint64_t>& out) {
-    void* head = displaced->parked_head.exchange(closedSentinel());
-    if (head == closedSentinel()) return; // already drained
-    auto* entry = (ParkedEntry*)head;
-    while (entry) {
-      out.push_back(entry->opaque);
-      auto* next = entry->next;
-      delete entry;
-      entry = next;
-    }
-  }
-
-public:
 
   // Narrow structural lock for the registry maps only (local_tps /
   // leaf_lookup); NOT a data-path lock. See the header comment.
   std::mutex maps_lock;
-  Node<Data>* root = nullptr;
-  size_t branch_factor = 0;
   NodeLookup local_tps;
   NodeLookup leaf_lookup; // all the cached leaves from copied TreePieces
   std::map<Key, std::vector<int>> treepiece_copy_started;
@@ -307,11 +276,8 @@ public:
   }
 
   // Only PLACEHOLDERS (Remote / RemoteAboveTPKey) carry an open parked
-  // list; every other node is born with the list CLOSED, so a park on an
-  // already-installed (or local) node returns AlreadyInstalled instead of
-  // accepting a waiter nobody would ever drain. Found by the standalone
-  // unit test (tests/treecache); the framework's own walkers only park on
-  // placeholder types, but the library contract should not rely on that.
+  // list; every other node is born with the list CLOSED (see
+  // TreeCacheCore::closeParkedList for why).
   static bool isPlaceholderType(typename Node<Data>::Type type) {
     return type == Node<Data>::Type::Remote ||
            type == Node<Data>::Type::RemoteAboveTPKey;
@@ -319,7 +285,7 @@ public:
 
   Node<Data>* makeNode(int lane, Key key, typename Node<Data>::Type type, int depth, int n_particles, Particle* particles, Node<Data>* parent, int tp_index, int cm_index) {
     auto* node = pools[lane]->alloc(key, type, depth, n_particles, particles, parent, tp_index, cm_index);
-    if (!isPlaceholderType(type)) node->parked_head.store(closedSentinel());
+    if (!isPlaceholderType(type)) closeParkedList(node);
     return node;
   }
 
@@ -334,7 +300,7 @@ public:
     }
     auto* node = pools[lane]->alloc(key, type, spatial_node, parent, nullptr, tp_index, cm_index);
     if (cached) node->setCachedParticles(cached);
-    if (!isPlaceholderType(type)) node->parked_head.store(closedSentinel());
+    if (!isPlaceholderType(type)) closeParkedList(node);
     return node;
   }
 
@@ -560,27 +526,6 @@ public:
     }
     for (auto& l : leaf_lookup) handleLeaf(l.second);
     return replaced;
-  }
-
-  // Atomically publish an installed node in place of its placeholder, and
-  // collect the placeholder's parked waiters into `parked` (each opaque
-  // handed back exactly once — the caller owns waking them). Waiters that
-  // parked before the exchange are drained here; one that parks after sees
-  // the closed list and gets AlreadyInstalled from park(), so no wakeup is
-  // lost (the same guarantee the old requested-bitmask handoff provided;
-  // see the fanout-fix record, design/walk-uf2-overlap.md step 2).
-  void swapIn(Node<Data>* to_swap, std::vector<uint64_t>& parked) {
-    if (to_swap->key > 1) {
-      auto which_child = to_swap->key % branch_factor;
-      Node<Data>* displaced = to_swap->parent->exchangeChild(which_child, to_swap);
-      if (displaced) drainParked(displaced, parked);
-    }
-    else {
-      std::swap(root, to_swap);
-      // to_swap now holds the displaced old root; NULL on the very first
-      // swap (the starter pack installing the initial root).
-      if (to_swap) drainParked(to_swap, parked);
-    }
   }
 
   // Wire an installed node's children: adopt registered local TreePiece
