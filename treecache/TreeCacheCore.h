@@ -130,11 +130,14 @@ public:
   Node* root = nullptr;
   size_t branch_factor = 0;
 
-protected:
   // Close a displaced placeholder's parked list and collect the opaques.
   // Exactly-once: the exchange with the sentinel wins against concurrent
   // parks (they either landed before — collected here — or see the
-  // sentinel and self-handle).
+  // sentinel and self-handle). swapIn calls this for the placeholder it
+  // displaces; a client that replaces INTERIOR placeholders while wiring
+  // a partial subtree (a placeholder chain below the installed top, see
+  // the ChaNGa binding) calls it directly for those, AFTER the top's
+  // publication, so a late parker that re-descends finds the new node.
   static void drainParked(Node* displaced, std::vector<uint64_t>& out) {
     void* head = Traits::parkedHead(displaced).exchange(closedSentinel());
     if (head == closedSentinel()) return; // already drained
