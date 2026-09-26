@@ -28,7 +28,7 @@
 //
 // SPLIT (2026-09-26, branch treecache-traits): the node-type-independent
 // part — root, park/install contract, atomic publication (swapIn) — lives
-// in TreeCacheCore<Traits> (TreeCacheCore.h) and is what a second
+// in TreeCacheCore<Traits> (../treecache/TreeCacheCore.h) and is what a second
 // application (ChaNGa) instantiates over its own node type. This class is
 // paratreet2's binding: NodeTraits<Data> over Node<Data>, plus everything
 // that knows what a paratreet2 node is (pools, registries, prefetch,
@@ -36,7 +36,7 @@
 
 #include "common.h"
 #include "Node.h"
-#include "TreeCacheCore.h"
+#include "../treecache/TreeCacheCore.h"
 
 #include <list>
 #include <map>
@@ -119,7 +119,7 @@ private:
   typename std::list<PoolElem>::iterator curr;
 };
 
-// paratreet2's binding of the node-independent core (TreeCacheCore.h) to
+// paratreet2's binding of the node-independent core (treecache/TreeCacheCore.h) to
 // Node<Data>: static inline forwarders only, so the instantiation compiles
 // to the same code as the pre-traits direct member access.
 template <typename Data>
