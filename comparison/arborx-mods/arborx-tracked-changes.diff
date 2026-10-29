@@ -1,0 +1,285 @@
+diff --git a/benchmarks/CMakeLists.txt b/benchmarks/CMakeLists.txt
+index c852d66..85b3c31 100644
+--- a/benchmarks/CMakeLists.txt
++++ b/benchmarks/CMakeLists.txt
+@@ -61,4 +61,9 @@ add_subdirectory(triangulated_surface_distance)
+ if (ARBORX_ENABLE_MPI)
+   add_subdirectory(distributed_contact)
+   add_subdirectory(distributed_tree_driver)
++  # FoF comparison campaign: distributed DBSCAN over Tipsy/NChilada cosmology
++  # snapshots, with its own reader and Morton-order redistribution. See
++  # benchmarks/cosmo_fof/cosmo_fof.cpp for why the stock cluster driver
++  # cannot read these snapshots.
++  add_subdirectory(cosmo_fof)
+ endif()
+diff --git a/src/cluster/detail/ArborX_DistributedDBSCANHelpers.hpp b/src/cluster/detail/ArborX_DistributedDBSCANHelpers.hpp
+index 3bb0ce4..28bb5c9 100644
+--- a/src/cluster/detail/ArborX_DistributedDBSCANHelpers.hpp
++++ b/src/cluster/detail/ArborX_DistributedDBSCANHelpers.hpp
+@@ -27,6 +27,9 @@
+ 
+ #include <mpi.h>
+ 
++#include <cstdio>
++#include <cstdlib>
++
+ namespace ArborX::Details
+ {
+ 
+@@ -225,6 +228,30 @@ auto gatherGlobalBoxes(MPI_Comm comm, ExecutionSpace const &space,
+                 MPI_BYTE, comm);
+ 
+   Kokkos::deep_copy(space, global_boxes, global_boxes_host);
++  // FENCE ADDED (FoF comparison campaign, 2026-09-02).
++  //
++  // The host staging buffer below is a FUNCTION-LOCAL mirror view, and
++  // this deep_copy is issued on `space`, i.e. ASYNCHRONOUSLY. The mirror's
++  // last reference dies when this function returns, so without a fence
++  // the host allocation can be freed while the host->device copy is still
++  // in flight. Under Kokkos/HIP on MI250X that reliably produces
++  // nondeterministic garbage in the destination view.
++  //
++  // Symptom this fixes: ArborX's own Details::verifyDBSCAN rejected
++  // ArborX's own labels on ~2/3 of runs, and FLIPPED VERDICT between two
++  // runs on byte-identical input (checked: identical point-multiset
++  // checksums). gatherGlobalBoxes feeds computeRanksTo, which decides
++  // which ranks exchange ghost points, so corruption there changes how
++  // many points end up with no neighbour at all -- the observed isolated
++  // count on one 100k dataset varied between 27971 (correct) and 91174
++  // across runs. communicateMergePairs feeds relabel, so corruption there
++  // mis-merges components.
++  //
++  // Note this is NOT the same as the two fences already present on the
++  // GPU-aware branches ("fill on device done before MPI_Allgather"):
++  // those protect the SEND buffer before MPI reads it. This protects the
++  // RECEIVE path's host buffer from being freed under an in-flight copy.
++  space.fence("ArborX::DistributedDBSCAN (host staging buffer must outlive the copy)");
+ #endif
+ 
+   return global_boxes;
+@@ -507,56 +534,105 @@ void sortAndFilterMergePairs(ExecutionSpace const &space,
+   if (merge_pairs.size() == 0)
+     return;
+ 
+-  Kokkos::sort(space, merge_pairs);
+-
+-  int const n = merge_pairs.size();
+-
+-  auto new_merge_pairs =
+-      KokkosExt::cloneWithoutInitializingNorCopying(space, merge_pairs);
+-
+-  int num_unique;
+-  Kokkos::parallel_scan(
+-      prefix + "filter", Kokkos::RangePolicy(space, 0, n),
+-      KOKKOS_LAMBDA(int i, int &update, bool is_final) {
+-        // For the same "from" value we are only intested in the lowest "to".
+-        // As the merge pairs are sorted, we just need to grab the first one
+-        // from the sequence with the same "from".
+-        if (i > 0 && merge_pairs(i).from == merge_pairs(i - 1).from)
+-          return;
++  // ITERATED TO A FIXED POINT (FoF comparison campaign, 2026-09-02).
++  //
++  // Upstream ran the filter below ONCE and then re-sorted without
++  // re-filtering. That leaves the invariant `relabel` depends on unmet.
++  //
++  // The filter keeps, for each run of equal `from`, only the entry with the
++  // lowest `to`, and re-inserts `{other_to, to}` for every other `to` in the
++  // run so that connectivity is preserved. Those re-inserted edges introduce
++  // NEW `from` values, and after the final sort one of those can coincide
++  // with a `from` that already carries an edge. `relabel` resolves a label by
++  //     lower_bound(from.begin(), from.end(), label)
++  // and follows the FIRST match only, so the second edge out of that label is
++  // silently discarded and two components that should merge do not.
++  //
++  // Which edge ends up "first" depends on which particle the LOCAL union-find
++  // happened to leave as a component's representative, and that varies from
++  // run to run -- which is why the symptom was intermittent rather than a
++  // clean wrong answer.
++  //
++  // Observed on real cosmology data (a 100k FoF snapshot whose answer two
++  // independent codes agree is 33933 components / max_size 26042): ArborX's
++  // own Details::verifyDBSCAN, on ArborX's own stock benchmark reading
++  // ArborX's own binary format, failed 11 of 12 runs at 2/4/8 ranks. The
++  // stock GENERATOR does not expose it because it gives each rank a
++  // spatially separate block, so every component lives on one or two ranks
++  // and the merge graph is shallow; a file-order slab of a cosmology
++  // snapshot puts every component on every rank, which is the deepest
++  // possible merge graph. (Sweeping the generator's eps past its `spacing`
++  // to force percolation does NOT reproduce it -- depth, not percolation, is
++  // what matters.)
++  //
++  // Fix: repeat sort + filter until no `from` value appears twice, which is
++  // exactly the precondition that makes `relabel`'s single-successor lookup
++  // well defined. Each pass rewrites some label to a strictly smaller one, so
++  // this terminates; the cap is a safety net, not an expected path.
++  constexpr int max_iterations = 64;
++  for (int iteration = 0;; ++iteration)
++  {
++    Kokkos::sort(space, merge_pairs);
++
++    int const n = merge_pairs.size();
++
++    // Is the precondition already met?
++    int num_duplicate_from = 0;
++    if (n > 1)
++      Kokkos::parallel_reduce(
++          prefix + "count_duplicate_from", Kokkos::RangePolicy(space, 1, n),
++          KOKKOS_LAMBDA(int i, int &update) {
++            if (merge_pairs(i).from == merge_pairs(i - 1).from)
++              ++update;
++          },
++          num_duplicate_from);
++    if (num_duplicate_from == 0)
++      break;
++
++    if (iteration >= max_iterations)
++    {
++      Kokkos::abort("ArborX::DistributedDBSCAN::sortAndFilterMergePairs: "
++                    "merge-pair filtering did not reach a fixed point");
++      break;
++    }
++
++    auto new_merge_pairs =
++        KokkosExt::cloneWithoutInitializingNorCopying(space, merge_pairs);
++
++    int num_unique;
++    Kokkos::parallel_scan(
++        prefix + "filter", Kokkos::RangePolicy(space, 0, n),
++        KOKKOS_LAMBDA(int i, int &update, bool is_final) {
++          // For the same "from" value we are only interested in the lowest
++          // "to". As the merge pairs are sorted, we just need to grab the
++          // first one from the sequence with the same "from".
++          if (i > 0 && merge_pairs(i).from == merge_pairs(i - 1).from)
++            return;
+ 
+-        if (is_final)
+-          new_merge_pairs(update) = merge_pairs(i);
+-        ++update;
++          if (is_final)
++            new_merge_pairs(update) = merge_pairs(i);
++          ++update;
+ 
+-        // Insert other connections that may be required on other ranks
+-        // FIXME: I need to convince myself that this is truly necessary, or
+-        // if it's a fix for something that should be addressed in a different
+-        // place
+-        auto from_i = merge_pairs(i).from;
+-        auto to = merge_pairs(i).to;
+-        int j = i + 1;
+-        while (j < n && merge_pairs(j).from == from_i)
+-        {
+-          if (merge_pairs(j).to != merge_pairs(j - 1).to)
++          // Re-insert the other connections in this run, so that dropping
++          // them above cannot disconnect anything.
++          auto from_i = merge_pairs(i).from;
++          auto to = merge_pairs(i).to;
++          int j = i + 1;
++          while (j < n && merge_pairs(j).from == from_i)
+           {
+-            if (is_final)
++            if (merge_pairs(j).to != merge_pairs(j - 1).to)
+             {
+-              KOKKOS_ASSERT(merge_pairs(j).to != to);
+-              new_merge_pairs(update) = {merge_pairs(j).to, to};
++              if (is_final)
++                new_merge_pairs(update) = {merge_pairs(j).to, to};
++              ++update;
+             }
+-            ++update;
++            ++j;
+           }
+-          ++j;
+-        }
+-      },
+-      num_unique);
+-  Kokkos::resize(space, new_merge_pairs, num_unique);
+-  merge_pairs = new_merge_pairs;
+-
+-  // Re-sort after reinsertion
+-  // FIXME: I don't know whether we have duplicates here or not. If we do, I
+-  // don't think it matters
+-  Kokkos::sort(space, merge_pairs);
++        },
++        num_unique);
++    Kokkos::resize(space, new_merge_pairs, num_unique);
++    merge_pairs = new_merge_pairs;
++  }
+ }
+ 
+ template <typename ExecutionSpace, typename Pairs>
+@@ -578,6 +654,22 @@ void communicateMergePairs(MPI_Comm comm, ExecutionSpace const &space,
+   auto global_n = offsets.back();
+   auto slice = Kokkos::make_pair(offsets[comm_rank], offsets[comm_rank + 1]);
+ 
++  // INSTRUMENTATION (FoF comparison campaign). The global merge-pair count is
++  // the quantity that decides whether this routine can run at all at a given
++  // problem size: every rank allocates `global_n` pairs on the device AND a
++  // host mirror of the same size, and the MPI_Allgatherv below is done in
++  // MPI_BYTE with `std::vector<int>` offsets scaled by sizeof(MergePair), so
++  // global_n * sizeof(MergePair) must fit in a signed int (~134e6 pairs for a
++  // 16-byte pair). Printed once per call so the ceiling can be extrapolated
++  // from small runs instead of discovered in a 512-node job.
++  if (comm_rank == 0 && std::getenv("ARBORX_REPORT_MERGE_PAIRS") != nullptr)
++  {
++    long long bytes = (long long)global_n * (long long)sizeof(typename Pairs::value_type);
++    std::printf("ARBORX_MERGE_PAIRS global %lld  bytes %lld  int32_headroom %.3f\n",
++                (long long)global_n, bytes, (double)bytes / 2147483647.0);
++    std::fflush(stdout);
++  }
++
+   // Scale counts and offsets by sizeof(pair) as we send in MPI_BYTE
+   auto const sc = sizeof(typename Pairs::value_type);
+   std::for_each(counts.begin(), counts.end(), [sc](auto &x) { x *= sc; });
+@@ -609,6 +701,30 @@ void communicateMergePairs(MPI_Comm comm, ExecutionSpace const &space,
+                  counts.data(), offsets.data(), MPI_BYTE, comm);
+ 
+   Kokkos::deep_copy(space, global_merge_pairs, global_merge_pairs_host);
++  // FENCE ADDED (FoF comparison campaign, 2026-09-02).
++  //
++  // The host staging buffer below is a FUNCTION-LOCAL mirror view, and
++  // this deep_copy is issued on `space`, i.e. ASYNCHRONOUSLY. The mirror's
++  // last reference dies when this function returns, so without a fence
++  // the host allocation can be freed while the host->device copy is still
++  // in flight. Under Kokkos/HIP on MI250X that reliably produces
++  // nondeterministic garbage in the destination view.
++  //
++  // Symptom this fixes: ArborX's own Details::verifyDBSCAN rejected
++  // ArborX's own labels on ~2/3 of runs, and FLIPPED VERDICT between two
++  // runs on byte-identical input (checked: identical point-multiset
++  // checksums). gatherGlobalBoxes feeds computeRanksTo, which decides
++  // which ranks exchange ghost points, so corruption there changes how
++  // many points end up with no neighbour at all -- the observed isolated
++  // count on one 100k dataset varied between 27971 (correct) and 91174
++  // across runs. communicateMergePairs feeds relabel, so corruption there
++  // mis-merges components.
++  //
++  // Note this is NOT the same as the two fences already present on the
++  // GPU-aware branches ("fill on device done before MPI_Allgather"):
++  // those protect the SEND buffer before MPI reads it. This protects the
++  // RECEIVE path's host buffer from being freed under an in-flight copy.
++  space.fence("ArborX::DistributedDBSCAN (host staging buffer must outlive the copy)");
+ #endif
+ }
+ 
+diff --git a/src/distributed/detail/ArborX_Distributor.hpp b/src/distributed/detail/ArborX_Distributor.hpp
+index 6f39426..73f7c25 100644
+--- a/src/distributed/detail/ArborX_Distributor.hpp
++++ b/src/distributed/detail/ArborX_Distributor.hpp
+@@ -436,6 +436,17 @@ public:
+     {
+       Kokkos::deep_copy(space, imports, imports_comm);
+     }
++    // FENCE ADDED (FoF comparison campaign, 2026-09-02). Same defect as the
++    // two in ArborX_DistributedDBSCANHelpers.hpp: `imports_comm` is a
++    // function-local host mirror, the copy above is issued on `space` and so
++    // is asynchronous, and the mirror's last reference dies at the closing
++    // brace -- freeing the host allocation under an in-flight copy. The
++    // existing fence in this function ("data ready before sending") guards
++    // the SEND buffer before MPI reads it; nothing guarded the RECEIVE
++    // buffer's lifetime.
++    space.fence(
++        "ArborX::Distributor::doPostsAndWaits (host receive buffer must "
++        "outlive the copy)");
+ #endif
+   }
+   size_t getTotalReceiveLength() const { return _src_offsets.back(); }

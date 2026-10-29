@@ -1,0 +1,56 @@
+#!/bin/bash
+# Stand-in for HDF5's h5cc, for SWIFT's m4/ax_lib_hdf5.m4 ONLY.
+#
+# WHY: Frontier's cray-hdf5-parallel ships h5pcc, but it is a thin shell over
+# the Cray `cc` wrapper and reports the BUILD MACHINE's paths:
+#   h5pcc -show      -> "cc -Wl,-rpath -Wl,<libdir>"   (no -I, no -l)
+#   h5pcc -showconfig-> "Installation point: /opt/cray/pe/hdf5-parallel/gnu/12.3"
+#                       (version component missing) and
+#                       "-I/workspace/csml-hdf5/src/H5FDsubfiling"
+# ax_lib_hdf5.m4 builds HDF5_CPPFLAGS as -I${Installation point}/include, so
+# SWIFT ended up with a nonexistent include dir and every .c failed on
+# "hdf5.h: No such file or directory".
+#
+# SECOND, INDEPENDENT REASON: configure.ac gates the parallel-HDF5 test on
+#   if test "$with_hdf5" = "yes"
+# i.e. it runs ONLY when --with-hdf5 was given the literal word `yes`, never
+# when given a path. Passing a path therefore silently produced
+# "HDF5 parallel support: no" and a SERIAL-IO build -- unusable for a 58B
+# particle snapshot. So SWIFT must be configured --with-hdf5=yes with this
+# shim first on PATH.
+#
+# Everything below is the real installation's own values, taken from
+# $HDF5_ROOT (set by the cray-hdf5-parallel module).
+ROOT=${HDF5_ROOT:?HDF5_ROOT must be set (module load cray-hdf5-parallel)}
+VER=$(basename "$(dirname "$(dirname "$ROOT")")")   # .../1.14.3.5/gnu/12.3 -> 1.14.3.5
+case "$1" in
+  -show)
+    echo "cc -I$ROOT/include -L$ROOT/lib -lhdf5_hl -lhdf5 -lz -ldl -lm"
+    ;;
+  -showconfig)
+    cat <<CFG
+	    SUMMARY OF THE HDF5 CONFIGURATION
+	    =================================
+
+General Information:
+-------------------
+                   HDF5 Version: ${VER%.*}
+              Installation point: $ROOT
+
+Compiling Options:
+------------------
+                     CPPFLAGS:
+                  H5_CPPFLAGS:
+                  AM_CPPFLAGS:
+                       CFLAGS:
+                    H5_CFLAGS:
+                    AM_CFLAGS:
+              Extra libraries: -lz -ldl -lm
+
+Parallel HDF5: yes
+CFG
+    ;;
+  *)
+    exec cc "$@"
+    ;;
+esac

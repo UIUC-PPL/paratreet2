@@ -1,0 +1,166 @@
+diff --git a/src/engine.h b/src/engine.h
+index afabfff..5d49889 100644
+--- a/src/engine.h
++++ b/src/engine.h
+@@ -115,7 +115,17 @@ enum engine_step_properties {
+ };
+ 
+ /* Some constants */
+-#define engine_maxproxies 64
++/* COMPARISON-HARNESS CHANGE (FoF scaling study, 2026-09): raised from 64.
++ * This caps the number of NEIGHBOUR RANKS a rank may exchange with. With a
++ * METIS partition of the top-level cell graph, a rank's region is irregular
++ * and at >= 128 ranks routinely touches more than 64 others, so every run at
++ * or above 16 nodes x 8 ranks died with
++ *   engine_proxy.c:engine_add_proxy():147: Maximum number of proxies exceeded.
++ * 64 ranks worked, 128 did not. The cost is a calloc of this many `struct
++ * proxy` plus two stack arrays of MPI_REQUEST_NUMBER_PARTICLE_TYPES * this
++ * many MPI_Requests in engine_strays.c -- a few hundred KB at 1024, which is
++ * nothing against the per-rank particle data. */
++#define engine_maxproxies 1024
+ #define engine_tasksreweight 1
+ #define engine_parts_size_grow 1.05
+ #define engine_redistribute_alloc_margin_default 1.2
+diff --git a/src/engine_redistribute.c b/src/engine_redistribute.c
+index cf22b14..c74b0e3 100644
+--- a/src/engine_redistribute.c
++++ b/src/engine_redistribute.c
+@@ -22,6 +22,9 @@
+ /* Config parameters. */
+ #include <config.h>
+ 
++/* getenv/atol for the redistribute chunk cap below. */
++#include <stdlib.h>
++
+ /* This object's header. */
+ #include "engine.h"
+ 
+@@ -68,7 +71,37 @@ static void *engine_do_redistribute(const char *label, int *counts, char *parts,
+ 
+     /* Only send and receive only "chunk" particles per request.
+      * Fixing the message size to 2GB. */
+-    const int chunk = INT_MAX / sizeofparts;
++    /* CAMPAIGN PATCH (FoF comparison, Frontier).
++     *
++     * Upstream sizes the chunk so one message just fits in INT_MAX BYTES:
++     * with sizeof(gpart) = 112 that is 19,174,318 particles, i.e. 2.1 GB in a
++     * single MPI_Irecv. Frontier's CXI NICs cannot register a buffer that
++     * large once the run is holding tens of GB of particle data, and the 24B
++     * snapshot dies here with a wall of
++     *   cxil_map: write error
++     *   MPIDI_OFI_do_irecv(356): OFI tagged recv failed (No space left on
++     *       device)
++     *   engine_redistribute.c:engine_do_redistribute():206: Failed to emit
++     *       irecv of parts from node 242.
++     * at 256 AND 512 ranks, with or without FI_MR_CACHE_MAX_COUNT=0. The
++     * failing count in the log is exactly INT_MAX/112, which is what
++     * identified this line.
++     *
++     * Capping the chunk at SWIFT_REDIST_CHUNK_MB (default 64 MB) costs extra
++     * rounds through the while(activenodes) loop and nothing else -- the
++     * loop already exists and already handles being run repeatedly. This is
++     * a portability fix, not a tuning change, and it is OUTSIDE every FoF
++     * timing: redistribute belongs to engine_split, which this campaign
++     * reports separately from "Complete FOF search". */
++    int chunk = INT_MAX / sizeofparts;
++    {
++      const char *e = getenv("SWIFT_REDIST_CHUNK_MB");
++      const long mb = e ? atol(e) : 64;
++      if (mb > 0) {
++        const long cap = (mb << 20) / (long)sizeofparts;
++        if (cap > 0 && cap < (long)chunk) chunk = (int)cap;
++      }
++    }
+     int res = 0;
+     for (int k = 0; k < nr_nodes; k++) {
+       int kk = k;
+@@ -147,7 +180,37 @@ static void *engine_do_redistribute(const char *label, int *counts, char *parts,
+     /* Only send and receive only "chunk" particles per request. So we need to
+      * loop as many times as necessary here. Make 2Gb/sizeofparts so we only
+      * send 2Gb packets. */
+-    const int chunk = INT_MAX / sizeofparts;
++    /* CAMPAIGN PATCH (FoF comparison, Frontier).
++     *
++     * Upstream sizes the chunk so one message just fits in INT_MAX BYTES:
++     * with sizeof(gpart) = 112 that is 19,174,318 particles, i.e. 2.1 GB in a
++     * single MPI_Irecv. Frontier's CXI NICs cannot register a buffer that
++     * large once the run is holding tens of GB of particle data, and the 24B
++     * snapshot dies here with a wall of
++     *   cxil_map: write error
++     *   MPIDI_OFI_do_irecv(356): OFI tagged recv failed (No space left on
++     *       device)
++     *   engine_redistribute.c:engine_do_redistribute():206: Failed to emit
++     *       irecv of parts from node 242.
++     * at 256 AND 512 ranks, with or without FI_MR_CACHE_MAX_COUNT=0. The
++     * failing count in the log is exactly INT_MAX/112, which is what
++     * identified this line.
++     *
++     * Capping the chunk at SWIFT_REDIST_CHUNK_MB (default 64 MB) costs extra
++     * rounds through the while(activenodes) loop and nothing else -- the
++     * loop already exists and already handles being run repeatedly. This is
++     * a portability fix, not a tuning change, and it is OUTSIDE every FoF
++     * timing: redistribute belongs to engine_split, which this campaign
++     * reports separately from "Complete FOF search". */
++    int chunk = INT_MAX / sizeofparts;
++    {
++      const char *e = getenv("SWIFT_REDIST_CHUNK_MB");
++      const long mb = e ? atol(e) : 64;
++      if (mb > 0) {
++        const long cap = (mb << 20) / (long)sizeofparts;
++        if (cap > 0 && cap < (long)chunk) chunk = (int)cap;
++      }
++    }
+     int sent = 0;
+     int recvd = 0;
+ 
+diff --git a/swift_fof.c b/swift_fof.c
+index 3d4764c..fb042bf 100644
+--- a/swift_fof.c
++++ b/swift_fof.c
+@@ -711,8 +711,29 @@ int main(int argc, char *argv[]) {
+   e.toc_step = getticks();
+ #endif
+ 
+-  /* Perform the FOF search */
+-  engine_fof(&e, /*dump_results=*/1, /*dump_debug=*/0, /*seed_black_holes=*/0,
++  /* Perform the FOF search.
++   *
++   * COMPARISON-HARNESS CHANGE (FoF scaling study, 2026-09). Two outputs are
++   * made optional through the environment. Both sit OUTSIDE every stage the
++   * "(FOF SCALING)" timers and "Complete FOF search took" cover the group
++   * FINDING; they are catalogue/snapshot WRITING. Neither variable being set
++   * leaves this file behaving exactly as upstream.
++   *
++   *   SWIFT_FOF_NO_CATALOGUE  skip the HDF5 group catalogue. With
++   *     FOF:min_group_size = 1 the catalogue has one row per component --
++   *     6.7e9 rows on the 24B snapshot -- and fof_compute_group_props also
++   *     allocates ~10 arrays of num_groups doubles PER RANK and MPI_Allreduces
++   *     them, which cannot fit at that group count.
++   *   SWIFT_FOF_NO_SNAPSHOT   skip engine_dump_snapshot, which writes every
++   *     particle again (2 TB on the 58B snapshot) purely to attach GroupIDs.
++   *
++   * The group census this study gates on is printed by fof_assign_group_ids
++   * ("No. of groups", "Largest group (linkables only) by size") and so is
++   * unaffected by either. */
++  const int fof_dump_catalogue = (getenv("SWIFT_FOF_NO_CATALOGUE") == NULL);
++  if (myrank == 0 && !fof_dump_catalogue)
++    message("SWIFT_FOF_NO_CATALOGUE set: not writing the group catalogue.");
++  engine_fof(&e, fof_dump_catalogue, /*dump_debug=*/0, /*seed_black_holes=*/0,
+              /*buffers allocated=*/1);
+ 
+   /* Update the policies to make sure the particles are written
+@@ -722,8 +743,12 @@ int main(int argc, char *argv[]) {
+   if (with_black_holes) e.policy |= engine_policy_black_holes;
+   if (with_sinks) e.policy |= engine_policy_sinks;
+ 
+-  /* Write output. */
+-  engine_dump_snapshot(&e, /*fof=*/1);
++  /* Write output. See the note on the engine_fof call above. */
++  if (getenv("SWIFT_FOF_NO_SNAPSHOT") == NULL) {
++    engine_dump_snapshot(&e, /*fof=*/1);
++  } else if (myrank == 0) {
++    message("SWIFT_FOF_NO_SNAPSHOT set: not writing the particle snapshot.");
++  }
+ 
+ #ifdef WITH_MPI
+   MPI_Barrier(MPI_COMM_WORLD);

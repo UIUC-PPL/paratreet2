@@ -1,0 +1,106 @@
+# SWIFT stand-alone FoF parameter file for the comparison campaign.
+# @@KEY@@ placeholders are substituted by scripts/run_swift.sh.
+#
+# THE THREE SETTINGS THAT MAKE THIS THE SAME PROBLEM THE OTHER TWO CODES SOLVE:
+#
+#  FOF:absolute_linking_length  is FoF3's own b, printed at full precision by
+#      the "FOF3STAT linking_length_exact" line. It is used INSTEAD of
+#      linking_length_ratio because SWIFT's ratio path derives the mean
+#      inter-particle separation from Omega_m and the critical density
+#      (fof.c:419), i.e. from cosmological parameters, while FoF3 derives it
+#      from the snapshot's own bounding-box volume. Those are different
+#      numbers, and a linking length that differs by even a percent moves the
+#      component count. Passing the absolute length makes the two identical.
+#
+#  linking_types: [0,1,0,0,0,0,0] / attaching_types: all zero
+#      The converter writes every particle -- gas, dark and star alike -- as
+#      PartType1, so every particle is a LINKABLE and can start a group.
+#      SWIFT's production setting instead attaches gas/stars to groups found
+#      among DM only, which is a smaller and cheaper problem than the one
+#      FoF3 and ArborX solve. All-zero attaching_types also skips
+#      fof_link_attachable_particles entirely, so nothing is timed that the
+#      other two codes do not do.
+#
+#  InitialConditions:periodic 0
+#      FoF3's reference runs pass no -P, i.e. open boundaries, so SWIFT must
+#      not wrap either. (ArborX has no periodic option at all, which is the
+#      reason the whole comparison is run non-periodic.)
+
+MetaData:
+  run_name: fof_comparison
+
+InternalUnitSystem:
+  UnitMass_in_cgs:     1
+  UnitLength_in_cgs:   1
+  UnitVelocity_in_cgs: 1
+  UnitCurrent_in_cgs:  1
+  UnitTemp_in_cgs:     1
+
+TimeIntegration:
+  time_begin: 0.
+  time_end:   1.
+  dt_min:     1e-10
+  dt_max:     1e-2
+
+Gravity:
+  eta:                    0.025
+  MAC:                    adaptive
+  theta_cr:               0.7
+  epsilon_fmm:            0.001
+  comoving_DM_softening:  @@SOFT@@
+  max_physical_DM_softening: @@SOFT@@
+  mesh_side_length:       32
+
+Snapshots:
+  basename:   @@OUTDIR@@/snap
+  delta_time: 1e-2
+  time_first: 0.
+
+Statistics:
+  delta_time: 1e-2
+  time_first: 0.
+
+DomainDecomposition:
+  # Stated explicitly rather than left to defaults, because this is where
+  # SWIFT failed at scale: METIS's recursive bisection of the top-level cell
+  # graph aborted with "Cannot bisect a graph with 0 vertices!" when there
+  # were too few cells per rank. metis_seed is pinned so a partition -- and
+  # therefore a timing -- is reproducible between runs.
+  initial_type:     @@DDTYPE@@
+  # The rank grid is PINNED rather than left to SWIFT's own factorisation,
+  # because max_top_level_cells has to be derived from it: see the proxy
+  # note in run_swift.sbatch.
+  initial_grid:     @@DDGRID@@
+  repartition_type: fullcosts
+  metis_seed:       42
+  adaptive:         @@DDADAPT@@
+  usemetis:         @@DDUSEMETIS@@
+
+Scheduler:
+  max_top_level_cells: @@TOPCELLS@@
+  cell_split_size:     @@SPLITSIZE@@
+  nr_queues:           0
+
+InitialConditions:
+  file_name:                @@ICFILE@@
+  periodic:                 0
+  cleanup_h_factors:        0
+  cleanup_velocity_factors: 0
+  generate_gas_in_ics:      0
+  cleanup_smoothing_lengths: 0
+
+FOF:
+  basename:                 @@OUTDIR@@/fof_output
+  min_group_size:           @@MINGROUP@@
+  absolute_linking_length:  @@LINKLEN@@
+  linking_length_ratio:     0.2
+  seed_black_holes_enabled: 0
+  dump_catalogue_when_seeding: 0
+  black_hole_seed_halo_mass_Msun: 1.5e10
+  scale_factor_first:       0.91
+  time_first:               0.2
+  delta_time:               1.005
+  group_id_default:         2147483647
+  group_id_offset:          1
+  linking_types:   [0, 1, 0, 0, 0, 0, 0]
+  attaching_types: [0, 0, 0, 0, 0, 0, 0]
