@@ -148,12 +148,19 @@ install, and `GPU=1` on the FoF makefiles.
   `CHARM_HOME` must carry the suffix too. The GPU arm needs HAPI for the PE→GPU mapping and the
   stream; `Makefile.common` detects such a build by the presence of
   `$(CHARM_HOME)/include/hapi.h`.
-- **ROCm** (developed against 6.2.4) for `hipcc`. On Frontier `module load
-  rocm/6.2.4` is a SILENT NO-OP in a non-interactive shell — it sets no
-  `ROCM_PATH` and does not show up in `module list`, and the CMake builds
-  below (and reconverse's own `find_package(hip REQUIRED CONFIG)`) then fail
-  looking for HIP. Pass the path explicitly instead:
-  `-DCMAKE_PREFIX_PATH=/opt/rocm-6.2.4`.
+- **ROCm** (developed against 6.2.4) for `hipcc`. On Frontier, source
+  `examples/fof3/scripts/frontier_env.sh` (every FoF3 job and build script
+  does): it loads the required module set in one transaction, asserts
+  `ROCM_PATH`, sets `CHARM_HOME` and `LD_LIBRARY_PATH` to the HIP build, and
+  refuses a binary linked against a different charm build. What used to look
+  like "`module load rocm/6.2.4` is a silent no-op in a non-interactive shell"
+  was Lmod aborting the WHOLE compound load because another name on the same
+  line failed (`darshan-runtime` with this PrgEnv, later the retired
+  hwloc/2.11.1, cmake/3.30.5, python/3.13.0): rocm never loaded and nothing
+  said so. Passing `-DCMAKE_PREFIX_PATH=/opt/rocm-6.2.4` to CMake builds is
+  still harmless belt-and-braces. One-shot Frontier rebuilds:
+  `fof/gpu/rebuild_charm_hip.sh` (the HIP charm) and
+  `GPU=1 fof/gpu/rebuild_deps.sh` (siblings, paratreet, fof, FoF3).
 - **Kokkos**, built with the HIP backend for the target arch. **Check out a
   4.x release, not `master`**: master's `Kokkos_BitManipulation.hpp` needs
   C++20 while `fof/gpu/Makefile` compiles `-std=c++17`, which is ~20 errors

@@ -82,14 +82,9 @@ echo "LCI revision built into charm:"
 git -C /ccs/home/rrao/charm_reconverse/reconverse-linux-x86_64-amd/_deps/lci-src \
   log -1 --format='  %H %ci %s' 2>&1
 
-module load craype-x86-trento libfabric/2.3.1 craype-network-ofi \
-  perftools-base/24.11.0 xpmem/1.0.1-1.5_1_gfb6998056825 cray-pmi/6.1.15 \
-  Core/25.03 tmux/3.4 hsi/default lfs-wrapper/0.0.1 DefApps hwloc/2.11.1 \
-  gcc-native/13.2 craype/2.7.33 cray-dsmml/0.3.0 cray-mpich/8.1.31 \
-  cray-libsci/24.11.0 PrgEnv-gnu/8.6.0 rocm/6.2.4 cmake/3.30.5 \
-  python/3.13.0 darshan-runtime/3.4.6-mpi
+# Modules, CHARM_HOME, LD_LIBRARY_PATH and the binary preflight: one shared file.
+source /ccs/home/rrao/paratreet2/examples/fof3/scripts/frontier_env.sh
 
-export LD_LIBRARY_PATH=/ccs/home/rrao/charm_reconverse/lib:/sw/frontier/spack-envs/cpe24.11-cpu/opt/gcc-13.2/darshan-runtime-3.4.6-evo63a663bvwadj3dgv5vwqgwupxnh43/lib:/sw/frontier/spack-envs/core-25.03/opt/gcc-13.2/python-3.13.0-z6cvwh43maa5kvglquodiadny7ohzirp/lib:/opt/rocm-6.2.4/lib/roctracer:/opt/rocm-6.2.4/lib/rocprofiler:/opt/rocm-6.2.4/lib:/sw/frontier/spack-envs/core-25.03/opt/gcc-13.2/hwloc-2.11.1-daogniiyv5buyimip5lfgv6i6zawodef/lib:/opt/cray/pe/papi/7.1.0.4/lib64:/opt/cray/libfabric/2.3.1/lib64
 
 # job_vni (NOT single_node_vni, which is 1-physical-node only) + the
 # cray_shasta PMI plugin; FI_CXI_RX_MATCH_MODE=hybrid because at 8

@@ -23,14 +23,9 @@ cd "$SLURM_SUBMIT_DIR"
 # one Kokkos was built with; note charm's HIP support was configured
 # against /opt/rocm-default (6.4.2) — see the ALLOW_UNDEF comment in
 # tests/kokkos-spike/Makefile.
-module load craype-x86-trento libfabric/2.3.1 craype-network-ofi \
-  perftools-base/24.11.0 xpmem/1.0.1-1.5_1_gfb6998056825 cray-pmi/6.1.15 \
-  Core/25.03 tmux/3.4 hsi/default lfs-wrapper/0.0.1 DefApps hwloc/2.11.1 \
-  gcc-native/13.2 craype/2.7.33 cray-dsmml/0.3.0 cray-mpich/8.1.31 \
-  cray-libsci/24.11.0 PrgEnv-gnu/8.6.0 rocm/6.2.4 cmake/3.30.5 \
-  python/3.13.0 darshan-runtime/3.4.6-mpi
+# Modules, CHARM_HOME, LD_LIBRARY_PATH and the binary preflight: one shared file.
+source /ccs/home/rrao/paratreet2/examples/fof3/scripts/frontier_env.sh
 
-export LD_LIBRARY_PATH=/ccs/home/rrao/charm_reconverse/lib:$LD_LIBRARY_PATH
 export LCI_ATTR_BACKEND=ofi
 export FI_CXI_RX_MATCH_MODE=hybrid
 export FI_MR_CACHE_MONITOR=userfaultfd
