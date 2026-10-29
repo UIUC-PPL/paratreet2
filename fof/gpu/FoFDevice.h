@@ -116,6 +116,12 @@ class Device {
   // the PE->GPU mapping, so this library never guesses. Idempotent;
   // initializes Kokkos if no one else has.
   void init(int device_id);
+  // PEs (worker threads) in this process, i.e. CkMyNodeSize(). The helper-
+  // thread affinity fix needs it when PEs are NOT pinned one per core
+  // (Slurm --cpu-bind=cores, no +pemap): a mask with more CPUs than PEs has
+  // room for ROCm's helpers, one with no more CPUs than PEs does not.
+  // Process-wide; 0 (the default) means unknown.
+  void setPesPerProcess(int n);
   void finalize();
   bool initialized() const;
   DeviceInfo info() const;

@@ -2146,6 +2146,7 @@ public:
     hapiCheck(hapiGetDevice(&device_id));
 #endif
     nb->device.init(device_id);
+    nb->device.setPesPerProcess(CkMyNodeSize());
     const int procs_per_node = CmiNumNodes() / CmiNumPhysicalNodes();
     // One process per GPU is an invariant, not a preference
     // (design/phase1-gpu.md section 2): sharing a GCD silently halves every

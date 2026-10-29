@@ -7,6 +7,7 @@
 
 #include <Kokkos_Core.hpp>
 
+#include <cerrno>
 #include <cstring>
 #include <cstdio>
 #include <cmath>
@@ -613,6 +614,11 @@ void Device::init(int device_id) {
   p_->inited = true;
 }
 
+// Read by FoFHelperAffinityScope (below). Process-wide by nature: the mask
+// question it answers is about this process's PEs, not about one Device.
+static int g_pes_per_process = 0;
+void Device::setPesPerProcess(int n) { g_pes_per_process = n; }
+
 void Device::finalize() {
   if (!p_->inited) return;
   // Drop the Views before finalizing Kokkos: their deallocation goes
@@ -972,6 +978,20 @@ void Device::releaseStaging() {
 // the child cannot inherit it.  The calling PE is therefore migrated to a
 // sibling for the duration of this one call and put straight back.
 //
+// PEs NOT PINNED ONE PER CORE (2026-10-29, paratreet2 issue #3).  The scope
+// used to return silently whenever the caller's mask was not exactly one
+// CPU.  But the multi-process shape charm-notes recommends for generic GPU
+// codes -- Slurm --cpu-bind=cores, no charm affinity flag -- gives every PE
+// of a process the SAME multi-CPU mask, and the fix was then inactive with
+// nothing printed.  By the reasoning above, a helper inheriting that mask is
+// harmless only if the mask has CPUs no spinning PE needs: more CPUs than
+// PEs (Device::setPesPerProcess).  If it has no more CPUs than PEs, the
+// helper rotates victims among them, so it is sent to the SMT siblings of
+// the mask's CPUs that lie OUTSIDE the mask, exactly as in the pinned case.
+// Every outcome -- engaged, not needed, declined, refused by the kernel --
+// is now announced once per process.  The pinned (+pemap) path, the one the
+// -22%/-63% measurements were taken on, is unchanged.
+//
 // FOF_NO_AFFINITY_FIX=1 disables the whole thing, for A/B.
 // ---------------------------------------------------------------------------
 #if defined(__linux__)
@@ -1041,6 +1061,26 @@ bool fof_helper_mask(cpu_set_t* out) {
   return CPU_COUNT(out) > 0;
 }
 
+// The multi-CPU counterpart: the SMT siblings of every CPU in `mask` that are
+// not themselves in `mask`.  Empty when the mask already holds whole cores
+// (e.g. --cpu-bind=cores with both hardware threads), which is the case where
+// there is nowhere outside the PEs' CPUs to go.
+bool fof_sibling_complement(const cpu_set_t* mask, cpu_set_t* out) {
+  CPU_ZERO(out);
+  for (int c = 0; c < CPU_SETSIZE; ++c)
+    if (CPU_ISSET(c, mask)) fof_add_siblings(c, out);
+  for (int c = 0; c < CPU_SETSIZE; ++c)
+    if (CPU_ISSET(c, mask)) CPU_CLR(c, out);
+  return CPU_COUNT(out) > 0;
+}
+
+// Once-per-process stderr note, keyed by the call site's own flag.
+#define FOF_AFF_ONCE(flag, ...)                     \
+  do {                                              \
+    static bool flag = false;                       \
+    if (!flag) { flag = true; fprintf(stderr, __VA_ARGS__); } \
+  } while (0)
+
 // RAII: widen for the duration of a block, restore on the way out.
 struct FoFHelperAffinityScope {
   cpu_set_t save;
@@ -1049,8 +1089,13 @@ struct FoFHelperAffinityScope {
     static const bool off = (getenv("FOF_NO_AFFINITY_FIX") != nullptr);
     if (off) return;
     CPU_ZERO(&save);
-    if (sched_getaffinity(0, sizeof save, &save) != 0) return;
-    if (CPU_COUNT(&save) != 1) return;      // not pinned: nothing to protect
+    if (sched_getaffinity(0, sizeof save, &save) != 0) {
+      FOF_AFF_ONCE(warned_get, "[fofgpu] WARNING: affinity fix NOT active -- "
+                   "sched_getaffinity failed (%s)\n", strerror(errno));
+      return;
+    }
+    const int ncpu = CPU_COUNT(&save);
+    const int npe = g_pes_per_process;
 
     cpu_set_t safe;
     CPU_ZERO(&safe);
@@ -1078,32 +1123,58 @@ struct FoFHelperAffinityScope {
         how = "SMT siblings";
       }
     }
-    if (CPU_COUNT(&safe) == 0 && !fof_helper_mask(&safe)) {
-      // Nothing safe exists -- every CPU this process can see already has a PE
-      // pinned to it.  That is the ppn 14 case.  DECLINE rather than guess,
-      // but SAY SO: a silent decline reads as "the fix is working".
-      static bool warned = false;
-      if (!warned) {
-        warned = true;
-        fprintf(stderr,
+    if (ncpu != 1) {
+      // PEs share a multi-CPU mask (Slurm binding, no +pemap).
+      if (CPU_COUNT(&safe) == 0 && npe > 0 && ncpu > npe) {
+        // More CPUs than spinning PEs: a helper inheriting the mask finds an
+        // idle one.  Nothing to protect -- but say so, it is a decision.
+        FOF_AFF_ONCE(noted_spare, "[fofgpu] affinity fix not needed: PEs share "
+                     "a %d-CPU mask with %d PEs, so HIP helper threads have "
+                     "spare CPUs\n", ncpu, npe);
+        return;
+      }
+      if (CPU_COUNT(&safe) == 0 && fof_sibling_complement(&save, &safe))
+        how = "SMT siblings outside the PE mask";
+    } else if (CPU_COUNT(&safe) == 0) {
+      fof_helper_mask(&safe);
+    }
+    if (CPU_COUNT(&safe) == 0) {
+      // Nothing safe exists.  DECLINE rather than guess, but SAY SO: a silent
+      // decline reads as "the fix is working".
+      if (ncpu == 1) {
+        // Every CPU this process can see has a PE pinned to it: ppn 14.
+        FOF_AFF_ONCE(warned_pinned,
                 "[fofgpu] WARNING: affinity fix DECLINED -- no CPU is free of "
                 "pinned PEs, so HIP helper threads will inherit this PE's core "
                 "and preempt it in ~16 ms slices (see reports/relay42.txt). "
                 "Either leave one CPU per process unpinned, or run with "
                 "--core-spec=0 and set FOF_HELPER_CPUS to the reserved "
                 "cores.\n");
+      } else {
+        char pes[32];
+        if (npe > 0) snprintf(pes, sizeof pes, "%d", npe);
+        else snprintf(pes, sizeof pes, "an unknown number of");
+        FOF_AFF_ONCE(warned_shared,
+                "[fofgpu] WARNING: affinity fix DECLINED -- PEs share a %d-CPU "
+                "mask with %s PEs and no SMT sibling lies outside it, so HIP "
+                "helper threads will inherit the mask and preempt spinning PEs. "
+                "Give each process more CPUs than PEs, or use the shipping "
+                "shape (+ppn 7 +pemap, --cpu-bind=none; README).\n",
+                ncpu, pes);
       }
       return;
     }
     if (sched_setaffinity(0, sizeof safe, &safe) == 0) {
       active = true;
-      static bool announced = false;
-      if (!announced) {
-        announced = true;
-        fprintf(stderr, "[fofgpu] affinity fix active (%s): HIP helper threads "
-                        "will inherit %d CPUs, not this PE's core\n",
-                how, CPU_COUNT(&safe));
-      }
+      FOF_AFF_ONCE(announced, "[fofgpu] affinity fix active (%s): HIP helper "
+                   "threads will inherit %d CPUs, not %s\n", how,
+                   CPU_COUNT(&safe), ncpu == 1 ? "this PE's core" : "the PEs' CPUs");
+    } else {
+      // e.g. FOF_HELPER_CPUS naming CPUs outside the job's cgroup (the
+      // 2026-08-21 helper_ccd arm: EINVAL, nothing printed, timed as "fixed").
+      FOF_AFF_ONCE(warned_set, "[fofgpu] WARNING: affinity fix NOT active -- "
+                   "sched_setaffinity to %d CPUs (%s) failed: %s\n",
+                   CPU_COUNT(&safe), how, strerror(errno));
     }
   }
   ~FoFHelperAffinityScope() {
@@ -1119,7 +1190,7 @@ struct FoFHelperAffinityScope {
 
 void Device::runPhase1Impl(float b2, float grid_thresh, bool async) {
   // See the block above: ROCm spawns its helpers from here, and they
-  // inherit this PE's single-core mask unless we widen it first.
+  // inherit this PE's mask (one core under +pemap) unless we widen it first.
   FOF_HELPER_AFFINITY_SCOPE;
   p_->pending = WalkStats();
   p_->in_flight = false;
