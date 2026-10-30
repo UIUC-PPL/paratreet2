@@ -90,7 +90,7 @@ arm() {
       --cpu-bind=none --distribution=block:block \
       --ntasks=$NT --gpus-per-node=8 --export=ALL \
       "$WRAP" "$FOF3_BIN" -f "$INPUT" -d oct -u dist -c stats -l $leaf -i 2 \
-      +ppn $PPN +pemap $PEMAP +lci_ndevices $NDEV +backend_poll_thread $POLL \
+      +noisomalloc +ppn $PPN +pemap $PEMAP +lci_ndevices $NDEV +backend_poll_thread $POLL \
     2>&1 | tee "$log"
   local rc=${PIPESTATUS[0]}
   echo "exit: $rc"

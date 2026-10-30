@@ -42,7 +42,7 @@ for L in 12 32 64 128; do
     FOF_GPU_STAGE0=$GPU srun --mpi=cray_shasta --network=single_node_vni \
       --unbuffered --cpu-bind=none --distribution=block:block \
       --ntasks=8 --gpus-per-node=8 \
-      $APP -f $BIG -d oct -u serial -l $L +ppn 14 +pemap $PEMAP
+      $APP -f $BIG -d oct -u serial -l $L +noisomalloc +ppn 14 +pemap $PEMAP
     echo "exit: $?"
   done
 done

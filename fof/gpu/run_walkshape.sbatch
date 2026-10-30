@@ -49,7 +49,7 @@ run() { # label ntasks shape args...
     srun --mpi=cray_shasta --network=single_node_vni \
     --unbuffered --cpu-bind=none --distribution=block:block \
     --ntasks=$nt --gpus-per-node=8 \
-    $APP "$@" +ppn 14 +pemap $PEMAP
+    $APP "$@" +noisomalloc +ppn 14 +pemap $PEMAP
   echo "exit: $?"
 }
 
@@ -75,11 +75,11 @@ echo "=== 80M leaf=12 auto ==="
 FOF_GPU_STAGE0=1 srun --mpi=cray_shasta --network=single_node_vni \
   --unbuffered --cpu-bind=none --distribution=block:block \
   --ntasks=8 --gpus-per-node=8 \
-  $APP -f $BIG -d oct -u serial -l 12 +ppn 14 +pemap $PEMAP
+  $APP -f $BIG -d oct -u serial -l 12 +noisomalloc +ppn 14 +pemap $PEMAP
 echo "exit: $?"
 echo "=== 80M leaf=128 auto ==="
 FOF_GPU_STAGE0=1 srun --mpi=cray_shasta --network=single_node_vni \
   --unbuffered --cpu-bind=none --distribution=block:block \
   --ntasks=8 --gpus-per-node=8 \
-  $APP -f $BIG -d oct -u serial -l 128 +ppn 14 +pemap $PEMAP
+  $APP -f $BIG -d oct -u serial -l 128 +noisomalloc +ppn 14 +pemap $PEMAP
 echo "exit: $?"

@@ -188,7 +188,7 @@ run() {
     --cpu-bind=none --distribution=block:block \
     --ntasks=128 --gpus-per-node=8 --export=ALL \
     "$WRAP" ./FoF3 -f "$INPUT" -d oct -u dist -c stats -l 128 -i 1 \
-    +ppn $PPN +pemap $PEMAP \
+    +noisomalloc +ppn $PPN +pemap $PEMAP \
     +lci_ndevices $NDEVICES $targs
   echo "exit: $?"
   date

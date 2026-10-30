@@ -36,7 +36,7 @@ run_one() {
   # --network=single_node_vni: required for a run confined to one physical node.
   srun --mpi=cray_shasta --network=single_node_vni --unbuffered \
     --cpu-bind=none --distribution=block:block \
-    ./FoF3 -f "$input" -d oct -u serial -b 0.2 -c stats +ppn $PPN \
+    ./FoF3 -f "$input" -d oct -u serial -b 0.2 -c stats +noisomalloc +ppn $PPN \
     2>&1 | tee "/tmp/fof3_nc_$tag.out" | grep -E "FOF3STAT components|Universal bounding box|components \(|Loading input data|Input file"
   echo
 }

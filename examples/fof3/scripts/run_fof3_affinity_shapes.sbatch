@@ -48,10 +48,10 @@ shape() {  # tag "srun shape opts" "charm opts" [extra env]
   grep -E '^Iteration [01] time' "$G/issue3_$tag.log" | sed 's/^/  /'
 }
 
-shape A_pemap    "-c14 --threads-per-core=2 --cpu-bind=none"   "+ppn 7 +pemap $PEMAP"
-shape A_pemapoff "-c14 --threads-per-core=2 --cpu-bind=none"   "+ppn 7 +pemap $PEMAP" FOF_NO_AFFINITY_FIX=1
-shape B_cores7   "-c7 --threads-per-core=1 --cpu-bind=cores"   "+ppn 7"
-shape C_thr7     "-c7 --threads-per-core=1 --cpu-bind=threads" "+ppn 7"
-shape D_thr7off  "-c7 --threads-per-core=1 --cpu-bind=threads" "+ppn 7" FOF_NO_AFFINITY_FIX=1
-shape E_cores14  "-c7 --threads-per-core=1 --cpu-bind=cores"   "+ppn 14"
+shape A_pemap    "-c14 --threads-per-core=2 --cpu-bind=none"   "+noisomalloc +ppn 7 +pemap $PEMAP"
+shape A_pemapoff "-c14 --threads-per-core=2 --cpu-bind=none"   "+noisomalloc +ppn 7 +pemap $PEMAP" FOF_NO_AFFINITY_FIX=1
+shape B_cores7   "-c7 --threads-per-core=1 --cpu-bind=cores"   "+noisomalloc +ppn 7"
+shape C_thr7     "-c7 --threads-per-core=1 --cpu-bind=threads" "+noisomalloc +ppn 7"
+shape D_thr7off  "-c7 --threads-per-core=1 --cpu-bind=threads" "+noisomalloc +ppn 7" FOF_NO_AFFINITY_FIX=1
+shape E_cores14  "-c7 --threads-per-core=1 --cpu-bind=cores"   "+noisomalloc +ppn 14"
 echo "=== expected: 23707197 components in every shape"

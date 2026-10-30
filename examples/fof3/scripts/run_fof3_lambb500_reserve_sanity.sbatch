@@ -32,7 +32,7 @@ cd /ccs/home/rrao/paratreet2/examples/fof3
 echo "=== -R 0 (reserve off, baseline) ==="
 srun --mpi=cray_shasta --network=job_vni --unbuffered \
   --cpu-bind=none --distribution=block:block \
-  ./FoF3 -f "$INPUT" -d oct -u serial -Z 6 -H 8 -R 0 +ppn $PPN \
+  ./FoF3 -f "$INPUT" -d oct -u serial -Z 6 -H 8 -R 0 +noisomalloc +ppn $PPN \
   +pemap 1-7,65-71,9-15,73-79,17-23,81-87,25-31,89-95,33-39,97-103,41-47,105-111,49-55,113-119,57-63,121-127 \
   +lci_ndevices $NDEVICES \
   +backend_poll_thread 2 \
@@ -41,7 +41,7 @@ srun --mpi=cray_shasta --network=job_vni --unbuffered \
 echo "=== -R 2 (reserve on: 2 batches = 32 units held back) ==="
 srun --mpi=cray_shasta --network=job_vni --unbuffered \
   --cpu-bind=none --distribution=block:block \
-  ./FoF3 -f "$INPUT" -d oct -u serial -Z 6 -H 8 -R 2 +ppn $PPN \
+  ./FoF3 -f "$INPUT" -d oct -u serial -Z 6 -H 8 -R 2 +noisomalloc +ppn $PPN \
   +pemap 1-7,65-71,9-15,73-79,17-23,81-87,25-31,89-95,33-39,97-103,41-47,105-111,49-55,113-119,57-63,121-127 \
   +lci_ndevices $NDEVICES \
   +backend_poll_thread 2 \

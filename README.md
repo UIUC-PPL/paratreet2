@@ -570,6 +570,13 @@ PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1 \
 #  thread affinity fix active (automatic at ppn 7; see FOF_HELPER_CPUS
 #  in the knobs table and design/campaign-archive/
 #  RECOMMENDATION-affinity-fix.md).
+# +noisomalloc — REQUIRED on more than one physical node with any charm
+#  build at or after ccc18c427 ("AMPI stage 1", reconverse 9c9bd45):
+#  isomalloc's startup address-space sync corrupts the heap or hangs
+#  (`malloc(): corrupted top size`), even for plain hello/megatest. FoF3
+#  uses no migratable threads or AMPI, so the flag costs nothing (2 nodes,
+#  lambb.00500: GPU 694-700 ms, CPU 1228 ms vs 680/1236 on the old stack).
+#  Every script in examples/fof3/scripts and fof/gpu passes it.
 ```
 
 Mixed jobs: add `FOF_PE_SETS_NODES=<CPU process list>` so GPU

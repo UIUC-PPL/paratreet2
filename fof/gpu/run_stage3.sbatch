@@ -53,7 +53,7 @@ run() { # label ntasks gpu grid args...
     srun --mpi=cray_shasta --network=single_node_vni \
     --unbuffered --cpu-bind=none --distribution=block:block \
     --ntasks=$nt --gpus-per-node=8 \
-    $APP "$@" +ppn 14 +pemap $PEMAP
+    $APP "$@" +noisomalloc +ppn 14 +pemap $PEMAP
   echo "exit: $?"
 }
 

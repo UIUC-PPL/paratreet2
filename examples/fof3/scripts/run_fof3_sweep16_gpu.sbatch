@@ -78,7 +78,7 @@ arm() {
       --cpu-bind=none --distribution=block:block \
       --ntasks=$NT --gpus-per-node=8 --export=ALL "$@" \
       "$WRAP" ./FoF3 -f "$INPUT" -d oct -u dist -c stats -l $leaf -i 2 \
-      +ppn $ppn +pemap $pemap +lci_ndevices $ndev +backend_poll_thread $poll
+      +noisomalloc +ppn $ppn +pemap $pemap +lci_ndevices $ndev +backend_poll_thread $poll
   echo "exit: $?"
   date +"end %s.%N %F %T"
 }

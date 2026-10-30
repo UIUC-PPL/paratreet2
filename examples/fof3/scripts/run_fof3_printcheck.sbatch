@@ -52,5 +52,5 @@ cd /ccs/home/rrao/paratreet2/examples/fof3
 srun --mpi=cray_shasta --network=single_node_vni --unbuffered \
   --cpu-bind=none --ntasks=1 --gpus-per-node=8 --export=ALL \
   ./FoF3 -f ../../inputs/10k.tipsy -d oct -u dist -c stats -l 32 -i 1 \
-  +ppn 14 +pemap 1-7,9-15 +traceoff
+  +noisomalloc +ppn 14 +pemap 1-7,9-15 +traceoff
 echo "exit: $?"

@@ -32,7 +32,7 @@ run_rep() {
   echo "=== ARM=$arm REP=$rep BIN=$bin ==="
   srun --mpi=cray_shasta --network=job_vni --unbuffered \
     --cpu-bind=none --distribution=block:block \
-    "$bin" -f "$INPUT" -d oct -u dist +ppn $PPN \
+    "$bin" -f "$INPUT" -d oct -u dist +noisomalloc +ppn $PPN \
     +pemap $PEMAP \
     +lci_ndevices $NDEVICES \
     +backend_poll_thread 2 \

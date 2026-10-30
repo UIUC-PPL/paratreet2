@@ -113,7 +113,7 @@ run() {
     --cpu-bind=none --distribution=block:block \
     --ntasks=$NT --gpus-per-node=8 \
     ./FoF3 -f "$INPUT" -d oct -u dist -c stats -l $leaf -i $iters \
-    +ppn $PPN +pemap $PEMAP \
+    +noisomalloc +ppn $PPN +pemap $PEMAP \
     +lci_ndevices $NDEVICES +backend_poll_thread 2 $targs
   echo "exit: $?"
   date

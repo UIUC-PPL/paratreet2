@@ -131,7 +131,7 @@ srun --mpi=cray_shasta --network=job_vni --unbuffered \
   --cpu-bind=none --distribution=block:block \
   --ntasks=64 --gpus-per-node=8 --export=ALL \
   "$WRAP" ./FoF3 -f "$INPUT" -d oct -u dist -c stats -l 128 -i 2 \
-  +ppn $PPN +pemap $PEMAP \
+  +noisomalloc +ppn $PPN +pemap $PEMAP \
   +lci_ndevices $NDEVICES +backend_poll_thread 2 \
   +traceroot "$TROOT" +logsize 20000000
 echo "exit: $?"
