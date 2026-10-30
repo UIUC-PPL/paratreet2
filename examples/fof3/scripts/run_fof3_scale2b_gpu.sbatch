@@ -81,17 +81,30 @@ arm() {
   local label=$1 leaf=$2; shift 2
   echo "=== ARM $label rep $REP nodes $N (ppn=$PPN leaf=$leaf ndev=$NDEV poll=$POLL pemap=$PEMAP env='$E') ==="
   date +"start %s.%N %F %T"
-  # A wedged arm reports 124 and the job moves on instead of the hang
-  # eating the allocation (08-21 arms took ~30 s at every node count).
+  # A wedged arm is cut off at ARM_TIMEOUT (08-21 arms took ~30 s at every
+  # node count). tee, never grep, at the end of the srun pipe: grep
+  # block-buffers and an early stop would leave an empty log.
+  local log=$L/arm_${N}n_${label}_${REP}.${SLURM_JOB_ID}.log
   env $E timeout --signal=TERM --kill-after=30 $ARM_TIMEOUT \
     srun --mpi=cray_shasta --network=job_vni --unbuffered \
       --cpu-bind=none --distribution=block:block \
       --ntasks=$NT --gpus-per-node=8 --export=ALL \
       "$WRAP" "$FOF3_BIN" -f "$INPUT" -d oct -u dist -c stats -l $leaf -i 2 \
-      +ppn $PPN +pemap $PEMAP +lci_ndevices $NDEV +backend_poll_thread $POLL
-  echo "exit: $?"
+      +ppn $PPN +pemap $PEMAP +lci_ndevices $NDEV +backend_poll_thread $POLL \
+    2>&1 | tee "$log"
+  local rc=${PIPESTATUS[0]}
+  echo "exit: $rc"
   date +"end %s.%N %F %T"
+  # FAIL FAST. 2026-10-29: a stack that crashed or hung at startup in every
+  # arm let four jobs carry on arm after arm to their time limit -- 110
+  # node-hours, no data. One arm missing the gold count means the stack or
+  # the launch is broken; stop so it costs one arm, not the allocation.
+  if ! grep -q "$GOLD" "$log"; then
+    echo "=== ABORT: arm $label rep $REP missed the gold count (exit $rc); stopping this job ==="
+    exit 1
+  fi
 }
+GOLD="FOF3STAT components: 424897832 max_size 185317566"
 
 DEV="PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1"
 [ -n "$HELPER" ] && DEV="$DEV FOF_HELPER_CPUS=$HELPER"
