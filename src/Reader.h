@@ -176,6 +176,10 @@ void Reader::flush(int n_treepieces,
   if (window <= 0) {
     // Legacy path: post everything in one unbounded burst, no acks.
     auto sendParticles = [&](int dest, int n_particles, Particle* parts) {
+      if (TreePiece<Data>* tp = treepieces[dest].ckLocal()) {
+        tp->receiveLocal(parts, n_particles);
+        return;
+      }
       if (treepieces.ckLocMgr()->homePe(CkArrayIndex1D(dest)) != CkMyPe())
         flushed_remote += n_particles;
       ParticleMsg* msg = new (n_particles) ParticleMsg(parts, n_particles);
@@ -208,6 +212,12 @@ void Reader::flush(int n_treepieces,
   Particle* const base = particles.data();
   const size_t base_n = particles.size();
   auto planParticles = [&](int dest, int n_particles, Particle* parts) {
+    // A TreePiece on this PE takes its particles now, with no message: in
+    // host-cell mode (HostCellDecomposition) that is nearly all of them.
+    if (TreePiece<Data>* tp = treepieces[dest].ckLocal()) {
+      tp->receiveLocal(parts, n_particles);
+      return;
+    }
     if (treepieces.ckLocMgr()->homePe(CkArrayIndex1D(dest)) != CkMyPe())
       flushed_remote += n_particles;
     if (parts >= base && parts + n_particles <= base + base_n) {

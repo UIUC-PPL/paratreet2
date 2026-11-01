@@ -62,6 +62,7 @@ public:
     delete msg;
   };
   void receive(ParticleMsg*);
+  void receiveLocal(const Particle* parts, int n);
   void buildTree(CProxy_Partition<Data>, CkCallback);
   void recursiveBuild(Node<Data>*, Particle*, size_t, size_t);
   void populateTree();
@@ -196,6 +197,13 @@ void TreePiece<Data>::pup(PUP::er& p) {
   if(p.isUnpacking()) {
     cm_local = cm_proxy.ckLocalBranch();
   }
+}
+
+// Particles from a Reader on this PE (Reader::flush hands them over
+// directly instead of copying them into a message first).
+template <typename Data>
+void TreePiece<Data>::receiveLocal(const Particle* parts, int n) {
+  incoming_particles.insert(incoming_particles.end(), parts, parts + n);
 }
 
 template <typename Data>
