@@ -3610,6 +3610,7 @@ public:
     p3_leaf_ints = 0;
     p3_redundant_descents = 0;
     p3_peak_edge_buf = 0;
+    thread_state_holder.ckLocalBranch()->hookIdle();
     thread_state_holder.ckLocalBranch()->resetWalk();
     node_proxy.ckLocalBranch()->clearSeen();
     node_proxy.ckLocalBranch()->clearNodeRedundant();
@@ -3713,13 +3714,27 @@ public:
     // anything.
     const auto* ts = thread_state_holder.ckLocalBranch();
     const bool walked = ts->walk_first >= 0;
-    double times[11] = {t_phaseA, t_phaseB, t_phaseB_maxpair, density_x,
+    // times[11..16] split the walk by rank within the process (rank 0 hosts
+    // the process's UnionFindLib chare, UFNodeMap): last exit, walk busy and
+    // OTHER busy inside the walk span (span - walk busy - scheduler idle),
+    // each as {rank 0, ranks 1..}; the other side reports 0.
+    const bool r0 = CkMyRank() == 0;
+    const double span = walked ? ts->walk_last - ts->walk_first : 0.0;
+    const double other =
+        walked ? std::max(0.0, span - ts->walk_busy -
+                                   (ts->walk_idle_at_last - ts->walk_idle_at_first))
+               : 0.0;
+    double times[17] = {t_phaseA, t_phaseB, t_phaseB_maxpair, density_x,
                         ts->walk_busy,
                         walked ? ts->walk_first : 1e300,
                         walked ? ts->walk_last : 0.0,
-                        walked ? ts->walk_last - ts->walk_first : 0.0,
+                        span,
                         (double)ts->walk_fetches, (double)p3_leaf_ints,
-                        walked ? ts->walk_first : 0.0};
+                        walked ? ts->walk_first : 0.0,
+                        r0 && walked ? ts->walk_last : 0.0,
+                        !r0 && walked ? ts->walk_last : 0.0,
+                        r0 ? ts->walk_busy : 0.0, r0 ? 0.0 : ts->walk_busy,
+                        r0 ? other : 0.0, r0 ? 0.0 : other};
     double corr[3] = {density_x * t_phaseA, density_x * density_x,
                       t_phaseA * t_phaseA};
     // Skew-split instrument (design/phasea-reassignment.md section 3;

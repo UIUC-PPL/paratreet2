@@ -270,11 +270,54 @@ them (walk = the walk alone; the unions move to `uf2`):
    phase-3 floor at 32-128 nodes; neither lever moves it. -E 16 is also
    the noisy configuration (0.55-0.78 at 128); -E 0 + weighted is steady
    (0.604/0.607) at about the same mean.
-4. WHY STREAMING ERASES THE GAIN is not yet shown. Candidate: one
-   UnionFindLib chare per process, on rank 0 (UFNodeMap), so union
-   handling lands on a walking PE that the weights know nothing about.
-   Test before building anything: report walk end / busy for rank-0 PEs
-   separately from the rest.
+4. WHY STREAMING ERASES THE GAIN: see the rank-0 test below.
 
-NEXT: the phase-3 lever is now UF_2's cascade latency, not walk
-assignment. Keep `weighted` as an opt-in comparison arm.
+RANK-0 TEST (job 5819956, 64 nodes, MODE=rank0, same binary as the 2-node
+gate 5819948; all arms gold in both iterations). There is one UnionFindLib
+chare per process, on rank 0 (UFNodeMap). `FOF3STAT walk_rank0` splits
+the walk window into rank-0 PEs (512 of them) and the rest (3072):
+end_max, walk busy, and other_busy = span - walk busy - scheduler idle (from
+the Converse BEGIN/END_IDLE conditions), i.e. any non-walk work done while
+that PE's walk was open. Iteration 1:
+
+   arm               phase3_walk end_max qd_tail | end r0  rest | other_busy max r0  rest
+   E16 parity warmup    0.516    0.407   0.110   | 0.355  0.407 |               0.248 0.162
+   E16 parity rep 1     0.502    0.405   0.097   | 0.379  0.405 |               0.300 0.140
+   E16 parity rep 2     0.690    0.512   0.178   | 0.512* 0.403 |               0.355 0.133
+   E16 weighted rep 1   0.487    0.374   0.112   | 0.374* 0.238 |               0.235 0.138
+   E16 weighted rep 2   0.488    0.375   0.112   | 0.375* 0.298 |               0.252 0.122
+   E0  parity           0.403    0.402   0.001   | 0.255  0.402 |               0.120 0.140
+   (* = rank 0 sets the walk's end)
+
+Iteration 0, where all arms walk parity, adds five more E16 samples: rank
+0 sets the end in 4 of them (0.445-0.687 vs rest 0.408-0.414), and E0
+again does not (0.275 vs 0.408).
+
+5. CONFIRMED: STREAMED UNIONS LAND ON RANK 0 AND SET THE END. Turning on
+   -E 16 leaves the rest unchanged (end 0.403-0.414 vs 0.402-0.408 under
+   -E 0, other_busy max 0.12-0.16 in every arm). On rank 0, other_busy max
+   rises from 0.12-0.13 to 0.24-0.53 s. The rank-0 average rises only
+   ~0.015 s (0.063-0.069 vs 0.048-0.052), so the extra is concentrated on
+   a few processes' UnionFindLib hosts, not spread evenly.
+6. IT CAPS THE WEIGHTED RULE. With weighted, the rest finish at
+   0.24-0.30 s, the same gain as weighted with -E 0. The hot rank-0 PEs
+   stay at 0.374-0.375 and set the end in both reps. Weighted still beats
+   parity at 64 nodes (0.487/0.488 vs 0.502-0.690, 8-sample parity mean
+   0.560: 1.15x), mostly by removing the parity outliers.
+7. THE 0.69 s PARITY OUTLIERS ARE RANK-0 BURSTS. Both (iteration 1 rep 2,
+   iteration 0 rep 1) have a rank-0 end far past the rest (0.512 / 0.687
+   vs <= 0.414) with rank-0 other_busy 0.355 / 0.531.
+8. NOT YET SHOWN: where the ~0.1 s qd_tail runs (union cascades after the
+   last walk exit). The instrument measures only the walk window.
+
+NEXT, two levers, smallest first:
+ (a) feed rank-0's non-walk time into the weights: w = iteration-0 busy
+     time (walk busy + other_busy) per PE instead of leaf interactions, so
+     the pieces on a hot UnionFindLib host lose more coins. The hot hosts
+     still walk 0.16-0.20 s under weighted, so there is room to shed. The
+     ceiling is the rest's 0.24-0.30 s end; qd_tail is untouched.
+ (b) take union handling off the walking PE, e.g. a UnionFindLib host PE
+     that holds no tree pieces, or union work that runs on whichever PE of
+     the process is idle. Bigger change; it could also shorten qd_tail if
+     that tail is the same hot hosts draining serially.
+Keep `weighted` as an opt-in arm until one of these lands.

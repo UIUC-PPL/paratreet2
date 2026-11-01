@@ -26,16 +26,41 @@ public: // these need to be seen by other local chares
   double walk_first = -1.0;
   double walk_last = 0.0;
   unsigned long walk_fetches = 0u;
+  // Scheduler idle time on this PE, accumulated from the Converse
+  // BEGIN/END_IDLE conditions once hookIdle() has run, and its value at the
+  // walk's first entry / last exit: span - busy - (idle_at_last -
+  // idle_at_first) is the time this PE spent on OTHER work during its walk
+  // span (cache service, resumes, union handling).
+  double idle_cum = 0.0;
+  double idle_since = -1.0;
+  double walk_idle_at_first = 0.0;
+  double walk_idle_at_last = 0.0;
   void resetWalk() {
     walk_busy = 0.0;
     walk_first = -1.0;
     walk_last = 0.0;
     walk_fetches = 0u;
+    walk_idle_at_first = walk_idle_at_last = idle_cum;
+  }
+  void hookIdle() {
+    if (idle_hooked_) return;
+    idle_hooked_ = true;
+    CcdCallOnConditionKeep(CcdPROCESSOR_BEGIN_IDLE, beginIdle, this);
+    CcdCallOnConditionKeep(CcdPROCESSOR_END_IDLE, endIdle, this);
+  }
+  static void beginIdle(void* self) {
+    static_cast<ThreadStateHolder*>(self)->idle_since = CkWallTimer();
+  }
+  static void endIdle(void* self) {
+    auto* t = static_cast<ThreadStateHolder*>(self);
+    if (t->idle_since >= 0) t->idle_cum += CkWallTimer() - t->idle_since;
+    t->idle_since = -1.0;
   }
 
   BoundingBox universe;
 
 private:
+  bool idle_hooked_ = false;
   std::map<int, std::map<Key, Particle::Effect>> opposing_effects; // (partition, pKey, effect)
 
 public:

@@ -5,7 +5,16 @@
 # (control) / weighted (w = 1 + leaf interactions of iteration 0, used from
 # iteration 1). Report iteration 1 and its `FOF3STAT walk_timing` line.
 #
-#   sbatch --nodes=N --export=ALL,OUTDIR=<dir>,FOF3_BIN=<frozen binary> \
+# MODE=tiebreak (default): the three rules with UF_2 streaming at its default
+# (-E 16), plus the CPU arm parity / weighted.
+# MODE=stream: -E 16 against -E 0 (no mid-walk union batches, so t_walk is
+# the walk alone and the union cascades move to uf2; design/walk-uf2-
+# overlap.md), parity and weighted, device arm only.
+# MODE=rank0: -E 16 parity / weighted and an -E 0 parity control, for the
+# `FOF3STAT walk_rank0` split (rank 0 hosts each process's UnionFindLib
+# chare: does union handling there set the walk's end?).
+#
+#   sbatch --nodes=N --export=ALL,OUTDIR=<dir>,FOF3_BIN=<frozen binary>[,MODE=...] \
 #     run_fof3_walk_tiebreak.sbatch
 #
 # Fails fast on the first arm that misses the gold count in either iteration.
@@ -59,7 +68,7 @@ arm() {  # label leaf "extra FoF3 args" envs...
     > "$log" 2>&1
   local rc=$?
   echo "exit: $rc"
-  grep -E '^Iteration 1 time|walk_timing|phase3_walk' "$log" | tail -3 | cut -c1-330
+  grep -E '^Iteration 1 time|walk_timing|walk_rank0|phase3_walk' "$log" | tail -4 | cut -c1-330
   if [ $rc -ne 0 ] || [ "$(grep -c "$GOLD" "$log")" -ne 2 ]; then
     echo "=== ABORT: $label rep $REP missed the gold count (exit $rc); stopping ==="
     exit 1
@@ -69,7 +78,14 @@ arm() {  # label leaf "extra FoF3 args" envs...
 DEV="PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1"
 echo "### walk5 mode=$MODE nodes=$N reps=$REPS timeout=${ARM_TIMEOUT}s bin=$FOF3_BIN md5=$(md5sum $FOF3_BIN | cut -c1-12)"
 REP=warmup; arm device_parity 128 "" $DEV FOF_WALK_TIEBREAK=parity
-if [ "$MODE" = stream ]; then
+if [ "$MODE" = rank0 ]; then
+  for REP in $(seq 1 $REPS); do
+    arm device_E16_parity   128 ""     $DEV FOF_WALK_TIEBREAK=parity
+    arm device_E16_weighted 128 ""     $DEV FOF_WALK_TIEBREAK=weighted
+  done
+  REP=1
+  arm device_E0_parity      128 "-E 0" $DEV FOF_WALK_TIEBREAK=parity
+elif [ "$MODE" = stream ]; then
   for REP in $(seq 1 $REPS); do
     arm device_E16_parity  128 ""     $DEV FOF_WALK_TIEBREAK=parity
     arm device_E0_parity   128 "-E 0" $DEV FOF_WALK_TIEBREAK=parity

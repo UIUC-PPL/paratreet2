@@ -420,6 +420,12 @@ struct FoFPhase3Result {
   double walk_span_avg = 0, walk_span_max = 0;
   double walk_fetch_min = 0, walk_fetch_avg = 0, walk_fetch_max = 0;
   double leaf_ints_min = 0, leaf_ints_avg = 0, leaf_ints_max = 0;
+  // The same split by rank within the process (rank 0 hosts the process's
+  // UnionFindLib chare): last exit relative to launch, walk busy max / avg,
+  // and other busy inside the walk span (span - busy - idle) max / avg.
+  double r0_end_max = 0, rest_end_max = 0;
+  double r0_busy_max = 0, r0_busy_avg = 0, rest_busy_max = 0, rest_busy_avg = 0;
+  double r0_other_max = 0, r0_other_avg = 0, rest_other_max = 0, rest_other_avg = 0;
   bool walk_weights_set = false;  // weighted tie-break table installed after this walk
 };
 
@@ -1133,6 +1139,15 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     r.walk_fetch_max = tmax[8];
     r.leaf_ints_min = tmin[9]; r.leaf_ints_avg = tsum[9] / n_pes;
     r.leaf_ints_max = tmax[9];
+    const double n_r0 = (double)CkNumNodes(), n_rest = n_pes - n_r0;
+    r.r0_end_max = tmax[11] - t0_abs;
+    r.rest_end_max = n_rest > 0 ? tmax[12] - t0_abs : 0.0;
+    r.r0_busy_max = tmax[13]; r.r0_busy_avg = tsum[13] / n_r0;
+    r.rest_busy_max = tmax[14];
+    r.rest_busy_avg = n_rest > 0 ? tsum[14] / n_rest : 0.0;
+    r.r0_other_max = tmax[15]; r.r0_other_avg = tsum[15] / n_r0;
+    r.rest_other_max = tmax[16];
+    r.rest_other_avg = n_rest > 0 ? tsum[16] / n_rest : 0.0;
     // Pearson r of density-work proxy X vs t_phaseA over PEs (layout:
     // FoFPhase1::phase3Stats element 7).
     const double* csum = (const double*)stats_elems[7].data;

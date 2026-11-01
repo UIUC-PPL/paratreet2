@@ -922,8 +922,12 @@ public:
     for (auto cn : curr_nodes_insertions) curr_nodes[cn.first].push_back(cn.second);
     const double tw1 = CkWallTimer();
     stats->walk_busy += tw1 - tw0;
-    if (stats->walk_first < 0) stats->walk_first = CmiInitTime() + tw0;
+    if (stats->walk_first < 0) {
+      stats->walk_first = CmiInitTime() + tw0;
+      stats->walk_idle_at_first = stats->idle_cum;
+    }
     stats->walk_last = CmiInitTime() + tw1;
+    stats->walk_idle_at_last = stats->idle_cum;
   }
 };
 

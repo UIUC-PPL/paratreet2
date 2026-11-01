@@ -658,6 +658,16 @@ using namespace paratreet;
                  pr.leaf_ints_min, pr.leaf_ints_avg, pr.leaf_ints_max,
                  pr.leaf_ints_avg > 0 ? pr.leaf_ints_max / pr.leaf_ints_avg : 0.0,
                  pr.walk_fetch_min, pr.walk_fetch_avg, pr.walk_fetch_max);
+      // The same, rank 0 of each process (UnionFindLib host) vs the rest:
+      // does union handling on rank 0 set the walk's end?
+      if (pr.walk_end_max > 0)
+        CkPrintf("FOF3STAT walk_rank0: end_max r0 +%.3f rest +%.3f busy "
+                 "max r0 %.3f rest %.3f avg r0 %.3f rest %.3f other_busy "
+                 "max r0 %.3f rest %.3f avg r0 %.3f rest %.3f\n",
+                 pr.r0_end_max, pr.rest_end_max, pr.r0_busy_max,
+                 pr.rest_busy_max, pr.r0_busy_avg, pr.rest_busy_avg,
+                 pr.r0_other_max, pr.rest_other_max, pr.r0_other_avg,
+                 pr.rest_other_avg);
       // Per-PROCESS redundant-descent skew (design/step3.md §6d): does the
       // pre-witness redundancy 3b would park concentrate on a few
       // dense-boundary nodes? avg = total / #processes.
