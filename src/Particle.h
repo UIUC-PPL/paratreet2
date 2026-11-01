@@ -34,7 +34,10 @@ struct Particle {
   // heap memory is often zero, which would masquerade as a valid uniform
   // fragment 0 and silently break the phase-3 certificates instead.
   long int group_number = -1;
-  uint64_t vertex_id; // vertexID of current particle in unionFindLib
+  // Hosted runs (design/plugin-interface.md): where the host staged this
+  // particle, (PE << 40) | index in that PE's staging order, so results
+  // can be routed back. Unused otherwise (was vertex_id, never written).
+  uint64_t origin;
 
   enum class Type : char {
     eStar = 1,

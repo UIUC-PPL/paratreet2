@@ -60,7 +60,7 @@ struct Partition : public CBase_Partition<Data> {
   void kick(Real, CkCallback);
   void perturb(Real, CkCallback);
   void rebuild(BoundingBox, TPHolder<Data>, bool);
-  void output(CProxy_Writer w, int n_total_particles, CkCallback cb);
+  void output(CProxy_ParticleWriter w, int n_total_particles, CkCallback cb);
   void output(CProxy_TipsyWriter w, int n_total_particles, CkCallback cb);
   void callPerLeafFn(paratreet::PerLeafAble<Data>&, const CkCallback&);
   void deleteParticleOfOrder(long order) {particle_delete_order.insert(order);}
@@ -481,7 +481,7 @@ void Partition<Data>::copyParticles(std::vector<Particle>& particles, bool check
 }
 
 template <typename Data>
-void Partition<Data>::output(CProxy_Writer w, int n_total_particles, CkCallback cb)
+void Partition<Data>::output(CProxy_ParticleWriter w, int n_total_particles, CkCallback cb)
 {
   doOutput(w, n_total_particles, cb);
 }

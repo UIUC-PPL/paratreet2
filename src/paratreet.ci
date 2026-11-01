@@ -74,8 +74,8 @@ module paratreet {
     entry void applyAccumulatedOpposingEffects(PPHolder<Data>);
   };
 
-  group Writer {
-    entry Writer(std::string of, long n_particles);
+  group ParticleWriter {
+    entry ParticleWriter(std::string of, long n_particles);
     entry void receive(std::vector<Particle> particles, Real time, int iter);
     entry void write(CkCallback cb);
   }
@@ -103,7 +103,7 @@ module paratreet {
     entry void kick(Real, CkCallback cb);
     entry void perturb(Real, CkCallback cb);
     entry void rebuild(BoundingBox, TPHolder<Data>, bool);
-    entry void output(CProxy_Writer, int, CkCallback);
+    entry void output(CProxy_ParticleWriter, int, CkCallback);
     entry void output(CProxy_TipsyWriter, int, CkCallback);
     entry void callPerLeafFn(CkReference<paratreet::PerLeafAble<Data>>, const CkCallback&);
     entry void deleteParticleOfOrder(long order);
@@ -162,6 +162,7 @@ module paratreet {
     entry Driver(CProxy_CacheManager<Data>, CProxy_Resumer<Data>, CProxy_TreeCanopy<Data>);
     entry [threaded] void init(CkCallback cb, CkReference<paratreet::Configuration>);
     entry [threaded] void run(CkCallback cb);
+    entry [threaded] void runHosted(CkCallback cb);
     entry [reductiontarget] void countInts(unsigned long long intrn_counts [4]);
     entry [reductiontarget] void reportTime();
     entry void recvTC(std::pair<Key, SpatialNode<Data>>);

@@ -47,6 +47,7 @@
 #include "fof-templates.h"
 #include "CoreFunctions.h"
 #include "common.h"
+#include "FoFPluginAPI.h"
 #include "Node.h"
 #include "Particle.h"
 #include "OrientedBox.h"
@@ -158,16 +159,6 @@ inline long uf2MinOrderLabel(long label) {
 // Registered with UnionFindLib::registerGetLocationFromID. Must be a plain
 // function (not a capturing lambda): the library stores it as a raw
 // std::pair<int,int>(*)(uint64_t) function pointer.
-// One particle's term in FOF3STAT label_digest: a 64-bit mix of (order,
-// minimum-ID label). The digest is the wrapping sum of these over all
-// particles, so it does not depend on which process holds which particle.
-inline uint64_t labelDigestTerm(long order, long label) {
-  uint64_t z = uint64_t(order) * 0x9e3779b97f4a7c15ull ^ uint64_t(label);
-  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-  return z ^ (z >> 31);
-}
-
 inline uint64_t uf2MakeVertexID(int chare, uint64_t localId) {
   return uf2EncodeTip(chare, (long)localId);
 }
@@ -175,6 +166,20 @@ inline uint64_t uf2MakeVertexID(int chare, uint64_t localId) {
 inline std::pair<int, uint64_t> uf2LocationFromID(uint64_t vid) {
   return { uf2Owner(vid), uf2Tip(vid) };
 }
+
+// One particle's term in FOF3STAT label_digest (shared with the plug-in
+// API, so hosts compute the same digest).
+using fofplugin::labelDigestTerm;
+
+// Hosted runs (design/plugin-interface.md): this PE's result for each
+// particle it staged, in staging order (the low 40 bits of
+// Particle::origin). Grown by fofplugin::stage, filled by
+// FoFPhase1::receiveHostLabels.
+inline std::vector<long>& hostLabels() {
+  static thread_local std::vector<long> labels;
+  return labels;
+}
+constexpr int kOriginIndexBits = 40;
 
 // Defined in FoF.C next to the keep-alive ring: one line per process of
 // ring-message gap counters (the no-tracing stall monitor). Called from
@@ -3921,6 +3926,31 @@ public:
       }
     this->contribute(2 * sizeof(unsigned long long), v,
                      CkReduction::sum_ulong_long, cb);
+  }
+
+  // Hosted runs: send each of this PE's particles' minimum-ID label to the
+  // PE that staged it (Particle::origin). The caller waits for quiescence
+  // after the contribution, which covers the sends.
+  void returnHostLabels(const CkCallback& cb) {
+    std::vector<std::vector<std::pair<uint64_t, long>>> out(CkNumPes());
+    const uint64_t mask = (uint64_t(1) << paratreet::kOriginIndexBits) - 1;
+    for (auto& s : treepieces)
+      for (int i = 0; i < s.n; i++) {
+        const uint64_t o = s.parts[i].origin;
+        out[int(o >> paratreet::kOriginIndexBits)].emplace_back(
+            o & mask, paratreet::uf2MinOrderLabel(s.parts[i].group_number));
+      }
+    for (int pe = 0; pe < CkNumPes(); pe++)
+      if (!out[pe].empty()) this->thisProxy[pe].receiveHostLabels(out[pe]);
+    this->contribute(cb);
+  }
+
+  void receiveHostLabels(const std::vector<std::pair<uint64_t, long>>& v) {
+    auto& labels = paratreet::hostLabels();
+    for (const auto& e : v) {
+      CkEnforce(e.first < labels.size());
+      labels[e.first] = e.second;
+    }
   }
 
   void depositLabelCounts(const CkCallback& cb) {

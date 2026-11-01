@@ -1,0 +1,15 @@
+// FoF3 as an in-situ plug-in (design/plugin-interface.md). A host program's
+// mainmodule declares `extern module fofplugin;`; this module brings in the
+// paratreet and fof modules and the template instantiations the plug-in's
+// FoF iteration calls (the same set examples/fof3/Main.ci declares).
+module fofplugin {
+    extern module paratreet;
+    extern module fof;
+
+    initnode void fofPluginRegisterReducers(void);
+
+    extern entry void TreePiece<FragData> callPerTreePieceFn(CkReference<paratreet::PerTreePieceAble<FragData>>, const CkCallback&);
+    extern entry void TreePiece<FragData> upwardPass(const CkCallback&);
+    extern entry void Partition<FragData> startDown<FoFEdgeVisitor> (FoFEdgeVisitor v);
+    extern entry void TreePiece<FragData> startDual<FoFEdgeVisitor> (FoFEdgeVisitor v);
+}

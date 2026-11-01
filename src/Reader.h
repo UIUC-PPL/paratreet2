@@ -45,6 +45,14 @@ class Reader : public CBase_Reader {
   long flush_outstanding = 0;
 
   public:
+  // Hosted runs (design/plugin-interface.md): the host appends its
+  // particles here on the PE that holds them; Driver::runHosted then
+  // decomposes them as if they had been loaded from a file. Empty again
+  // after the flush.
+  void stage(const Particle* p, size_t n) {
+    particles.insert(particles.end(), p, p + n);
+  }
+
   static long flushWindow() {
     static long w = [] {
       const char* e = std::getenv("PARATREET_FLUSH_WINDOW");

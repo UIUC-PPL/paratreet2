@@ -10,7 +10,7 @@ include ../src/Makefile.common
 OPTS = -g -O3 $(INCLUDES) $(FOF_INCLUDES) -DDEBUG=0 $(GPU_OPTS) $(MAKE_OPTS)
 CHARMC = $(CHARM_HOME)/bin/charmc $(OPTS)
 
-all: libfof.a
+all: libfof.a libmodulefofplugin.a
 
 # unionFindLib.decl.h comes from the pre-built sibling (on the include path
 # via FOF_INCLUDES); fof.ci extern-references its module and paratreet's.
@@ -23,6 +23,22 @@ FoF.o: FoF.C FoFData.h FoFPhase1.h FoFPhase3.h fof.decl.h $(PARATREET_PATH)/para
 libfof.a: FoF.o
 	ar cr libfof.a FoF.o
 	ranlib libfof.a
+
+# The in-situ plug-in (design/plugin-interface.md): hosted app main + the
+# FoFPluginAPI.h entry points, for host programs only (FoF3 has its own main).
+# Named libmodule*.a so a host links it with `charmc -module fofplugin`,
+# which registers the module without an `extern module` in the host's .ci
+# (that would pull paratreet's generated headers, and their TreePiece, into
+# the host's own).
+fofplugin.decl.h: FoFPlugin.ci fof.decl.h
+	$(CHARMC) $<
+
+FoFPlugin.o: FoFPlugin.C FoFPluginAPI.h FoFData.h FoFPhase1.h FoFPhase3.h fofplugin.decl.h fof.decl.h $(PARATREET_PATH)/paratreet.decl.h
+	$(CHARMC) -c $<
+
+libmodulefofplugin.a: FoFPlugin.o
+	ar cr libmodulefofplugin.a FoFPlugin.o
+	ranlib libmodulefofplugin.a
 
 clean:
 	rm -f *.decl*.h *.def*.h conv-host *.o *.a

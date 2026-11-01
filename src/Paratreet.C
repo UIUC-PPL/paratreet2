@@ -24,7 +24,11 @@ MainChare::MainChare(CkArgMsg* m) {
     auto& main = CsvAccess(main_);
 
     main->setDefaults();
-    (main->configuration()).parse(m->argc, m->argv);
+    // A hosted paratreet (design/plugin-interface.md) must not read the
+    // host program's argv: Charm constructs this mainchare in any program
+    // that links the module.
+    if (!main->configuration().hosted)
+      (main->configuration()).parse(m->argc, m->argv);
     main->main(m);
 
     CkCallback runCB(CkIndex_MainChare::run(), thisProxy);

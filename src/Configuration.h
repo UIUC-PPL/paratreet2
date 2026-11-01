@@ -167,6 +167,13 @@ namespace paratreet {
         // phase B of the design).
         bool single_distribution = false;
 
+        // Hosted (design/plugin-interface.md): paratreet runs inside another
+        // Charm++ program that owns argv and the particles. MainChare skips
+        // argv parsing, Driver::init loads no file, and each run is started
+        // by the host through Driver::runHosted on particles staged in the
+        // Readers. Set by the hosting app main's setDefaults().
+        bool hosted = false;
+
         // we support loading config files with "-x"
         Configuration(const char* config_arg = "-x")
         : Loadable(config_arg) { register_fields(); }
@@ -234,6 +241,7 @@ namespace paratreet {
             p | perturb_particles;
             p | read_velocity_and_soft;
             p | single_distribution;
+            p | hosted;
         }
     };
 

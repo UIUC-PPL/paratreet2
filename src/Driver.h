@@ -72,7 +72,58 @@ public:
     cache_manager.initialize(CkCallbackResumeThread());
     // Useful particle keys
     CkPrintf("* Initialization\n");
-    decompose(0);
+    // Hosted: there is no input file; each run decomposes the particles the
+    // host staged (runHosted).
+    if (!cfg.hosted) decompose(0);
+    cb.send();
+  }
+
+  // Hosted (design/plugin-interface.md): the host staged its particles into
+  // the Readers. Universe, keys and local sort as after a file load, then
+  // the usual decomposition.
+  void decomposeStaged() {
+    double t = CkWallTimer();
+    CkReductionMsg* result;
+    readers.computeUniverseBoundingBox(CkCallbackResumeThread((void*&)result));
+    universe = *((BoundingBox*)result->getData());
+    delete result;
+    if (universe.n_particles == 0)
+      CkAbort("paratreet hosted run: no particles were staged\n");
+    remakeUniverse();
+    readers.assignKeys(universe, CkCallbackResumeThread());
+    CkPrintf("Staged particles: universe and keys: %.3lf ms\n",
+             (CkWallTimer() - t) * 1000);
+    decompose(-1);
+  }
+
+  // One pass over host-staged particles: decompose them, one iteration
+  // through the registered main's hooks (its postIterationFn hands results
+  // back to the host), then destroy the TreePieces so the next call starts
+  // from new particles. The Readers are empty again after the flush.
+  void runHosted(CkCallback cb) {
+    double t0 = CkWallTimer();
+    decomposeStaged();
+
+    CkCallback timeCb(CkReductionTarget(Driver<Data>, reportTime), this->thisProxy);
+    treepieces.buildTree(partitions, timeCb);
+    CkWaitQD();
+    ProxyPack<Data> proxy_pack(this->thisProxy, treepieces, partitions, cache_manager);
+    paratreet::preTraversalFn(proxy_pack);
+    CkWaitQD();
+    paratreet::traversalFn(universe, proxy_pack, 0);
+    CkWaitQD();
+    paratreet::postIterationFn(universe, proxy_pack, 0);
+
+    resumer.reset();
+    treespec.reset();
+    treepieces.destroy();
+    cache_manager.destroy(true);
+    CkCallback statsCb(CkReductionTarget(Driver<Data>, countInts), this->thisProxy);
+    thread_state_holder.collectAndResetStats(statsCb);
+    storage.clear();
+    storage_sorted = false;
+    CkWaitQD();
+    CkPrintf("Hosted run time: %.3lf ms\n", (CkWallTimer() - t0) * 1000);
     cb.send();
   }
 
@@ -125,7 +176,8 @@ public:
       readers.assignKeys(universe, CkCallbackResumeThread());
       CkPrintf("Assigning keys and sorting particles: %.3lf ms\n",
         (CkWallTimer() - start_time) * 1000);
-    } else CkWaitQD();
+    } else if (iter > 0) CkWaitQD();
+    // iter < 0: decomposeStaged already built the universe and keys.
 
     bool matching_decomps = config.decomp_type == paratreet::treepieceDecompForTree(config.tree_type);
     // Single-distribution mode (design/single-distribution-mode.md): no

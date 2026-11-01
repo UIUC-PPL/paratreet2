@@ -1,6 +1,13 @@
 # FoF3 as an in-situ plug-in (steps 1-3 of the ChaNGa port)
 
-Status: plan, 2026-11-01. This is Track A of the journal plan: FoF3 runs
+Status (2026-11-01): stage A done (99a1122, gate job 5821848); stage B done
+(gate job 5822088: the stand-in host reproduces FoF3's label_digest
+d5262332457c155e on lambb, device and CPU arms, over two consecutive
+calls, no unlabeled particles). A hosted call at 2 nodes takes 2.1 s, of
+which 1.38 s is decomposition (universe 0.14, splitter search 0.42, flush
+0.81): stage C removes the splitter search and the flush.
+
+Plan written 2026-11-01. This is Track A of the journal plan: FoF3 runs
 inside a host simulation (first host: ChaNGa) on the particles in its
 memory, and returns a halo label per particle and a halo catalog, without
 writing a snapshot. Steps 1-3 here are the paratreet2-only part. Step 4,

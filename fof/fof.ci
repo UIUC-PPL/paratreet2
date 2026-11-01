@@ -132,6 +132,8 @@ module fof {
     entry void memoryStats(const CkCallback&);
     entry void depositLabelCounts(const CkCallback&);
     entry void labelDigest(const CkCallback&);
+    entry void returnHostLabels(const CkCallback&);
+    entry void receiveHostLabels(const std::vector<std::pair<uint64_t, long>>&);
     entry void histogramShard(int min_component_size, const CkCallback&);
     entry void collectTouchedCounts(const CkCallback&);
     // Routed replacement for collectTouchedCounts (FOF_HIST_ROUTED, default

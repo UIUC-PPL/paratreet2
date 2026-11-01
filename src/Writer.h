@@ -5,8 +5,8 @@
 #include "paratreet.decl.h"
 #include <vector>
 
-struct Writer : public CBase_Writer {
-  Writer(std::string of, long n_particles);
+struct ParticleWriter : public CBase_ParticleWriter {
+  ParticleWriter(std::string of, long n_particles);
   void receive(std::vector<Particle> ps, Real time, int iter);
   void write(CkCallback cb);
 

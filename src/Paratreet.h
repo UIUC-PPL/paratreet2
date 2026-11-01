@@ -259,7 +259,7 @@ namespace paratreet {
     template<typename Data>
     void outputParticleAccelerations(BoundingBox& universe, CProxy_Partition<Data>& partitions) {
         auto& output_file = paratreet::getConfiguration().output_file;
-        CProxy_Writer w = CProxy_Writer::ckNew(output_file, universe.n_particles);
+        CProxy_ParticleWriter w = CProxy_ParticleWriter::ckNew(output_file, universe.n_particles);
         CkPrintf("Outputting particle accelerations for verification...\n");
         partitions.output(w, universe.n_particles, CkCallback::ignore);
         CkWaitQD();

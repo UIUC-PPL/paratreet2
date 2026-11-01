@@ -127,7 +127,6 @@ public:
     particles_[i].group_number = group_number;
   }
   void setParticleVertexID(int i, uint64_t vertex_id) {
-    particles_[i].vertex_id = vertex_id;
     
     // Update vertex ID range
     if (!vertex_range_initialized) {

@@ -1,12 +1,12 @@
 #include "Writer.h"
 #include "TipsyFile.h"
 
-Writer::Writer(std::string of, long n_particles)
+ParticleWriter::ParticleWriter(std::string of, long n_particles)
   : output_file(of), total_particles(n_particles)
 {
 }
 
-void Writer::receive(std::vector<Particle> ps, Real time, int iter)
+void ParticleWriter::receive(std::vector<Particle> ps, Real time, int iter)
 {
   // Accumulate received particles
   particles.insert(particles.end(), ps.begin(), ps.end());
@@ -14,7 +14,7 @@ void Writer::receive(std::vector<Particle> ps, Real time, int iter)
   iter_ = iter;
 }
 
-void Writer::write(CkCallback cb)
+void ParticleWriter::write(CkCallback cb)
 {
   // Received expected number of particles, sort the particles
   std::sort(particles.begin(), particles.end(),
@@ -28,7 +28,7 @@ void Writer::write(CkCallback cb)
   else thisProxy[0].write(cb);
 }
 
-void Writer::do_write()
+void ParticleWriter::do_write()
 {
   // Write particle accelerations and other quantities to output file
   FILE *fp;

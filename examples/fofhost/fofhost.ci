@@ -1,0 +1,19 @@
+// Stand-in host for the FoF3 plug-in (design/plugin-interface.md). The
+// plug-in is linked with `-module fofplugin`, not declared here, as ChaNGa
+// would have to.
+mainmodule fofhost {
+    readonly int peanoKey;
+    readonly CProxy_HostPiece hostPieces;
+
+    mainchare HostMain {
+        entry HostMain(CkArgMsg*);
+        entry [threaded] void go();
+    };
+
+    array [1D] HostPiece {
+        entry HostPiece(std::string file, long n_total, int n_pieces);
+        entry void stage(const CkCallback&);
+        entry void digest(const CkCallback&);
+        entry void clearStaged(const CkCallback&);
+    };
+}

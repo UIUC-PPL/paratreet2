@@ -79,7 +79,7 @@ public:
   void print(Node<Data>*);
   void destroy();
   void reset();
-  void output(CProxy_Writer w, CkCallback cb);
+  void output(CProxy_ParticleWriter w, CkCallback cb);
   void pup(PUP::er& p);
   void collectMetaData(const CkCallback & cb);
   void callPerLeafFn(paratreet::PerLeafAble<Data>&, const CkCallback&);
