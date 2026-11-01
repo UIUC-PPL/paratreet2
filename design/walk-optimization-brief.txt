@@ -230,3 +230,51 @@ per-pair m2 added to the dump and one run.
 IMPLICATION WORTH WEIGHING BEFORE MORE TIE-BREAK WORK: the skewed group
 is small and the large group is even, so the larger lever in this phase
 is REDUCING CACHE TRAFFIC, not rebalancing traversal work.
+
+====================================================================
+ADDENDUM 2026-11-01 -- IMPLEMENTED AND MEASURED AT 32-128 NODES (issue #5)
+====================================================================
+
+Built: FOF_WALK_TIEBREAK=parity|hash|weighted (src/common.h, the rule in
+DualTraverser::keepMirroredPair) with the weights fed back WITHIN the run:
+iteration 0 walks under parity, each PE's leaf interactions (sum n_src *
+n_tgt) go to the driver by a set reduction, w = 1 + cost is broadcast to a
+per-process table, iteration 1 walks weighted. Plus an always-on
+instrument, `FOF3STAT walk_timing`, from ThreadStateHolder timers in
+DualTraverser::doTrav (absolute wall times, comparable across processes).
+Gold exact in both iterations of every arm (2-node gate job 5818102 on
+both arms; jobs 5818128-30 and 5818556-58 at 2B). Stack: recharm +
+charm#4119, ppn 7, leaf 128 device arm, iteration 1.
+
+THE HEADLINE CORRECTION: `phase3_walk` IS NOT THE WALK.  With UF_2
+streaming on (-E 16, the default since relay11) union batches leave during
+the walk and their cascades run under the walk's CkWaitQD. -E 0 separates
+them (walk = the walk alone; the unions move to `uf2`):
+
+   nodes   walk alone (-E 0)       union alone   walk+uf2, -E 16    walk+uf2, -E 0
+           parity -> weighted      (-E 0 uf2)    parity  weighted   weighted
+   32      0.357 -> 0.35-0.41       0.33-0.37    0.58-0.63 0.51-0.55  0.73
+   64      0.424 -> 0.28-0.30       0.34-0.40    0.54-0.58 0.56-0.65  0.62-0.70
+   128     0.311 -> 0.230           0.37-0.55    0.55-0.78 0.54-0.67  0.604-0.607
+
+1. THE WEIGHTED RULE WORKS ON THE WALK: -26 to -32% at 64-128 nodes, with
+   the busiest PE's busy time down ~35% (0.32 -> 0.20 s at 64), leaf-work
+   max/mean 8.1 -> 5.6-6.0. Nothing at 32 nodes. hash alone does nothing,
+   as the simulator said.
+2. WITH STREAMING IT DOES NOT REACH THE ITERATION. Under -E 16 the last
+   walk work ends at ~0.43 s at 64 nodes whatever the rule, and the union
+   drain adds 0.07-0.30 s after it (qd_tail). With -E 0 qd_tail is
+   0.001: quiescence detection itself costs nothing here.
+3. THE UNION CASCADES ARE NOW AS BIG AS THE WALK and grow with scale
+   (0.33 -> 0.55 s alone). The overlapped sum walk+uf2 ~0.55-0.6 s is the
+   phase-3 floor at 32-128 nodes; neither lever moves it. -E 16 is also
+   the noisy configuration (0.55-0.78 at 128); -E 0 + weighted is steady
+   (0.604/0.607) at about the same mean.
+4. WHY STREAMING ERASES THE GAIN is not yet shown. Candidate: one
+   UnionFindLib chare per process, on rank 0 (UFNodeMap), so union
+   handling lands on a walking PE that the weights know nothing about.
+   Test before building anything: report walk end / busy for rank-0 PEs
+   separately from the rest.
+
+NEXT: the phase-3 lever is now UF_2's cascade latency, not walk
+assignment. Keep `weighted` as an opt-in comparison arm.

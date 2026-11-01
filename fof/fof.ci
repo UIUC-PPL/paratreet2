@@ -29,6 +29,8 @@ module fof {
     entry void reset(const CkCallback&);
     entry void fragmentHistogram(const CkCallback&);
     entry void redundancyHistogram(const CkCallback&);
+    // Weighted dual-walk tie-break table (issue #5; paratreet::walkTieWeights).
+    entry void setWalkWeights(const std::vector<long>&, const CkCallback&);
     // Stage 3 of design/relabel-representative.md: receive this process's
     // slice of the phase-3 label map (keys owner-sharded by processor 0),
     // store it once per process, and trigger applySliceOnPE on each of the
@@ -116,6 +118,8 @@ module fof {
     // reduction is [local, cross] counts (sum_long) and the staging barrier.
     entry void stagePhase3Edges(const CkCallback&);
     entry void phase3Stats(const CkCallback&);
+    // {PE, leaf interactions} set reduction for the weighted tie-break.
+    entry void walkCosts(const CkCallback&);
     entry void depositNodeRedundant(const CkCallback&);
     entry void applyGlobalMap(const std::vector<std::pair<long, long> >&, const CkCallback&);
     // Stage-3 sliced counterpart: apply the node branch's stored slice at

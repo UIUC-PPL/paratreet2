@@ -292,6 +292,7 @@ public:
       return;
     }
     branch->p3_leaf_visits++;
+    branch->p3_leaf_ints += (long)source.n_particles * target.n_particles;
     if (source.data.uniform() && target.data.uniform()) {
       // Uniform leaf pair: one (g, f) covers every particle pair, so
       // resolve it before the O(n*m) loop (the suppression payoff at leaf
@@ -407,6 +408,19 @@ struct FoFPhase3Result {
   // max_piece_n = largest TreePiece (floor of piece-level rebalancing).
   double a_within, a_proc_avg_max, size_r;
   long max_piece_n;
+  // Dual-walk timing (issue #5; -u dist only, zero elsewhere). Times are
+  // seconds relative to the driver's walk launch: start_min/start_max = the
+  // first PE / last PE to enter the walk, end_max = the last PE to leave it,
+  // so t_walk - end_max is what CkWaitQD adds after the last walk work.
+  // busy = time inside the traverser per PE, span = last exit - first entry
+  // per PE, fetches = remote-node requests issued per PE, leaf_ints = sum of
+  // n_src * n_tgt per PE (the tie-break's cost unit).
+  double walk_start_min = 0, walk_start_max = 0, walk_end_max = 0;
+  double walk_busy_min = 0, walk_busy_avg = 0, walk_busy_max = 0;
+  double walk_span_avg = 0, walk_span_max = 0;
+  double walk_fetch_min = 0, walk_fetch_avg = 0, walk_fetch_max = 0;
+  double leaf_ints_min = 0, leaf_ints_avg = 0, leaf_ints_max = 0;
+  bool walk_weights_set = false;  // weighted tie-break table installed after this walk
 };
 
 // Convenience driver for the full phase-3 sequence:
@@ -1053,6 +1067,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // QD (all plain entry sends), overlapping uf2's latency chains with the
   // walk's remaining work and fetch stalls.
   double t0 = CkWallTimer();
+  const double t0_abs = CmiInitTime() + t0;  // walk_* times are absolute
   if (dual_walk) {
     treepieces.startDual<FoFEdgeVisitor>(FoFEdgeVisitor(fof, b2, period));
   } else {
@@ -1109,6 +1124,15 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     r.units_max = maxs[3];
     r.units_total = stats[8];
     r.x_min = tmin[3]; r.x_avg = tsum[3] / n_pes; r.x_max = tmax[3];
+    r.walk_busy_min = tmin[4]; r.walk_busy_avg = tsum[4] / n_pes;
+    r.walk_busy_max = tmax[4];
+    r.walk_start_min = tmin[5] - t0_abs; r.walk_start_max = tmax[10] - t0_abs;
+    r.walk_end_max = tmax[6] - t0_abs;
+    r.walk_span_avg = tsum[7] / n_pes; r.walk_span_max = tmax[7];
+    r.walk_fetch_min = tmin[8]; r.walk_fetch_avg = tsum[8] / n_pes;
+    r.walk_fetch_max = tmax[8];
+    r.leaf_ints_min = tmin[9]; r.leaf_ints_avg = tsum[9] / n_pes;
+    r.leaf_ints_max = tmax[9];
     // Pearson r of density-work proxy X vs t_phaseA over PEs (layout:
     // FoFPhase1::phase3Stats element 7).
     const double* csum = (const double*)stats_elems[7].data;
@@ -1207,6 +1231,27 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   r.t_gather = t2 - t1;   // phase3Stats only on this path (no edge gather)
   r.t_uf2 = t3 - t2;      // initUF2 + fireUF2Edges + QD + find_components
   r.t_relabel = t4 - t3;  // applyUF2Labels
+  // Weighted tie-break (FOF_WALK_TIEBREAK=weighted; issue #5): after the first
+  // walk -- run under the parity rule because no table exists yet -- turn each
+  // PE's leaf interactions into the integer weight table w = 1 + cost and
+  // install it in every process. Later walks (iteration 1 on) use it. Outside
+  // every timed bracket above; it lands in this iteration's total only.
+  if (paratreet::walkTieBreakMode() == 2 && paratreet::walkTieWeights().empty()) {
+    void* cost_result = nullptr;
+    fof.walkCosts(CkCallbackResumeThread(cost_result));
+    CkReductionMsg* cost_msg = (CkReductionMsg*)cost_result;
+    std::vector<long> w(CkNumPes(), 0);
+    for (auto* e = (CkReduction::setElement*)cost_msg->getData(); e != nullptr;
+         e = e->next()) {
+      const long* pc = (const long*)&e->data;
+      CkEnforce(pc[0] >= 0 && pc[0] < CkNumPes() && w[pc[0]] == 0);
+      w[pc[0]] = 1 + pc[1];
+    }
+    delete cost_msg;
+    for (long x : w) CkEnforce(x > 0);  // every PE reported exactly once
+    fof_node.setWalkWeights(w, CkCallbackResumeThread());
+    r.walk_weights_set = true;
+  }
   return r;
 }
 

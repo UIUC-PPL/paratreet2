@@ -50,7 +50,12 @@
 #include "Node.h"
 #include "Particle.h"
 #include "OrientedBox.h"
+#include "ThreadStateHolder.h"
 #include "unionFindLib.h"
+
+// Per-PE dual-walk timing (ThreadStateHolder::walk_*) is cleared in
+// resetPhase3 and read in phase3Stats.
+extern CProxy_ThreadStateHolder thread_state_holder;
 
 #ifdef FOF_GPU
 // design/phase1-gpu.md section 6.2: the device library's header names
@@ -811,6 +816,14 @@ public:
   void addNodeRedundant(long v) {
     std::lock_guard<std::mutex> g(seen3_lock);
     p3_node_redundant += v;
+  }
+
+  // Install the weighted tie-break's per-PE table in this process (issue #5;
+  // paratreet::walkTieWeights). Runs between walks, so no PE of this process
+  // is reading it; the reduction is the barrier before the next walk.
+  void setWalkWeights(const std::vector<long>& w, const CkCallback& cb) {
+    paratreet::walkTieWeights() = w;
+    this->contribute(cb);
   }
 
   // Per-(g,f) redundant-descent counts (design/step3.md §6e): how CONCENTRATED
@@ -3552,6 +3565,9 @@ public:
                                   // (no cross-process edge possible; 3a
                                   // addition, not in the spec's 3-case list)
   long p3_leaf_visits = 0;        // leaf() invocations
+  long p3_leaf_ints = 0;          // sum of n_src * n_tgt over leaf visits:
+                                  // the walk-cost unit the tie-break
+                                  // weights are built from (issue #5)
   long p3_redundant_descents = 0; // opens that descend while both-uniform
                                   // (unSEEN, distinct tips): §8.3 data
   long p3_peak_edge_buf = 0;      // high-water mark of edge_buf3.size()
@@ -3591,8 +3607,10 @@ public:
     p3_suppression_prunes = 0;
     p3_same_frag_prunes = 0;
     p3_leaf_visits = 0;
+    p3_leaf_ints = 0;
     p3_redundant_descents = 0;
     p3_peak_edge_buf = 0;
+    thread_state_holder.ckLocalBranch()->resetWalk();
     node_proxy.ckLocalBranch()->clearSeen();
     node_proxy.ckLocalBranch()->clearNodeRedundant();
     node_proxy.ckLocalBranch()->clearRedun();
@@ -3687,7 +3705,21 @@ public:
     long node_redundant = node_proxy.ckLocalBranch()->p3_node_redundant;
     long per_pe[4] = {p3_leaf_visits, phase3_emitted, node_redundant,
                       t_phaseB_units};
-    double times[4] = {t_phaseA, t_phaseB, t_phaseB_maxpair, density_x};
+    // times[4..10] are the dual walk on this PE (issue #5): busy, absolute
+    // first entry (for the min), last exit, active span, fetches issued,
+    // leaf interactions, absolute first entry again (for the max). A PE that
+    // never walked reports +huge / 0 so it drops out of the min / max. Only
+    // the min / max (and the sum for busy, span, fetches, leaf_ints) mean
+    // anything.
+    const auto* ts = thread_state_holder.ckLocalBranch();
+    const bool walked = ts->walk_first >= 0;
+    double times[11] = {t_phaseA, t_phaseB, t_phaseB_maxpair, density_x,
+                        ts->walk_busy,
+                        walked ? ts->walk_first : 1e300,
+                        walked ? ts->walk_last : 0.0,
+                        walked ? ts->walk_last - ts->walk_first : 0.0,
+                        (double)ts->walk_fetches, (double)p3_leaf_ints,
+                        walked ? ts->walk_first : 0.0};
     double corr[3] = {density_x * t_phaseA, density_x * density_x,
                       t_phaseA * t_phaseA};
     // Skew-split instrument (design/phasea-reassignment.md section 3;
@@ -3721,6 +3753,14 @@ public:
     CkReductionMsg* msg = CkReductionMsg::buildFromTuple(tupleRedn, 10);
     msg->setCallback(cb);
     this->contribute(msg);
+  }
+
+  // This PE's walk cost for the weighted tie-break (issue #5): a set
+  // reduction of {PE, leaf interactions} pairs, 16 bytes per PE, from which
+  // the driver builds the per-PE weight table.
+  void walkCosts(const CkCallback& cb) {
+    long pc[2] = {(long)CkMyPe(), p3_leaf_ints};
+    this->contribute(sizeof(pc), pc, CkReduction::set, cb);
   }
 
   // Deposit this PE's redundant-descent count into the per-process total

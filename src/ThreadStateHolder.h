@@ -17,6 +17,22 @@ public: // these need to be seen by other local chares
   unsigned long n_ps_copies           = 0u;
   unsigned long n_ps_shares           = 0u;
 
+  // Dual-walk timing on this PE (DualTraverser::doTrav; issue #5). busy =
+  // time inside doTrav; first/last = ABSOLUTE wall times (CkWallTimer +
+  // CmiInitTime, comparable across processes) of the first entry and last
+  // exit; fetches = remote-node requests this PE issued. Cleared by
+  // resetWalk() before each walk the caller wants to measure.
+  double walk_busy = 0.0;
+  double walk_first = -1.0;
+  double walk_last = 0.0;
+  unsigned long walk_fetches = 0u;
+  void resetWalk() {
+    walk_busy = 0.0;
+    walk_first = -1.0;
+    walk_last = 0.0;
+    walk_fetches = 0u;
+  }
+
   BoundingBox universe;
 
 private:

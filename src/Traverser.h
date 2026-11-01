@@ -765,7 +765,35 @@ public:
     }
   }
 
+  // Symmetry-prune policy (paratreet::walkTieBreakMode, common.h): does the
+  // target side keep the pair (target_piece, source_piece)? Both owners
+  // evaluate the same expression and exactly one gets true.
+  bool keepMirroredPair(int target_piece, int source_piece) {
+    const int mode = paratreet::walkTieBreakMode();
+    const auto& w = paratreet::walkTieWeights();
+    if (mode == 0 || (mode == 2 && w.empty()))
+      return (((target_piece + source_piece) & 1) == 0)
+                 ? (target_piece < source_piece)
+                 : (target_piece > source_piece);
+    const int lo = std::min(target_piece, source_piece);
+    const int hi = std::max(target_piece, source_piece);
+    uint64_t w_lo = 1, w_hi = 1;
+    if (mode == 2) {
+      CkLocMgr* lm = tp.thisProxy.ckLocMgr();
+      const int pe_lo = lm->homePe(CkArrayIndex1D(lo));
+      const int pe_hi = lm->homePe(CkArrayIndex1D(hi));
+      CkAssert(w.size() == (size_t)CkNumPes());
+      w_lo = (uint64_t)w[pe_lo];
+      w_hi = (uint64_t)w[pe_hi];
+      CkAssert(w_lo > 0 && w_hi > 0);
+    }
+    const int winner =
+        (paratreet::walkPairMix(lo, hi) % (w_lo + w_hi)) < w_hi ? lo : hi;
+    return winner == target_piece;
+  }
+
   void doTrav(Node<Data>* start_node) {
+    const double tw0 = CkWallTimer();
     Key new_key = start_node->key;
     std::vector<std::pair<Key, Node<Data>*>> curr_nodes_insertions;
     auto& now_ready = curr_nodes[new_key];
@@ -804,12 +832,9 @@ public:
       // exactly one of its two owners (balanced tie-break), discard the
       // mirror.
       if (dualSkipMirroredPairs<Visitor>(0) && node->tp_index >= 0 &&
-          node->tp_index != tp.thisIndex) {
-        int target_piece = tp.thisIndex, source_piece = node->tp_index;
-        bool keep = (((target_piece + source_piece) & 1) == 0)
-                        ? (target_piece < source_piece)
-                        : (target_piece > source_piece);
-        if (!keep) continue;
+          node->tp_index != tp.thisIndex &&
+          !keepMirroredPair(tp.thisIndex, node->tp_index)) {
+        continue;
       }
       switch (node->type) {
         case Node<Data>::Type::Leaf:
@@ -886,7 +911,8 @@ public:
         case Node<Data>::Type::RemoteLeaf:
           {
             curr_nodes_insertions.push_back(std::make_pair(node->key, curr_payload));
-            handleRemoteNode(node, trav_idx, tp.thisIndex, tp.tc_proxy, tp.cm_proxy, tp.r_proxy);
+            if (handleRemoteNode(node, trav_idx, tp.thisIndex, tp.tc_proxy, tp.cm_proxy, tp.r_proxy))
+              stats->walk_fetches++;
             break;
           }
         default: break;
@@ -894,6 +920,10 @@ public:
     }
     curr_nodes.erase(new_key);
     for (auto cn : curr_nodes_insertions) curr_nodes[cn.first].push_back(cn.second);
+    const double tw1 = CkWallTimer();
+    stats->walk_busy += tw1 - tw0;
+    if (stats->walk_first < 0) stats->walk_first = CmiInitTime() + tw0;
+    stats->walk_last = CmiInitTime() + tw1;
   }
 };
 

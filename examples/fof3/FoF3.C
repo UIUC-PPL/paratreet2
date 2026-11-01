@@ -641,6 +641,23 @@ using namespace paratreet;
                pr.leaf_visits_min, pr.leaf_visits / n_pes, pr.leaf_visits_max,
                pr.emitted_min, pr.edges_emitted / n_pes, pr.emitted_max,
                CkNumPes());
+      // Dual-walk timing (issue #5; -u dist only): when the walk work starts
+      // and ends relative to the launch, how much of t_walk is CkWaitQD after
+      // the last PE stops, and the per-PE busy / leaf-work / fetch spread.
+      if (pr.walk_end_max > 0)
+        CkPrintf("FOF3STAT walk_timing: tiebreak %s%s t_walk %.3f start "
+                 "+%.4f/+%.4f end_max +%.3f qd_tail %.3f busy %.3f/%.3f/%.3f "
+                 "span %.3f/%.3f leaf_ints %.3g/%.3g/%.3g (max/avg %.2f) "
+                 "fetches %.0f/%.0f/%.0f (min/avg/max over PEs)\n",
+                 paratreet::walkTieBreakName(),
+                 pr.walk_weights_set ? " (weights set after this walk)" : "",
+                 pr.t_walk, pr.walk_start_min, pr.walk_start_max,
+                 pr.walk_end_max, pr.t_walk - pr.walk_end_max,
+                 pr.walk_busy_min, pr.walk_busy_avg, pr.walk_busy_max,
+                 pr.walk_span_avg, pr.walk_span_max,
+                 pr.leaf_ints_min, pr.leaf_ints_avg, pr.leaf_ints_max,
+                 pr.leaf_ints_avg > 0 ? pr.leaf_ints_max / pr.leaf_ints_avg : 0.0,
+                 pr.walk_fetch_min, pr.walk_fetch_avg, pr.walk_fetch_max);
       // Per-PROCESS redundant-descent skew (design/step3.md §6d): does the
       // pre-witness redundancy 3b would park concentrate on a few
       // dense-boundary nodes? avg = total / #processes.

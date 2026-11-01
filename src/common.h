@@ -202,6 +202,56 @@ inline bool peSetKeepLocalPair(int src_piece, int tgt_piece) {
 }
 
 #endif // __CHARMC__
+
+// ---- DUAL-WALK TIE-BREAK (issue #5; design/walk-optimization-brief.txt).
+//
+// The symmetry prune in DualTraverser keeps each cross-piece pair on exactly
+// one of its two owners. Which one is a policy:
+//
+//   FOF_WALK_TIEBREAK=parity    (default) parity of the piece-index sum: even
+//                               -> lower index keeps, odd -> higher. Balanced
+//                               in pair COUNT, blind to load.
+//                     hash      coin over the piece pair with equal weights:
+//                               the control that separates "weighted" from
+//                               merely "randomised" (brief: 4.97x vs 5.22x).
+//                     weighted  coin with per-PE weights w = 1 + that PE's leaf
+//                               interactions in the previous (parity) walk;
+//                               parity until the table is set (brief: 3.57x).
+//
+// The coin hashes over PIECES and weighs over PEs, and both sides compute the
+// WINNER (never "do I keep it", which drops 31% of pairs): lo = min piece,
+// hi = max piece, lo wins iff mix(lo, hi) % (w[pe(lo)] + w[pe(hi)]) <
+// w[pe(hi)]. Every process must hold the bit-identical integer table, or the
+// two sides disagree and a pair is walked twice or not at all.
+inline int walkTieBreakMode() {
+  static const int v = [] {
+    const char* e = std::getenv("FOF_WALK_TIEBREAK");
+    if (!e) return 0;
+    std::string s(e);
+    if (s == "hash") return 1;
+    if (s == "weighted") return 2;
+    return 0;
+  }();
+  return v;
+}
+inline const char* walkTieBreakName() {
+  static const char* names[] = {"parity", "hash", "weighted"};
+  return names[walkTieBreakMode()];
+}
+// Per-PROCESS weight table indexed by PE (empty = not set yet). Written only
+// between walks (FoFPhase1Node::setWalkWeights, one PE per process, behind a
+// reduction barrier); read-only while a walk runs.
+inline std::vector<long>& walkTieWeights() {
+  static std::vector<long> w;
+  return w;
+}
+inline uint64_t walkPairMix(uint64_t lo, uint64_t hi) {
+  uint64_t z = (lo << 32) ^ hi;  // splitmix64 finalizer
+  z += 0x9e3779b97f4a7c15ull;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  return z ^ (z >> 31);
+}
 }  // namespace paratreet
 
 #endif // PARATREET_COMMON_H_
