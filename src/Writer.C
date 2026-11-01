@@ -59,7 +59,9 @@ void ParticleWriter::do_write()
     //else if (cur_dim == 2) outval = particle.acceleration.z;
     fprintf(fp, "%.14g\n", outval);
     if (cur_dim == 0) {
+#ifndef PARATREET_SLIM_PARTICLE
         fprintf(fpDen, "%.14g\n", particle.density);
+#endif
         const double gammam1 = 5./3. - 1.0;
         //fprintf(fpPres, "%.14g\n", gammam1*particle.u*particle.density);
     }

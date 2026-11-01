@@ -72,7 +72,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SC")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SCK")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -122,6 +122,9 @@ PARATREET_REGISTER_MAIN(ExMain);
           conf.cache_share_depth = atoi(optarg);
           if (conf.cache_share_depth < 1)
             CkAbort("-D requires a cache share depth >= 1");
+          break;
+        case 'K':
+          fof_catalog = true;
           break;
         case 'm':
           fof_min_component_size = atoi(optarg);

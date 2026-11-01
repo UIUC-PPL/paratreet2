@@ -700,6 +700,18 @@ using namespace paratreet;
       CkPrintf("FOF3STAT label_digest: n %llu digest %016llx\n", d[0], d[1]);
       delete dmsg;
     }
+    if (fof_catalog) {
+      // The halo catalog by its own route (a group-by over labels), so its
+      // group count must equal the histogram's surviving count for -m.
+      const long min_size = std::max(1, fof_min_component_size);
+      double tc0 = CkWallTimer();
+      auto cs = paratreet::runFoFCatalog(
+          fof, min_size, Vector3D<Real>(pbc_period, pbc_period, pbc_period));
+      CkPrintf("FOF3STAT catalog: min_size %ld groups %ld particles %ld "
+               "max_size %ld digest %016llx time_s %.3f\n", min_size,
+               cs.groups, cs.particles, cs.max_size, cs.digest,
+               CkWallTimer() - tc0);
+    }
 
     if (!do_full) {
       // Stats mode: no particle gather, no serial reference. The component

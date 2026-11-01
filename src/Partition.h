@@ -243,7 +243,11 @@ void Partition<Data>::applyOpposingEffects(std::vector<std::pair<Key, Particle::
       auto it = effects_map.find(leaf->particles()[pi].key);
       if (it != effects_map.end()) {
         //leaf->applyAcceleration(pi, it->second.first);
+#ifndef PARATREET_SLIM_PARTICLE
         leaf->applyGasWork(pi, it->second.second);
+#else
+        CkAbort("slim particles (PARATREET_SLIM_PARTICLE) carry no SPH work");
+#endif
       }
     }
   }

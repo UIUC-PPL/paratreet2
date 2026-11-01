@@ -16,6 +16,23 @@ label_digest on CPU, device Replace and FOF_GPU_VERIFY (e88625a3f5164c05,
 23,699,565 components); periodic 100k-uniform b 0.8 passes -c full on all
 arms and matches the pre-change binary (24,151 components; the 98,264 that
 phase1-scaling.md quotes was a different, unrecorded configuration).
+Stage D done (gate jobs 5822468, 5822528): -K -m 20 on 2B lambb lists
+116,565 groups (= the histogram's surviving count), 46,851,449 particles,
+catalog digest f15a6e13021caba9 identical across iterations, CPU/device,
+copy-in and host-cell plug-in runs; -m 1 lists all 23,707,197 components;
+periodic CPU and device catalogs agree. Cost 0.57-0.70 s at 2 nodes, too
+high: every group, singletons included, goes through the group-by. Next:
+a size pre-pass so only groups that can reach the minimum are summed.
+Stage F done (gate job 5822528): SLIM_PARTICLE=1 (default for the FoF
+stack) gives 72-byte particles; same job, device arm: peak memory after
+decomposition 4616 -> 3651 MB, decomposition 2.14 -> 1.03 s, iteration 1
+642 -> 547 ms, all digests unchanged; the plug-in frees its phase-1 and
+catalog scratch after each call. Hosted call with host cells: 1.50 s.
+
+Open: the host-cell flush still sorts each Reader's particles (0.3 s);
+the min-ID encoding moves union-find bosses to the process owning each
+group's minimum id, unmeasured above 2 nodes; step 4 (ChaNGa hooks)
+waits on Kale and Tom Quinn.
 
 Plan written 2026-11-01. This is Track A of the journal plan: FoF3 runs
 inside a host simulation (first host: ChaNGa) on the particles in its

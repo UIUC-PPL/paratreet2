@@ -14,17 +14,28 @@ struct Particle {
   int partition_idx = 0; // Only used when TreePiece and Partition have different decomp types
 
   Real mass;
+#ifndef PARATREET_SLIM_PARTICLE
   Real density;
   Real potential;
   //Real u;
   Real soft;
+#endif
   Vector3D<Real> position;
+#ifndef PARATREET_SLIM_PARTICLE
   Vector3D<Real> acceleration;
+#endif
   Vector3D<Real> velocity;
+#ifndef PARATREET_SLIM_PARTICLE
   Vector3D<Real> velocity_predicted;
   Real pressure_dVolume = 0.;
+#endif
   using Effect = std::pair<Vector3D<Real>, Real>; // accel, pressure
+#ifndef PARATREET_SLIM_PARTICLE
   Real u_predicted;
+#endif
+  // PARATREET_SLIM_PARTICLE (the FoF build; design/plugin-interface.md
+  // stage F) drops the gravity and SPH fields above, which FoF never reads:
+  // 72 bytes per particle instead of 120. Slim particles cannot move.
 
   // FoF: add a field to store component number in UnionFind (groupId)
   // postIterationFn loo

@@ -51,6 +51,22 @@ struct Params {
   bool host_cells = false;
   double universe_lo[3] = {0, 0, 0};
   double universe_side = 0.0;
+  // Halo catalog and minimum group size. With min_group_size > 1, particles
+  // in smaller groups get label -1 ("no group"). With catalog, groups()
+  // lists the groups of at least min_group_size particles.
+  long min_group_size = 1;
+  bool catalog = false;
+};
+
+// One halo, as groups() lists it. Under a period, x / lo / hi are in the
+// image of one member and may extend past the box by the group's size.
+struct Group {
+  uint64_t id;        // minimum particle id: the label its particles carry
+  uint64_t n;         // particles
+  double mass;
+  double x[3];        // centre of mass
+  double v[3];        // mass-weighted mean velocity
+  double lo[3], hi[3];  // bounding box
 };
 
 // Fires `cb` once the plug-in has finished startup (paratreet's
@@ -76,7 +92,11 @@ void run(const Params& params, const CkCallback& done);
 // Each is the minimum id in that particle's group.
 const long* labels(size_t& n);
 
-// Forget this PE's staged particles and labels.
+// After `done`, with Params::catalog: the groups this PE holds the catalog
+// row for. Every group is listed on exactly one PE.
+const Group* groups(size_t& n);
+
+// Forget this PE's staged particles, labels and catalog rows.
 void clear();
 
 // One particle's term in a label digest (FoF3's FOF3STAT label_digest):

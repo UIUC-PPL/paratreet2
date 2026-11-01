@@ -8,6 +8,9 @@ module fof {
   // (see examples/fof3/Main.ci).
   extern module paratreet;
 
+  // The halo catalog's partial record (catalogReceive).
+  include "FoFCatalog.h";
+
   // Distributed union-find for FoF step 4 (sibling UIUC-PPL/unionfind; see
   // design/step4.md). Living here — not in the core module — makes linking
   // unionfind/prefix/htram an FoF-only cost; non-FoF applications build
@@ -133,7 +136,12 @@ module fof {
     entry void depositLabelCounts(const CkCallback&);
     entry void labelDigest(const CkCallback&);
     entry void returnHostLabels(const CkCallback&);
-    entry void receiveHostLabels(const std::vector<std::pair<uint64_t, long>>&);
+    entry void catalogAccumulate(Vector3D<Real> period, const CkCallback&);
+    entry void catalogReceive(int from, const std::vector<paratreet::FoFCatPartial>& partials);
+    entry void catalogFinish(long min_size, const CkCallback&);
+    entry void catalogKept(const std::vector<long>& labels);
+    entry void releaseScratch(const CkCallback&);
+    entry void receiveHostLabels(const std::vector<paratreet::HostLabel>&);
     entry void histogramShard(int min_component_size, const CkCallback&);
     entry void collectTouchedCounts(const CkCallback&);
     // Routed replacement for collectTouchedCounts (FOF_HIST_ROUTED, default

@@ -66,6 +66,9 @@ class ExMain: public paratreet::Main<FragData> {
   WalkMode walk_mode = WalkMode::Dual;
   // Min component size for reporting (-m); 0 = report everything (default).
   int fof_min_component_size = 0;
+  // -K: build the halo catalog (groups of >= max(1, -m) particles) after
+  // the labels, and print FOF3STAT catalog (design/plugin-interface.md D).
+  bool fof_catalog = false;
   // -G <t>: occupancy threshold (expected particles per b/sqrt(6) cell at
   // a chare's root) above which phaseA solves that chare's self pair with
   // the cell grid instead of the tree walk. 0 disables the grid (the

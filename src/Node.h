@@ -28,20 +28,24 @@ public:
   void changeParticle(int index, const Particle& part) {
     particles_[index] = part;
   }
+#ifndef PARATREET_SLIM_PARTICLE
   void applyAcceleration(int index, Vector3D<Real> accel) {
     particles_[index].acceleration += accel;
   }
+#endif
   // First leapfrog half-kick over this leaf's particles (Partition::kick;
   // see Particle::kick — restored 2026-08-04 with the gravity example).
   void kick(Real timestep) {
     for (int i = 0; i < n_particles; i++) particles_[i].kick(timestep);
   }
+#ifndef PARATREET_SLIM_PARTICLE
   void applyGasWork(int index, Real work) {
     particles_[index].pressure_dVolume += work;
   }
   void applyPotential(int index, Real pot) {
     particles_[index].potential += pot;
   }
+#endif
 
 #ifdef __CHARMC__ // serialization only under Charm (same guard as Vector3D.h)
   void pup (PUP::er& p) {

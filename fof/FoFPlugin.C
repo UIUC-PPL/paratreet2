@@ -103,8 +103,18 @@ class FoFPluginMain : public paratreet::Main<FragData> {
   }
 
   void postIterationFn(BoundingBox&, ProxyPack<FragData>&, int) override {
+    // The catalog first: it decides which labels a size filter keeps.
+    if (params.catalog || params.min_group_size > 1) {
+      auto cs = paratreet::runFoFCatalog(fof, std::max(1L, params.min_group_size),
+                                         period());
+      CkPrintf("FOFPLUGIN catalog: min_size %ld groups %ld particles %ld "
+               "max_size %ld digest %016llx\n",
+               std::max(1L, params.min_group_size), cs.groups, cs.particles,
+               cs.max_size, cs.digest);
+    }
     fof.returnHostLabels(CkCallbackResumeThread());
     CkWaitQD();
+    fof.releaseScratch(CkCallbackResumeThread());
   }
 };
 
@@ -178,7 +188,16 @@ const long* labels(size_t& n) {
   return l.data();
 }
 
-void clear() { paratreet::hostLabels().clear(); }
+const Group* groups(size_t& n) {
+  auto& g = paratreet::catalogGroups();
+  n = g.size();
+  return g.data();
+}
+
+void clear() {
+  paratreet::hostLabels().clear();
+  paratreet::catalogGroups().clear();
+}
 
 }  // namespace fofplugin
 

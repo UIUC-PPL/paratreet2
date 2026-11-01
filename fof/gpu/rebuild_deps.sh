@@ -27,6 +27,9 @@ PT=${PT:-$HOME/paratreet2}
 UF=${UF:-$HOME/unionfind}
 HTRAM=${HTRAM:-$HOME/htram}
 JOBS=${JOBS:-8}
+# The FoF stack's Particle omits the gravity/SPH fields (src/Makefile.common
+# SLIM_PARTICLE). SLIM_PARTICLE=0 restores the full record.
+SLIM_PARTICLE=${SLIM_PARTICLE:-1}
 
 # Modules and the charm library path come from the one shared env file.
 # FOF3_BIN skips its binary preflight: the binary is what we are rebuilding,
@@ -47,6 +50,7 @@ export LD_LIBRARY_PATH=$CHARM/lib:$LD_LIBRARY_PATH
 
 echo "### charm  = $CHARM"
 echo "### GPU    = ${GPU:-0}"
+echo "### SLIM_PARTICLE = $SLIM_PARTICLE"
 
 # A HIP-enabled charm makes charm++.h include <hip/hip_runtime.h>, which
 # hard-#errors without a platform macro. That hits EVERY client of this
@@ -80,16 +84,16 @@ fi
 
 echo "### 4/6 paratreet src"
 make -C "$PT/src" clean >/dev/null 2>&1 || true
-make -C "$PT/src" CHARM_HOME="$CHARM" -j"$JOBS"
+make -C "$PT/src" CHARM_HOME="$CHARM" SLIM_PARTICLE="$SLIM_PARTICLE" -j"$JOBS"
 
 echo "### 5/6 fof module"
 make -C "$PT/fof" clean >/dev/null 2>&1 || true
-make -C "$PT/fof" CHARM_HOME="$CHARM" GPU="${GPU:-0}" -j"$JOBS"
+make -C "$PT/fof" CHARM_HOME="$CHARM" GPU="${GPU:-0}" SLIM_PARTICLE="$SLIM_PARTICLE" -j"$JOBS"
 
 echo "### 6/6 examples/fof3 (PROJECTIONS=${PROJECTIONS:-0})"
 make -C "$PT/examples/fof3" clean >/dev/null 2>&1 || true
 make -C "$PT/examples/fof3" CHARM_HOME="$CHARM" GPU="${GPU:-0}" \
-  PROJECTIONS="${PROJECTIONS:-0}" -j"$JOBS"
+  PROJECTIONS="${PROJECTIONS:-0}" SLIM_PARTICLE="$SLIM_PARTICLE" -j"$JOBS"
 if [ "${PROJECTIONS:-0}" = "1" ]; then
   grep -q "tracemode projections" "$PT/examples/fof3/.tracemode" \
     || { echo "ERROR: PROJECTIONS=1 requested but .tracemode says otherwise"; exit 1; }

@@ -48,6 +48,7 @@
 #include "CoreFunctions.h"
 #include "common.h"
 #include "FoFPluginAPI.h"
+#include "FoFCatalog.h"
 #include "Node.h"
 #include "Particle.h"
 #include "OrientedBox.h"
@@ -178,6 +179,11 @@ using fofplugin::labelDigestTerm;
 inline std::vector<long>& hostLabels() {
   static thread_local std::vector<long> labels;
   return labels;
+}
+// This PE's catalog rows (FoFPhase1::catalogFinish): the groups it owns.
+inline std::vector<fofplugin::Group>& catalogGroups() {
+  static thread_local std::vector<fofplugin::Group> groups;
+  return groups;
 }
 constexpr int kOriginIndexBits = 40;
 
@@ -1417,6 +1423,8 @@ public:
 
   void reset(const CkCallback& cb) {
     treepieces.clear();
+    cat_min_size_ = 0;   // a size filter applies only to the run that set it
+    cat_kept_.clear();
     uf_parent.clear();
     flat_order.clear();
     roots.clear();
@@ -3934,24 +3942,175 @@ public:
   // PE that staged it (Particle::origin). The caller waits for quiescence
   // after the contribution, which covers the sends.
   void returnHostLabels(const CkCallback& cb) {
-    std::vector<std::vector<std::pair<uint64_t, long>>> out(CkNumPes());
+    std::vector<std::vector<paratreet::HostLabel>> out(CkNumPes());
     const uint64_t mask = (uint64_t(1) << paratreet::kOriginIndexBits) - 1;
     for (auto& s : treepieces)
       for (int i = 0; i < s.n; i++) {
         const uint64_t o = s.parts[i].origin;
-        out[int(o >> paratreet::kOriginIndexBits)].emplace_back(
-            o & mask, paratreet::uf2MinOrderLabel(s.parts[i].group_number));
+        long label = paratreet::uf2MinOrderLabel(s.parts[i].group_number);
+        if (cat_min_size_ > 1 && !cat_kept_.count(label)) label = -1;
+        out[int(o >> paratreet::kOriginIndexBits)].push_back({o & mask, label});
       }
     for (int pe = 0; pe < CkNumPes(); pe++)
       if (!out[pe].empty()) this->thisProxy[pe].receiveHostLabels(out[pe]);
     this->contribute(cb);
   }
 
-  void receiveHostLabels(const std::vector<std::pair<uint64_t, long>>& v) {
+  // ---- Halo catalog and minimum group size (design/plugin-interface.md
+  // stage D). A group-by over minimum-ID labels, separate from the size
+  // census above. 1) Each PE sums its particles into one partial per label
+  // and sends it to the label's owner: a PE of its own process for an
+  // untouched label (the group is process-local), any PE for a touched one.
+  // 2) Owners merge partials, unwrapping positions by minimum image
+  // against each partial's reference member, keep the groups of at least
+  // min_size particles as catalog rows, and tell each contributing PE which
+  // of its labels were kept. returnHostLabels then reports -1 for the rest.
+  void catalogAccumulate(Vector3D<Real> period, const CkCallback& cb) {
+    cat_period_ = period;
+    cat_owner_.clear();
+    cat_kept_.clear();
+    paratreet::catalogGroups().clear();
+    std::unordered_map<long, paratreet::FoFCatPartial> acc;
+    std::unordered_map<long, bool> touched;
+    acc.reserve(roots.size());
+    touched.reserve(roots.size());
+    paratreet::FoFCatPartial* cur = nullptr;
+    long cur_label = -2;
+    for (auto& s : treepieces)
+      for (int i = 0; i < s.n; i++) {
+        const Particle& p = s.parts[i];
+        const long label = paratreet::uf2MinOrderLabel(p.group_number);
+        if (label < 0) continue;
+        if (label != cur_label) {
+          cur_label = label;
+          auto it = acc.find(label);
+          if (it == acc.end()) {
+            it = acc.emplace(label, paratreet::FoFCatPartial()).first;
+            it->second.label = label;
+            it->second.ref[0] = p.position.x;
+            it->second.ref[1] = p.position.y;
+            it->second.ref[2] = p.position.z;
+            touched[label] = p.group_number < 0;
+          }
+          cur = &it->second;
+        }
+        const double x[3] = {p.position.x, p.position.y, p.position.z};
+        const double v[3] = {p.velocity.x, p.velocity.y, p.velocity.z};
+        const double per[3] = {period.x, period.y, period.z};
+        cur->n++;
+        cur->m += p.mass;
+        for (int k = 0; k < 3; k++) {
+          double d = x[k] - cur->ref[k];
+          if (per[k] > 0) d -= per[k] * std::round(d / per[k]);
+          cur->mx[k] += p.mass * d;
+          cur->mv[k] += p.mass * v[k];
+          if (cur->n == 1 || d < cur->lo[k]) cur->lo[k] = d;
+          if (cur->n == 1 || d > cur->hi[k]) cur->hi[k] = d;
+        }
+      }
+    std::vector<std::vector<paratreet::FoFCatPartial>> out(CkNumPes());
+    const int node_first = CkNodeFirst(CkMyNode()), node_size = CkMyNodeSize();
+    for (auto& kv : acc) {
+      const uint64_t h = labelShardMix(kv.first);
+      const int owner = touched[kv.first]
+          ? int(h % (uint64_t)CkNumPes())
+          : node_first + int(h % (uint64_t)node_size);
+      out[owner].push_back(kv.second);
+    }
+    for (int pe = 0; pe < CkNumPes(); pe++)
+      if (!out[pe].empty()) this->thisProxy[pe].catalogReceive(CkMyPe(), out[pe]);
+    this->contribute(cb);
+  }
+
+  void catalogReceive(int from, const std::vector<paratreet::FoFCatPartial>& partials) {
+    const double per[3] = {cat_period_.x, cat_period_.y, cat_period_.z};
+    for (const auto& b : partials) {
+      auto it = cat_owner_.find(b.label);
+      if (it == cat_owner_.end()) {
+        cat_owner_.emplace(b.label, CatOwned{b, {from}});
+        continue;
+      }
+      paratreet::FoFCatPartial& a = it->second.sum;
+      it->second.from.push_back(from);
+      for (int k = 0; k < 3; k++) {
+        double s = b.ref[k] - a.ref[k];  // b's frame relative to a's
+        if (per[k] > 0) s -= per[k] * std::round(s / per[k]);
+        a.mx[k] += b.mx[k] + b.m * s;
+        a.mv[k] += b.mv[k];
+        a.lo[k] = std::min(a.lo[k], b.lo[k] + s);
+        a.hi[k] = std::max(a.hi[k], b.hi[k] + s);
+      }
+      a.n += b.n;
+      a.m += b.m;
+    }
+  }
+
+  // Owners: keep groups of >= min_size particles, report them back to their
+  // contributors, and reduce (groups, particles in them, largest, digest of
+  // (label, n)) to the caller.
+  void catalogFinish(long min_size, const CkCallback& cb) {
+    std::vector<std::vector<long>> kept(CkNumPes());
+    auto& rows = paratreet::catalogGroups();
+    long ng = 0, np = 0, mx = 0;
+    unsigned long long dig = 0;
+    for (auto& kv : cat_owner_) {
+      const paratreet::FoFCatPartial& a = kv.second.sum;
+      if (a.n < min_size) continue;
+      fofplugin::Group g;
+      g.id = (uint64_t)a.label;
+      g.n = (uint64_t)a.n;
+      g.mass = a.m;
+      for (int k = 0; k < 3; k++) {
+        g.x[k] = a.ref[k] + (a.m > 0 ? a.mx[k] / a.m : 0.0);
+        g.v[k] = a.m > 0 ? a.mv[k] / a.m : 0.0;
+        g.lo[k] = a.ref[k] + a.lo[k];
+        g.hi[k] = a.ref[k] + a.hi[k];
+      }
+      rows.push_back(g);
+      for (int pe : kv.second.from) kept[pe].push_back(a.label);
+      ng++;
+      np += a.n;
+      mx = std::max(mx, a.n);
+      dig += paratreet::labelDigestTerm(a.label, a.n);
+    }
+    cat_owner_.clear();
+    for (int pe = 0; pe < CkNumPes(); pe++)
+      if (!kept[pe].empty()) this->thisProxy[pe].catalogKept(kept[pe]);
+    cat_min_size_ = min_size;
+    CkReduction::tupleElement te[] = {
+        CkReduction::tupleElement(sizeof(long), &ng, CkReduction::sum_long),
+        CkReduction::tupleElement(sizeof(long), &np, CkReduction::sum_long),
+        CkReduction::tupleElement(sizeof(long), &mx, CkReduction::max_long),
+        CkReduction::tupleElement(sizeof(unsigned long long), &dig,
+                                  CkReduction::sum_ulong_long)};
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(te, 4);
+    msg->setCallback(cb);
+    this->contribute(msg);
+  }
+
+  void catalogKept(const std::vector<long>& labels) {
+    cat_kept_.insert(labels.begin(), labels.end());
+  }
+
+  // Hosted runs, after the results are back: free this PE's phase-1 and
+  // catalog scratch (reset() keeps vector capacity), so it does not stay
+  // resident through the host's own steps between FoF calls.
+  void releaseScratch(const CkCallback& cb) {
+    std::vector<int>().swap(uf_parent);
+    decltype(flat_order)().swap(flat_order);
+    decltype(roots)().swap(roots);
+    decltype(rep_label)().swap(rep_label);
+    decltype(root_counts)().swap(root_counts);
+    decltype(cat_owner_)().swap(cat_owner_);
+    decltype(cat_kept_)().swap(cat_kept_);
+    this->contribute(cb);
+  }
+
+  void receiveHostLabels(const std::vector<paratreet::HostLabel>& v) {
     auto& labels = paratreet::hostLabels();
     for (const auto& e : v) {
-      CkEnforce(e.first < labels.size());
-      labels[e.first] = e.second;
+      CkEnforce(e.index < labels.size());
+      labels[e.index] = e.label;
     }
   }
 
@@ -4832,6 +4991,14 @@ private:
   std::vector<std::pair<long, long>> touched_totals_;
   // Box period for PBC (design/pbc.md); {0,0,0} = open (default).
   Vector3D<Real> period_ = Vector3D<Real>(0, 0, 0);
+  // Halo catalog (catalogAccumulate): owned partials with their
+  // contributing PEs, this PE's kept labels, and the size filter in force
+  // for returnHostLabels (0 = none).
+  struct CatOwned { paratreet::FoFCatPartial sum; std::vector<int> from; };
+  std::unordered_map<long, CatOwned> cat_owner_;
+  std::unordered_set<long> cat_kept_;
+  long cat_min_size_ = 0;
+  Vector3D<Real> cat_period_ = Vector3D<Real>(0, 0, 0);
 };
 
 namespace fof {
@@ -5134,6 +5301,34 @@ FoFMemoryStats runFoFMemoryStats(CProxy_FoFPhase1<Data> fof) {
 // observable: for a given input the resulting line must be bit-identical
 // across process/PE configurations (and it computes the same multiset of
 // sizes as the old 240-way concat gather it replaces).
+// Halo catalog driver (design/plugin-interface.md stage D): groups of at
+// least min_size particles, each listed on one PE (catalogGroups); the
+// kept labels are known on every PE afterwards for the size filter.
+struct FoFCatalogStats {
+  long groups = 0, particles = 0, max_size = 0;
+  unsigned long long digest = 0;
+};
+template <typename Data>
+FoFCatalogStats runFoFCatalog(CProxy_FoFPhase1<Data> fof, long min_size,
+                              Vector3D<Real> period) {
+  fof.catalogAccumulate(period, CkCallbackResumeThread());
+  CkWaitQD();
+  CkReductionMsg* msg = nullptr;
+  fof.catalogFinish(min_size, CkCallbackResumeThread((void*&)msg));
+  CkReduction::tupleElement* te = nullptr;
+  int nte = 0;
+  msg->toTuple(&te, &nte);
+  FoFCatalogStats st;
+  st.groups = *(long*)te[0].data;
+  st.particles = *(long*)te[1].data;
+  st.max_size = *(long*)te[2].data;
+  st.digest = *(unsigned long long*)te[3].data;
+  delete[] te;
+  delete msg;
+  CkWaitQD();  // the kept-label replies
+  return st;
+}
+
 template <typename Data>
 FoFComponentHistogram runFoFComponentHistogram(CProxy_FoFPhase1<Data> fof,
                                                int min_component_size = 0) {

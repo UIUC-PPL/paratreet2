@@ -75,9 +75,13 @@ void loadNCFamily(const std::string& dir, Particle::Type type, int64_t start,
     for (int64_t i = 0; i < n; ++i) p[i].mass = scalars[i];
 
     if (read_vel_soft && NChilada::readOptionalField(dir + "/soft", s, n, &scalars[0])) {
+#ifndef PARATREET_SLIM_PARTICLE
       for (int64_t i = 0; i < n; ++i) p[i].soft = scalars[i];
+#endif
     } else {
+#ifndef PARATREET_SLIM_PARTICLE
       for (int64_t i = 0; i < n; ++i) p[i].soft = 0.0;
+#endif
     }
 
     for (int64_t i = 0; i < n; ++i) p[i].type = type;
@@ -234,7 +238,9 @@ void Reader::loadTipsy(const std::string& input_file, const CkCallback& cb) {
           CkAbort("Could not read gas particle\n");
         }
         particles[i].mass = gp.mass;
+#ifndef PARATREET_SLIM_PARTICLE
         particles[i].soft = gp.hsmooth;
+#endif
         particles[i].position = gp.pos;
         particles[i].velocity = gp.vel;
         //particles[i].u = gp.temp * gasConstant / gammam1 / meanMolWeight;
@@ -248,7 +254,9 @@ void Reader::loadTipsy(const std::string& input_file, const CkCallback& cb) {
         particles[i].mass = dp.mass;
         particles[i].position = dp.pos;
         particles[i].velocity = dp.vel;
+#ifndef PARATREET_SLIM_PARTICLE
         particles[i].soft = dp.eps;
+#endif
         particles[i].type = Particle::Type::eDark;
         box.n_dark++;
       }
@@ -291,7 +299,9 @@ void Reader::loadTipsy(const std::string& input_file, const CkCallback& cb) {
 void Reader::setSoft(const double dSoft, const CkCallback& cb) {
     for (std::vector<Particle>::iterator it = particles.begin();
          it != particles.end(); ++it) {
+#ifndef PARATREET_SLIM_PARTICLE
         it->soft = dSoft;
+#endif
     }
     contribute(cb);
 }

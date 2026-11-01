@@ -7,6 +7,16 @@ STRUCTURE_PATH = $(BASE_PATH)/utility/structures
 
 INCLUDES:=$(INCLUDES) -I$(STRUCTURE_PATH) -I$(PARATREET_PATH) -I.
 
+# SLIM_PARTICLE=1: Particle without the gravity/SPH fields FoF never reads
+# (72 B instead of 120; design/plugin-interface.md stage F). It changes the
+# Particle layout, so src, fof and the application must all be built with
+# the same setting (fof/gpu/rebuild_deps.sh defaults it to 1 for the FoF
+# stack; the gravity and SPH examples need 0).
+SLIM_PARTICLE ?= 0
+ifeq ($(SLIM_PARTICLE),1)
+	INCLUDES := $(INCLUDES) -DPARATREET_SLIM_PARTICLE
+endif
+
 CHARM_HOME ?= $(HOME)/charm_reconverse
 
 LD_LIBS:=$(LD_LIBS) -L$(PARATREET_PATH) -lparatreet

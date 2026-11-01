@@ -14,8 +14,12 @@
 // (-s: scrambled instead), and stages each leaf with stageCell, so FoF
 // keeps them in place.
 //
+// -m <n> drops groups smaller than n particles (their label is -1); -K
+// asks for the halo catalog and prints its summary (FOFHOST catalog),
+// comparable with FoF3's FOF3STAT catalog for the same -m.
+//
 //   fofhost -f <tipsy> [-b factor | -L length] [-P period] [-l leaf]
-//           [-k pieces per PE] [-r repeats] [-c maxlevel [-s]]
+//           [-k pieces per PE] [-r repeats] [-c maxlevel [-s]] [-m n] [-K]
 
 #include "fofhost.decl.h"
 #include "FoFPluginAPI.h"
@@ -45,7 +49,7 @@ class HostMain : public CBase_HostMain {
     std::string file;
     int pieces_per_pe = 2;
     int c;
-    while ((c = getopt(m->argc, m->argv, "f:b:L:P:l:k:r:c:s")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "f:b:L:P:l:k:r:c:sm:K")) != -1) {
       switch (c) {
         case 'f': file = optarg; break;
         case 'b': params_.b_factor = atof(optarg); break;
@@ -56,6 +60,8 @@ class HostMain : public CBase_HostMain {
         case 'r': repeats_ = atoi(optarg); break;
         case 'c': cell_level_ = atoi(optarg); break;
         case 's': scramble_ = true; break;
+        case 'm': params_.min_group_size = atol(optarg); break;
+        case 'K': params_.catalog = true; break;
         default: CkAbort("fofhost: unknown option\n");
       }
     }
@@ -170,10 +176,14 @@ class HostMain : public CBase_HostMain {
       fofplugin::run(params_, CkCallbackResumeThread());
       double t2 = CkWallTimer();
       CkReductionMsg* msg = nullptr;
-      hostPieces.digest(CkCallbackResumeThread((void*&)msg));
+      hostPieces.digest(rep, CkCallbackResumeThread((void*&)msg));
       const auto* d = (const unsigned long long*)msg->getData();
       CkPrintf("FOFHOST label_digest: n %llu digest %016llx unlabeled %llu "
                "(rep %d)\n", d[0], d[1], d[2], rep);
+      if (params_.catalog)
+        CkPrintf("FOFHOST catalog: min_size %ld groups %llu particles %llu "
+                 "digest %016llx (rep %d)\n", std::max(1L, params_.min_group_size),
+                 d[3], d[4], d[5], rep);
       CkPrintf("FOFHOST time_s: stage %.3f fof %.3f (rep %d)\n", t1 - t0,
                t2 - t1, rep);
       delete msg;
@@ -309,18 +319,31 @@ class HostPiece : public CBase_HostPiece {
     }
   }
 
-  // Count, wrapping digest sum, and particles left unlabeled.
-  void digest(const CkCallback& cb) {
+  // Count, wrapping digest sum, particles left unlabeled, and this PE's
+  // catalog rows (groups, their particles, digest of (id, n)), counted by
+  // the first piece on each PE only.
+  void digest(int rep, const CkCallback& cb) {
     size_t n = 0;
     const long* labels = fofplugin::labels(n);
-    unsigned long long v[3] = {0, 0, 0};
+    unsigned long long v[6] = {0, 0, 0, 0, 0, 0};
     for (size_t i = 0; i < parts_.size(); i++) {
       const long label = labels[first_ + i];
       v[0]++;
       v[1] += fofplugin::labelDigestTerm((long)parts_[i].id, label);
       if (label < 0) v[2]++;
     }
-    contribute(3 * sizeof(unsigned long long), v, CkReduction::sum_ulong_long, cb);
+    static thread_local int counted_rep = -1;
+    if (counted_rep != rep) {
+      counted_rep = rep;
+      size_t ng = 0;
+      const fofplugin::Group* g = fofplugin::groups(ng);
+      for (size_t i = 0; i < ng; i++) {
+        v[3]++;
+        v[4] += g[i].n;
+        v[5] += fofplugin::labelDigestTerm((long)g[i].id, (long)g[i].n);
+      }
+    }
+    contribute(6 * sizeof(unsigned long long), v, CkReduction::sum_ulong_long, cb);
   }
 
   void clearStaged(const CkCallback& cb) {

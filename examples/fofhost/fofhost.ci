@@ -24,7 +24,7 @@ mainmodule fofhost {
         entry void receiveCellParticles(const std::vector<uint32_t>& cells,
                                         const std::vector<uint64_t>& ids,
                                         const std::vector<double>& vals);
-        entry void digest(const CkCallback&);
+        entry void digest(int rep, const CkCallback&);
         entry void clearStaged(const CkCallback&);
     };
 }

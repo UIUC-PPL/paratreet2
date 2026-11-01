@@ -12,6 +12,7 @@ Particle::Particle() : key(Key(0)) {
 // here for the next iteration's traversal to accumulate afresh. The
 // internal-energy (u) lines of the original body are dropped: the u field
 // itself is commented out of Particle (SPH-only; restore both together).
+#ifndef PARATREET_SLIM_PARTICLE
 void Particle::kick(Real timestep) {
   velocity += acceleration * timestep / 2;
 }
@@ -24,6 +25,10 @@ void Particle::perturb(Real timestep) {
   density = 0;
   pressure_dVolume = 0.;
 }
+#else
+void Particle::kick(Real) { CkAbort("slim particles (PARATREET_SLIM_PARTICLE) cannot move"); }
+void Particle::perturb(Real) { CkAbort("slim particles (PARATREET_SLIM_PARTICLE) cannot move"); }
+#endif
 
 void Particle::adjustNewUniverse(OrientedBox<Real> universe) {
   for (int dim = 0; dim < 3; dim++) {
@@ -46,16 +51,22 @@ void Particle::pup(PUP::er &p) {
   p|order;
   p|partition_idx;
   p|mass;
+#ifndef PARATREET_SLIM_PARTICLE
   p|density;
   p|potential;
   //p|u;
   p|u_predicted;
   p|pressure_dVolume;
+#endif
   p|position;
+#ifndef PARATREET_SLIM_PARTICLE
   p|acceleration;
+#endif
   p|velocity;
+#ifndef PARATREET_SLIM_PARTICLE
   p|velocity_predicted;
   p|soft;
+#endif
   p|type;
   p|group_number;
   p|origin;
@@ -63,9 +74,11 @@ void Particle::pup(PUP::er &p) {
 #endif
 
 void Particle::reset() {
+#ifndef PARATREET_SLIM_PARTICLE
   pressure_dVolume = 0.0;
   density       = 0.0;
   acceleration  = Vector3D<Real> (0.0, 0.0, 0.0);
+#endif
 }
 
 bool Particle::operator==(const Particle& other) const {
