@@ -1,5 +1,53 @@
 # FoF3 2B-particle node-count scaling: CPU chain vs device phase 1 (2026-08-14)
 
+## 0. Current baseline: 2026-10-31 (recharm + charm#4119)
+
+Sections 1-6 below are the August sweep and stay as history; this is the
+baseline later work is measured against.
+
+Stack: charm `recharm` with charm#4119 (reconverse main c9d8d2e, which
+carries reconverse#313; LCI 1287c59c), paratreet2 f98db0f, no
+`+noisomalloc`. Shape: 8 processes/node, **7 PEs/process** (`+ppn 7`, no-SMT
+pemap), `+lci_ndevices 7`, `+backend_poll_thread 1`, helper-thread affinity
+fix on. That differs from the August shape (ppn 14, poll 2), so the
+before/after gap below is not the stack alone: at 8 nodes on identical
+hardware the previous recharm stack ran within 2% of this one (job 5799735).
+Script `examples/fof3/scripts/run_fof3_scale2b_gpu.sbatch` via
+`submit_scale2b.sh 128 7 1 7`; jobs 5811096-100; logs, `STACK.txt` and
+`RESULTS.md` in `/lustre/orion/csc710/scratch/rrao/scale2b-2026-10-31/`
+(scratch: purged eventually). All 50 arm-iterations exact (424897832 /
+185317566). 7.7 node-hours.
+
+Iteration 1, median of 3 reps, seconds; GPU speedup = cpu / device:
+
+| Nodes | device l128 | device l12 | cpu l12 | GPU speedup | Aug device / cpu (speedup) |
+|---:|---:|---:|---:|---:|---|
+| 8   | 4.484 | 5.863 | 9.148 | **2.04x** | 6.843 / 13.360 (1.95x) |
+| 16  | 2.400 | 3.150 | 4.913 | **2.05x** | 4.984 / 8.268 (1.66x) |
+| 32  | 1.484 | 1.883 | 2.798 | **1.89x** | 4.205 / 6.502 (1.55x) |
+| 64  | 1.104 | 1.374 | 1.801 | **1.63x** | 4.008 / 5.332 (1.33x) |
+| 128 | 1.043 | 1.161 | 1.433 | **1.37x** | 5.883 / 5.849 (0.99x) |
+
+128 nodes no longer turns over: the device arm is still (slightly) faster
+than at 64. Strong scaling 8 -> 128 nodes: device 4.3x, cpu 6.4x.
+
+Where the device arm's iteration goes (rep 2, seconds):
+
+| Nodes | phase 1 | upwardPass | loadCache | phase-3 walk | uf2 | histogram | leaf visits max/avg |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8   | 0.861 | 0.443 | 0.005 | 0.984 | 0.046 | 0.318 | 8.85 |
+| 16  | 0.477 | 0.224 | 0.010 | 0.592 | 0.037 | 0.178 | 7.64 |
+| 32  | 0.283 | 0.122 | 0.025 | 0.524 | 0.035 | 0.098 | 8.29 |
+| 64  | 0.156 | 0.075 | 0.069 | 0.520 | 0.029 | 0.052 | 8.79 |
+| 128 | 0.086 | 0.064 | 0.158 | 0.525 | 0.034 | 0.027 | 10.38 |
+
+The phase-3 walk is flat at ~0.52 s from 32 nodes up and is half the
+iteration at 128 (issue #5). The busiest PE's leaf visits keep falling
+(25,990 -> 14,349 from 32 to 128 nodes) while the walk does not, so past 32
+nodes the walk is not bound by leaf work on the worst PE. loadCache still
+anti-scales (issue #4) but is ~15% of the iteration at 128, down from 0.378
+s in September.
+
 Cosmo25 dataset (`cosmo25cmb.768g2_dm.001024`, N = 1,981,808,640
 particles), OctDecomp, `-u dist`, `-c stats`, b_factor 0.2, 8
 processes/node, 14 PEs/process, **one GPU per process** (8 MI250X GCDs
