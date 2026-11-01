@@ -698,7 +698,7 @@ inline FoFPhase3Result runFoFPhase3(CProxy_Partition<FragData> partitions,
     int n_procs = CkNumNodes();
     std::vector<std::vector<std::pair<long, long>>> slices(n_procs);
     for (auto& kv : map_vec) {
-      uint64_t owner = (uint64_t)kv.first >> paratreet::kUF2IdxBits;
+      uint64_t owner = (uint64_t)paratreet::uf2Owner((uint64_t)kv.first);
       CkEnforce(owner < (uint64_t)n_procs);
       slices[owner].push_back(kv);
     }
@@ -945,7 +945,7 @@ inline FoFPhase3Result runFoFPhase3Staged(
     int n_procs = CkNumNodes();
     std::vector<std::vector<std::pair<long, long>>> slices(n_procs);
     for (auto& kv : map_vec) {
-      uint64_t owner = (uint64_t)kv.first >> paratreet::kUF2IdxBits;
+      uint64_t owner = (uint64_t)paratreet::uf2Owner((uint64_t)kv.first);
       CkEnforce(owner < (uint64_t)n_procs);
       slices[owner].push_back(kv);
     }

@@ -690,6 +690,17 @@ using namespace paratreet;
       }
     }
 
+    // Per-particle label check: every label is the group's minimum particle
+    // ID, so this line must match across process counts, arms and input
+    // modes (compare it, not only the components line).
+    {
+      CkReductionMsg* dmsg = nullptr;
+      fof.labelDigest(CkCallbackResumeThread((void*&)dmsg));
+      const auto* d = (const unsigned long long*)dmsg->getData();
+      CkPrintf("FOF3STAT label_digest: n %llu digest %016llx\n", d[0], d[1]);
+      delete dmsg;
+    }
+
     if (!do_full) {
       // Stats mode: no particle gather, no serial reference. The component
       // count + size histogram is still exact — computed from a distributed

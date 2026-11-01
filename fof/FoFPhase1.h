@@ -122,25 +122,58 @@ namespace paratreet {
 // the prefix removal x is the component's boss TIP rather than a dense
 // serial, but the sign still carries the counter's touched-vs-untouched
 // classification (FoFPhase3.h sign-contract comment).
+//
+// FIELD ORDER (2026-11-01): the tip is the HIGH field, (tip << kUF2ProcBits)
+// | process, no longer (process << kUF2IdxBits) | tip. The union-find boss
+// is the minimum vertex id, and the serial path unions by minimum id, so
+// with the tip high every component's boss carries its minimum particle
+// order. Every final label then decodes to the group's minimum particle ID
+// (uf2MinOrderLabel), independent of decomposition and process count; with
+// the process high, a touched group's boss was the minimum by (process,
+// order). Decode only through uf2Owner / uf2Tip.
 constexpr int kUF2IdxBits = 43;
 constexpr int kUF2ProcBits = 20;
 constexpr uint64_t kUF2IdxMask = (uint64_t(1) << kUF2IdxBits) - 1;
+constexpr uint64_t kUF2ProcMask = (uint64_t(1) << kUF2ProcBits) - 1;
 static_assert(kUF2IdxBits + kUF2ProcBits <= 63,
               "encoded tips must leave the sign bit of long clear");
 
-inline uint64_t uf2EncodeTip(int process, long dense_index) {
-  return (uint64_t(uint32_t(process)) << kUF2IdxBits) | (uint64_t(dense_index) & kUF2IdxMask);
+inline uint64_t uf2EncodeTip(int process, long tip) {
+  return ((uint64_t(tip) & kUF2IdxMask) << kUF2ProcBits) |
+         (uint64_t(uint32_t(process)) & kUF2ProcMask);
+}
+// The process that owns an encoded tip, and the tip (a particle order).
+inline int uf2Owner(uint64_t vid) { return int(vid & kUF2ProcMask); }
+inline uint64_t uf2Tip(uint64_t vid) { return vid >> kUF2ProcBits; }
+
+// The group's minimum particle order, from a final label. Untouched labels
+// are the fragment's encoded tip; touched ones are -(boss + 2), the boss
+// being the component's minimum encoded tip. -1 (never labeled) stays -1.
+inline long uf2MinOrderLabel(long label) {
+  if (label == -1) return -1;
+  const uint64_t enc = label >= 0 ? uint64_t(label) : uint64_t(-(label + 2));
+  return long(uf2Tip(enc));
 }
 
 // Registered with UnionFindLib::registerGetLocationFromID. Must be a plain
 // function (not a capturing lambda): the library stores it as a raw
 // std::pair<int,int>(*)(uint64_t) function pointer.
+// One particle's term in FOF3STAT label_digest: a 64-bit mix of (order,
+// minimum-ID label). The digest is the wrapping sum of these over all
+// particles, so it does not depend on which process holds which particle.
+inline uint64_t labelDigestTerm(long order, long label) {
+  uint64_t z = uint64_t(order) * 0x9e3779b97f4a7c15ull ^ uint64_t(label);
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  return z ^ (z >> 31);
+}
+
 inline uint64_t uf2MakeVertexID(int chare, uint64_t localId) {
   return uf2EncodeTip(chare, (long)localId);
 }
 
 inline std::pair<int, uint64_t> uf2LocationFromID(uint64_t vid) {
-  return { int(vid >> kUF2IdxBits), vid & kUF2IdxMask };
+  return { uf2Owner(vid), uf2Tip(vid) };
 }
 
 // Defined in FoF.C next to the keep-alive ring: one line per process of
@@ -1227,9 +1260,9 @@ public:
       else         stage_parent[ra] = rb;
     }
     for (auto& e : stage_cross) {
-      if ((int)((uint64_t)e.first >> paratreet::kUF2IdxBits) == me)
+      if (paratreet::uf2Owner((uint64_t)e.first) == me)
         stage_tips.insert(e.first);
-      if ((int)((uint64_t)e.second >> paratreet::kUF2IdxBits) == me)
+      if (paratreet::uf2Owner((uint64_t)e.second) == me)
         stage_tips.insert(e.second);
     }
     this->contribute(cb);
@@ -1250,8 +1283,8 @@ public:
       std::lock_guard<std::mutex> g(stage_lock);
       for (auto& e : stage_cross) {
         long a = e.first, b = e.second;
-        const int oa = (int)((uint64_t)a >> paratreet::kUF2IdxBits);
-        const int ob = (int)((uint64_t)b >> paratreet::kUF2IdxBits);
+        const int oa = paratreet::uf2Owner((uint64_t)a);
+        const int ob = paratreet::uf2Owner((uint64_t)b);
         // Every staged edge has at least one endpoint owned here (the walk
         // emits against a process-local target fragment); routing assumes
         // the other endpoint is the single remote one.
@@ -1271,11 +1304,11 @@ public:
     std::lock_guard<std::mutex> g(stage_lock);
     for (auto& e : in_edges) {
       long a = e.first, b = e.second;
-      if ((int)((uint64_t)a >> paratreet::kUF2IdxBits) == me) {
+      if (paratreet::uf2Owner((uint64_t)a) == me) {
         stage_tips.insert(a);
         a = findRoot(stage_parent, a);
       }
-      if ((int)((uint64_t)b >> paratreet::kUF2IdxBits) == me) {
+      if (paratreet::uf2Owner((uint64_t)b) == me) {
         stage_tips.insert(b);
         b = findRoot(stage_parent, b);
       }
@@ -3411,7 +3444,7 @@ public:
       for (int i = 0; i < s.n; i++) {
         long enc = s.parts[i].group_number;
         CkEnforce(enc >= 0); // sign bit clear (43/20 split)
-        CkEnforce(int(uint64_t(enc) >> paratreet::kUF2IdxBits) == my_node);
+        CkEnforce(paratreet::uf2Owner(uint64_t(enc)) == my_node);
       }
     }
     this->contribute(cb);
@@ -3455,7 +3488,7 @@ public:
     // Representative-indirect: probe the node-shared touched-label map
     // once per frozen root, then materialize.
     for (int r : roots) {
-      uint64_t local_id = (uint64_t)rep_label[r] & paratreet::kUF2IdxMask;
+      uint64_t local_id = paratreet::uf2Tip((uint64_t)rep_label[r]);
       auto it = labels.find(local_id);
       if (it != labels.end()) {
         // NEGATE per the sign contract shared with the serial path and
@@ -3510,11 +3543,11 @@ public:
     // once tips are owner-encoded (-u dist); serial-mode raw tips carry
     // no owner bits to compare.
     if (tips_encoded_ &&
-        (uint64_t(ti) >> paratreet::kUF2IdxBits) ==
-        (uint64_t(tj) >> paratreet::kUF2IdxBits)) {
+        uint64_t(paratreet::uf2Owner(uint64_t(ti))) ==
+        uint64_t(paratreet::uf2Owner(uint64_t(tj)))) {
       CkAbort("FoF phase-3: same-process edge emitted (tips %ld, %ld on "
               "process %ld) — phase 1 incomplete or stale cached tips",
-              ti, tj, (long)(uint64_t(ti) >> paratreet::kUF2IdxBits));
+              ti, tj, (long)paratreet::uf2Owner(uint64_t(ti)));
     }
 #endif
     phase3_emitted++;
@@ -3631,8 +3664,8 @@ public:
     const int me = CkMyNode();
     std::vector<std::pair<long, long>> loc, cross;
     for (auto& e : edge_buf3) {
-      const int oa = (int)((uint64_t)e.first >> paratreet::kUF2IdxBits);
-      const int ob = (int)((uint64_t)e.second >> paratreet::kUF2IdxBits);
+      const int oa = paratreet::uf2Owner((uint64_t)e.first);
+      const int ob = paratreet::uf2Owner((uint64_t)e.second);
       if (oa == me && ob == me) loc.push_back(e);
       else                      cross.push_back(e);
     }
@@ -3874,6 +3907,22 @@ public:
     return h;
   }
 
+  // FOF3STAT label_digest: this PE's particle count and the wrapping sum of
+  // labelDigestTerm(order, minimum-ID label). Identical for any
+  // decomposition, process count, CPU/GPU arm or input mode, so it checks
+  // labels per particle rather than by component count.
+  void labelDigest(const CkCallback& cb) {
+    unsigned long long v[2] = {0, 0};
+    for (auto& s : treepieces)
+      for (int i = 0; i < s.n; i++) {
+        v[0]++;
+        v[1] += paratreet::labelDigestTerm(
+            s.parts[i].order, paratreet::uf2MinOrderLabel(s.parts[i].group_number));
+      }
+    this->contribute(2 * sizeof(unsigned long long), v,
+                     CkReduction::sum_ulong_long, cb);
+  }
+
   void depositLabelCounts(const CkCallback& cb) {
     int n_shards = CkNodeSize(CkMyNode());
     auto* nb = node_proxy.ckLocalBranch();
@@ -3914,7 +3963,7 @@ public:
       std::vector<std::vector<std::pair<long, long>>> tbuckets(n_shards);
       for (int r : roots) {
         long label = rep_label[r];
-        long order = (long)((uint64_t)label & paratreet::kUF2IdxMask);
+        long order = (long)(paratreet::uf2Tip((uint64_t)label));
         if (label >= 0 && dw > 0 && order >= dlo && order < dlo + dw) {
           nb->dense_hist[order - dlo].fetch_add(
               root_counts[r], std::memory_order_relaxed);
@@ -4072,8 +4121,8 @@ public:
   // bigger. The old path stays reachable as FOF_HIST_ROUTED=0.)
   //
   // Routing rule: a TOUCHED label is -(bossTip + 2) and bossTip is an
-  // encoded UF_2 vertex id, (owner << kUF2IdxBits) | local. So the process
-  // owning a component's boss is a pure bit-shift on the label -- no
+  // encoded UF_2 vertex id, (tip << kUF2ProcBits) | owner. So the process
+  // owning a component's boss is a pure bit-mask on the label -- no
   // directory, no all-to-all, the same Option-C routing routeCrossEdges
   // uses for cross edges. Every partial of one component therefore lands on
   // exactly ONE process, which can sum and bin it without talking to anyone.
@@ -4083,7 +4132,7 @@ public:
     for (auto& p : touched_totals_) {
       // histogramShard files only negatives here, so the decode is total.
       const long boss = -p.first - 2;
-      const int owner = (int)((uint64_t)boss >> paratreet::kUF2IdxBits);
+      const int owner = paratreet::uf2Owner((uint64_t)boss);
       if (owner < 0 || owner >= n_procs) {
         // Name the value: a bad owner means the label is not an encoded
         // tip, which is a sign-contract or truncation bug upstream, and a

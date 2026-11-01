@@ -131,6 +131,7 @@ module fof {
     // fof3 harness's stats mode (no full particle gather).
     entry void memoryStats(const CkCallback&);
     entry void depositLabelCounts(const CkCallback&);
+    entry void labelDigest(const CkCallback&);
     entry void histogramShard(int min_component_size, const CkCallback&);
     entry void collectTouchedCounts(const CkCallback&);
     // Routed replacement for collectTouchedCounts (FOF_HIST_ROUTED, default
