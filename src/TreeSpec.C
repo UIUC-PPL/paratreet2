@@ -12,6 +12,10 @@ void TreeSpec::receiveConfiguration(const CkCallback& cb, paratreet::Configurati
   // is our own, independently owned copy.
   paratreet::setConfiguration(std::shared_ptr<paratreet::Configuration>(
     static_cast<paratreet::Configuration*>(cfg.clone())));
+  // The tree and decomposition objects are made from the configuration on
+  // first use; a new configuration (a hosted run's per-call settings, e.g.
+  // host_cells) must not keep ones made from the previous one.
+  this->reset();
   CkAssert(this->getTree() && this->getTreePieceDecomposition() && this->getPartitionDecomposition());
   this->contribute(cb);
 }
@@ -37,7 +41,10 @@ Decomposition* TreeSpec::getPartitionDecomposition() {
 
 void TreeSpec::getDecomposition(std::unique_ptr<Decomposition>& decomp, paratreet::DecompType decomp_type, bool is_treepiece) {
   if (!decomp) {
-    if (decomp_type == paratreet::DecompType::eOct) {
+    if (decomp_type == paratreet::DecompType::eOct &&
+        paratreet::getConfiguration().host_cells) {
+      decomp.reset(new HostCellDecomposition(is_treepiece));
+    } else if (decomp_type == paratreet::DecompType::eOct) {
       decomp.reset(new OctDecomposition(is_treepiece));
     } else if (decomp_type == paratreet::DecompType::eBinaryOct) {
       decomp.reset(new BinaryOctDecomposition(is_treepiece));

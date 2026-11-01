@@ -1,5 +1,7 @@
 #include <memory>
 #include <algorithm>
+#include <map>
+#include <set>
 
 #include "common.h"
 #include "Decomposition.h"
@@ -457,6 +459,96 @@ int OctDecomposition::findSplitters(BoundingBox &universe, CProxy_Reader &reader
 
   // Return the number of TreePieces
   return splitters.size();
+}
+
+int HostCellDecomposition::findSplitters(BoundingBox &universe, CProxy_Reader &readers, int) {
+  CkReductionMsg* msg;
+  readers.reportHostCells(CkCallbackResumeThread((void*&)msg));
+  const auto* reps = (const HostCellReport*)msg->getData();
+  const int n_reps = msg->getSize() / sizeof(HostCellReport);
+
+  // A cell staged on several PEs (allowed) is one TreePiece, kept on the
+  // PE that staged most of its particles.
+  struct Cell { long n = 0; int pe = -1; long pe_n = -1; };
+  std::map<Key, Cell> cells;
+  std::map<std::pair<Key, int>, long> per_pe;
+  for (int i = 0; i < n_reps; i++) {
+    const HostCellReport& r = reps[i];
+    if (r.key < 1 || Utility::getDepthFromKey(r.key, 3) > BITS_PER_DIM)
+      CkAbort("HostCellDecomposition: bad cell key %llu\n", (unsigned long long)r.key);
+    cells[r.key].n += r.n;
+    per_pe[{r.key, r.pe}] += r.n;
+  }
+  delete msg;
+  for (const auto& kv : per_pe) {
+    Cell& c = cells[kv.first.first];
+    if (kv.second > c.pe_n) { c.pe_n = kv.second; c.pe = kv.first.second; }
+  }
+
+  // Every proper ancestor of a cell is split; no cell may be one.
+  std::set<Key> internal;
+  for (const auto& kv : cells)
+    for (Key a = kv.first >> 3; a >= 1; a >>= 3)
+      if (!internal.insert(a).second) break;
+  for (const auto& kv : cells)
+    if (internal.count(kv.first))
+      CkAbort("HostCellDecomposition: cell %llu contains another staged cell\n",
+              (unsigned long long)kv.first);
+  // Fill: the missing children of split nodes become empty cells.
+  std::set<Key> fill;
+  for (Key a : internal)
+    for (int j = 0; j < 8; j++) {
+      const Key c = a * 8 + j;
+      if (!cells.count(c) && !internal.count(c)) fill.insert(c);
+    }
+
+  // Leaves in particle-key order: (first particle key, tree key, n, pe).
+  struct Leaf { Key from; Key key; long n; int pe; };
+  std::vector<Leaf> leaves;
+  for (const auto& kv : cells)
+    leaves.push_back({Utility::removeLeadingZeros(kv.first, 3), kv.first, kv.second.n, kv.second.pe});
+  for (Key k : fill)
+    leaves.push_back({Utility::removeLeadingZeros(k, 3), k, 0, -1});
+  std::sort(leaves.begin(), leaves.end(),
+            [](const Leaf& a, const Leaf& b) { return a.from < b.from; });
+
+  splitters.clear();
+  pe_of_index.clear();
+  partition_idxs.clear();
+  long staged = 0;
+  int last_pe = -1;
+  for (const Leaf& l : leaves) if (l.pe >= 0) { last_pe = l.pe; break; }
+  for (size_t i = 0; i < leaves.size(); i++) {
+    const Leaf& l = leaves[i];
+    const int depth = Utility::getDepthFromKey(l.key, 3);
+    const Key span = Key(1) << (3 * (BITS_PER_DIM - depth));
+    const Key to = (l.from + span == 0) ? ~Key(0) : l.from + span;
+    if (i + 1 < leaves.size() && leaves[i + 1].from < to)
+      CkAbort("HostCellDecomposition: cells %llu and %llu overlap\n",
+              (unsigned long long)l.key, (unsigned long long)leaves[i + 1].key);
+    splitters.emplace_back(l.from, to, l.key, l.n);
+    if (l.pe >= 0) last_pe = l.pe;   // a fill cell joins its predecessor's PE
+    pe_of_index.push_back(last_pe);
+    partition_idxs.push_back((int)i);
+    staged += l.n;
+  }
+  if (staged != universe.n_particles)
+    CkAbort("HostCellDecomposition: cells hold %ld particles, %ld were staged\n",
+            staged, (long)universe.n_particles);
+  CkPrintf("Host cells: %zu staged, %zu fill, %zu TreePieces\n", cells.size(),
+           fill.size(), splitters.size());
+  saved_n_total_particles = universe.n_particles;
+  return splitters.size();
+}
+
+void HostCellDecomposition::setArrayOpts(CkArrayOptions& opts, const std::vector<int>& partition_locations, bool collocate) {
+  if (collocate) Decomposition::setArrayOpts(opts, partition_locations, collocate);
+  else opts.setMap(CProxy_ExplicitArrayMap::ckNew(pe_of_index));
+}
+
+void HostCellDecomposition::pup(PUP::er& p) {
+  OctDecomposition::pup(p);
+  p | pe_of_index;
 }
 
 Key BinaryDecomposition::getTpKey(int idx) {

@@ -123,7 +123,8 @@ void whenReady(const CkCallback& cb) {
   else m.waiting.push_back(cb);
 }
 
-size_t stage(const Particle* p, size_t n) {
+static size_t stageInto(const Particle* p, size_t n, int level, uint32_t ix,
+                        uint32_t iy, uint32_t iz, bool cell) {
   auto& labels = paratreet::hostLabels();
   const size_t first = labels.size();
   CkEnforce(first + n < (size_t(1) << paratreet::kOriginIndexBits));
@@ -137,9 +138,20 @@ size_t stage(const Particle* p, size_t n) {
     q.order = (long)p[i].id;
     q.origin = (uint64_t(CkMyPe()) << paratreet::kOriginIndexBits) | (first + i);
   }
-  readers.ckLocalBranch()->stage(staged.data(), n);
+  if (cell) readers.ckLocalBranch()->stageCell(staged.data(), n, level, ix, iy, iz);
+  else readers.ckLocalBranch()->stage(staged.data(), n);
   labels.resize(first + n, -1);
   return first;
+}
+
+size_t stage(const Particle* p, size_t n) {
+  return stageInto(p, n, 0, 0, 0, 0, false);
+}
+
+size_t stageCell(const Particle* p, size_t n, int level, uint32_t ix,
+                 uint32_t iy, uint32_t iz) {
+  CkEnforce(level >= 0 && level <= 21);
+  return stageInto(p, n, level, ix, iy, iz, true);
 }
 
 void run(const Params& params, const CkCallback& done) {
@@ -150,6 +162,11 @@ void run(const Params& params, const CkCallback& done) {
   // Per-call configuration (the leaf size is read through the broadcast
   // copy on every PE), then one hosted pass.
   m.conf.max_particles_per_leaf = params.leaf_size;
+  m.conf.host_cells = params.host_cells;
+  m.conf.host_universe_lo = Vector3D<Real>(params.universe_lo[0],
+                                           params.universe_lo[1],
+                                           params.universe_lo[2]);
+  m.conf.host_universe_side = params.universe_side;
   treespec.receiveConfiguration(CkCallbackResumeThread(),
                                 CkReference<paratreet::Configuration>(m.conf));
   m.driver.runHosted(done);

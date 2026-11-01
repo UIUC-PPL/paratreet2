@@ -318,6 +318,24 @@ void Reader::assignKeys(BoundingBox universe_, const CkCallback& cb) {
   contribute(cb);
 }
 
+void Reader::reportHostCells(const CkCallback& cb) {
+  // Each cell's tree key: the key of its centre, truncated to its level.
+  // The centre is half a cell from every face, so float rounding cannot
+  // move it to a neighbouring cell.
+  std::vector<HostCellReport> out;
+  const Vector3D<Real> lo = universe.box.lesser_corner;
+  const double side = universe.box.greater_corner.x - lo.x;
+  for (const HostCell& c : host_cells) {
+    const double w = side / double(uint64_t(1) << c.level);
+    const Vector3D<Real> centre(lo.x + (c.ix + 0.5) * w, lo.y + (c.iy + 0.5) * w,
+                                lo.z + (c.iz + 0.5) * w);
+    const Key full = SFC::generateKey(centre, universe.box) | (Key(1) << (KEY_BITS - 1));
+    out.push_back({full >> (3 * (BITS_PER_DIM - c.level)), c.n, CkMyPe()});
+  }
+  host_cells.clear();
+  contribute(out.size() * sizeof(HostCellReport), out.data(), CkReduction::concat, cb);
+}
+
 void Reader::countAssignments(const std::vector<GenericSplitter>& states, bool is_treepiece, const CkCallback& cb, bool weight_by_partition) {
   auto decomp = is_treepiece ? treespec.ckLocalBranch()->getTreePieceDecomposition() : treespec.ckLocalBranch()->getPartitionDecomposition();
   decomp->countAssignments(states, particles, this, cb, weight_by_partition);

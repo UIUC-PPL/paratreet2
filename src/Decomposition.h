@@ -35,6 +35,24 @@ private:
   const std::vector<int> partition_locations;
 };
 
+// Element i on PE pes[i] (HostCellDecomposition: each cell's TreePiece on
+// the PE that staged the cell).
+class ExplicitArrayMap : public CkArrayMap {
+public:
+  ExplicitArrayMap(const std::vector<int>& pes) : pes_(pes) {}
+  int procNum(int, const CkArrayIndex &idx) { return pes_[*(const int*)idx.data()]; }
+
+private:
+  const std::vector<int> pes_;
+};
+
+// One staged host cell, as Reader::reportHostCells reports it.
+struct HostCellReport {
+  Key key;   // tree key of the cell (leading-1 form)
+  long n;    // particles staged for it
+  int pe;    // the PE that staged them
+};
+
 
 struct Decomposition: public PUP::able {
   PUPable_abstract(Decomposition);
@@ -115,6 +133,27 @@ struct OctDecomposition : public SfcDecomposition {
   virtual void countAssignments(const std::vector<GenericSplitter>& states, const std::vector<Particle>& particles, Reader* reader, const CkCallback& cb, bool weight_by_partition) override;
   virtual int findSplitters(BoundingBox &universe, CProxy_Reader &readers, int min_n_splitters) override;
   virtual void setArrayOpts(CkArrayOptions& opts, const std::vector<int>& partition_locations, bool collocate) override;
+};
+
+// Stage C of design/plugin-interface.md: the host staged its particles as
+// octree cells (Reader::stageCell). Those cells become the TreePieces, each
+// on the PE that staged it; there is no splitter search, and the flush
+// sends only stragglers that float rounding put across a cell face. Empty
+// sibling cells are added so that every split node has all 8 children, as
+// the canopy requires, and the leaves then tile the universe.
+struct HostCellDecomposition : public OctDecomposition {
+  PUPable_decl(HostCellDecomposition);
+
+  HostCellDecomposition(bool is_treepiece) : OctDecomposition(is_treepiece) {}
+  HostCellDecomposition(CkMigrateMessage *m) : OctDecomposition(m) { }
+  virtual ~HostCellDecomposition() = default;
+
+  virtual int findSplitters(BoundingBox &universe, CProxy_Reader &readers, int min_n_splitters) override;
+  virtual void setArrayOpts(CkArrayOptions& opts, const std::vector<int>& partition_locations, bool collocate) override;
+  virtual void pup(PUP::er& p) override;
+
+protected:
+  std::vector<int> pe_of_index;
 };
 
 struct BinaryOctDecomposition : public OctDecomposition {

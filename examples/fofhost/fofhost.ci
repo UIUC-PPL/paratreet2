@@ -13,6 +13,17 @@ mainmodule fofhost {
     array [1D] HostPiece {
         entry HostPiece(std::string file, long n_total, int n_pieces);
         entry void stage(const CkCallback&);
+        entry void bbox(const CkCallback&);
+        entry void histogram(double lo_x, double lo_y, double lo_z, double side,
+                             int level, const CkCallback&);
+        entry void makeCells(double lo_x, double lo_y, double lo_z, double side,
+                             int level, const std::vector<int>& fine_to_leaf,
+                             const std::vector<int>& leaf_desc,
+                             const std::vector<int>& leaf_owner,
+                             const CkCallback&);
+        entry void receiveCellParticles(const std::vector<uint32_t>& cells,
+                                        const std::vector<uint64_t>& ids,
+                                        const std::vector<double>& vals);
         entry void digest(const CkCallback&);
         entry void clearStaged(const CkCallback&);
     };

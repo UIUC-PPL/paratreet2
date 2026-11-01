@@ -40,6 +40,9 @@ class Reader : public CBase_Reader {
   // and let acks pull the rest through. `particles` stays alive until the last
   // message is constructed, exactly as in the original code.
   struct FlushChunk { int dest; int offset; int count; };
+  struct HostCell { int level; uint32_t ix, iy, iz; long n; };
+  std::vector<HostCell> host_cells;
+  long flushed_remote = 0;
   std::vector<FlushChunk> flush_plan;
   size_t flush_next = 0;
   long flush_outstanding = 0;
@@ -51,6 +54,23 @@ class Reader : public CBase_Reader {
   // after the flush.
   void stage(const Particle* p, size_t n) {
     particles.insert(particles.end(), p, p + n);
+  }
+  // Stage C (host decomposition): the particles staged by this call form
+  // the octree cell (ix, iy, iz) at `level` of the host's universe cube.
+  void stageCell(const Particle* p, size_t n, int level, uint32_t ix,
+                 uint32_t iy, uint32_t iz) {
+    stage(p, n);
+    host_cells.push_back(HostCell{level, ix, iy, iz, (long)n});
+  }
+  // This PE's staged cells as (cell key, particles, PE), for
+  // HostCellDecomposition::findSplitters. Consumes the list.
+  void reportHostCells(const CkCallback& cb);
+  // Particles this Reader flushed to a TreePiece on another PE, since the
+  // last report.
+  void reportFlushRemote(const CkCallback& cb) {
+    long v = flushed_remote;
+    flushed_remote = 0;
+    contribute(sizeof(long), &v, CkReduction::sum_long, cb);
   }
 
   static long flushWindow() {
@@ -156,6 +176,8 @@ void Reader::flush(int n_treepieces,
   if (window <= 0) {
     // Legacy path: post everything in one unbounded burst, no acks.
     auto sendParticles = [&](int dest, int n_particles, Particle* parts) {
+      if (treepieces.ckLocMgr()->homePe(CkArrayIndex1D(dest)) != CkMyPe())
+        flushed_remote += n_particles;
       ParticleMsg* msg = new (n_particles) ParticleMsg(parts, n_particles);
       treepieces[dest].receive(msg);
     };
@@ -186,6 +208,8 @@ void Reader::flush(int n_treepieces,
   Particle* const base = particles.data();
   const size_t base_n = particles.size();
   auto planParticles = [&](int dest, int n_particles, Particle* parts) {
+    if (treepieces.ckLocMgr()->homePe(CkArrayIndex1D(dest)) != CkMyPe())
+      flushed_remote += n_particles;
     if (parts >= base && parts + n_particles <= base + base_n) {
       flush_plan.push_back(FlushChunk{dest, (int)(parts - base), n_particles});
     } else {

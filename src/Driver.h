@@ -89,7 +89,22 @@ public:
     delete result;
     if (universe.n_particles == 0)
       CkAbort("paratreet hosted run: no particles were staged\n");
-    remakeUniverse();
+    auto& config = paratreet::getConfiguration();
+    if (config.host_cells) {
+      // The host's cells are cells of ITS cube: use it exactly, no slop.
+      const Vector3D<Real> lo = config.host_universe_lo;
+      const Vector3D<Real> hi = lo + Vector3D<Real>(config.host_universe_side);
+      const auto& b = universe.box;
+      if (config.host_universe_side <= 0 ||
+          b.lesser_corner.x < lo.x || b.lesser_corner.y < lo.y || b.lesser_corner.z < lo.z ||
+          b.greater_corner.x >= hi.x || b.greater_corner.y >= hi.y || b.greater_corner.z >= hi.z)
+        CkAbort("paratreet hosted run: staged particles are not inside the host's "
+                "universe cube\n");
+      universe.box = OrientedBox<Real>(lo, hi);
+      thread_state_holder.setUniverse(universe);
+    } else {
+      remakeUniverse();
+    }
     readers.assignKeys(universe, CkCallbackResumeThread());
     CkPrintf("Staged particles: universe and keys: %.3lf ms\n",
              (CkWallTimer() - t) * 1000);
@@ -233,6 +248,13 @@ public:
       CkStartQD(CkCallbackResumeThread());
       CkPrintf("Flushing particles to TreePieces: %.3lf ms\n",
           (CkWallTimer() - start_time) * 1000);
+      if (config.hosted) {
+        CkReductionMsg* r;
+        readers.reportFlushRemote(CkCallbackResumeThread((void*&)r));
+        CkPrintf("Hosted flush: %ld of %ld particles sent to another PE\n",
+                 *(long*)r->getData(), (long)universe.n_particles);
+        delete r;
+      }
       // Peak RSS of THIS process (PE 0's) since start. The flush is the largest
       // memory event in decomposition, so this is the number the flush window is
       // meant to hold down; compare across PARATREET_FLUSH_WINDOW settings.

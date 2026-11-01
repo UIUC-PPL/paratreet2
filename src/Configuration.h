@@ -173,6 +173,14 @@ namespace paratreet {
         // by the host through Driver::runHosted on particles staged in the
         // Readers. Set by the hosting app main's setDefaults().
         bool hosted = false;
+        // Hosted, host decomposition (design/plugin-interface.md stage C):
+        // the host staged its particles as octree cells of this universe
+        // cube (Reader::stageCell). The TreePieces are those cells, kept on
+        // the PE that staged them, so decomposition moves no particles
+        // except stragglers rounding put across a cell face.
+        bool host_cells = false;
+        Vector3D<Real> host_universe_lo;
+        Real host_universe_side = 0;
 
         // we support loading config files with "-x"
         Configuration(const char* config_arg = "-x")
@@ -242,6 +250,9 @@ namespace paratreet {
             p | read_velocity_and_soft;
             p | single_distribution;
             p | hosted;
+            p | host_cells;
+            p | host_universe_lo;
+            p | host_universe_side;
         }
     };
 

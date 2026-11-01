@@ -6,6 +6,11 @@ d5262332457c155e on lambb, device and CPU arms, over two consecutive
 calls, no unlabeled particles). A hosted call at 2 nodes takes 2.1 s, of
 which 1.38 s is decomposition (universe 0.14, splitter search 0.42, flush
 0.81): stage C removes the splitter search and the flush.
+Stage C done (gate job 5822288): at FoF3's exact linking length, the host's
+own adaptive octree (3851 cells, count-balanced or scrambled placement)
+reproduces the digest; the flush sends 299 (balanced) / 641 (scrambled) of
+80.6M particles to another PE; decomposition 0.66 s instead of 1.29 s, call
+2.03 s instead of 2.17 s. The rest of that flush is local message copies.
 
 Plan written 2026-11-01. This is Track A of the journal plan: FoF3 runs
 inside a host simulation (first host: ChaNGa) on the particles in its

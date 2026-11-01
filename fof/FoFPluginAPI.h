@@ -44,6 +44,13 @@ struct Params {
   int leaf_size = 128;
   // UF_2 edge batches streamed during the walk (FoF3's -E).
   long stream_batch = 16;
+  // Host decomposition: the particles were staged with stageCell, as
+  // octree cells of the cube [universe_lo, universe_lo + universe_side)^3,
+  // and FoF keeps each cell on the PE that staged it instead of
+  // redistributing particles. Every particle must lie strictly inside.
+  bool host_cells = false;
+  double universe_lo[3] = {0, 0, 0};
+  double universe_side = 0.0;
 };
 
 // Fires `cb` once the plug-in has finished startup (paratreet's
@@ -53,6 +60,14 @@ void whenReady(const CkCallback& cb);
 // Copy n particles into the calling PE's staging area. Returns the staging
 // index of the first: labels() reports them at the same indices.
 size_t stage(const Particle* p, size_t n);
+
+// As stage(), for host decomposition (Params::host_cells): the n particles
+// form the octree cell (ix, iy, iz) at `level` (0 = the whole cube, side
+// universe_side / 2^level). Cells may come in any number of calls and at
+// mixed levels, but must not overlap; a cell staged on several PEs stays
+// where most of its particles are. Missing regions become empty cells.
+size_t stageCell(const Particle* p, size_t n, int level, uint32_t ix,
+                 uint32_t iy, uint32_t iz);
 
 // Run FoF over everything staged on all PEs. PE 0, threaded context.
 void run(const Params& params, const CkCallback& done);

@@ -16,6 +16,7 @@ module paratreet {
   PUPable BinaryOctDecomposition;
   PUPable KdDecomposition;
   PUPable LongestDimDecomposition;
+  PUPable HostCellDecomposition;
 
   readonly CProxy_Reader readers;
   readonly CProxy_TreeSpec treespec;
@@ -178,6 +179,8 @@ module paratreet {
     entry void load(std::string, const CkCallback&);
     entry void setSoft(const double dSoft, const CkCallback&);
     entry void computeUniverseBoundingBox(const CkCallback&);
+    entry void reportHostCells(const CkCallback&);
+    entry void reportFlushRemote(const CkCallback&);
     entry void assignKeys(BoundingBox, const CkCallback&);
     template <typename Data>
     entry void request(CProxy_TreePiece<Data>, int, int);
@@ -225,6 +228,10 @@ module paratreet {
 
   group CollocateMap : CkArrayMap {
     entry CollocateMap(CkPointer<Decomposition>, const std::vector<int>&);
+  };
+
+  group ExplicitArrayMap : CkArrayMap {
+    entry ExplicitArrayMap(const std::vector<int>&);
   };
 
   mainchare MainChare {
