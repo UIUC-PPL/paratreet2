@@ -2424,6 +2424,7 @@ public:
       // flight on the HAPI stream; this PE goes back to its scheduler and
       // hapiPollEvents — already installed on every PE by hapiInit, so it
       // costs nothing extra — fires deviceComplete when the stream drains.
+      nb->device.setPeriod((float)period_.x, (float)period_.y, (float)period_.z);
       nb->device.enqueuePhase1((float)b2_, (float)gth);
       hapiAddCallback((hapiStream_t)nb->dev_stream,
                       CkCallback(CkIndex_FoFPhase1<Data>::deviceComplete(),
@@ -2442,6 +2443,7 @@ public:
     // Fenced form: every sub-kernel wall is real. deviceComplete then just
     // collects them (completePhase1 is idempotent once the pass has
     // already been waited on).
+    nb->device.setPeriod((float)period_.x, (float)period_.y, (float)period_.z);
     nb->device.runPhase1((float)b2_, (float)gth, nullptr);
     deviceComplete();
   }
@@ -4435,8 +4437,9 @@ private:
     const int64_t ny = (int64_t)(exy / c) + 1;
     const int64_t nz = (int64_t)(exz / c) + 1;
     if (nx > (1 << 20) || ny > (1 << 20) || nz > (1 << 20)) return false;
-    if (period_.x > 0 && (exx > period_.x / 2 || exy > period_.y / 2 ||
-                          exz > period_.z / 2))
+    if ((period_.x > 0 && exx > period_.x / 2) ||
+        (period_.y > 0 && exy > period_.y / 2) ||
+        (period_.z > 0 && exz > period_.z / 2))
       return false; // minimum-image identity with plain distance broken
 
     auto cellKey = [&](int64_t ix, int64_t iy, int64_t iz) -> uint64_t {
@@ -4985,17 +4988,10 @@ void runFoFPhase1(CProxy_TreePiece<Data> treepieces,
     CkAbort("FoF: FOF_GPU_PHASE1/FOF_GPU_VERIFY was set but this binary was "
             "built without FOF_GPU. Rebuild with GPU=1 (fof/gpu/rebuild_deps.sh).");
 #endif
-  // The device traversal has no periodic wrap (design/pbc.md is a CPU-only
-  // path so far, and section 8 lists PBC as explicitly deferred). Under
-  // Verify that shows up as mismatches on the boundary particles; under
-  // Replace it would be a quietly wrong answer at the box faces, which is
-  // exactly the kind of result that looks plausible.
-  if (gpu_mode == FoFGpuMode::Replace &&
-      (period.x != 0 || period.y != 0 || period.z != 0))
-    CkAbort("FoF GPU: FOF_GPU_PHASE1 does not implement periodic boundaries "
-            "(period %g %g %g). Run without -P, or use FOF_GPU_VERIFY to "
-            "measure the device pass beside the CPU answer.",
-            (double)period.x, (double)period.y, (double)period.z);
+  // The device traversal honours the period since 2026-11-01 (minimum-image
+  // leaf distances, periodic box prune, no max-distance certificate, and no
+  // grid in a node wider than half the period; fof/gpu/FoFDevice.cpp
+  // Period). Gate: FOF_GPU_VERIFY with -P (design/plugin-interface.md E).
 
   // The CPU chain: one broadcast starts the within-process chain; the
   // single global reduction at its end delivers the max-reduced stage

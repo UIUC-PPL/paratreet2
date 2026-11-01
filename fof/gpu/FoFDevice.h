@@ -194,6 +194,12 @@ class Device {
   // leaves the traversal to solve dense nodes by descent.
   void runPhase1(float b2, float grid_thresh, WalkStats* out);
 
+  // Periodic box sides for the next pass, per axis (0 = open). The CPU's
+  // FoFPhase1::period_; set before runPhase1 / enqueuePhase1.
+  void setPeriod(float px, float py, float pz) {
+    period_[0] = px; period_[1] = py; period_[2] = pz;
+  }
+
   // Stage 4: the same pass, split so no scheduler thread waits on the GPU.
   //
   // enqueuePhase1() runs the prepare (which CANNOT be asynchronous — the
@@ -232,6 +238,7 @@ class Device {
   // whether the trailing fences are taken.
   void runPhase1Impl(float b2, float grid_thresh, bool async);
 
+  float period_[3] = {0.f, 0.f, 0.f};
   struct Impl;
   Impl* p_;
 };

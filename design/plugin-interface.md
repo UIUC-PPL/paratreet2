@@ -11,6 +11,11 @@ own adaptive octree (3851 cells, count-balanced or scrambled placement)
 reproduces the digest; the flush sends 299 (balanced) / 641 (scrambled) of
 80.6M particles to another PE; decomposition 0.66 s instead of 1.29 s, call
 2.03 s instead of 2.17 s. The rest of that flush is local message copies.
+Stage E done (gate jobs 5822288, 5822332): periodic lambb (-P 1) gives one
+label_digest on CPU, device Replace and FOF_GPU_VERIFY (e88625a3f5164c05,
+23,699,565 components); periodic 100k-uniform b 0.8 passes -c full on all
+arms and matches the pre-change binary (24,151 components; the 98,264 that
+phase1-scaling.md quotes was a different, unrecorded configuration).
 
 Plan written 2026-11-01. This is Track A of the journal plan: FoF3 runs
 inside a host simulation (first host: ChaNGa) on the particles in its

@@ -143,6 +143,39 @@ KOKKOS_INLINE_FUNCTION float boxMinDist2(const float* alo, const float* ahi,
   return d2;
 }
 
+// Periodic boundaries (design/plugin-interface.md stage E): the period per
+// axis, 0 = open. Transliterated from the CPU's 3-argument mindist2 and
+// periodicDistSq (fof/FoFPhase1.h), same operation order.
+struct Period {
+  float p[3];
+  KOKKOS_INLINE_FUNCTION bool on() const { return p[0] > 0.f || p[1] > 0.f || p[2] > 0.f; }
+};
+
+KOKKOS_INLINE_FUNCTION float boxMinDist2P(const float* alo, const float* ahi,
+                                          const float* blo, const float* bhi,
+                                          const Period& P) {
+  float d2 = 0.f;
+  for (int k = 0; k < 3; k++) {
+    const float p = P.p[k];
+    const float g0 = fmaxf(alo[k] - bhi[k], blo[k] - ahi[k]);
+    float g;
+    if (p <= 0.f) {
+      g = g0 > 0.f ? g0 : 0.f;
+    } else {
+      const float gp = fmaxf(alo[k] - (bhi[k] + p), (blo[k] + p) - ahi[k]);
+      const float gm = fmaxf(alo[k] - (bhi[k] - p), (blo[k] - p) - ahi[k]);
+      g = (g0 <= 0.f || gp <= 0.f || gm <= 0.f) ? 0.f : fminf(g0, fminf(gp, gm));
+    }
+    d2 += g * g;
+  }
+  return d2;
+}
+
+// Minimum image of one coordinate difference.
+KOKKOS_INLINE_FUNCTION float wrapDelta(float d, float p) {
+  return p > 0.f ? d - p * roundf(d / p) : d;
+}
+
 KOKKOS_INLINE_FUNCTION float boxMaxDist2(const float* alo, const float* ahi,
                                          const float* blo, const float* bhi) {
   float d2 = 0.f;
@@ -366,6 +399,7 @@ KOKKOS_INLINE_FUNCTION void starUnionT(
 template <typename Team>
 KOKKOS_INLINE_FUNCTION void walkOneLeaf(
     const Team& tm, int li, int* stack, int* sp, int kStack, float b2,
+    const Period P,
     const Kokkos::View<DDNode*, MemSpace>& d_nodes,
     const Kokkos::View<DTopNode*, MemSpace>& d_top,
     const Kokkos::View<int*, MemSpace>& d_piece_root,
@@ -402,7 +436,8 @@ KOKKOS_INLINE_FUNCTION void walkOneLeaf(
 
     if (e < 0) {  // top tree
       const DTopNode t = d_top(-e - 1);
-      if (boxMinDist2(L.lo, L.hi, t.lo, t.hi) <= b2) {
+      if ((P.on() ? boxMinDist2P(L.lo, L.hi, t.lo, t.hi, P)
+                  : boxMinDist2(L.lo, L.hi, t.lo, t.hi)) <= b2) {
         tm.one([&]() {
           if (t.piece >= 0) {
             if (sp[0] < kStack) stack[sp[0]++] = d_piece_root(t.piece);
@@ -428,7 +463,8 @@ KOKKOS_INLINE_FUNCTION void walkOneLeaf(
     }
 
     const DDNode M = d_nodes(e);
-    if (boxMinDist2(L.lo, L.hi, M.lo, M.hi) > b2) {
+    if ((P.on() ? boxMinDist2P(L.lo, L.hi, M.lo, M.hi, P)
+                : boxMinDist2(L.lo, L.hi, M.lo, M.hi)) > b2) {
       tm.barrier();
       continue;
     }
@@ -517,7 +553,9 @@ KOKKOS_INLINE_FUNCTION void walkOneLeaf(
     // with a CAS, not merely checked: thousands of teams can reach a hot
     // node at once, and without the claim they all run the same
     // O(n_below) star-union.
-    if (boxMaxDist2(L.lo, L.hi, M.lo, M.hi) <= b2) {
+    // Not under a period: the plain farthest-pair bound is not a bound on
+    // minimum-image distances (the CPU skips its certificate there too).
+    if (!P.on() && boxMaxDist2(L.lo, L.hi, M.lo, M.hi) <= b2) {
       starUnionT(tm, d_nodes, d_parent, d_order, d_node_rep, li);
       if (e != li) {
         starUnionT(tm, d_nodes, d_parent, d_order, d_node_rep, e);
@@ -556,9 +594,9 @@ KOKKOS_INLINE_FUNCTION void walkOneLeaf(
           if (self && j <= i) return;  // unordered pairs once
           const int q = ab + i;
           const int p = (self ? ab : bb) + j;
-          const float dx = d_pos(3 * q) - d_pos(3 * p);
-          const float dy = d_pos(3 * q + 1) - d_pos(3 * p + 1);
-          const float dz = d_pos(3 * q + 2) - d_pos(3 * p + 2);
+          const float dx = wrapDelta(d_pos(3 * q) - d_pos(3 * p), P.p[0]);
+          const float dy = wrapDelta(d_pos(3 * q + 1) - d_pos(3 * p + 1), P.p[1]);
+          const float dz = wrapDelta(d_pos(3 * q + 2) - d_pos(3 * p + 2), P.p[2]);
           if (dx * dx + dy * dy + dz * dz <= b2)
             ufUnite(d_parent, d_order, q, p);
         });
@@ -1192,6 +1230,7 @@ void Device::runPhase1Impl(float b2, float grid_thresh, bool async) {
   // See the block above: ROCm spawns its helpers from here, and they
   // inherit this PE's mask (one core under +pemap) unless we widen it first.
   FOF_HELPER_AFFINITY_SCOPE;
+  const Period P = {{period_[0], period_[1], period_[2]}};
   p_->pending = WalkStats();
   p_->in_flight = false;
   WalkStats& st = p_->pending;
@@ -1360,6 +1399,12 @@ void Device::runPhase1Impl(float b2, float grid_thresh, bool async) {
           if (!(vol > 0.0)) return;
           const double cc = (double)cell;
           if ((double)d.n_below * cc * cc * cc / vol < (double)thresh) return;
+          // Under a period, a node wider than half of it on some axis
+          // breaks "minimum image = plain distance" inside the node, which
+          // the grid's face-adjacent unions and residual test rely on. The
+          // walk handles those (the CPU's grid has the same guard).
+          for (int k = 0; k < 3; k++)
+            if (P.p[k] > 0.f && d.hi[k] - d.lo[k] > 0.5f * P.p[k]) return;
           int dim[3];
           gridDims(d, cell, dim);
           const long cells = (long)dim[0] * dim[1] * dim[2];
@@ -1663,7 +1708,7 @@ void Device::runPhase1Impl(float b2, float grid_thresh, bool async) {
         KOKKOS_LAMBDA(const long k) {
           int stack[128];
           int sp[2];
-          walkOneLeaf(Solo(), d_leaves_k(k), stack, sp, kStack, b2, d_nodes,
+          walkOneLeaf(Solo(), d_leaves_k(k), stack, sp, kStack, b2, P, d_nodes,
                       d_top_k, d_piece_root_k, d_parent, d_order, d_node_rep,
                       d_grid_root_k, d_pos, counters);
         });
@@ -1683,7 +1728,7 @@ void Device::runPhase1Impl(float b2, float grid_thresh, bool async) {
           int* stack = (int*)team.team_shmem().get_shmem(kStack * sizeof(int));
           int* sp = (int*)team.team_shmem().get_shmem(2 * sizeof(int));
           walkOneLeaf(Wave<member_t>{team}, d_leaves_k(team.league_rank()),
-                      stack, sp, kStack, b2, d_nodes, d_top_k, d_piece_root_k,
+                      stack, sp, kStack, b2, P, d_nodes, d_top_k, d_piece_root_k,
                       d_parent, d_order, d_node_rep, d_grid_root_k, d_pos,
                       counters);
         });

@@ -219,8 +219,9 @@ the build only makes the arm available, it does not turn it on:
 
 `FOF_GPU_PHASE1` set in a binary built without `GPU=1` aborts rather than
 falling back to the CPU — a silent fallback turns "the GPU path regressed"
-into "the GPU path was never on". Replace mode does not implement periodic
-boundaries (`-P`); use verify mode there. Tuning knobs, all off/zero by
+into "the GPU path was never on". Both modes honour periodic boundaries
+(`-P`) since 2026-11-01: on periodic lambb and 100k-uniform the device and
+CPU labels match per particle (design/plugin-interface.md, stage E). Tuning knobs, all off/zero by
 default: `FOF_GPU_ASYNC=1` (non-blocking launch), `FOF_GPU_RELEASE=1` (free
 the pinned staging each iteration), `FOF_GPU_GRID=<occupancy>` (the dense-node
 cell grid), `PARATREET_DEVICE_TREE_VERIFY=1` (check the flat tree against the
@@ -432,10 +433,10 @@ Specifically:
    counts are ~1000x smaller than N); it is a scaffold that step 4 replaces
    with a distributed UF_2. Expect the `uf2`/`edge_gather` times to grow with
    process count — that is the placeholder, not a defect.
-2. **No periodic boundaries.** The walk and both serial references treat the
-   box as open. Use the synthetic generators above for exact comparisons; a
-   cosmological snapshot will produce answers that differ from any
-   PBC-respecting FoF at the box faces.
+2. **Periodic boundaries need `-P`.** Without it the box is open, and a
+   cosmological snapshot differs from a periodic FoF at the box faces. With
+   `-P <L>` every phase, both arms and the full-check references use the
+   minimum image (cubic box, b < L/2).
 3. **Full-verification auto-gate at 20M.** `-c auto` (the default) skips full
    verification above N = 20,000,000 because it gathers ~24 bytes/particle to
    PE 0 and runs the serial grid reference there (plus reference working
