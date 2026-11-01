@@ -3372,15 +3372,17 @@ public:
 
   // Submit this PE's buffered phase-3 edges (already encoded-tip pairs --
   // the walk emitted them post-encoding) as one batched union_requests
-  // message to this process's UnionFindLib element; the library internally
-  // routes each edge to its actual owner (see union_request/boss_send), so
-  // any element works as the entry point. No-op (no message) if empty.
+  // message to this process's UnionFindLib element, or with UF_SPREAD=1 to
+  // its UFInbox, where any free PE of the process runs it; the library
+  // internally routes each edge to its actual owner (see
+  // union_request/boss_send), so any element works as the entry point.
+  // No-op (no message) if empty.
   void fireUF2Edges(CProxy_UnionFindLib uf_proxy, const CkCallback& cb) {
     if (!edge_buf3.empty()) {
       std::vector<UFEdge> edges;
       edges.reserve(edge_buf3.size());
       for (auto& e : edge_buf3) edges.push_back(UFEdge{(uint64_t)e.first, (uint64_t)e.second});
-      uf_proxy[CkMyNode()].union_requests(edges);
+      UnionFindLib::submitUnionRequests(uf_proxy, CkMyNode(), edges);
     }
     this->contribute(cb);
   }
@@ -3533,7 +3535,7 @@ public:
     edges.reserve(edge_buf3.size());
     for (auto& e : edge_buf3)
       edges.push_back(UFEdge{(uint64_t)e.first, (uint64_t)e.second});
-    uf2_stream_proxy[CkMyNode()].union_requests(edges);
+    UnionFindLib::submitUnionRequests(uf2_stream_proxy, CkMyNode(), edges);
     p3_edges_streamed += (long)edge_buf3.size();
     edge_buf3.clear();
   }

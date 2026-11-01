@@ -321,3 +321,50 @@ NEXT, two levers, smallest first:
      the process is idle. Bigger change; it could also shorten qd_tail if
      that tail is the same hot hosts draining serially.
 Keep `weighted` as an opt-in arm until one of these lands.
+
+LEVER (b) BUILT: UF_SPREAD (unionfind f599657, job 5820918, 64 nodes).
+Placement, not the runtime, caused the rank-0 load. UnionFindLib is a chare
+array whose map pins element i to CkNodeFirst(i), so its entries can only
+run there. Nodegroup messages, by contrast, run on whichever PE of the
+process takes them: classic Converse checks the node queue after a PE's own
+queues, and reconverse (issue #268) takes node work ahead of local work. So
+the union phase now goes through a per-process nodegroup, UFInbox:
+- entries queue their work, and the PE that wins a drain flag runs it
+  against the element, so the library stays single-threaded;
+- union-phase sends go to the destination process's inbox;
+- labeling stays on the element, after QD.
+[exclusive] was rejected: a busy lock re-enqueues the message, and on
+reconverse every PE would cycle through the retries ahead of its own walk
+work. UF_SPREAD=1 at run time, default off. Gate: 2 nodes, job 5820904, all
+exact, including UF_SPREAD_BUDGET_US=0, which hands off after every batch.
+
+64 nodes, -E 16, same binary; each sample is one iteration (parity
+samples include every arm's iteration 0):
+
+   arm                     samples  phase3_walk           qd_tail  rank 0 sets end
+   parity, spread off         4     0.516-0.698 (mean 0.609)  0.001-0.090  3 of 4
+   parity, spread on          6     0.428-0.461 (mean 0.440)  0.001        0 of 6
+   weighted, spread on        2     0.289, 0.338              0.001        tie / no
+   weighted, spread off (5819956) 2 0.487, 0.488              0.112        2 of 2
+
+   rank-0 other_busy max: 0.32-0.52 s off, 0.13-0.18 s on (rest 0.15-0.19 on)
+   iteration 1: parity off 1107/1149 ms, parity on 1015/1022, weighted on 859/919
+
+9. SPREAD REMOVES THE RANK-0 CAP. Under parity, rank-0 PEs now finish
+   0.09-0.14 s before the rest, and their non-walk time matches the rest's. Spread alone is
+   1.38x on phase3_walk (0.609 -> 0.440 mean) and removes the outliers
+   (range 0.033 vs 0.18).
+10. THE POST-WALK UNION TAIL IS GONE. qd_tail is 0.001 in all 8 spread
+    samples, against up to 0.18 s before: the cascades finish while the
+    walk runs instead of queueing behind it on a few hot PEs. The overlap
+    -E 16 was built for now works.
+11. WEIGHTED NOW REACHES THE PHASE. Weighted + spread gives phase3_walk
+    0.289 / 0.338 s, close to the -E 0 walk-alone figure (0.28-0.30). The
+    streamed unions now cost almost nothing on top of the walk. That is
+    1.55x over weighted without spread (0.4875 mean) and 1.94x over parity
+    without spread (0.609). Iteration 1: 1.27x (1127.5 -> 889 ms mean).
+    The ~0.55-0.6 s "phase-3 floor" of point 3 was the rank-0 placement,
+    not the cascade itself.
+
+NEXT: confirm at 32 and 128 nodes (weighted did nothing at 32 with -E 0),
+then make UF_SPREAD=1 + FOF_WALK_TIEBREAK=weighted the FoF3 defaults.

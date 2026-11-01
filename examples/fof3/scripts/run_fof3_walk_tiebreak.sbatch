@@ -13,6 +13,9 @@
 # MODE=rank0: -E 16 parity / weighted and an -E 0 parity control, for the
 # `FOF3STAT walk_rank0` split (rank 0 hosts each process's UnionFindLib
 # chare: does union handling there set the walk's end?).
+# MODE=spread: UF_SPREAD=1 (union phase through unionfind's per-process
+# UFInbox nodegroup, so any free PE runs it) for -E 16 parity / weighted, and
+# a UF_SPREAD=0 parity control; the warmup arm is UF_SPREAD=0 too.
 #
 #   sbatch --nodes=N --export=ALL,OUTDIR=<dir>,FOF3_BIN=<frozen binary>[,MODE=...] \
 #     run_fof3_walk_tiebreak.sbatch
@@ -85,6 +88,13 @@ if [ "$MODE" = rank0 ]; then
   done
   REP=1
   arm device_E0_parity      128 "-E 0" $DEV FOF_WALK_TIEBREAK=parity
+elif [ "$MODE" = spread ]; then
+  for REP in $(seq 1 $REPS); do
+    arm device_E16_parity_s1   128 "" $DEV FOF_WALK_TIEBREAK=parity UF_SPREAD=1
+    arm device_E16_weighted_s1 128 "" $DEV FOF_WALK_TIEBREAK=weighted UF_SPREAD=1
+  done
+  REP=1
+  arm device_E16_parity_s0     128 "" $DEV FOF_WALK_TIEBREAK=parity UF_SPREAD=0
 elif [ "$MODE" = stream ]; then
   for REP in $(seq 1 $REPS); do
     arm device_E16_parity  128 ""     $DEV FOF_WALK_TIEBREAK=parity
