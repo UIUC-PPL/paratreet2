@@ -366,5 +366,10 @@ samples include every arm's iteration 0):
     The ~0.55-0.6 s "phase-3 floor" of point 3 was the rank-0 placement,
     not the cascade itself.
 
-NEXT: confirm at 32 and 128 nodes (weighted did nothing at 32 with -E 0),
-then make UF_SPREAD=1 + FOF_WALK_TIEBREAK=weighted the FoF3 defaults.
+DEFAULTS (2026-11-01, the user's call on the 64-node result alone):
+FoF3 now runs weighted + spread unless told otherwise.
+FOF_WALK_TIEBREAK unset = weighted. FoF3 passes spread = true to
+unionFindInitOnePerNodeLazy, while the library default stays off for its
+other clients. UF_SPREAD=0 / FOF_WALK_TIEBREAK=parity restore the old
+behaviour. Not yet confirmed at 32 nodes (where weighted alone did nothing
+with -E 0) or at 128.

@@ -208,15 +208,21 @@ inline bool peSetKeepLocalPair(int src_piece, int tgt_piece) {
 // The symmetry prune in DualTraverser keeps each cross-piece pair on exactly
 // one of its two owners. Which one is a policy:
 //
-//   FOF_WALK_TIEBREAK=parity    (default) parity of the piece-index sum: even
-//                               -> lower index keeps, odd -> higher. Balanced
-//                               in pair COUNT, blind to load.
+//   FOF_WALK_TIEBREAK=parity    parity of the piece-index sum: even -> lower
+//                               index keeps, odd -> higher. Balanced in pair
+//                               COUNT, blind to load. The default until
+//                               2026-11-01.
 //                     hash      coin over the piece pair with equal weights:
 //                               the control that separates "weighted" from
 //                               merely "randomised" (brief: 4.97x vs 5.22x).
-//                     weighted  coin with per-PE weights w = 1 + that PE's leaf
-//                               interactions in the previous (parity) walk;
-//                               parity until the table is set (brief: 3.57x).
+//                     weighted  (default) coin with per-PE weights w = 1 +
+//                               that PE's leaf interactions in the previous
+//                               (parity) walk; parity until the table is set
+//                               (brief: 3.57x). Only FoF3's dist driver builds
+//                               the table, so other traversals stay on parity.
+//                               With UF_SPREAD on (FoF3's default) it is 1.94x
+//                               on phase3_walk over parity without spread at 2B on
+//                               64 nodes (job 5820918).
 //
 // The coin hashes over PIECES and weighs over PEs, and both sides compute the
 // WINNER (never "do I keep it", which drops 31% of pairs): lo = min piece,
@@ -226,7 +232,7 @@ inline bool peSetKeepLocalPair(int src_piece, int tgt_piece) {
 inline int walkTieBreakMode() {
   static const int v = [] {
     const char* e = std::getenv("FOF_WALK_TIEBREAK");
-    if (!e) return 0;
+    if (!e) return 2;
     std::string s(e);
     if (s == "hash") return 1;
     if (s == "weighted") return 2;

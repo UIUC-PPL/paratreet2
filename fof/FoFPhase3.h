@@ -1028,13 +1028,23 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
   // caller's pre-created UFNodeMap when given (race-safe on reconverse); the
   // inline-ckNew fallback keeps the old one-argument form's semantics
   // (classic Converse only). Lazy vertex storage (sparse-uf2): vertices are
-  // created on first touch.
+  // created on first touch. Spread (default since 2026-11-01; UF_SPREAD=0
+  // turns it off): the union phase runs on any free PE of each process, not
+  // only the rank-0 PE that hosts the element, which otherwise sets the
+  // walk's end under -E 16 (design/walk-optimization-brief.txt, addendum
+  // 2026-11-01). The library refuses spread in htram and wave builds.
+#if defined(AGGREGATION) || defined(CONCURRENT_COMPRESSION_WAVE)
+  const bool uf_spread = false;
+#else
+  const bool uf_spread = true;
+#endif
   CProxy_UnionFindLib uf_proxy =
       uf_node_map_gid.isZero()
           ? UnionFindLib::unionFindInitOnePerNodeLazy(
-                CkCallbackResumeThread(), CProxy_UFNodeMap::ckNew())
+                CkCallbackResumeThread(), CProxy_UFNodeMap::ckNew(), uf_spread)
           : UnionFindLib::unionFindInitOnePerNodeLazy(
-                CkCallbackResumeThread(), CProxy_UFNodeMap(uf_node_map_gid));
+                CkCallbackResumeThread(), CProxy_UFNodeMap(uf_node_map_gid),
+                uf_spread);
   fof.initUF2(uf_proxy, CkCallbackResumeThread());
 #ifdef AGGREGATION
   // Streamed unions would sit in tram buffers invisible to the walk's QD

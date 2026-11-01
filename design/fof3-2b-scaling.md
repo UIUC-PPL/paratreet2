@@ -5,6 +5,12 @@
 Sections 1-6 below are the August sweep and stay as history; this is the
 baseline later work is measured against.
 
+Since 2026-11-01 FoF3 defaults to `FOF_WALK_TIEBREAK=weighted` and
+union-phase spread (`UF_SPREAD`), and this baseline predates both. To
+reproduce it, set `FOF_WALK_TIEBREAK=parity UF_SPREAD=0`. When comparing a
+new sweep against it, expect phase 3 to differ (64 nodes: phase3_walk
+0.61 -> 0.31 s, iteration 1.27x faster; design/walk-optimization-brief.txt).
+
 Stack: charm `recharm` with charm#4119 (reconverse main c9d8d2e, which
 carries reconverse#313; LCI 1287c59c), paratreet2 f98db0f, no
 `+noisomalloc`. Shape: 8 processes/node, **7 PEs/process** (`+ppn 7`, no-SMT

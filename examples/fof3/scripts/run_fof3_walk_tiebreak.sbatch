@@ -1,9 +1,13 @@
 #!/bin/bash
 # Issue #5: phase-3 dual-walk tie-break A/B at 2B particles, one job per node
 # count, same shape as run_fof3_scale2b_gpu.sbatch (ppn 7, leaf 128 device /
-# leaf 12 cpu, ndev 7, poll 1). FOF_WALK_TIEBREAK = parity (today) / hash
-# (control) / weighted (w = 1 + leaf interactions of iteration 0, used from
-# iteration 1). Report iteration 1 and its `FOF3STAT walk_timing` line.
+# leaf 12 cpu, ndev 7, poll 1). FOF_WALK_TIEBREAK = parity / hash (control) /
+# weighted (w = 1 + leaf interactions of iteration 0, used from iteration 1).
+# Report iteration 1 and its `FOF3STAT walk_timing` line.
+#
+# Every arm names its FOF_WALK_TIEBREAK and UF_SPREAD explicitly: since
+# 2026-11-01 FoF3 defaults to weighted + spread, and the tiebreak / stream /
+# rank0 modes measured spread OFF, so they pin UF_SPREAD=0.
 #
 # MODE=tiebreak (default): the three rules with UF_2 streaming at its default
 # (-E 16), plus the CPU arm parity / weighted.
@@ -80,7 +84,8 @@ arm() {  # label leaf "extra FoF3 args" envs...
 
 DEV="PARATREET_DEVICE_TREE=1 FOF_GPU_PHASE1=1"
 echo "### walk5 mode=$MODE nodes=$N reps=$REPS timeout=${ARM_TIMEOUT}s bin=$FOF3_BIN md5=$(md5sum $FOF3_BIN | cut -c1-12)"
-REP=warmup; arm device_parity 128 "" $DEV FOF_WALK_TIEBREAK=parity
+REP=warmup; arm device_parity 128 "" $DEV FOF_WALK_TIEBREAK=parity UF_SPREAD=0
+if [ "$MODE" != spread ]; then DEV="$DEV UF_SPREAD=0"; fi
 if [ "$MODE" = rank0 ]; then
   for REP in $(seq 1 $REPS); do
     arm device_E16_parity   128 ""     $DEV FOF_WALK_TIEBREAK=parity
@@ -108,7 +113,7 @@ else
     done
   done
   REP=1
-  arm cpu_parity   12 "" PARATREET_DEVICE_TREE=0 FOF_WALK_TIEBREAK=parity
-  arm cpu_weighted 12 "" PARATREET_DEVICE_TREE=0 FOF_WALK_TIEBREAK=weighted
+  arm cpu_parity   12 "" PARATREET_DEVICE_TREE=0 FOF_WALK_TIEBREAK=parity UF_SPREAD=0
+  arm cpu_weighted 12 "" PARATREET_DEVICE_TREE=0 FOF_WALK_TIEBREAK=weighted UF_SPREAD=0
 fi
 echo "=== WALK5 COMPLETE ==="
