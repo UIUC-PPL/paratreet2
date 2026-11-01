@@ -59,7 +59,7 @@ run_one() {
   srun --mpi=cray_shasta --network=single_node_vni --unbuffered \
     --cpu-bind=none --distribution=block:block --export=ALL \
     "$WRAP" ./FoF3 -f "$input" -d oct -u dist -b 0.2 -c stats -l 128 \
-    +noisomalloc +ppn $PPN +pemap $PEMAP +lci_ndevices 7 +backend_poll_thread 1 \
+    +ppn $PPN +pemap $PEMAP +lci_ndevices 7 +backend_poll_thread 1 \
     2>&1 | tee "$DATA/run_$tag.log"
   echo "exit: ${PIPESTATUS[0]}"
   date +"end %F %T"

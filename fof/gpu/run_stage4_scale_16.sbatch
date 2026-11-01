@@ -92,7 +92,7 @@ run() { # label mode leaf iters seconds_needed [extra env]
     --cpu-bind=none --distribution=block:block \
     --ntasks=128 --gpus-per-node=8 \
     ./FoF3 -f "$INPUT" -d oct -u dist -c stats -l $leaf -i $iters \
-    +noisomalloc +ppn 14 +pemap $PEMAP +lci_ndevices 7 +backend_poll_thread 2
+    +ppn 14 +pemap $PEMAP +lci_ndevices 7 +backend_poll_thread 2
   echo "exit: $?"
   date
 }

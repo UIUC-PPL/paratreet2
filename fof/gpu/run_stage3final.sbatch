@@ -32,7 +32,7 @@ run() { local label=$1 nt=$2 gpu=$3; shift 3
   echo "=== $label (ntasks=$nt gpu=$gpu grid=${FOF_GPU_GRID:-default}) ==="
   FOF_GPU_STAGE0=$gpu srun --mpi=cray_shasta --network=single_node_vni \
     --unbuffered --cpu-bind=none --distribution=block:block \
-    --ntasks=$nt --gpus-per-node=8 $APP "$@" +noisomalloc +ppn 14 +pemap $PEMAP
+    --ntasks=$nt --gpus-per-node=8 $APP "$@" +ppn 14 +pemap $PEMAP
   echo "exit: $?"; }
 run "1k default"    2 1 -f ../../inputs/1k.tipsy   -d oct -u serial
 run "100k default"  2 1 -f ../../inputs/100k.tipsy -d oct -u serial

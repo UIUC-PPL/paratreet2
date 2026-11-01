@@ -95,7 +95,7 @@ run() { # label gpu leaf seconds_needed
     srun --mpi=cray_shasta --network=job_vni --unbuffered \
     --cpu-bind=none --distribution=block:block \
     --ntasks=128 --gpus-per-node=8 \
-    ./FoF3 -f "$INPUT" -d oct -u dist -l $leaf +noisomalloc +ppn $PPN \
+    ./FoF3 -f "$INPUT" -d oct -u dist -l $leaf +ppn $PPN \
     +pemap $PEMAP \
     +lci_ndevices $NDEVICES \
     +backend_poll_thread 2 \

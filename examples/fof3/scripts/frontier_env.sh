@@ -31,10 +31,6 @@ module load craype-x86-trento craype-network-ofi PrgEnv-gnu/8.6.0 \
 # follows the most recent charm build and is kept on the CPU build for NAMD,
 # and LD_LIBRARY_PATH beats the binary's RUNPATH -- an AMD-built FoF3 would
 # load the CPU build's libreconverse.so.
-#
-# Every FoF3 launch line also passes +noisomalloc: on this build (recharm
-# >= ccc18c427) isomalloc's startup address-space sync corrupts the heap or
-# hangs on more than one physical node. See README "GPU run".
 export CHARM_HOME=${FOF3_CHARM_HOME:-/ccs/home/rrao/charm_reconverse/reconverse-linux-x86_64-amd}
 [ -d "$CHARM_HOME/lib" ] || { echo "### ABORT: no charm build at $CHARM_HOME" >&2; exit 3; }
 export LD_LIBRARY_PATH=$CHARM_HOME/lib:$ROCM_PATH/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
