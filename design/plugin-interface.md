@@ -30,9 +30,11 @@ decomposition 4616 -> 3651 MB, decomposition 2.14 -> 1.03 s, iteration 1
 catalog scratch after each call. Hosted call with host cells: 1.50 s.
 
 Open: the host-cell flush still sorts each Reader's particles (0.3 s);
-the min-ID encoding moves union-find bosses to the process owning each
-group's minimum id, unmeasured above 2 nodes; step 4 (ChaNGa hooks)
-waits on Kale and Tom Quinn.
+step 4 (ChaNGa hooks) waits on Kale and Tom Quinn. The min-ID encoding,
+which moves union-find bosses to the process owning each group's minimum
+id, was measured at 32 and 128 nodes on 2026-11-02: uf2 is unchanged and
+cosmo25's label_digest is 2e8eaba371ff1d31 on every arm
+(fof3-2b-scaling.md section 0).
 
 Plan written 2026-11-01. This is Track A of the journal plan: FoF3 runs
 inside a host simulation (first host: ChaNGa) on the particles in its

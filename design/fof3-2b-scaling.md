@@ -7,9 +7,44 @@ baseline later work is measured against.
 
 Since 2026-11-01 FoF3 defaults to `FOF_WALK_TIEBREAK=weighted` and
 union-phase spread (`UF_SPREAD`), and this baseline predates both. To
-reproduce it, set `FOF_WALK_TIEBREAK=parity UF_SPREAD=0`. When comparing a
-new sweep against it, expect phase 3 to differ (64 nodes: phase3_walk
-0.61 -> 0.31 s, iteration 1.27x faster; design/walk-optimization-brief.txt).
+reproduce it, set `FOF_WALK_TIEBREAK=parity UF_SPREAD=0`.
+
+**Re-sweep under the new defaults: 2026-11-02, 32 and 128 nodes.** Same
+stack and shape as below. paratreet2 1b974f4, which also carries the
+minimum-ID labels and the 72-byte slim particles; unionfind 52c78b2.
+Jobs 5833410-11, after the 2-node smoke test 5833386 on the same binary.
+All 40 arm-iterations are exact, and every arm prints cosmo25
+`label_digest 2e8eaba371ff1d31`. 5.3 node-hours. Logs and `STACK.txt`
+are in `/lustre/orion/csc710/scratch/rrao/scale2b-2026-11-02/`.
+
+Iteration 1, median of 3 reps, seconds:
+
+| Nodes | device l128 | device l12 | cpu l12 | GPU speedup | speedup vs 10-31, device / cpu |
+|---:|---:|---:|---:|---:|---|
+| 32  | 1.193 | 1.552 | 2.369 | **1.99x** | 1.24x / 1.18x |
+| 128 | 0.761 | 0.870 | 1.124 | **1.48x** | 1.37x / 1.28x |
+
+Device arm by phase, median, seconds (10-31 -> 11-02):
+
+| Nodes | phase-3 walk | loadCache | tree build | upwardPass | phase 1 | uf2 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32  | 0.524 -> 0.302 | 0.025 -> 0.027 | 0.250 -> 0.158 | 0.121 -> 0.106 | 0.279 -> 0.292 | 0.034 -> 0.035 |
+| 128 | 0.525 -> 0.262 | 0.158 -> 0.159 | 0.068 -> 0.059 | 0.064 -> 0.058 | 0.084 -> 0.088 | 0.035 -> 0.029 |
+
+- The phase-3 walk halves at both node counts. The spread across reps
+  drops from 127-172 ms to under 10 ms, because the rank-0 outliers are
+  gone. The walk is still nearly flat from 32 to 128 nodes. It is now a
+  third of the 128-node iteration instead of half (issue #5).
+- loadCache is unchanged. It is now the only phase that grows with node
+  count: 21% of the 128-node device iteration (issue #4).
+- Tree build is 1.6x faster at 32 nodes, probably from the slim
+  particles (not measured on its own).
+- uf2 is unchanged. The minimum-ID encoding moves each union-find root to
+  the process that owns the group's minimum id, and this shows it costs
+  nothing measurable at 128 nodes.
+- Device phase 1 is 4-5% slower at both node counts. It is small and not
+  yet explained. One candidate is the period argument now passed into
+  the leaf kernel.
 
 Stack: charm `recharm` with charm#4119 (reconverse main c9d8d2e, which
 carries reconverse#313; LCI 1287c59c), paratreet2 f98db0f, no
