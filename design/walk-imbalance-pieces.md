@@ -88,3 +88,54 @@ Measure before quoting.
 Files: CSVs, logs and `wpan.py` in
 `/lustre/orion/csc710/scratch/rrao/walkpieces-2026-11-02/` (scratch, purged
 eventually); the analysis script is also `examples/fof3/scripts/walkpieces.py`.
+
+## Tried: spreading pieces within the process (PARATREET_TP_PLACEMENT)
+
+`DecompArrayMap` now takes `PARATREET_TP_PLACEMENT` (default `block`, the
+contiguous particle-balanced intervals). Both alternatives keep every piece
+on its block PE's process and change only the PE within it:
+
+- `rr`: the process's pieces dealt round-robin in index order. Per-PE
+  particle counts become 1.37-1.60x the average (block: 1.09-1.12x), and
+  tree build, which is per-PE work, slows from 90-95 to 109-115 ms at 2
+  nodes (lambb, jobs 5836727 and 5836833).
+- `spread`: in index order, each piece to the PE holding the fewest
+  particles so far. Neighbouring pieces still land on different PEs, and
+  the per-PE particle balance is as good as block's (1.06-1.10x). Offline
+  it matches or beats `rr` on the walk (128 nodes: 86 ms busiest PE, both).
+
+2B cosmo25 at 128 nodes, arms interleaved, 2 reps each, means (job 5836861,
+all gold):
+
+| | iteration 1 (weighted), block -> spread | iteration 0 (parity), block -> spread |
+|---|---|---|
+| walk busiest PE | 146 -> 95 ms | 192 -> 106 ms |
+| walk end_max (last PE out) | 0.215 -> 0.206 s | 0.286 -> 0.227 s |
+| qd_tail (union drain after it) | 0.040 -> 0.052 s | 0.001 -> 0.045 s |
+| phase3_walk | 0.255 -> 0.258 s | 0.287 -> 0.272 s |
+| walk + uf2 | 0.284 -> 0.284 s | 0.317 -> 0.299 s |
+| tree build | 55 -> 56 ms | 66 -> 67 ms |
+| iteration | 615 -> 622 ms (0.99x) | 703 -> 686 ms (1.03x) |
+
+The placement did what the what-ifs said it would to compute: the busiest
+PE's walk time falls 1.5x in iteration 1 and 1.8x in iteration 0 (predicted
+86 ms; measured 93-97). The walk's wall time barely follows, and in the
+production iteration not at all:
+
+- **The last PE out of the walk is set by waiting, not compute.** With the
+  busiest PE at 95 ms, PEs still leave the walk at ~0.2 s. Spans (first
+  entry to last exit) stay near 0.2 s, so the critical path is the time
+  pieces spend waiting on remote fetches and resumes, not their busy time.
+- **What the walk gained in iteration 0 moved into the union drain.** The
+  last PE left 59 ms earlier, but the streamed UF_2 cascades were still
+  running, so qd_tail grew from 1 to 45 ms.
+
+So `spread` stays opt-in. It does no harm (tree build unchanged) and may
+matter once the waiting is shorter, but it is not a lever on its own.
+
+What to look at next: what keeps a piece in the walk for ~0.2 s when its
+busy time is a fraction of that. Candidates, in order of cost: per-piece
+first-entry/last-exit times and resume counts (extend the instrument), to
+find the chain of dependent fetches on the critical path; then fetch
+granularity (`-D`, swept only at 16 nodes, where requests were already
+the expensive term at 14.9 us each).

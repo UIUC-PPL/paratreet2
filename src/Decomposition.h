@@ -22,7 +22,15 @@ public:
   DecompArrayMap(Decomposition*, long, int);
   int procNum(int, const CkArrayIndex &idx);
 private:
+  int blockPe(int index) const;
   std::vector<size_t> pe_intervals;
+  // PARATREET_TP_PLACEMENT (issue #5; default block = pe_intervals alone):
+  // each element stays on its block PE's process, but the process's run of
+  // indices is dealt over its PEs so that neighbouring (similarly loaded)
+  // pieces land on different PEs. rr = plain round-robin in index order;
+  // spread = in index order, each to the PE with the fewest particles so
+  // far. Empty unless one of the two is set.
+  std::vector<int> pe_of_index;
 };
 
 class CollocateMap : public CkArrayMap {

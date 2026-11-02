@@ -1,7 +1,12 @@
 #include <memory>
 #include <algorithm>
+#include <cstdlib>
+#include <functional>
 #include <map>
+#include <queue>
 #include <set>
+#include <string>
+#include <utility>
 
 #include "common.h"
 #include "Decomposition.h"
@@ -22,14 +27,54 @@ DecompArrayMap::DecompArrayMap(Decomposition* decomp, long n_total_particles, in
     }
   }
   pe_intervals.push_back(n_splitters - 1);
+
+  const char* env = std::getenv("PARATREET_TP_PLACEMENT");
+  const std::string mode = env ? env : "block";
+  if (mode != "rr" && mode != "spread") return;
+  // blockPe is non-decreasing in the index, so each process's indices are
+  // one contiguous run [i, j); only the PE within the process changes.
+  pe_of_index.resize(n_splitters);
+  for (int i = 0; i < n_splitters;) {
+    const int nd = CkNodeOf(blockPe(i));
+    int j = i;
+    while (j < n_splitters && CkNodeOf(blockPe(j)) == nd) j++;
+    const int first = CkNodeFirst(nd), size = CkNodeSize(nd);
+    if (mode == "rr") {
+      for (int k = i; k < j; k++) pe_of_index[k] = first + (k - i) % size;
+    } else {
+      // Each piece, in index order, to the PE holding the fewest particles
+      // so far: consecutive pieces still land on different PEs, and the
+      // per-PE particle count stays as even as the block placement's.
+      using Load = std::pair<long, int>;  // (particles, rank in process)
+      std::priority_queue<Load, std::vector<Load>, std::greater<Load>> load;
+      for (int r = 0; r < size; r++) load.push({0, r});
+      for (int k = i; k < j; k++) {
+        const Load l = load.top();
+        load.pop();
+        pe_of_index[k] = first + l.second;
+        load.push({l.first + decomp->getNumParticles(k), l.second});
+      }
+    }
+    i = j;
+  }
+  if (CkMyPe() == 0)
+    CkPrintf("TreePiece placement: %s within each process "
+             "(PARATREET_TP_PLACEMENT=%s)\n",
+             mode == "rr" ? "round-robin" : "particle-greedy spread",
+             mode.c_str());
+}
+
+int DecompArrayMap::blockPe(int index) const {
+  auto it = std::lower_bound(pe_intervals.begin(), pe_intervals.end(), index);
+  int pe = std::distance(pe_intervals.begin(), it);
+  return std::min(CkNumPes() - 1, pe);
 }
 
 int DecompArrayMap::procNum(int, const CkArrayIndex &idx) {
   int index = *(int *)idx.data();
   if (pe_intervals.empty()) CkAbort("using procNum but array is not prepped");
-  auto it = std::lower_bound(pe_intervals.begin(), pe_intervals.end(), index);
-  int pe = std::distance(pe_intervals.begin(), it);
-  return std::min(CkNumPes() - 1, pe);
+  if (!pe_of_index.empty()) return pe_of_index[index];
+  return blockPe(index);
 }
 
 CollocateMap::CollocateMap(Decomposition* d, const std::vector<int>& pl)
