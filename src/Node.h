@@ -208,8 +208,23 @@ class Node : public SpatialNode<Data>
 {
 public:
   virtual Node* getChild(int child_idx) const = 0;
+  // getChild without the lazy canopy hook below: the slot as it is, null
+  // included. For read-only enumerations (cache tally, teardown, dot) that
+  // must not create nodes.
+  virtual Node* peekChild(int child_idx) const = 0;
   virtual Node* exchangeChild(int child_idx, Node* child) = 0;
+  // Install `desired` only if the slot still holds `expected`; on failure
+  // `expected` is updated to the slot's current value.
+  virtual bool casChild(int child_idx, Node*& expected, Node* desired) = 0;
   virtual Node<Data>* getDescendant(Key to_find) = 0;
+
+  // Lazy canopy children (TreeCache, PARATREET_LAZY_CANOPY): a
+  // CachedBoundary node's slots for remote TreePiece roots stay null until
+  // a walk first asks for them; getChild then calls this to create the
+  // placeholder. Set once per process by the (nodegroup) TreeCache; null
+  // means every slot is filled eagerly, as before.
+  using LazyChildFn = Node* (*)(Node* parent, int child_idx);
+  static LazyChildFn lazy_child_fn;
   
   // Propagate vertex ID ranges from children up to this node
   virtual void propagateVertexIDRanges() = 0;
@@ -315,7 +330,7 @@ public:
         type == Type::CachedRemote || type == Type::CachedBoundary)
     {
       for (int i = 0; i < n_children; i++) {
-        auto child = getChild(i);
+        auto child = peekChild(i);
         if (child == nullptr) continue;
         child->triggerFree();
         delete child;
@@ -357,12 +372,16 @@ public:
       return;
 
     for (int i = 0; i < n_children; i++) {
-      auto child = getChild(i);
+      auto child = peekChild(i);
+      if (child == nullptr) continue;
       out << key << " -> " << child->key << ";" << std::endl;
       child->dot(out);
     }
   }
 };
+
+template <typename Data>
+typename Node<Data>::LazyChildFn Node<Data>::lazy_child_fn = nullptr;
 
 template <class Data, size_t BRANCH_FACTOR>
 class FullNode : public Node<Data>
@@ -394,21 +413,39 @@ public:
  
   virtual Node<Data>* getChild(int child_idx) const override {
     CkAssert(child_idx < this->n_children);
+    Node<Data>* c = children[child_idx].load(std::memory_order_relaxed);
+    if (c == nullptr && this->type == Node<Data>::Type::CachedBoundary &&
+        Node<Data>::lazy_child_fn)
+      c = Node<Data>::lazy_child_fn(const_cast<FullNode*>(this), child_idx);
+    return c;
+  }
+  virtual Node<Data>* peekChild(int child_idx) const override {
+    CkAssert(child_idx < this->n_children);
     return children[child_idx].load(std::memory_order_relaxed);
   }
   virtual Node<Data>* exchangeChild(int child_idx, Node<Data>* child) override {
     CkAssert(child_idx < this->n_children);
     return children[child_idx].exchange(child, std::memory_order_relaxed);
   }
+  virtual bool casChild(int child_idx, Node<Data>*& expected, Node<Data>* desired) override {
+    CkAssert(child_idx < this->n_children);
+    return children[child_idx].compare_exchange_strong(
+        expected, desired, std::memory_order_acq_rel, std::memory_order_acquire);
+  }
   virtual Node<Data>* getDescendant(Key to_find) override {
-    std::vector<int> remainders;
+    // A fixed array, not a vector: this runs once per starter-pack entry
+    // (the parent lookup in TreeCache::installBoundary), so a heap
+    // allocation per call is avoidable install cost. 64 levels covers a
+    // binary tree over 64-bit keys.
+    int remainders[64];
+    int n_rem = 0;
     Key temp = to_find;
     while (temp >= BRANCH_FACTOR * this->key) {
-      remainders.push_back(temp % BRANCH_FACTOR);
+      remainders[n_rem++] = temp % BRANCH_FACTOR;
       temp /= BRANCH_FACTOR;
     }
     Node<Data>* node = this;
-    for (int i = remainders.size()-1; i >= 0; i--) {
+    for (int i = n_rem - 1; i >= 0; i--) {
       if (node && remainders[i] < node->n_children) node = node->getChild(remainders[i]);
       else return nullptr;
     }

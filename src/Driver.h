@@ -36,6 +36,7 @@ public:
   CProxy_Resumer<Data> resumer;
   std::vector<std::pair<Key, SpatialNode<Data>>> storage;
   bool storage_sorted;
+  long storage_raw = 0;   // recvTC calls since the last clear
   BoundingBox universe;
   CProxy_TreePiece<Data> treepieces; // Cannot be a global readonly variable
   CProxy_Partition<Data> partitions;
@@ -135,8 +136,7 @@ public:
     cache_manager.destroy(true);
     CkCallback statsCb(CkReductionTarget(Driver<Data>, countInts), this->thisProxy);
     thread_state_holder.collectAndResetStats(statsCb);
-    storage.clear();
-    storage_sorted = false;
+    clearStorage();
     CkWaitQD();
     CkPrintf("Hosted run time: %.3lf ms\n", (CkWallTimer() - t0) * 1000);
     cb.send();
@@ -506,8 +506,7 @@ public:
       cache_manager.destroy(true);
       CkCallback statsCb (CkReductionTarget(Driver<Data>, countInts), this->thisProxy);
       thread_state_holder.collectAndResetStats(statsCb);
-      storage.clear();
-      storage_sorted = false;
+      clearStorage();
       CkWaitQD();
       double iter_time = CkWallTimer() - iter_start_time;
       total_time += iter_time;
@@ -531,7 +530,14 @@ public:
      CkPrintf("%llu node-particle interactions, %llu bucket-particle interactions %llu node opens, %llu node closes\n", intrn_counts[0], intrn_counts[1], intrn_counts[2], intrn_counts[3]);
   }
 
+  void clearStorage() {
+    storage.clear();
+    storage_sorted = false;
+    storage_raw = 0;
+  }
+
   void recvTC(std::pair<Key, SpatialNode<Data>> param) {
+    storage_raw++;
     storage.emplace_back(param);
     // A later annotation round (TreePiece::upwardPass) may re-send canopies
     // after a loadCache already sorted; force a re-sort (and keep-newest
@@ -541,10 +547,10 @@ public:
 
   void loadCache(CkCallback cb) {
     auto& config = paratreet::getConfiguration();
-    CkPrintf("Received data from %d TreeCanopies\n", (int) storage.size());
+    CkPrintf("Received data from %ld TreeCanopies\n", storage_raw);
     // Sort data received from TreeCanopies (by their indices)
     const double lc_sort_t0 = CkWallTimer();   // relay92: pack build
-    const long lc_raw = (long)storage.size();
+    const long lc_raw = storage_raw;
     if (!storage_sorted) sortStorage();
     const double lc_sort_s = CkWallTimer() - lc_sort_t0;
 
@@ -567,23 +573,26 @@ public:
   }
 
   void sortStorage() {
-    auto comp = [] (const std::pair<Key, SpatialNode<Data>>& a, const std::pair<Key, SpatialNode<Data>>& b) {return a.first < b.first;};
-    // stable_sort + keep-newest dedup: TreeCanopy re-sends every canopy on
-    // each accumulation round (initial build, then each TreePiece::upwardPass),
+    // Keep-newest dedup: TreeCanopy re-sends every canopy on each
+    // accumulation round (initial build, then each TreePiece::upwardPass),
     // and recvTC appends, so storage can hold several generations per key.
     // Later arrivals supersede earlier ones (e.g. post-FoF-phase-1 FragData
-    // vs build-time garbage); an unstable sort would ship an arbitrary
-    // generation. Keep only the last occurrence per key.
-    std::stable_sort(storage.begin(), storage.end(), comp);
-    auto out = storage.begin();
-    for (auto it = storage.begin(); it != storage.end(); ) {
-      auto next = it + 1;
-      while (next != storage.end() && next->first == it->first) it = next++;
-      if (out != it) *out = std::move(*it);
-      ++out;
-      it = next;
+    // vs build-time garbage). Sorting (key, position) pairs keeps that
+    // order for equal keys, and the gather keeps the last one. It replaces
+    // a stable_sort of the 128-byte entries themselves, because this runs
+    // on PE 0 inside loadCache (issue #4: 11 ms at 2B / 128 nodes). For a
+    // 65,000-entry storage at 2 nodes it is 6.8-7.7 ms against 9.5 (job
+    // 5833900).
+    std::vector<std::pair<Key, size_t>> order(storage.size());
+    for (size_t i = 0; i < storage.size(); i++) order[i] = {storage[i].first, i};
+    std::sort(order.begin(), order.end());
+    std::vector<std::pair<Key, SpatialNode<Data>>> sorted;
+    sorted.reserve(order.size());
+    for (size_t i = 0; i < order.size(); i++) {
+      if (i + 1 < order.size() && order[i + 1].first == order[i].first) continue;
+      sorted.emplace_back(std::move(storage[order[i].second]));
     }
-    storage.erase(out, storage.end());
+    storage.swap(sorted);
     storage_sorted = true;
   }
 

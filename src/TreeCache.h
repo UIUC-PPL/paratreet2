@@ -190,6 +190,47 @@ public:
       else if (branch_factor == 8) pools.emplace_back(new FullNodePool<Data, 8>(pool_elem_size));
       else CkAbort("Config branch factor is not 2 or 8. Update list in TreeCache::init to handle this.");
     }
+    // Lazy canopy children need the one-cache-per-process (nodegroup)
+    // setup: the hook is process-wide and finds this instance through
+    // s_lazy_owner. On by default; PARATREET_LAZY_CANOPY=0 restores the
+    // eager install.
+    const char* lazy = getenv("PARATREET_LAZY_CANOPY");
+    lazy_canopy = shared && (lazy == nullptr || atoi(lazy) != 0);
+    if (lazy_canopy) {
+      s_lazy_owner = this;
+      Node<Data>::lazy_child_fn = &TreeCache::lazyCanopyChild;
+    }
+  }
+
+  // Lazy canopy (default; PARATREET_LAZY_CANOPY=0 turns it off). The
+  // starter pack holds every canopy node, and installing it eagerly gives
+  // each canopy node a placeholder child for every remote TreePiece root
+  // below it: one per TreePiece in the whole tree (~244K per process at
+  // 2B / 128 nodes, ~7x the pack itself), built by every process, while a
+  // process's walk opens only the canopy near its own particles (issue #4).
+  // Lazily, insertNode leaves those slots null and FullNode::getChild
+  // creates the placeholder on first use, on the asking PE's lane. Slots
+  // for canopy nodes that are themselves in the pack are filled by that
+  // node's own install (swapIn into a null slot), and local TreePiece roots
+  // are still adopted eagerly. Measured 2026-11-02 (FoF3, 2B, eager vs lazy
+  // in one job, jobs 5833938-39): loadCache 0.128 -> 0.086 s at 128 nodes
+  // and 0.055 -> 0.021 s at 64, cache node slots -45% at 128, iteration
+  // 1.11x / 1.07x faster.
+  bool lazy_canopy = false;
+  static TreeCache* s_lazy_owner;
+  static Node<Data>* lazyCanopyChild(Node<Data>* parent, int child_idx) {
+    return s_lazy_owner->makeCanopyPlaceholder(parent, child_idx);
+  }
+  Node<Data>* makeCanopyPlaceholder(Node<Data>* parent, int child_idx) {
+    Key child_key = parent->key * branch_factor + child_idx;
+    SpatialNode<Data> empty_sn(parent->depth + 1, -1);
+    Node<Data>* ph = makeCachedNode(CkMyRank(), child_key,
+                                    Node<Data>::Type::RemoteAboveTPKey,
+                                    empty_sn, parent, nullptr, -1, -1);
+    Node<Data>* expected = nullptr;
+    if (parent->casChild(child_idx, expected, ph)) return ph;
+    // Another PE created it first; ours stays an unused pool slot.
+    return expected;
   }
 
   void lockMaps() {
@@ -246,7 +287,7 @@ public:
         break;
     }
     for (int i = 0; i < n->n_children; i++)
-      tallyCache(n->getChild(i), cached_nodes, cached_leaves_n,
+      tallyCache(n->peekChild(i), cached_nodes, cached_leaves_n,
                  cached_particles);
   }
 
@@ -545,6 +586,8 @@ public:
           add_placeholder = true;
         }
       }
+      // Lazy canopy: leave the slot null (see lazy_canopy above).
+      if (add_placeholder && lazy_canopy) continue;
       if (!above_tp || add_placeholder) {
         auto type = (above_tp) ? Node<Data>::Type::RemoteAboveTPKey : Node<Data>::Type::Remote;
         SpatialNode<Data> empty_sn (node->depth + 1, -1);
@@ -565,5 +608,8 @@ public:
 private:
   bool shared = false;
 };
+
+template <typename Data>
+TreeCache<Data>* TreeCache<Data>::s_lazy_owner = nullptr;
 
 #endif // PARATREET_TREECACHE_H_
