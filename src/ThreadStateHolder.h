@@ -5,6 +5,9 @@
 #include "common.h"
 #include "Particle.h"
 
+#include <cstdlib>
+#include <unordered_map>
+
 class ThreadStateHolder : public CBase_ThreadStateHolder {
 public: // these need to be seen by other local chares
   unsigned long long n_part_ints = 0ull;
@@ -35,12 +38,31 @@ public: // these need to be seen by other local chares
   double idle_since = -1.0;
   double walk_idle_at_first = 0.0;
   double walk_idle_at_last = 0.0;
+  // Per-piece split of the same walk (PARATREET_WALK_PIECES set; issue #5):
+  // doTrav charges its busy time, its fetches and the visitor work units it
+  // produced to the TreePiece it was walking. walk_work is the visitor's
+  // counter (FoF: leaf interactions n_src * n_tgt); n and the root-box
+  // center are recorded on the piece's first call. Off: nothing is touched.
+  struct WalkPiece {
+    double busy = 0.0;
+    long calls = 0, fetches = 0, work = 0;
+    int n = 0;
+    float cx = 0, cy = 0, cz = 0;
+  };
+  static bool walkPiecesOn() {
+    static const bool on = std::getenv("PARATREET_WALK_PIECES") != nullptr;
+    return on;
+  }
+  long walk_work = 0;
+  std::unordered_map<int, WalkPiece> walk_pieces;
   void resetWalk() {
     walk_busy = 0.0;
     walk_first = -1.0;
     walk_last = 0.0;
     walk_fetches = 0u;
     walk_idle_at_first = walk_idle_at_last = idle_cum;
+    walk_work = 0;
+    walk_pieces.clear();
   }
   void hookIdle() {
     if (idle_hooked_) return;

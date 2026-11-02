@@ -794,6 +794,9 @@ public:
 
   void doTrav(Node<Data>* start_node) {
     const double tw0 = CkWallTimer();
+    const bool per_piece = ThreadStateHolder::walkPiecesOn();
+    const long work0 = stats->walk_work;
+    const unsigned long fetch0 = stats->walk_fetches;
     Key new_key = start_node->key;
     std::vector<std::pair<Key, Node<Data>*>> curr_nodes_insertions;
     auto& now_ready = curr_nodes[new_key];
@@ -922,6 +925,18 @@ public:
     for (auto cn : curr_nodes_insertions) curr_nodes[cn.first].push_back(cn.second);
     const double tw1 = CkWallTimer();
     stats->walk_busy += tw1 - tw0;
+    if (per_piece) {
+      auto& wp = stats->walk_pieces[tp.thisIndex];
+      if (wp.calls == 0 && tp.local_root) {
+        wp.n = (int)tp.particles.size();  // node n_particles is -1 above leaves
+        const auto c = tp.local_root->data.box.center();
+        wp.cx = c.x; wp.cy = c.y; wp.cz = c.z;
+      }
+      wp.busy += tw1 - tw0;
+      wp.calls++;
+      wp.fetches += (long)(stats->walk_fetches - fetch0);
+      wp.work += stats->walk_work - work0;
+    }
     if (stats->walk_first < 0) {
       stats->walk_first = CmiInitTime() + tw0;
       stats->walk_idle_at_first = stats->idle_cum;

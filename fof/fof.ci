@@ -123,6 +123,8 @@ module fof {
     entry void phase3Stats(const CkCallback&);
     // {PE, leaf interactions} set reduction for the weighted tie-break.
     entry void walkCosts(const CkCallback&);
+    // Per-piece walk records (PARATREET_WALK_PIECES), concat reduction.
+    entry void walkPieceDump(const CkCallback&);
     entry void depositNodeRedundant(const CkCallback&);
     entry void applyGlobalMap(const std::vector<std::pair<long, long> >&, const CkCallback&);
     // Stage-3 sliced counterpart: apply the node branch's stored slice at

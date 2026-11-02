@@ -3828,6 +3828,29 @@ public:
     this->contribute(sizeof(pc), pc, CkReduction::set, cb);
   }
 
+  // Per-piece dual-walk records (PARATREET_WALK_PIECES; issue #5): one per
+  // TreePiece this PE walked, from ThreadStateHolder::walk_pieces, as a
+  // concat reduction to the driver (paratreet::walkPieceReport).
+  struct WalkPieceRec {
+    int32_t piece, pe, n, calls, fetches, pad;
+    float busy, cx, cy, cz;
+    int64_t work;
+  };
+  static_assert(sizeof(WalkPieceRec) == 48, "WalkPieceRec layout");
+  void walkPieceDump(const CkCallback& cb) {
+    const auto& m = thread_state_holder.ckLocalBranch()->walk_pieces;
+    std::vector<WalkPieceRec> recs;
+    recs.reserve(m.size());
+    for (const auto& kv : m) {
+      const auto& w = kv.second;
+      recs.push_back({kv.first, CkMyPe(), w.n, (int32_t)w.calls,
+                      (int32_t)w.fetches, 0, (float)w.busy, w.cx, w.cy, w.cz,
+                      (int64_t)w.work});
+    }
+    this->contribute((int)(recs.size() * sizeof(WalkPieceRec)), recs.data(),
+                     CkReduction::concat, cb);
+  }
+
   // Deposit this PE's redundant-descent count into the per-process total
   // (design/step3.md §6d), then barrier via cb. Called once per PE between the
   // walk's QD and phase3Stats, so the process total is complete before

@@ -77,6 +77,9 @@
 #include <cstdlib>
 #include <algorithm>
 #include <cmath>
+#include <functional>
+#include <queue>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -292,7 +295,10 @@ public:
       return;
     }
     branch->p3_leaf_visits++;
-    branch->p3_leaf_ints += (long)source.n_particles * target.n_particles;
+    const long ints = (long)source.n_particles * target.n_particles;
+    branch->p3_leaf_ints += ints;
+    if (ThreadStateHolder::walkPiecesOn())  // per-piece split (issue #5)
+      thread_state_holder.ckLocalBranch()->walk_work += ints;
     if (source.data.uniform() && target.data.uniform()) {
       // Uniform leaf pair: one (g, f) covers every particle pair, so
       // resolve it before the O(n*m) loop (the suppression payoff at leaf
@@ -428,6 +434,145 @@ struct FoFPhase3Result {
   double r0_other_max = 0, r0_other_avg = 0, rest_other_max = 0, rest_other_avg = 0;
   bool walk_weights_set = false;  // weighted tie-break table installed after this walk
 };
+
+// Per-piece split of the dual walk (PARATREET_WALK_PIECES; issue #5). Gathers
+// one record per TreePiece (busy time in doTrav, calls, fetches, leaf
+// interactions, particles, root-box center), prints where the busiest PE's
+// time sits, and what whole-piece rebalancing could reach from the measured
+// piece times:
+//   lpt_global      pieces reassigned across ALL PEs (longest first, to the
+//                   least-loaded PE): the floor for piece-granularity LB
+//   lpt_in_process  pieces reassigned only among their own process's PEs,
+//                   which share the cache (no extra fetches, phase-1
+//                   ownership unchanged)
+//   proc_even       each process's walk split perfectly over its PEs
+//   floor           max(largest piece, average PE): below it pieces must split
+// A value other than "1" is a path prefix: <prefix>.iter<k>.csv gets every
+// record. Call from the threaded driver, outside timed brackets.
+inline void walkPieceReport(CProxy_FoFPhase1<FragData> fof) {
+  using Rec = FoFPhase1<FragData>::WalkPieceRec;
+  static int iter = 0;
+  const int k = iter++;
+  void* res = nullptr;
+  fof.walkPieceDump(CkCallbackResumeThread(res));
+  CkReductionMsg* msg = (CkReductionMsg*)res;
+  const size_t n_rec = msg->getSize() / sizeof(Rec);
+  std::vector<Rec> rec((const Rec*)msg->getData(),
+                       (const Rec*)msg->getData() + n_rec);
+  delete msg;
+  if (rec.empty()) return;
+
+  const int P = CkNumPes(), N = CkNumNodes();
+  std::vector<double> pe_busy(P, 0.0), node_busy(N, 0.0);
+  double tot = 0, sw = 0, sn = 0, sb = 0, sww = 0, snn = 0, sbb = 0, swb = 0,
+         snb = 0;
+  for (const auto& r : rec) {
+    pe_busy[r.pe] += r.busy;
+    node_busy[CkNodeOf(r.pe)] += r.busy;
+    tot += r.busy;
+    const double w = (double)r.work, n = (double)r.n, b = r.busy;
+    sw += w; sn += n; sb += b;
+    sww += w * w; snn += n * n; sbb += b * b; swb += w * b; snb += n * b;
+  }
+  const double m = (double)rec.size();
+  auto pearson = [m](double sx, double sy, double sxx, double syy, double sxy) {
+    const double vx = sxx - sx * sx / m, vy = syy - sy * sy / m;
+    return (vx > 0 && vy > 0) ? (sxy - sx * sy / m) / std::sqrt(vx * vy) : 0.0;
+  };
+  const int hot = (int)(std::max_element(pe_busy.begin(), pe_busy.end()) -
+                        pe_busy.begin());
+  const double pe_avg = tot / P, pe_max = pe_busy[hot];
+
+  std::sort(rec.begin(), rec.end(),
+            [](const Rec& a, const Rec& b) { return a.busy > b.busy; });
+  const double piece_max = rec[0].busy;
+  long over_avg = 0;
+  std::vector<double> hot_pieces;
+  for (const auto& r : rec) {
+    if (r.busy > pe_avg) over_avg++;
+    if (r.pe == hot) hot_pieces.push_back(r.busy);  // already descending
+  }
+  double top1 = 0, top3 = 0;
+  for (size_t i = 0; i < hot_pieces.size() && i < 3; i++) {
+    if (i == 0) top1 = hot_pieces[i];
+    top3 += hot_pieces[i];
+  }
+
+  // Longest-first onto the least-loaded bin; pieces arrive sorted.
+  auto lpt = [](const std::vector<double>& pieces, int bins) {
+    std::priority_queue<double, std::vector<double>, std::greater<double>> h;
+    for (int i = 0; i < bins; i++) h.push(0.0);
+    double mk = 0;
+    for (double p : pieces) {
+      double l = h.top() + p;
+      h.pop();
+      h.push(l);
+      mk = std::max(mk, l);
+    }
+    return mk;
+  };
+  std::vector<double> all;
+  all.reserve(rec.size());
+  std::vector<std::vector<double>> by_node(N);
+  for (const auto& r : rec) {
+    all.push_back(r.busy);
+    by_node[CkNodeOf(r.pe)].push_back(r.busy);
+  }
+  const double lpt_global = lpt(all, P);
+  double lpt_proc = 0, proc_even = 0;
+  int hot_node = 0;
+  for (int nd = 0; nd < N; nd++) {
+    const int sz = CkNodeSize(nd);
+    lpt_proc = std::max(lpt_proc, lpt(by_node[nd], sz));
+    if (node_busy[nd] / sz > proc_even) {
+      proc_even = node_busy[nd] / sz;
+      hot_node = nd;
+    }
+  }
+  double hot_node_pe_max = 0;
+  for (int i = 0; i < CkNodeSize(hot_node); i++)
+    hot_node_pe_max = std::max(hot_node_pe_max, pe_busy[CkNodeFirst(hot_node) + i]);
+
+  CkPrintf("FOF3STAT walk_pieces: iter %d pieces %zu busy_pe avg %.4f max %.4f "
+           "(pe %d node %d: %zu pieces, top1 %.0f%% top3 %.0f%%) piece_max %.4f "
+           "pieces_over_pe_avg %ld r_busy_work %.2f r_busy_n %.2f\n",
+           k, rec.size(), pe_avg, pe_max, hot, CkNodeOf(hot), hot_pieces.size(),
+           pe_max > 0 ? 100 * top1 / pe_max : 0.0,
+           pe_max > 0 ? 100 * top3 / pe_max : 0.0, piece_max, over_avg,
+           pearson(sw, sb, sww, sbb, swb), pearson(sn, sb, snn, sbb, snb));
+  CkPrintf("FOF3STAT walk_pieces_whatif: iter %d now %.4f floor %.4f "
+           "lpt_global %.4f lpt_in_process %.4f proc_even %.4f "
+           "(hottest process %d: pe max/avg %.2f)\n",
+           k, pe_max, std::max(piece_max, pe_avg), lpt_global, lpt_proc,
+           proc_even, hot_node, proc_even > 0 ? hot_node_pe_max / proc_even : 0.0);
+  std::string top;
+  char buf[96];
+  for (size_t i = 0; i < rec.size() && i < 8; i++) {
+    const auto& r = rec[i];
+    snprintf(buf, sizeof(buf), " %d/pe%d/%.1fms/%.3g/%dc/%df/%dn", r.piece,
+             r.pe, 1e3 * r.busy, (double)r.work, r.calls, r.fetches, r.n);
+    top += buf;
+  }
+  CkPrintf("FOF3STAT walk_pieces_top: iter %d (piece/pe/busy/leaf_ints/calls/"
+           "fetches/particles)%s\n", k, top.c_str());
+
+  const char* prefix = std::getenv("PARATREET_WALK_PIECES");
+  if (prefix && std::string(prefix) != "1") {
+    const std::string path = std::string(prefix) + ".iter" + std::to_string(k) + ".csv";
+    FILE* f = std::fopen(path.c_str(), "w");
+    if (!f) {
+      CkPrintf("walk_pieces: cannot write %s\n", path.c_str());
+      return;
+    }
+    std::fprintf(f, "piece,pe,node,n,calls,fetches,busy_s,leaf_ints,cx,cy,cz\n");
+    for (const auto& r : rec)
+      std::fprintf(f, "%d,%d,%d,%d,%d,%d,%.6e,%" PRId64 ",%.6g,%.6g,%.6g\n",
+                   r.piece, r.pe, CkNodeOf(r.pe), r.n, r.calls, r.fetches,
+                   (double)r.busy, (int64_t)r.work, r.cx, r.cy, r.cz);
+    std::fclose(f);
+    CkPrintf("walk_pieces: wrote %zu records to %s\n", rec.size(), path.c_str());
+  }
+}
 
 // Convenience driver for the full phase-3 sequence:
 //   verifySharedLeaves -> resetPhase3 -> walk + CkWaitQD
@@ -1277,6 +1422,7 @@ inline FoFPhase3Result runFoFPhase3Dist(CProxy_Partition<FragData> partitions,
     fof_node.setWalkWeights(w, CkCallbackResumeThread());
     r.walk_weights_set = true;
   }
+  if (ThreadStateHolder::walkPiecesOn()) walkPieceReport(fof);
   return r;
 }
 
