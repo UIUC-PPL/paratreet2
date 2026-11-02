@@ -41,6 +41,8 @@ module paratreet {
     entry void initialize(const CkCallback&);
     entry void requestNodes(std::pair<Key, int>);
     entry void recvStarterPack(std::pair<Key, SpatialNode<Data>> pack [n], int n, CkCallback);
+    entry void recvStarterChunk(std::pair<Key, SpatialNode<Data>> pack [n], int n, int chunk, int n_chunks, CkCallback);
+    entry void lcProbe(char blob [n], int n, const CkCallback&);
     entry void addCache(MultiData<Data>);
     entry void restoreData(std::pair<Key, SpatialNode<Data>>);
     entry void receiveTreePiece(MultiData<Data>, PPHolder<Data>);

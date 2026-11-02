@@ -167,6 +167,25 @@ using namespace paratreet;
     // canopy propagation (including the re-sends to Driver::recvTC) settle.
     proxy_pack.treepiece.upwardPass(CkCallbackResumeThread());
     CkWaitQD();
+    const double t_upward_end = CkWallTimer();
+
+    // FOF_LC_PROBE=1 (issue #4): time the transport apart from the install.
+    // An empty broadcast + reduction, then one carrying as many bytes as
+    // the starter pack, to the same nodegroup, before the real loadCache.
+    // Outside both the upwardPass and the loadCache timers.
+    static const bool lc_probe = getenv("FOF_LC_PROBE") && atoi(getenv("FOF_LC_PROBE"));
+    if (lc_probe) {
+      const long entries = proxy_pack.driver.ckLocal()->starterPackEntries();
+      const int bytes = (int)(entries * (long)sizeof(std::pair<Key, SpatialNode<FragData>>));
+      std::vector<char> blob(bytes, 0);
+      double p0 = CkWallTimer();
+      proxy_pack.cache.lcProbe(nullptr, 0, CkCallbackResumeThread());
+      double p1 = CkWallTimer();
+      proxy_pack.cache.lcProbe(blob.data(), bytes, CkCallbackResumeThread());
+      double p2 = CkWallTimer();
+      CkPrintf("FOF3STAT loadcache_probe: empty_s %.4f pack_s %.4f pack_MB %.2f\n",
+               p1 - p0, p2 - p1, bytes / 1e6);
+    }
     double t2 = CkWallTimer();
 
     // Only now ship the starter pack: every canopy annotation is valid.
@@ -178,23 +197,27 @@ using namespace paratreet;
       CkReductionMsg* lcm = (CkReductionMsg*)lcres;
       CkReduction::tupleElement* le = nullptr; int ln = 0;
       lcm->toTuple(&le, &ln);
-      if (ln == 3) {
+      if (ln == 4) {
         const double* sums = (const double*)le[0].data;
         double mx = *(const double*)le[1].data;
         double mn = *(const double*)le[2].data;
+        double span_mx = *(const double*)le[3].data;
         int procs = CkNumNodes();
+        // span: first chunk's arrival to the last chunk's install, per
+        // process (chunked starter pack); equals install with one chunk.
         CkPrintf("FOF3STAT loadcache_install: procs %d pack_n %.0f "
                  "install_sum_s %.4f mean_s %.4f max_s %.4f min_s %.4f "
-                 "max/mean %.2f\n",
+                 "max/mean %.2f span_mean_s %.4f span_max_s %.4f\n",
                  procs, sums[1] / procs, sums[0], sums[0] / procs, mx, mn,
-                 sums[0] > 0 ? mx / (sums[0] / procs) : 0.0);
+                 sums[0] > 0 ? mx / (sums[0] / procs) : 0.0,
+                 sums[2] / procs, span_mx);
       }
       delete[] le; delete lcm;
     }
     double t3 = CkWallTimer();
     CkPrintf("FOF3STAT time_s: phase1 %.3f tip_encode %.3f fragcount %.3f "
              "upwardPass %.3f loadCache %.3f\n",
-             t1 - t0, t_encode, t_fragcount, t2 - t1, t3 - t2);
+             t1 - t0, t_encode, t_fragcount, t_upward_end - t1, t3 - t2);
   }
 
   // Shared printer for the final component-count + histogram line: full and

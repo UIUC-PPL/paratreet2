@@ -1,4 +1,4 @@
-# loadCache at scale (issue #4): where it goes, and lazy canopy placeholders
+# loadCache at scale (issue #4): lazy canopy placeholders and a chunked starter pack
 
 2026-11-02. FoF3 on the 2B cosmo25 snapshot, shipping GPU config (device
 phase 1, leaf 128), 8 processes x 7 PEs per node, stack as in
@@ -89,24 +89,62 @@ than loadCache's 42 ms. The walk accounts for another 9 ms; the rest is
 not attributed. Cache node slots (all processes, used_nodes) drop 45% at
 128 nodes.
 
-## What is left at 128 nodes
+## What was left: the broadcast (fixed by chunking)
 
-Lazy loadCache 0.086 s: sort 7 ms, install max 11 ms, and about 68 ms of
-broadcast, reduction and scheduling. The broadcast is now the main term.
-Reconverse sends the 4.46 MB pack store-and-forward down an arity-4
-spanning tree, about 5 levels for 1,024 processes, copying it for each
-child (`src/collectives.cpp`, `CmiNodeBcastForward`). The pack still
-grows linearly with process count. Candidates, in order:
+After the lazy change, loadCache at 128 nodes was 0.086 s: sort 7 ms,
+install max 11 ms, and about 68 ms of everything else.
 
-1. Measure the broadcast on its own: an empty and a pack-sized broadcast
-   plus reduction just before the real one, timed at the driver.
-2. Pipelined starter pack: send it in chunks so the tree's levels overlap,
-   and install each chunk as it arrives (parents come first in key order).
-3. Smaller entries: 128 B per entry; check which `SpatialNode<Data>`
-   fields the walk reads from a canopy node.
+`FOF_LC_PROBE=1` (FoF3) times, just before the real loadCache, an empty
+broadcast + reduction to the CacheManager nodegroup and one carrying as
+many bytes as the pack, with no install. At 128 nodes (job 5834408):
+empty 0.7-0.8 ms, **pack-sized 53-73 ms**. So the transport alone was the
+remainder. Reconverse relays a node broadcast down an arity-4 spanning
+tree (about 5 levels for 1,024 processes). Each relay copies the whole
+message once per child (`CmiSyncNodeSend`) and forwards only after the
+whole message has arrived. At 2 nodes (2 levels) the same 4.16 MB probe
+is 6-7 ms. Why one 4.46 MB message costs ~10+ ms per level is not
+measured (copies, LCI rendezvous, registration of the fresh copies are
+all candidates).
 
-The `-s` cap (ship only the top of the canopy, fetch the rest on demand)
-is the other lever. In August it crossed over rather than having an
-optimum: uncapped was best at 16 nodes, and cap 128 was worst at 64
-(campaign-report-2026-08.md). It was measured before the walk fixes
-(issue #5) and before this change, so its trade-off may have moved.
+Fix: the Driver sends the pack as several broadcasts of contiguous key
+ranges, about 256 KB each (`PARATREET_STARTER_CHUNK_KB`, default 256;
+`PARATREET_STARTER_CHUNKS=K` forces K). `CacheManager::recvStarterChunk`
+installs chunks in key order. One PE at a time installs, out-of-order
+chunks are copied aside, and the installing PE drains them in order. The
+PE that installs the last chunk contributes. Parents always precede
+children in key order, so chunk k never needs chunk k+1. At 128 nodes
+the 4.46 MB pack becomes 18 chunks; small packs stay at one.
+
+128 nodes, arms interleaved in one job, median of 3, iteration 1 (job
+5834408; all 22 runs exact):
+
+| arm | loadCache | iteration | phase3_walk |
+|---|---:|---:|---:|
+| one broadcast (a88f109) | 0.082 | 0.666 | 0.256 |
+| one broadcast, install polls the network every 1024 entries | 0.083 | 0.654 | 0.244 |
+| 16 chunks (+ polls) | **0.023** | **0.602** | 0.248 |
+
+16 chunks: loadCache 3.57x and iteration 1.11x faster. The 0.023 s is
+the same in all three reps: sort 7 ms, install ~10 ms, and ~6 ms of
+transport.
+
+The polling arm tested a hypothesis: a relay installs right after
+forwarding, and LCI moves a large message only after the sender sees
+the receiver's RTR (RTS -> RTR -> RDMA write), so the children might
+wait out the relay's install. It made no difference, and the probe shows
+the transport alone is slow. The polling was not kept.
+
+## Together
+
+At 2B / 128 nodes loadCache went 0.128 -> 0.086 s (lazy, job 5833938)
+and then 0.082 -> 0.023 s (chunks, job 5834408). Each is a within-job
+comparison, so the product, about 5.5x, is an estimate across two
+allocations. The 128-node iteration gained 1.11x from each.
+
+Still linear in process count: the pack (128 B x ~34 canopy nodes per
+process), the PE-0 sort, and the per-process install of the pack itself.
+At 0.023 s none of them is large at 128 nodes. The `-s` cap is the lever
+if they become large at higher node counts. In August it crossed over
+rather than having an optimum: uncapped was best at 16 nodes, and cap
+128 was worst at 64 (campaign-report-2026-08.md). That was measured
+before these changes and the walk fixes (issue #5).

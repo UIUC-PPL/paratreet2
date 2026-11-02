@@ -6,6 +6,8 @@
 #include "CoreFunctions.h"
 
 #include <algorithm>
+#include <cmath>
+#include <unordered_set>
 #include <vector>
 
 #include <numeric>
@@ -563,13 +565,51 @@ public:
       CkPrintf("Broadcasting every tree canopy because num_share_nodes is unset\n");
     }
 
+    // The pack goes out as several broadcasts of contiguous key ranges
+    // (CacheManager::recvStarterChunk), about PARATREET_STARTER_CHUNK_KB
+    // (default 256) each; PARATREET_STARTER_CHUNKS=K forces K. A single
+    // 4.46 MB broadcast at 2B / 128 nodes costs 53-73 ms by itself (empty:
+    // 0.8 ms), going store-and-forward down reconverse's arity-4 spanning
+    // tree; in 16 chunks the levels overlap, and each process installs a
+    // chunk while later ones are still in flight. loadCache 0.082 -> 0.023
+    // s (job 5834408, issue #4).
+    const double pack_bytes = send_size * (double)sizeof(std::pair<Key, SpatialNode<Data>>);
+    int n_chunks;
+    if (const char* chunks_env = getenv("PARATREET_STARTER_CHUNKS")) {
+      n_chunks = atoi(chunks_env);
+    } else {
+      const char* kb_env = getenv("PARATREET_STARTER_CHUNK_KB");
+      const double chunk_bytes = 1024.0 * ((kb_env && atoi(kb_env) > 0) ? atoi(kb_env) : 256);
+      n_chunks = (int)std::ceil(pack_bytes / chunk_bytes);
+    }
+    if (n_chunks < 1) n_chunks = 1;
+    if (send_size > 0 && n_chunks > send_size) n_chunks = send_size;
+
     CkPrintf("FOF3STAT loadcache_pack: raw_canopies %ld deduped %ld shipped %d "
-             "sort_s %.4f entry_B %d pack_MB %.2f\n",
+             "sort_s %.4f entry_B %d pack_MB %.2f chunks %d\n",
              lc_raw, (long)storage.size(), send_size, lc_sort_s,
              (int)sizeof(std::pair<Key, SpatialNode<Data>>),
-             send_size * (double)sizeof(std::pair<Key, SpatialNode<Data>>) / 1e6);
+             send_size * (double)sizeof(std::pair<Key, SpatialNode<Data>>) / 1e6,
+             n_chunks);
     // Send data to caches
-    cache_manager.recvStarterPack(storage.data(), send_size, cb);
+    for (int k = 0; k < n_chunks; k++) {
+      const long b = (long)send_size * k / n_chunks;
+      const long e = (long)send_size * (k + 1) / n_chunks;
+      cache_manager.recvStarterChunk(storage.data() + b, (int)(e - b), k, n_chunks, cb);
+    }
+  }
+
+  // Entries the next loadCache will ship, for FoF3's FOF_LC_PROBE (a
+  // same-size broadcast timed before the real one). Counts distinct keys
+  // instead of sorting, so loadCache's own sort time is unchanged.
+  long starterPackEntries() {
+    std::unordered_set<Key> keys;
+    keys.reserve(storage.size());
+    for (auto& e : storage) keys.insert(e.first);
+    long n = (long)keys.size();
+    auto& config = paratreet::getConfiguration();
+    if (config.num_share_nodes > 0 && config.num_share_nodes < n) n = config.num_share_nodes;
+    return n;
   }
 
   void sortStorage() {

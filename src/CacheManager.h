@@ -10,6 +10,7 @@
 #include "TreeCache.h"
 
 #include <map>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -73,14 +74,18 @@ public:
   // against the driver's own total.
   double lc_install_s = 0.0;
   long   lc_pack_n = 0;
+  // Chunked pack only: first chunk's arrival to the last chunk's install,
+  // on this process. With one chunk it equals lc_install_s.
+  double lc_span_s = 0.0;
   void loadCacheProf(const CkCallback& cb) {
-    double sums[2] = {lc_install_s, (double)lc_pack_n};
-    double mx = lc_install_s, mn = lc_install_s;
-    CkReduction::tupleElement elems[3] = {
+    double sums[3] = {lc_install_s, (double)lc_pack_n, lc_span_s};
+    double mx = lc_install_s, mn = lc_install_s, span_mx = lc_span_s;
+    CkReduction::tupleElement elems[4] = {
         CkReduction::tupleElement(sizeof(sums), sums, CkReduction::sum_double),
         CkReduction::tupleElement(sizeof(double), &mx, CkReduction::max_double),
-        CkReduction::tupleElement(sizeof(double), &mn, CkReduction::min_double)};
-    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(elems, 3);
+        CkReduction::tupleElement(sizeof(double), &mn, CkReduction::min_double),
+        CkReduction::tupleElement(sizeof(double), &span_mx, CkReduction::max_double)};
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(elems, 4);
     msg->setCallback(cb);
     this->contribute(msg);
   }
@@ -151,6 +156,32 @@ public:
   // cap redirects.
   long canopy_fills = 0;
   void recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack, int n, CkCallback);
+
+  // Chunked starter pack (Driver::loadCache, PARATREET_STARTER_CHUNKS;
+  // issue #4). The pack goes out as n_chunks separate broadcasts, so the
+  // spanning tree forwards chunk k+1 while chunk k is a level further down,
+  // and each process installs a chunk as soon as it can. Chunks are
+  // contiguous key ranges of the sorted pack and every parent has a smaller
+  // key, so installing chunks in order keeps every parent ahead of its
+  // children. Chunks can arrive out of order, and on a nodegroup two PEs
+  // can receive two chunks at once: one PE at a time installs
+  // (sp_installing), a chunk that cannot be installed yet is copied to
+  // sp_pending, and the installing PE drains sp_pending in order before it
+  // lets go. The PE that installs the last chunk contributes.
+  void recvStarterChunk(std::pair<Key, SpatialNode<Data>>* pack, int n,
+                        int chunk, int n_chunks, CkCallback cb);
+  void installStarterEntries(std::pair<Key, SpatialNode<Data>>* pack, int n);
+  std::mutex sp_lock;
+  std::map<int, std::vector<std::pair<Key, SpatialNode<Data>>>> sp_pending;
+  int sp_next = 0;
+  bool sp_installing = false;
+  double sp_first_arrival = -1.0;   // CkWallTimer() of this process's first chunk
+
+  // loadCache probe (FOF_LC_PROBE in FoF3): a broadcast of n bytes and a
+  // reduction, nothing else, so the transport can be timed apart from the
+  // install.
+  void lcProbe(char* blob, int n, const CkCallback& cb) { this->contribute(cb); }
+
   void addCache(MultiData<Data>);
   void receiveTreePiece(MultiData<Data>, PPHolder<Data>);
   void refreshTreePieceCopy(MultiData<Data>);
@@ -228,10 +259,74 @@ void CacheManager<Data>::recvStarterPack(std::pair<Key, SpatialNode<Data>>* pack
     core.installBoundary(CkMyRank(), pack[i], parked);
   }
   lc_install_s = CkWallTimer() - lc_t0;        // O(n) per process, n ~ canopies
+  lc_span_s = lc_install_s;
   lc_pack_n = n;
   if (n == 0) root = local_tps[1];
   CkAssert(root);
   this->contribute(cb);
+}
+
+template <typename Data>
+void CacheManager<Data>::installStarterEntries(std::pair<Key, SpatialNode<Data>>* pack, int n) {
+  std::vector<uint64_t> parked; // starter pack precedes all walks: stays empty
+  const double t0 = CkWallTimer();
+  for (int i = 0; i < n; i++) core.installBoundary(CkMyRank(), pack[i], parked);
+  lc_install_s += CkWallTimer() - t0;
+  lc_pack_n += n;
+}
+
+template <typename Data>
+void CacheManager<Data>::recvStarterChunk(std::pair<Key, SpatialNode<Data>>* pack, int n,
+                                          int chunk, int n_chunks, CkCallback cb) {
+  sp_lock.lock();
+  if (sp_first_arrival < 0) {
+    sp_first_arrival = CkWallTimer();
+    lc_install_s = 0.0;
+    lc_pack_n = 0;
+  }
+  if (sp_installing || chunk != sp_next) {
+    // Not installable now: keep a copy (the marshalled buffer is freed when
+    // this entry returns) for whichever PE installs chunk sp_next.
+    sp_pending.emplace(chunk, std::vector<std::pair<Key, SpatialNode<Data>>>(pack, pack + n));
+    sp_lock.unlock();
+    return;
+  }
+  sp_installing = true;
+  sp_lock.unlock();
+
+  CkAssert(chunk != 0 || n == 0 || pack[0].first == Key(1));
+  installStarterEntries(pack, n);
+
+  sp_lock.lock();
+  sp_next = chunk + 1;
+  for (auto it = sp_pending.find(sp_next); it != sp_pending.end();
+       it = sp_pending.find(sp_next)) {
+    auto entries = std::move(it->second);
+    sp_pending.erase(it);
+    sp_lock.unlock();
+    installStarterEntries(entries.data(), (int)entries.size());
+    sp_lock.lock();
+    sp_next++;
+  }
+  sp_installing = false;
+  const bool done = (sp_next == n_chunks);
+  if (done) {
+    lc_span_s = CkWallTimer() - sp_first_arrival;
+    sp_next = 0;
+    sp_first_arrival = -1.0;
+  }
+  sp_lock.unlock();
+
+  if (done) {
+    if (lc_pack_n == 0) root = local_tps[1];
+    CkAssert(root);
+#if !DEBUG
+    if (this->thisIndex == 0)
+#endif
+    CkPrintf("[CacheManager %d] installed starter pack, %ld entries in %d chunks\n",
+             this->thisIndex, lc_pack_n, n_chunks);
+    this->contribute(cb);
+  }
 }
 
 template <typename Data>
