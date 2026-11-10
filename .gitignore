@@ -44,3 +44,7 @@ fof/gpu/stage0.*.err
 tests/kokkos-spike/kokkos-spike
 tests/nchilada/nchilada-test
 tests/nchilada/nchilada-fixture/
+
+# Sub-halo tools (built from subhalo/*.cpp)
+subhalo/tipsy2hbt
+subhalo/hbtstat
