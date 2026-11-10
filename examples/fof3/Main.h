@@ -69,6 +69,9 @@ class ExMain: public paratreet::Main<FragData> {
   // -K: build the halo catalog (groups of >= max(1, -m) particles) after
   // the labels, and print FOF3STAT catalog (design/plugin-interface.md D).
   bool fof_catalog = false;
+  // -L <prefix>: write every particle's (order, label) to <prefix>.<pe>.lbl,
+  // one file per PE (FoFPhase1::writeLabels). Empty = off.
+  std::string fof_label_prefix;
   // -G <t>: occupancy threshold (expected particles per b/sqrt(6) cell at
   // a chare's root) above which phaseA solves that chare's self pair with
   // the cell grid instead of the tree walk. 0 disables the grid (the

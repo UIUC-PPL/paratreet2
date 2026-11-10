@@ -72,7 +72,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SCK")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SCKL:")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -126,6 +126,9 @@ PARATREET_REGISTER_MAIN(ExMain);
         case 'K':
           fof_catalog = true;
           break;
+        case 'L':
+          fof_label_prefix = optarg;
+          break;
         case 'm':
           fof_min_component_size = atoi(optarg);
           if (fof_min_component_size < 0)
@@ -155,6 +158,9 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t-m [min component size for REPORTING (default 0 = report all);\n");
           CkPrintf("\t    when >0, also prints a FOF3STAT surviving line for\n");
           CkPrintf("\t    components with size >= m (a reporting filter only)]\n");
+          CkPrintf("\t-L [prefix: write each particle's (order, label) as two\n");
+          CkPrintf("\t    8-byte integers to <prefix>.<pe>.lbl, one file per PE;\n");
+          CkPrintf("\t    with -K -m, groups below the minimum size get -1]\n");
           CkPrintf("\t-P [periodic box period L (cubic, all axes); default 0 = off\n");
           CkPrintf("\t    (open boundaries). Minimum-image PBC; requires b < L/2]\n");
           CkPrintf("\t-E [UF_2 mid-walk edge-batch size; 0 = classic post-walk\n");
@@ -229,6 +235,8 @@ PARATREET_REGISTER_MAIN(ExMain);
     CkPrintf("Min component size for reporting: %d%s\n",
              fof_min_component_size,
              fof_min_component_size == 0 ? " (report all)" : "");
+    CkPrintf("Label files (-L): %s\n",
+             fof_label_prefix.empty() ? "off" : fof_label_prefix.c_str());
     CkPrintf("Fragments histogram (-g): %s\n",
              fof_frag_histogram ? "on" : "off");
     CkPrintf("phaseA grid threshold (-G): %g%s\n",

@@ -735,6 +735,19 @@ using namespace paratreet;
                cs.groups, cs.particles, cs.max_size, cs.digest,
                CkWallTimer() - tc0);
     }
+    if (!fof_label_prefix.empty()) {
+      // -L: one (order, label) file per PE. After the catalog, so that with
+      // -K -m the groups below the minimum size are written as -1.
+      double tw0 = CkWallTimer();
+      CkReductionMsg* wmsg = nullptr;
+      fof.writeLabels(fof_label_prefix, CkCallbackResumeThread((void*&)wmsg));
+      const auto* w = (const unsigned long long*)wmsg->getData();
+      CkPrintf("FOF3STAT label_files: prefix %s files %d records %llu "
+               "digest %016llx no_group %llu time_s %.3f\n",
+               fof_label_prefix.c_str(), CkNumPes(), w[0], w[1], w[2],
+               CkWallTimer() - tw0);
+      delete wmsg;
+    }
 
     if (!do_full) {
       // Stats mode: no particle gather, no serial reference. The component

@@ -3961,6 +3961,39 @@ public:
                      CkReduction::sum_ulong_long, cb);
   }
 
+  // Label files (FoF3's -L): this PE writes one record per particle it
+  // holds to <prefix>.<pe>.lbl, as two native 8-byte integers: the
+  // particle's order and its label. The label is the group's minimum
+  // particle order, or -1 when a catalogue run with a minimum size came
+  // first and the group is below it (the rule returnHostLabels applies).
+  // Records are in no particular order; a reader places them by `order`.
+  // Contributes {records, digest of (order, minimum-ID label), records
+  // written as -1}: the first two must equal the label_digest line.
+  void writeLabels(std::string prefix, const CkCallback& cb) {
+    unsigned long long v[3] = {0, 0, 0};
+    const std::string path = prefix + "." + std::to_string(CkMyPe()) + ".lbl";
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) CkAbort("FoF writeLabels: cannot open %s", path.c_str());
+    std::vector<long> buf;
+    for (auto& s : treepieces) {
+      buf.resize(2 * (size_t)s.n);
+      for (int i = 0; i < s.n; i++) {
+        long label = paratreet::uf2MinOrderLabel(s.parts[i].group_number);
+        v[0]++;
+        v[1] += paratreet::labelDigestTerm(s.parts[i].order, label);
+        if (cat_min_size_ > 1 && !cat_kept_.count(label)) { label = -1; v[2]++; }
+        buf[2 * (size_t)i] = s.parts[i].order;
+        buf[2 * (size_t)i + 1] = label;
+      }
+      if (!buf.empty() &&
+          fwrite(buf.data(), sizeof(long), buf.size(), f) != buf.size())
+        CkAbort("FoF writeLabels: short write to %s", path.c_str());
+    }
+    if (fclose(f) != 0) CkAbort("FoF writeLabels: cannot close %s", path.c_str());
+    this->contribute(3 * sizeof(unsigned long long), v,
+                     CkReduction::sum_ulong_long, cb);
+  }
+
   // Hosted runs: send each of this PE's particles' minimum-ID label to the
   // PE that staged it (Particle::origin). The caller waits for quiescence
   // after the contribution, which covers the sends.

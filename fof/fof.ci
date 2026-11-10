@@ -137,6 +137,7 @@ module fof {
     entry void memoryStats(const CkCallback&);
     entry void depositLabelCounts(const CkCallback&);
     entry void labelDigest(const CkCallback&);
+    entry void writeLabels(std::string prefix, const CkCallback&);
     entry void returnHostLabels(const CkCallback&);
     entry void catalogAccumulate(Vector3D<Real> period, const CkCallback&);
     entry void catalogReceive(int from, const std::vector<paratreet::FoFCatPartial>& partials);
