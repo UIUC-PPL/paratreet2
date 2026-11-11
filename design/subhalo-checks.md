@@ -773,7 +773,9 @@ with many differing particles is visible.
 
 `subhalo/unbindcheck` applies it (and prints the verdict of the rule as
 first written). It reads the file `unbind --dump` writes, or a
-`.particles.bin` file. Cases with known answers, all on 8m-lambb against
+`.particles.bin` file; the dump reader was tested with files written in
+that layout from two of the results below, and it read the real dumps of
+Frontier job 5903512. Cases with known answers, all on 8m-lambb against
 exact-double:
 
 | Candidate | Should | Rule as written | Amended rule | Groups with different bound sets |
@@ -791,6 +793,50 @@ exact-double:
 The checker takes 0.7 s when no group differs and 41 s for the 12 groups of
 the code-unit case, which include the largest (Mac, 10 threads).
 
+### Tolerance for single-precision kernels (decided 2026-11-11, before any kernel output was compared)
+
+Decision: a single-precision kernel that differs from the reference by its
+own rounding gets a looser tolerance; it is not treated as needing a fix.
+
+tau was set as ten times the difference between HBT-HERONS's single- and
+double-precision builds. A kernel's single-precision rounding is measured
+the same way, against the same kernel in double precision on the same
+input, and ten times it is added:
+
+    tau_single = min(tau + 10 * n_k, 10 * tau)
+
+n_k is the 99.9th percentile, over the particles bound in both runs, of
+|E_single - E_double| / S. Neither measurement involves the comparison
+being judged. Conditions:
+
+- the double-precision kernel passes at tau by itself first;
+- the allowance stops at 10 * tau (0.0141), so that an error cannot buy its
+  own tolerance;
+- it applies to `--kernel f32` and `--kernel f32f32`, with or without
+  `--rsqrt`. Double-precision variants are held to tau.
+
+`unbindcheck --single-against <double result>` measures n_k, prints it and
+applies the wider tolerance. Checks: HBT-HERONS's single-precision run
+against its double one gives n = 1.41e-4 and tolerance 0.00282, and passes;
+the run without the Hubble term and the run with G 1.1% too large reach the
+10 * tau stop and still fail (47% and 38% of energies within the tolerance).
+
+What the kernel's arithmetic predicts. Its self-checks give a relative
+error in the potential of 9.5e-7 (single, summed in double) and 9.3e-6
+(single, summed in single), and `unbindspec --potential-ratio` gives
+|U| / S = 1.46 at the median, 4.04 at the 99.9th percentile and 4.96 at
+most on this input, so those errors move an energy by about 4e-6 and 4e-5
+of S at the 99.9th percentile.
+
+Outcome on 8m-lambb (Frontier job 5903512, run before this allowance was
+on `main`): it was not needed. All three single-precision forms pass at
+tau itself, with the reference's bound particles exactly. Against the
+reference their 99.9th percentiles are 5.3e-7 (`f32`), 5.0e-5 (`f32f32`,
+which matches the 4e-5 predicted above) and 5.4e-7 (`f32 --rsqrt`), so the
+allowance would have set tolerances of about 0.00142, 0.0019 and 0.00142.
+These are read from the distributions against the reference, not from a
+`--single-against` run. The allowance stays as the rule for other inputs.
+
 ### Comparing `unbind` with the references
 
 Tools, all in `subhalo/` (`make compare`):
@@ -799,8 +845,8 @@ Tools, all in `subhalo/` (`make compare`):
 |---|---|---|
 | `hbtref` | HBT-HERONS output (`SubhaloParticles`, `BindingEnergies`) to a `.particles.bin` reference; with the snapshot as third argument also a copy in FoF3's numbering | HDF5 |
 | `unbindcmp` | two `.particles.bin` files under the rule as first written; without `--tau` it measures the noise that sets tau | nothing |
-| `unbindcheck` | the amended rule; reads `unbind --dump` directly | HDF5, OpenMP |
-| `unbindspec` | the written definition on every group, in plain double-precision loops (`--trace`, `--g`, `--no-hubble`) | HDF5, OpenMP |
+| `unbindcheck` | the amended rule; reads `unbind --dump` directly; `--single-against` for single-precision kernels | HDF5, OpenMP |
+| `unbindspec` | the written definition on every group, in plain double-precision loops (`--trace`, `--g`, `--no-hubble`, `--potential-ratio`) | HDF5, OpenMP |
 | `unbindrec.h`, `unbindspec.h` | the 24-byte record and its reader; the definition shared by `unbindspec` and `unbindcheck` | |
 
 A `.particles.bin` file has one 24-byte record per bound particle, native
@@ -828,13 +874,17 @@ make compare                     # in subhalo/, same HDF5 as unbind
 # 2. per particle, both sides running to the end
 ./unbind snap_0000.hdf5 --bound-fraction 1 --dump kernel_f64.hdf5
 ./unbindcheck snap_0000.hdf5 exact-double.particles.bin kernel_f64.hdf5 --tau 0.00141
+# 3. the single-precision kernels, each against the double-precision run
+./unbind snap_0000.hdf5 --bound-fraction 1 --kernel f32 --dump kernel_f32.hdf5
+./unbindcheck snap_0000.hdf5 exact-double.particles.bin kernel_f32.hdf5 --tau 0.00141 \
+              --single-against kernel_f64.hdf5
 ```
 
 Expected in 1: 13,256 groups with a sub-halo on both sides, 4,217,368 bound
 particles against HBT-HERONS's 4,217,367. Expected in 2: 13,256 groups and
 about 4,215,954 bound particles. Run 2 without `--float-positions`: the
-reference is the double-precision build. The single-precision kernels are
-held to the same tau, which was set from single-precision rounding.
+reference is the double-precision build. Run 3 only after 2 passes; repeat
+it for `--kernel f32f32` and for each with `--rsqrt`.
 
 `unbind` reads the snapshot's units, as HBT-HERONS does, so item 6 does not
 apply to it. A later kernel in code units (box 1, G = 1, H = 2.894405, the
@@ -895,7 +945,8 @@ Per particle, both sides running until a pass removes nothing
 - Unbinding time is `unbind`'s own figure for the whole unbinding (kernel,
   host work and copies to and from the die; not reading or grouping, 1.1 s).
   The kernel part is 0.85, 0.68, 0.67 and 0.38 s, in table order.
-- `unbindcheck` does not print the largest difference. It comes from
+- `unbindcheck` as run here did not print the largest difference (it does
+  since the commit that added `--single-against`). It comes from
   `unbindcmp` on the bound particles of each dump, written as a
   `.particles.bin` file with `h5dump` and numpy (no tool in the repo does
   that conversion). The rest of the distribution of \|dE\|/S, lower is

@@ -2,7 +2,8 @@
 // reference under the amended pass rule of design/subhalo-checks.md
 // ("Pass rule, amended").
 //
-//   unbindcheck <snapshot.hdf5> <reference.particles.bin> <candidate> --tau T [--list N]
+//   unbindcheck <snapshot.hdf5> <reference.particles.bin> <candidate> --tau T
+//               [--single-against <double result>] [--list N]
 //
 //   <snapshot.hdf5>            the file tipsy2hbt wrote, which both sides read
 //   <reference.particles.bin>  hbtref's output for the exact HBT-HERONS run,
@@ -10,6 +11,13 @@
 //   <candidate>                the file `unbind --dump` writes, or a
 //                              .particles.bin file in the snapshot's numbering
 //   --tau T                    the tolerance (0.00141 for 8m-lambb)
+//   --single-against F         for a single-precision kernel: F is the same
+//                              kernel's double-precision result on the same
+//                              input (a --dump file or a .particles.bin
+//                              file). The tolerance becomes
+//                              min(T + 10 n, 10 T), n being the 99.9th
+//                              percentile of |E_single - E_double| / S over
+//                              the particles bound in both.
 //   --list N                   print at most N differing groups (default 20)
 //
 // Both sides must have run until a pass removes nothing: HBT-HERONS with
@@ -43,6 +51,14 @@
 //   3. Groups. A group has a sub-halo in only one result only if its bound
 //      count there is within 2 of the 20-particle minimum.
 // It also prints the verdict of the rule as first written.
+//
+// Single-precision kernels get a looser tolerance (--single-against). T was
+// set as ten times the difference between HBT-HERONS's single- and
+// double-precision builds; a kernel's own single-precision rounding is
+// measured the same way, against the same kernel in double precision, and
+// ten times it is added. Neither measurement involves the comparison being
+// judged. The double-precision kernel must pass at T by itself first, and
+// the allowance stops at 10 T so that an error cannot buy its own tolerance.
 //
 // Exit status 0 = pass (amended rule), 1 = fail, 2 = usage or input error.
 //
@@ -105,14 +121,17 @@ struct GroupResult {
 int main(int argc, char** argv) {
   double tau = -1;
   long list = 20;
+  const char* single_against = nullptr;
   for (int i = 4; i < argc; i++) {
     if (!strcmp(argv[i], "--tau") && i + 1 < argc) tau = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--single-against") && i + 1 < argc) single_against = argv[++i];
     else if (!strcmp(argv[i], "--list") && i + 1 < argc) list = atol(argv[++i]);
     else { fprintf(stderr, "%s: unknown option %s\n", TOOL, argv[i]); return 2; }
   }
   if (argc < 4 || tau <= 0) {
     fprintf(stderr, "usage: unbindcheck <snapshot.hdf5> <reference.particles.bin> "
-                    "<candidate: unbind --dump file or .particles.bin> --tau T [--list N]\n");
+                    "<candidate: unbind --dump file or .particles.bin> --tau T "
+                    "[--single-against <double-precision result>] [--list N]\n");
     return 2;
   }
 
@@ -125,6 +144,31 @@ int main(int argc, char** argv) {
     auto it = sref.find(g);
     return it != sref.end() ? it->second : scand.at(g);
   };
+
+  // A single-precision kernel: widen the tolerance by ten times its own
+  // rounding, measured against the same kernel in double precision.
+  if (single_against) {
+    const std::vector<Rec> dbl = isHdf5(single_against) ? loadDump(single_against)
+                                                        : loadRecords(single_against, TOOL);
+    std::vector<double> d;
+    for (size_t i = 0, j = 0; i < dbl.size() && j < cand.size();) {
+      if (dbl[i].id < cand[j].id) i++;
+      else if (cand[j].id < dbl[i].id) j++;
+      else {
+        d.push_back(std::fabs(cand[j].e - dbl[i].e) / scale(cand[j].group));
+        i++; j++;
+      }
+    }
+    const double p50 = percentile(d, 0.5), n = percentile(d, 0.999);
+    const double top = d.empty() ? 0 : *std::max_element(d.begin(), d.end());
+    const double widened = std::min(tau + 10 * n, 10 * tau);
+    printf("single-precision allowance, against %s: %zu bound particles there, %zu "
+           "bound in both;\n  |dE|/S median %.3g, 99.9%% n = %.3g, largest %.3g; "
+           "tolerance = min(%.3g + 10 n, 10 * %.3g) = %.3g%s\n\n", single_against,
+           dbl.size(), d.size(), p50, n, top, tau, tau, widened,
+           tau + 10 * n > 10 * tau ? " (stopped at 10 tau)" : "");
+    tau = widened;
+  }
 
   // First merge by particle id: which groups differ.
   struct Diff { long long only_ref = 0, only_cand = 0; };
@@ -177,6 +221,13 @@ int main(int argc, char** argv) {
   printf("groups: %lld with equal bound sets, %lld with different bound sets, "
          "%lld with a sub-halo on one side only\n", g_equal, g_differ,
          g_ref_only + g_cand_only);
+  {
+    const double p50 = percentile(all, 0.5), p99 = percentile(all, 0.99),
+                 p999 = percentile(all, 0.999);
+    const double top = all.empty() ? 0 : *std::max_element(all.begin(), all.end());
+    printf("|dE|/S over particles bound in both: median %.3g, 99%% %.3g, 99.9%% %.3g, "
+           "largest %.3g\n", p50, p99, p999, top);
+  }
 
   // ---- the rule as first written (what unbindcmp prints) -------------------
   {

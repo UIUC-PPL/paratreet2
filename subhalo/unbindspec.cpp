@@ -8,6 +8,7 @@
 // correct kernel can pass too.
 //
 //   unbindspec <snapshot.hdf5> <out.particles.bin> [--g G] [--no-hubble] [--trace ID]
+//              [--potential-ratio]
 //
 // <snapshot.hdf5> is the file tipsy2hbt wrote. The output has one 24-byte
 // record per bound particle (unbindrec.h), the layout unbindcmp and
@@ -17,7 +18,10 @@
 // kernel with a slightly different constant would see. --no-hubble drops the
 // Hubble term, a deliberately wrong result for testing the comparison tools.
 // --trace prints one particle's energy at every pass of its group, to see
-// where a difference between two results began.
+// where a difference between two results began. --potential-ratio prints
+// how large the bound particles' potential term |U| is against S, their
+// group's median |E|: a relative error eps in a kernel's potential moves an
+// energy by eps * |U| / S in the units of the pass rule.
 //
 // Build: make unbindspec (subhalo/Makefile; HDF5 and OpenMP).
 
@@ -29,20 +33,23 @@
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: unbindspec <snapshot.hdf5> <out.particles.bin> "
-                    "[--g G] [--no-hubble] [--trace ID]\n");
+                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio]\n");
     return 2;
   }
   long long trace_id = -1;
+  bool potential_ratio = false;
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--g") && i + 1 < argc) ubs::G = atof(argv[++i]);
     else if (!strcmp(argv[i], "--trace") && i + 1 < argc) trace_id = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--no-hubble")) ubs::hubble_factor = 0;
+    else if (!strcmp(argv[i], "--potential-ratio")) potential_ratio = true;
     else { fprintf(stderr, "unbindspec: unknown option %s\n", argv[i]); return 2; }
   }
   const ubs::Snapshot s = ubs::readSnapshot(argv[1], "unbindspec");
   const size_t ng = s.groups.size();
 
   std::vector<std::vector<Rec>> out(ng);
+  std::vector<std::vector<double>> ratio(ng);     // --potential-ratio: |U| / S
   std::vector<long> passes(ng, 0);
 
   // One group. `inner` = parallelize over its particles (large groups).
@@ -68,6 +75,13 @@ int main(int argc, char** argv) {
         });
     for (size_t i = 0; i < n; i++)
       if (alive[i]) out[gi].push_back({s.ID[idx[i]], g.id, e[i]});
+    if (potential_ratio && !out[gi].empty()) {
+      std::vector<double> ae;
+      for (const Rec& r : out[gi]) ae.push_back(std::fabs(r.e));
+      const double S = percentile(ae, 0.5);
+      for (size_t i = 0; i < n; i++)
+        if (alive[i]) ratio[gi].push_back(std::fabs(pot[i] * ubs::G / s.a) / S);
+    }
   };
 
   size_t nbig = 0;
@@ -99,5 +113,14 @@ int main(int argc, char** argv) {
          (double)total_passes / ng, max_passes);
   printf("unbindspec: box %g Mpc, a %g, H %g km/s/Mpc, softening %g Mpc, G %.7g%s\n",
          s.L, s.a, s.H, s.eps, ubs::G, ubs::hubble_factor == 1.0 ? "" : ", NO Hubble term");
+  if (potential_ratio) {
+    std::vector<double> all;
+    for (auto& r : ratio) all.insert(all.end(), r.begin(), r.end());
+    const double p50 = percentile(all, 0.5), p99 = percentile(all, 0.99),
+                 p999 = percentile(all, 0.999);
+    const double top = all.empty() ? 0 : *std::max_element(all.begin(), all.end());
+    printf("unbindspec: |U|/S over the bound particles: median %.3g, 99%% %.3g, "
+           "99.9%% %.3g, largest %.3g\n", p50, p99, p999, top);
+  }
   return 0;
 }
