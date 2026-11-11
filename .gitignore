@@ -50,3 +50,7 @@ subhalo/tipsy2hbt
 subhalo/hbtstat
 subhalo/unbind
 subhalo/unbind_rate
+subhalo/hbtref
+subhalo/unbindcmp
+subhalo/unbindspec
+subhalo/unbindcheck

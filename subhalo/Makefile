@@ -3,6 +3,8 @@
 #   make                 # Frontier: unbind_rate and unbind, Kokkos/HIP by hipcc
 #   make unbind_rate     # the synthetic checks and rates only (no HDF5)
 #   make convert         # tipsy2hbt and hbtstat (HDF5 only)
+#   make compare         # hbtref, unbindcmp, unbindspec, unbindcheck: the
+#                        # comparison with HBT-HERONS (HDF5; OpenMP for speed)
 #
 # Any other machine: name a C++ compiler, a Kokkos install and HDF5, e.g.
 # the Mac with Homebrew and a Kokkos built for OpenMP:
@@ -20,6 +22,7 @@ KCXX          ?= $(ROCM_DIR)/bin/hipcc
 ARCH_FLAG     ?= --offload-arch=gfx90a
 HDF5_DIR      ?= /opt/cray/pe/hdf5/1.14.3.9/gnu/12.3
 HOSTCXX       ?= c++
+HOSTOMP       ?= -fopenmp
 
 CXXFLAGS    = -std=c++17 -O3 -ffp-contract=off $(ARCH_FLAG) -I$(KOKKOS_DIR)/include
 KOKKOS_LIBS = -L$(KOKKOS_LIBDIR) -lkokkoscontainers -lkokkosalgorithms -lkokkoscore -ldl
@@ -42,7 +45,25 @@ tipsy2hbt: tipsy2hbt.cpp
 hbtstat: hbtstat.cpp
 	$(HOSTCXX) -O2 -std=c++17 $(HDF5_FLAGS) -o $@ $< $(HDF5_LIBS)
 
-clean:
-	rm -f unbind_rate unbind tipsy2hbt hbtstat *.o
+# The comparison with HBT-HERONS (design/subhalo-checks.md, "Exact reference
+# for the unbinding kernel"). Plain C++ by the host compiler. unbindspec and
+# unbindcheck use OpenMP: on the Mac pass HOSTCXX=g++-16 HDF5_DIR=/opt/homebrew
+# (Apple's c++ has no -fopenmp; HOSTOMP= builds them serial).
+compare: hbtref unbindcmp unbindspec unbindcheck
 
-.PHONY: all convert clean
+hbtref: hbtref.cpp
+	$(HOSTCXX) -O2 -std=c++17 $(HDF5_FLAGS) -o $@ $< $(HDF5_LIBS)
+
+unbindcmp: unbindcmp.cpp unbindrec.h
+	$(HOSTCXX) -O2 -std=c++17 -o $@ $<
+
+unbindspec: unbindspec.cpp unbindspec.h unbindrec.h
+	$(HOSTCXX) -O3 -std=c++17 -ffp-contract=off $(HOSTOMP) $(HDF5_FLAGS) -o $@ $< $(HDF5_LIBS)
+
+unbindcheck: unbindcheck.cpp unbindspec.h unbindrec.h
+	$(HOSTCXX) -O3 -std=c++17 -ffp-contract=off $(HOSTOMP) $(HDF5_FLAGS) -o $@ $< $(HDF5_LIBS)
+
+clean:
+	rm -f unbind_rate unbind tipsy2hbt hbtstat hbtref unbindcmp unbindspec unbindcheck *.o
+
+.PHONY: all convert compare clean

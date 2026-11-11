@@ -307,6 +307,12 @@ OMP_NUM_THREADS=4 mpirun -np 2 ~/HBT-HERONS/build/HBT ../../subhalo/hbt_8m_lambb
   unbinds it. That is exactly "unbind every FoF group", the first product of
   our step 1.
 
+Since 2026-11-11 `hbt_8m_lambb.conf` also turns sampling off, sets the
+opening angle to 0.1 and saves energies. The numbers in this section are from
+the file before that change (HBT-HERONS's defaults); the run with the change
+is in "Results" under "Exact reference" below. On the Mac the output of this
+section's run is now `out-sampled/` and its table `hbt_reference_sampled.txt`.
+
 Result (2 processes x 4 threads; HBT-HERONS read the same 15,181 groups and
 153,804-particle largest group that FoF3's catalogue reports):
 
@@ -526,6 +532,13 @@ What this says:
 
 ### Not done
 
+Update, 2026-11-11: the HBT-HERONS reruns of the first two items are done
+on the Mac and `hbtref` reads `SubhaloParticles` and `BindingEnergies`. The
+three settings alone turned out not to be enough for a per-particle target
+(the default early stop). Results, the pass rule and the commands for
+Frontier are in "Exact reference for the unbinding kernel" below. What is
+left of the first two items is to run `unbind` against those files.
+
 - The per-group comparison. On the Mac, add to `hbt_8m_lambb.conf`
 
   ```
@@ -548,9 +561,295 @@ What this says:
   wide on real data (the nearest-image kernel is checked on synthetic
   particles only; the 8M input has no such group).
 
+## Exact reference for the unbinding kernel (2026-11-11)
+
+The run above is not a fair reference for a kernel: groups above 1,000
+particles got 1,000 sampled sources, and every group used a tree with opening
+angle 0.45. This section replaces it with a reference that has neither, and
+that saves every bound particle's energy.
+
+### What HBT-HERONS computes (read from c728ee0)
+
+For one group with particles i (comoving position x_i in Mpc, peculiar
+velocity v_i in km/s, mass m_i in 1e10 Msun), at expansion factor a:
+
+- Frame: position X and velocity V. On the first pass they are the
+  mass-weighted means over all of the group's particles; after each pass they
+  are the mass-weighted means over the particles still bound. Positions are
+  averaged as nearest-image offsets from one member, then shifted back.
+- Kinetic term: K_i = 1/2 |(v_i - V) + H a (x_i - X)|^2, with x_i - X the
+  nearest image, H in km/s/Mpc (70 here) and a = 1.
+- Potential: U_i = (G / a) * sum over the other bound particles j of
+  m_j * phi(r_ij), r_ij the nearest-image comoving distance, G = 43.0071
+  (km/s)^2 Mpc / 1e10 Msun. With eps the softening (0.01 Mpc here) and
+  h = 2.8 eps: phi = -1/r for r >= h; otherwise, with u = r/h,
+  phi = (1/h) * (-2.8 + u^2 (5.333333333333 + u^2 (6.4 u - 9.6))) for u < 0.5
+  and phi = (1/h) * (-3.2 + 0.066666666667/u + u^2 (10.666666666667 +
+  u (-16 + u (9.6 - 2.133333333333 u)))) for u >= 0.5.
+- Energy: E_i = K_i + U_i, per unit mass, in (km/s)^2. Bound means E_i < 0.
+- One pass removes every particle with E_i >= 0, then updates X and V. If
+  fewer than 20 particles remain, the group has no sub-halo.
+- It stops when N_bound >= `BoundMassPrecision` * N_before. The default is
+  0.995, so it can stop while up to 0.5% of the particles are still
+  removable, and the saved energies are the ones computed BEFORE the last
+  removal and frame update. With `BoundMassPrecision 1` it stops only when a
+  pass removes nothing, and the saved energies are those of the final bound
+  set in its own frame. Only that is a fixed point a kernel can be held to.
+- `TreeNodeOpenAngle 0` opens every tree node, so the potential is the plain
+  pairwise sum. `MaxSampleSizeOfPotentialEstimate 0` turns sampling off, and
+  also turns off the separate centre refinement.
+- Precision: potentials are summed in double, but positions are single (a
+  default build) and each particle's energy is stored and tested as a single.
+  When less than half of the particles are removed, the next pass does not
+  recompute: it subtracts the removed particles' potential and adjusts the
+  kinetic term for the frame change, in single precision.
+
+### Runs
+
+All on `8m-lambb` with `-P 1`, the snapshot of the Mac check above:
+
+| Name | Build | Settings beyond no sampling, angle 0, energies saved |
+|---|---|---|
+| exact-double | `HBT_REAL8=ON` | `BoundMassPrecision 1`. **The reference.** |
+| exact-single | default | `BoundMassPrecision 1`. Measures the reference's own rounding. |
+| exact-single-p995 | default | default precision 0.995: the three settings alone. Shows what the early stop costs. |
+| rerun (`hbt_8m_lambb.conf`) | default | angle 0.1 instead of 0, default precision 0.995 |
+| rerun with full stop | default | angle 0.1 instead of 0, `BoundMassPrecision 1` |
+
+exact-single-p995 was stopped one minute in and not rerun: the two
+opening-angle-0.1 runs in "Results" below isolate the early stop at a
+fraction of the cost.
+
+### Pass rule, written before any of these runs
+
+For a group g, B_ref and B_k are the bound sets of the reference and of the
+kernel, and S_g is the median of |E_ref| over B_ref.
+
+The tolerance tau is set from the reference alone, before any kernel output
+is looked at: tau = max(1e-4, 10 * n), where n is the 99.9th percentile, over
+particles bound in both exact-single and exact-double, of
+|E_single - E_double| / S_g.
+
+A kernel passes if all three hold:
+
+1. Energies. Of the particles in both B_ref and B_k, at least 99.9% have
+   |E_k - E_ref| <= tau * S_g, and none exceeds 10 * tau * S_g.
+2. Membership. Every particle bound in one and not the other lies at the
+   zero-energy boundary: |E| <= tau * S_g, taking E from whichever side has
+   it bound. The number of such particles is at most the number of reference
+   particles with |E_ref| <= tau * S_g.
+3. Groups. A group may have a sub-halo in one and not the other only if its
+   bound count in either is within 2 of the 20-particle minimum.
+
+Counts are expected to be near-equal, not identical.
+
+### Results (2026-11-11)
+
+All runs: 2 processes x 4 threads on the Mac, the same 15,181 groups. Lower
+time is better. "Stop" is `BoundMassPrecision`.
+
+| Run | Precision | Sources | Opening angle | Stop | Unbinding, wall (s) | CPU (s) | Groups with a sub-halo | Bound particles |
+|---|---|---|---|---|---|---|---|---|
+| sampled (2026-11-10) | single | 1,000 sampled | 0.45 | 0.995 | 1.97 | not kept | 13,257 | 4,216,629 |
+| rerun, `hbt_8m_lambb.conf` | single | all | 0.1 | 0.995 | 416 | 2,195 | 13,256 | 4,217,367 |
+| the rerun with full stop | single | all | 0.1 | 1 | 428 | 2,311 | 13,256 | 4,215,955 |
+| exact-single | single | all | 0 | 1 | 1,884 | 8,634 | 13,256 | 4,215,954 |
+| exact-double (**reference**) | double | all | 0 | 1 | 2,047 | 9,787 | 13,256 | 4,215,954 |
+| `unbindspec` (plain loops, 10 threads) | double | all | all pairs | nothing removed | 137 (whole program) | 987 | 13,256 | 4,215,954 |
+
+`hbtstat` on the rerun (`hbt_8m_lambb.conf` as it now stands; table in
+`~/hbt-test/8m-lambb/hbt_reference.txt`, the sampled run's table is now
+`hbt_reference_sampled.txt` and its output `out-sampled/`):
+
+| Quantity | Sampled run | Rerun |
+|---|---|---|
+| Whole output (s) | 3.37 | 418.5 |
+| Unbinding step, wall (s) | 1.97 | 416.2 |
+| Unbinding time summed over sub-haloes (s) | 10.2 | 2,437 |
+| Groups with a self-bound sub-halo | 13,257 | 13,256 |
+| Bound particles | 4,216,629 | 4,217,367 |
+| Unbinding passes per sub-halo | mean 1.52, largest 24 | mean 1.52, largest 24 |
+| Largest group: bound / passes / time (s) | 153,390 / 1 / 0.42 | 153,524 / 1 / 400.8 |
+
+| Particles in group | Sub-haloes, rerun | Bound, rerun (%) | Mean passes, rerun | Time, rerun (s) | Time, sampled run (s) |
+|---|---|---|---|---|---|
+| 16-63 | 8,415 | 96.9 | 1.41 | 0.2 | 0.14 |
+| 64-1,023 | 4,397 | 96.9 | 1.70 | 3.3 | 1.36 |
+| 1,024-16,383 | 407 | 98.5 | 1.75 | 88.5 | 3.73 |
+| 16,384 and up | 37 | 99.4 | 1.49 | 2,345.5 | 4.98 |
+
+- Without sampling the 37 largest groups hold 96% of the time. HBT-HERONS
+  unbinds one group on one thread, so the step's wall time is one group's
+  time: the second-largest group took 416.15 s of the 416.17 s.
+- The largest group costs 2.6 ms per particle, against 2.7 microseconds with
+  sampling: a factor of about 1,000.
+
+Tolerance, from exact-single against exact-double, as the rule says: the
+same 4,215,954 particles are bound in both, |dE|/S is 2.8e-6 at the median,
+1.41e-4 at the 99.9th percentile and 4.6e-4 at most. So **tau = 0.00141**.
+248 reference particles have |E| <= tau * S.
+
+Each result against the reference at that tau (|dE|/S over the particles
+bound in both; lower is better):
+
+| Candidate | Only in candidate | Only in reference | Median | 99.9% | Largest | Verdict |
+|---|---|---|---|---|---|---|
+| exact-single | 0 | 0 | 2.8e-6 | 1.4e-4 | 4.6e-4 | pass (sets tau) |
+| `unbindspec` | 0 | 0 | 2.6e-8 | 4.0e-7 | 1.1e-6 | **pass** |
+| rerun with full stop (angle 0.1) | 1 | 0 | 6.6e-6 | 1.5e-4 | 0.016 | fail: one group |
+| rerun (angle 0.1, default stop) | 1,413 | 0 | 1.0e-3 | 5.0e-2 | 0.54 | fail |
+| `unbindspec --g 43.0091733` | 14 | 0 | 7.2e-5 | 5.3e-4 | 0.23 | fail: 7 groups |
+
+What this says:
+
+1. **The written definition is what HBT-HERONS computes.** A plain
+   double-precision all-pairs loop reproduces every bound set and every
+   energy to 1.1e-6 of S, which is the single-precision storage of the
+   energies. The rule can be passed.
+2. **The default early stop is not a reference.** With `BoundMassPrecision`
+   left at 0.995 the rerun keeps 1,413 particles that further passes remove,
+   and only 58% of its energies are within tau. With full stop the same
+   settings are one particle from the reference. So the three settings alone
+   are not enough: the reference needs `BoundMassPrecision 1`
+   (`hbt_8m_lambb_exact.conf`).
+3. **Opening angle 0.1 is small enough for the energies** (99.9th percentile
+   1.5e-4, the same as single-precision rounding) and 4.4 times cheaper than
+   angle 0 (428 s against 1,884 s).
+4. **The result is not unique at the level of tau.** Removing particles until
+   none has E >= 0 can end on different bound sets. In group 2536 (136
+   particles) particle 6008911 has E = +0.20 (km/s)^2 on the first pass, 9e-6
+   of S. The reference removes it and ends with 129 bound. The angle-0.1 run
+   computes it just below zero, keeps it, and ends with 130 bound, where that
+   particle has E = -354 (km/s)^2 (0.016 of S) and the other particles are
+   lower by its potential, 111 of them by more than tau. Both end states
+   satisfy the definition. `unbindspec --trace 6008911` shows the two paths.
+5. **The rule as first written does not allow for that.** It assumes a particle
+   that changes sides is at the boundary in the final state. A particle that
+   changes sides at an earlier pass can end well inside, and take its
+   neighbours' energies with it. HBT-HERONS itself fails the rule this way in
+   one group of 13,256.
+6. **The gravitational constant matters.** N-Body Shop code units (G = 1,
+   rho_crit = 1) imply G = 43.0091733 in the snapshot's units, 4.8e-5 above
+   HBT-HERONS's 43.0071. That alone moves 14 particles across the boundary
+   and puts 311 particles in 7 groups beyond tau, up to 0.23 of S in a
+   40-particle group. A kernel working in code units must multiply its
+   potential by 43.0071 / 43.0091733 = 0.9999518 before the comparison.
+
+### Pass rule, amended (adopted 2026-11-11, before any kernel output was compared)
+
+Items 4 and 5 are about HBT-HERONS against itself, so the rule is amended
+without having looked at a kernel result. S is still the median of |E_ref|
+over a group's bound particles in the reference; tau is unchanged (0.00141).
+
+1. Energies. In a group whose bound sets are equal, each particle is
+   compared with the reference. In a group whose bound sets differ, each of
+   the kernel's bound particles is compared with the definition evaluated in
+   double precision on the kernel's own bound set. Over all of them, at
+   least 99.9% within tau * S and none beyond 10 * tau * S.
+2. Groups whose bound sets differ. In each one:
+   a. the kernel's set is an end state: evaluated on that set, no particle
+      of it has E >= tau * S;
+   b. the difference starts at the boundary. The definition is replayed from
+      the whole group. P is the first pass at which a differing particle is
+      within tau * S of zero: one the reference removes and the kernel keeps
+      (0 <= E <= tau * S when removed), or one the reference keeps and the
+      kernel removes (-tau * S <= E < 0 at that pass). No particle the
+      kernel keeps may be removed before P, or at P with E > tau * S.
+3. Groups. Unchanged: a sub-halo on one side only is allowed only within 2
+   of the 20-particle minimum.
+
+Both sides must run until a pass removes nothing (HBT-HERONS
+`BoundMassPrecision 1`, `unbind --bound-fraction 1`); a result that stopped
+early fails 2a.
+
+Known limit: after the first boundary difference at pass P, later
+differences in that group are held only by 1 and 2a, not judged one by one.
+A stricter version would follow the kernel's path pass by pass and require
+every decision that departs from the definition to be within tau * S. Not
+built; the listing below shows each differing group's counts, so a group
+with many differing particles is visible.
+
+`subhalo/unbindcheck` applies it (and prints the verdict of the rule as
+first written). It reads the file `unbind --dump` writes, or a
+`.particles.bin` file. Cases with known answers, all on 8m-lambb against
+exact-double:
+
+| Candidate | Should | Rule as written | Amended rule | Groups with different bound sets |
+|---|---|---|---|---|
+| exact-single | pass | pass | pass | 0 |
+| `unbindspec` (after it was moved onto `unbindspec.h`) | pass | pass | pass | 0 |
+| HBT-HERONS, angle 0.1, full stop | pass | fail | pass | 1: group 2536, particle 6008911 at 9.1e-6 of S on pass 1 |
+| `unbindspec --g 43.0091733` (code-unit constant) | pass | fail | pass | 12, each from a particle within 1.1e-4 of S of zero |
+| HBT-HERONS, angle 0.1, default early stop | fail | fail | fail | 220, of which 183 fail (not end states) |
+| `unbindspec --no-hubble` | fail | fail | fail | 2,549, of which 2,507 fail; 6.7% of energies within tau |
+| `unbindspec --g 43.5` (1.1% too large) | fail | fail | fail | 773, of which 705 fail; no energy within tau |
+| reference with the most bound particle of group 2 taken out | fail | fail | fail | 1: does not start at the boundary |
+| reference with group 3's energies times 1.01 | fail | fail | fail | 0; 34,595 energies beyond 10 tau |
+
+The checker takes 0.7 s when no group differs and 41 s for the 12 groups of
+the code-unit case, which include the largest (Mac, 10 threads).
+
+### Comparing `unbind` with the references
+
+Tools, all in `subhalo/` (`make compare`):
+
+| Tool | What it does | Needs |
+|---|---|---|
+| `hbtref` | HBT-HERONS output (`SubhaloParticles`, `BindingEnergies`) to a `.particles.bin` reference; with the snapshot as third argument also a copy in FoF3's numbering | HDF5 |
+| `unbindcmp` | two `.particles.bin` files under the rule as first written; without `--tau` it measures the noise that sets tau | nothing |
+| `unbindcheck` | the amended rule; reads `unbind --dump` directly | HDF5, OpenMP |
+| `unbindspec` | the written definition on every group, in plain double-precision loops (`--trace`, `--g`, `--no-hubble`) | HDF5, OpenMP |
+| `unbindrec.h`, `unbindspec.h` | the 24-byte record and its reader; the definition shared by `unbindspec` and `unbindcheck` | |
+
+A `.particles.bin` file has one 24-byte record per bound particle, native
+byte order, no header: int64 particle id, int64 group id, float64 energy in
+(km/s)^2.
+
+Files on the Mac, in `~/hbt-test/8m-lambb/`:
+
+| File | Size | What it is |
+|---|---|---|
+| `hbt_reference.txt` | 0.3 MB | per-group table of the rerun with the three settings (angle 0.1, default early stop): the input of `unbind --ref` |
+| `exact-double.particles.bin` | 101 MB | the exact reference in the snapshot's numbering (ParticleIDs, FOFGroupIDs), which is also what `unbind --dump` writes |
+| `exact-double.fof3.particles.bin` | 101 MB | the same in FoF3's numbering: particle id = order in the Tipsy file, group id = FoF3's label. Checked against FoF3's `-L` files: 0 of 4,215,954 records differ. For a later kernel inside FoF3 |
+| `exact-double.groups.txt` | 1 MB | per group: bound count, passes, final frame position and velocity |
+| `open0.1.particles.bin` | 101 MB | per-particle output of the rerun with default early stop |
+
+On Frontier, with the first two files copied next to the snapshot (the
+snapshot built there has the same particle and group numbers: `tipsy2hbt`
+numbers groups by size, ties by label):
+
+```sh
+make compare                     # in subhalo/, same HDF5 as unbind
+# 1. per-group counts, both sides stopping early at 0.995
+./unbind snap_0000.hdf5 --ref hbt_reference.txt --float-positions
+# 2. per particle, both sides running to the end
+./unbind snap_0000.hdf5 --bound-fraction 1 --dump kernel_f64.hdf5
+./unbindcheck snap_0000.hdf5 exact-double.particles.bin kernel_f64.hdf5 --tau 0.00141
+```
+
+Expected in 1: 13,256 groups with a sub-halo on both sides, 4,217,368 bound
+particles against HBT-HERONS's 4,217,367. Expected in 2: 13,256 groups and
+about 4,215,954 bound particles. Run 2 without `--float-positions`: the
+reference is the double-precision build. The single-precision kernels are
+held to the same tau, which was set from single-precision rounding.
+
+`unbind` reads the snapshot's units, as HBT-HERONS does, so item 6 does not
+apply to it. A later kernel in code units (box 1, G = 1, H = 2.894405, the
+Tipsy file's softening, 1e-4 stored as a single, so h = 2.8e-4) converts,
+for the 100 Mpc, h = 0.7 stand-in, as E in (km/s)^2 = E_code * 5,848,944.23
+(the velocity unit, 2,418.459062 km/s, squared), with the potential first
+multiplied by 0.9999518.
+
+For scale: `unbindspec` does the 1.381e11 pair terms of this input's first
+pass at about 1.0e9 pair terms/s on the Mac's 10 cores in double precision,
+against 1.6e11 per second on one MI250X die (step 1).
+
 ## Open
 
-- The per-group comparison of `unbind` with HBT-HERONS run with sampling
-  off (step 1, "Not done"). The pair-term rate is measured: 2.0e11 per die.
+- The comparison of `unbind` with HBT-HERONS. The HBT-HERONS side is done
+  ("Exact reference for the unbinding kernel"); the two `unbind` runs on
+  Frontier are not ("Comparing `unbind` with the references"). The pair-term
+  rate is measured: 2.0e11 per die.
 - lambb's box size in Mpc, for physical units.
 - The decision on when steps 1-2 start.
