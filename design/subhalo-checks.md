@@ -560,9 +560,10 @@ third is not started.
   particle's ID, group, bound flag and energy; nothing reads HBT-HERONS's
   `SubhaloParticles` and `BindingEnergies` yet.
 - Capped sampling in `unbind_groups.h`: done 2026-11-11, see "Capped
-  sampling: definition and pass rule". Still not done: groups at least half
-  the box wide on real data (the nearest-image kernel is checked on synthetic
-  particles only; the 8M input has no such group).
+  sampling: definition and pass rule". Groups at least half the box wide,
+  made from real particles, and a scale factor other than 1: done
+  2026-11-11 against `unbindspec`, not yet against HBT-HERONS, see "A scale
+  factor other than 1, and groups at least half the box wide".
 
 ## Exact reference for the unbinding kernel (2026-11-11)
 
@@ -1265,10 +1266,309 @@ and none above 153,804, where the targets have groups a thousand times
 larger; one or two samples per cap; scale factor 1; HBT-HERONS at the same
 caps was not run.
 
-The cap is not chosen yet. On these numbers 10,000 gives bound sets within
-0.2% and centres within 1.5 softening lengths at a tenth of the cost of
-FoF; 1,000 gives bound sets within 2% but needs a centre refinement step
-before its most bound particles can be used.
+**The cap is 10,000 (decided 2026-11-11).** On these numbers it gives bound
+sets within 0.2% and centres within 1.5 softening lengths at a tenth of the
+cost of FoF; 1,000 gives bound sets within 2% but needs a centre refinement
+step before its most bound particles can be used. Two later measurements at
+this cap are in the next section: on marginally bound groups (the a = 1.25
+input) the worst sampled group differs in 2.9% of its particles, and on a
+group that spans the box the capped result is not close to the exact one.
+
+## A scale factor other than 1, and groups at least half the box wide (2026-11-11)
+
+Frontier job 5904186, one node, 11 min 38 s
+(`subhalo/run_unbind_scale_wide.sbatch`): FoF3 on the node's cores, `unbind`
+on one MI250X die, `unbindspec` and `unbindcheck` on 56 threads.
+
+**The reference in this section is `unbindspec`, the written definition. It
+is not an HBT-HERONS run.** HBT-HERONS is not built on Frontier: one attempt
+on 2026-11-11 was stopped by the session's permission check and was not
+repeated. So this section shows that the kernel computes the definition on
+these inputs, and records what was read from HBT-HERONS's source. It does
+not show that the definition is what HBT-HERONS computes at a scale factor
+other than 1 or on wide groups. The HBT-HERONS runs are listed at the end.
+
+### Where the scale factor enters (read from HBT-HERONS c728ee0, not run)
+
+| Quantity | HBT-HERONS | `unbind` and `unbindspec` |
+|---|---|---|
+| Velocities | file value times a to the dataset's `a-scale exponent` (`swiftsim_io.cpp:349-363`) | the same; `tipsy2hbt` writes peculiar velocities with exponent 0 |
+| Masses | file value times a to its exponent (`swiftsim_io.cpp:383-398`) | the same (exponent 0) |
+| Softening | the smaller of the comoving one and the largest physical one over a (`config_parser.cpp:641-648`) | the same |
+| Potential | G / a times the sum over comoving distances (`gravity_tree.cpp:165`) | `Ga = G / a` |
+| Hubble term | H a (x - X), H from `H [internal units]` (`snapshot.h:146`, `subhalo_unbind.cpp:130`) | `Ha = H * a` |
+
+`tipsy2hbt` takes a from the Tipsy header's time, multiplies Tipsy
+velocities by a to make them peculiar, and writes H = 100 h
+sqrt(Omega_m / a^3 + Omega_Lambda + (1 - Omega_m - Omega_Lambda) / a^2).
+That velocity convention is pynbody's for N-Body Shop files. It has not been
+checked against a real output at a below 1. New here: `tipsy2hbt
+--scale-factor a` writes a given a instead of the header's.
+
+### Inputs
+
+All are made from real particles (`lambb.00500`). None is a production case.
+
+| Name | Particles | How it is made | Groups of 20 or more | Largest group (particles) | Groups at least half the box wide: particles, extent along x, y, z (box lengths) |
+|---|---|---|---|---|---|
+| a0.5 | 8,062,157 | 8m-lambb and its FoF3 groups, written with `--scale-factor 0.5`: H = 123.25 km/s/Mpc, softening 0.01 Mpc | 15,181 | 153,804 | none |
+| a1.25 | 8,062,157 | the same with `--scale-factor 1.25`: H = 64.67 km/s/Mpc, softening 0.008 Mpc (the physical maximum over a) | 15,181 | 153,804 | none |
+| w565 | 806,216 | every tenth particle of 8m-lambb (`subsample_tipsy.py`), FoF3 `-b 0.565 -P 1` | 1,844 | 82,206 | 82,206: 0.40, 0.48, 0.55; and 61,195: 0.29, 0.35, 0.56 |
+| w580 | 806,216 | the same particles, FoF3 `-b 0.58 -P 1` | 1,804 | 191,492 | 191,492: 0.58, 1.00, 0.76 |
+| cube45 | 92,719 | a cube of side 0.045 around the 79,173-particle halo of 8m-lambb, treated as a periodic box of 4.5 Mpc (`subcube_tipsy.py`), FoF3 at 8m-lambb's linking length | 47 | 79,096 | 79,096: 0.71, 1.00, 1.00 |
+| cube40 | 89,558 | the same with side 0.04 (4 Mpc) | 36 | 78,823 | 78,823: 0.995, 1.00, 1.00 |
+
+- a0.5 and a1.25 are not real epochs: the positions and Tipsy velocities
+  are those of the a = 1 output and only the scale factor differs. At 0.5
+  the groups are more bound than at 1 (98.9% of grouped particles bound). At
+  1.25 they are marginally bound (58.4%, up to 67 passes), and the softening
+  takes the physical branch. The only snapshot on Frontier at a real scale
+  factor other than 1 is `h34462gs.000616` (a = 0.2447, a zoom run of 3.7e9
+  particles in NChilada format). It was not used: it needs an NChilada
+  reader in the converter and a choice of linking length in a zoom region.
+- 8m-lambb has no wide group: its widest is 8% of the box. A group at least
+  half the box wide appears only when FoF percolates (w565 and w580, at 2.8
+  and 2.9 times the usual linking length) or when the box is as small as
+  one halo (the cubes, whose periodic boundary is artificial). An extent of
+  1.00 means the group reaches all the way round the box.
+- FoF3 `label_digest`: w565 c6db3522b8591d53, w580 904d16defaeb8f0a, cube45
+  317c06d80c306124, cube40 3e2c10066f6666ec. Snapshots are in
+  `/lustre/orion/csc710/scratch/rrao/unbind-2026-11-11/scalewide/run.5904186/<name>/snap_0000.hdf5`;
+  md5 a0.5 5f8a3bc7a5ea, a1.25 a65a4daa1f59, w565 3da22001928d, w580
+  2ac86ac1dbb0, cube45 7e3d4d54475c, cube40 c9891feedee4.
+
+### Pass rule
+
+Unchanged: the amended rule at tau = 0.00141, with the single-precision
+allowance. tau was measured on 8m-lambb at a = 1 from HBT-HERONS's two
+builds; it should be measured again on these inputs when their HBT-HERONS
+runs exist. The kernel's distance from the definition is far below tau
+everywhere except the one failure, so the value does not decide anything
+here.
+
+### Results
+
+Without a cap. Six kernel forms: double, double with rsqrt, single summed
+in double with and without rsqrt, single summed in single with and without
+rsqrt. \|dE\|/S is against the definition.
+
+| Input | Groups with a sub-halo (definition) | Bound particles (definition) | Passes per sub-halo: mean, largest | Forms that pass at tau (of 6; higher is better) | Forms whose bound sets all equal the definition's (of 6; higher is better) | Largest \|dE\|/S: double / single summed in double / single summed in single (lower is better) | Unbinding: double / single with rsqrt (s; lower is better) |
+|---|---|---|---|---|---|---|---|
+| a0.5 | 13,930 | 4,294,867 | 1.19, 12 | 6 | 6 | 4.7e-9 / 1.5e-6 / 7.6e-5 | 1.01 / 0.51 |
+| a1.25 | 10,385 | 2,536,941 | 5.42, 67 | 6 | 4 | 8.3e-9 / 2.7e-6 / 0.018 | 2.35 / 1.42 |
+| w565 | 1,561 | 514,690 | 2.35, 23 | 6 | 6 | 1.3e-8 / 2.2e-5 / 2.4e-4 | 0.23 / 0.17 |
+| w580 | 1,522 | 389,629 | 2.45, 35 | 6 | 6 | 2.0e-8 / 2.2e-5 / 8.2e-4 | 0.60 / 0.42 |
+| cube45 | 11 | 79,559 | 2.45, 3 | 6 | 6 | 2.2e-9 / 4.2e-7 / 5.7e-5 | 0.09 / 0.07 |
+| cube40 | 9 | 79,066 | 2.67, 5 | **0** | 6 | 0.090 in every form | 0.09 / 0.07 |
+
+- **Scale factor.** At a = 0.5 and at a = 1.25 the kernel selects the
+  definition's particles and passes at tau in all six forms. The two forms
+  that sum in single precision differ at a = 1.25 in 9 groups, by 11
+  particles one way and 9 the other. Each of the 9 starts from a particle
+  within tau S of zero and passes the amended rule; they fail the rule as
+  first written. Their measured rounding is n_k = 0.0016, so the allowance
+  stops at 10 tau. At a = 1 and a = 0.5 these forms had the definition's
+  particles exactly: marginally bound groups are where summing in single
+  precision shows.
+- **Wide groups.** On w565, w580 and cube45 all six forms select the
+  definition's particles and pass. On cube40 all six fail (next heading).
+- **Nothing changed at a = 1.** With this section's changes `tipsy2hbt`
+  rebuilds the 8m-lambb snapshot (`h5diff`: identical) and `unbind` rebuilds
+  the dump of job 5903809 (`h5diff`: identical) and passes against the exact
+  HBT-HERONS reference.
+
+At the chosen cap of 10,000 sources, against `unbindspec --cap 10000`
+(three forms: double, double with rsqrt, single summed in double with
+rsqrt). The last column is `capdistance.py` on the kernel's own two results.
+
+| Input | Forms that pass at tau (of 3; higher is better) | Bound particles with the cap | Bound particles without | Groups sampled (count) | Particles bound in one result only, per sampled group: median, largest (% of the group's bound count without a cap; lower is better) |
+|---|---|---|---|---|---|
+| a0.5 | 3 | 4,294,867 | 4,294,867 | 60 | 0, 0 |
+| a1.25 | 3 | 2,538,527 | 2,536,941 | 60, of which 59 have a sub-halo | 0.23, 2.9 |
+| w565 | 3 | 514,744 | 514,690 | 9 | 0.15, 0.38 |
+| w580 | 3 | 422,173 | 389,629 | 7 | 0.12, 98 |
+| cube45 | 3 | 79,536 | 79,559 | 1 | 0.04 |
+| cube40 | 3 | 79,053 | 79,066 | 1 | 0.02 |
+
+- The capped kernel is the capped definition on every input, cube40
+  included.
+- How far the cap is from the exact result depends on the input. Deeply
+  bound groups (a0.5) do not change at all. Marginally bound groups (a1.25)
+  change ten times more than at a = 1: up to 2.9% of a group. The group
+  that spans the box in w580 has 35,117 bound particles without the cap and
+  67,703 with it. That group's result is not stable in any case (below).
+
+### The failure on cube40
+
+`unbindcheck` on the double-precision kernel, in full. The other five forms
+print the same counts and the same largest value.
+
+```
+reference: 79066 bound particles in 9 groups
+candidate: 79066 bound particles in 9 groups
+bound in both: 79066; only in reference: 0; only in candidate: 0
+groups: 9 with equal bound sets, 0 with different bound sets, 0 with a sub-halo on one side only
+|dE|/S over particles bound in both: median 4.8e-13, 99% 1.26e-10, 99.9% 8.91e-10, largest 0.0903
+
+rule as first written, tau = 0.00141: FAIL (energies FAIL: 99.9911% within, 6 beyond 10 tau; membership pass: 0 of 0 one-sided particles outside the band; groups pass)
+
+amended rule, tau = 0.00141
+1. energies:  99.9911% of 79066 within tau*S, 6 beyond 10*tau*S: FAIL
+2. groups with different bound sets: 0, of which 0 fail (0 not an end state, 0 do not start at the boundary, 0 where the replay does not end on the reference's set): pass
+3. groups with a sub-halo on one side only: 0, of which 0 have more than 22 bound particles: pass
+FAIL
+```
+
+Nothing was changed to make it pass: tau, the rule, `unbindcheck` and
+`unbindspec` are as they were.
+
+- **It is not precision.** The double-precision kernel gives the same
+  result as the single-precision ones. The bound sets are equal, and all
+  but 7 of the 79,066 energies agree to 9e-10 of S at the 99.9th percentile.
+- **Where.** The 7 particles (ids 6892, 54413, 56554, 64005, 64306, 75437,
+  77101) all belong to the wide group, and each lies between 0.49960 and
+  0.49999 box lengths from the group's frame along one axis. Half a box
+  from the frame, the Hubble term H a (x - X) jumps from +H a L / 2 to
+  -H a L / 2, here from +140 to -140 km/s.
+- **Why the two differ there.** A pass that removes fewer particles than it
+  keeps is a correction in HBT-HERONS (`subhalo_unbind.cpp:563-589`): the
+  energy gets dv . shift + shift^2 / 2 minus the removed particles'
+  potential, where dv is the particle's velocity in the old frame and shift
+  the old frame's velocity in the new one. The particle's nearest image is
+  taken with respect to the old frame and not again with respect to the new
+  one. `unbind` does the same. `unbindspec` computes every pass afresh from
+  the current frame and takes the nearest image again. The two agree unless
+  a particle's nearest image changes when the frame moves, which needs the
+  particle to be within the frame's movement of that half-box plane. That
+  can only happen in a group that reaches half a box from its own centre.
+- **What it means.** In this corner the kernel does what HBT-HERONS's
+  source does and the written definition does not. That is a reading, not a
+  run. HBT-HERONS's own result on cube40 decides it: if its energies for
+  these 7 particles are the kernel's, `unbindspec.h` needs the correction
+  form for later passes; if they are `unbindspec`'s, the kernel is wrong.
+- With the cap of 10,000 this group is sampled, a sampled pass is always
+  computed in full by both the kernel and the capped definition, and the
+  same input passes. The corner is reachable only by a wide group at or
+  below the cap.
+- cube45 has the same geometry along two axes and passes. Why none of its
+  particles is affected was not looked into.
+
+### Broken kernels
+
+Five deliberately wrong copies of `unbind` (built by
+`scalewide/mutants/build.sh` on scratch), and `unbind --open`. "Caught"
+means `unbindcheck` fails.
+
+| Wrong kernel | Inputs where it is caught | Inputs where it is not |
+|---|---|---|
+| G instead of G / a | a0.5, a1.25 (no energy within tau) | |
+| H instead of H a | a0.5 (33% of energies within tau), a1.25 (14%) | |
+| Comoving softening whatever a is | a1.25 (73% within tau) | a0.5, as it must be: below a = 1 the softening is the comoving one |
+| Pair separations without the nearest image | w580, cube45, cube40 | w565 |
+| Frames without the nearest image | cube45, cube40 | w565, w580 |
+| Periodic box ignored (`--open`) | w565, w580, cube45, cube40 | |
+
+- The scale-factor checks see each of the three places where a enters the
+  kernel. The velocity and mass exponents cannot be tested with these
+  files, which write exponent 0.
+- **w565 does not test the wide-group code.** Both wrong kernels give the
+  definition's particles on it. Its groups are a little over half the box
+  wide and their lowest-id particle is near the middle, so every particle
+  is within half a box of it and the stored offsets are consistent without
+  any wrapping. Only pairs more than half a box apart differ, and they move
+  no energy by tau. `--open` fails there because of ordinary groups that
+  cross the box edge, not because of the wide ones.
+- w580 tests the pair separations but not the frames: the bound part of its
+  spanning group is narrow.
+- The two cubes test both. They are the wide-group check with teeth.
+
+### The first frame of a wide group depends on its first particle
+
+Read from HBT-HERONS c728ee0, not run:
+
+- The first frame of a new sub-halo is its FoF group's mean position
+  (`subhalo_tracking.cpp:834`), computed by `AveragePosition`
+  (`snapshot.cpp:163-200`) as nearest-image offsets from the group's
+  particle number 0.
+- That is done in `MergeHalos` (`io/comms/exchange_and_merge.cpp:231`) one
+  line before the group's particles are sorted by id (line 237). The order
+  before the sort comes from an unstable sort by group
+  (`swiftsim_io.cpp:975`) and from the order in which the pieces of a group
+  arrive from the MPI ranks. So particle number 0 depends on the number of
+  ranks and on the C++ library, not on the input alone.
+- Later frames take their offsets from the first bound particle in id order
+  (`subhalo_unbind.cpp:151-198`, with a stable partition), which is what
+  `unbind` and `unbindspec` do for every frame.
+- For a group narrower than half the box every origin gives the same frame,
+  which is why this never showed on 8m-lambb.
+
+Measured: `unbind --first-origin` (new) with six other origins per wide
+group (the highest id, the two ends of the widest axis, the middle of it,
+two at random; `subhalo/wideorigins.py`), each against the lowest-id origin.
+
+| Input, group | Particles | First frame moves by up to (box lengths) | Hubble term of that move (km/s) / velocity dispersion per axis (km/s) | Bound particles, lowest-id origin | Bound particles over the six other origins: fewest to most | Most particles bound in one result only (lower is better) |
+|---|---|---|---|---|---|---|
+| w565, group 1 | 82,206 | 0.043 | 303 / 597 | 63,785 | 63,593 to 63,897 | 196 |
+| w565, group 2 | 61,195 | 0.045 | 312 / 603 | 54,861 | 53,398 to 54,900 | 1,681 |
+| w580 | 191,492 | 0.48 | 3,344 / 586 | 35,117 | 23,328 to 68,485 | 88,438 |
+| cube45 | 79,096 | 0.13 | 41 / 767 | 78,874 | 78,854 to 78,867 | 48 |
+| cube40 | 78,823 | 0.23 | 64 / 768 | 78,528 | 78,551 to 78,561 | 95 |
+
+What this says:
+
+1. **For a group that spans a real box, the first particle decides the
+   answer.** On w580 the bound count runs from 23,328 to 68,485. HBT-HERONS's
+   result for such a group cannot be reproduced from the input alone, and
+   no kernel can be held to it particle for particle without knowing which
+   particle it started from.
+2. For groups a little over half the box wide (w565), four of the six other
+   origins give exactly the lowest-id result, and the two at the ends of the
+   group differ by up to 1,681 particles. In the cubes the Hubble term is
+   small against the velocities and the choice moves under 100 particles.
+3. For the comparison with HBT-HERONS on wide groups, HBT-HERONS has to
+   print the id of that particle (below). `unbind --first-origin` takes it;
+   `unbindspec` and `unbindcheck` do not have the option yet.
+4. For our own catalogues the frame of a wide group is our choice, and none
+   is made yet. Whether any production input has such a group at b = 0.2 is
+   not known.
+
+### Not done: the HBT-HERONS runs
+
+On the Mac, per input X of a0.5, a1.25, w565, w580, cube45, cube40, with
+the snapshot copied from Frontier to `~/hbt-test/X/snap/snap_0000.hdf5`
+(check the md5 above) and the `HBT_REAL8=ON` build of HBT-HERONS:
+
+```sh
+sed -e "s#8m-lambb/snap#X/snap#" -e "s#8m-lambb/out-exact-double#X/out-exact-double#" \
+    subhalo/hbt_8m_lambb_exact.conf > ~/hbt-test/X/hbt_exact.conf
+OMP_NUM_THREADS=4 mpirun -np 2 <HBT, HBT_REAL8=ON build> ~/hbt-test/X/hbt_exact.conf
+subhalo/hbtref ~/hbt-test/X/out-exact-double/000 ~/hbt-test/X/exact-double ~/hbt-test/X/snap/snap_0000.hdf5
+```
+
+Then copy `exact-double.particles.bin` next to the snapshot on Frontier and
+run, inside a job,
+
+```sh
+./unbindcheck <X>/snap_0000.hdf5 <X>/exact-double.particles.bin kernel_<X>_f64.hdf5 --tau 0.00141
+```
+
+on the kernel dumps of job 5904186 (same directory as the snapshots).
+
+- a0.5 and a1.25 need nothing else. They cost about as much as the a = 1
+  reference (34 minutes there); a1.25 has more passes.
+- For the four wide inputs the result depends on HBT-HERONS's first
+  particle, so that run also needs one added line that prints it, in
+  `MergeHalos` right after `h.AverageCoordinates();`:
+
+  ```cpp
+  std::cout << "FIRSTPARTICLE " << h.Particles.size() << " " << h.Particles[0].Id << std::endl;
+  ```
+
+  It changes no result. With those lines the kernel is rerun with
+  `--first-origin`. cube40 and cube45 are the ones worth running first
+  (about 79,000 particles each, minutes); cube40 also settles the failure
+  above. w580's group has 191,492 particles and 35 passes.
+- The single-precision build's run on each input, to measure tau there.
 
 ## Open
 
@@ -1281,10 +1581,32 @@ before its most bound particles can be used.
   held to a written definition: 18 runs at three caps pass at tau with the
   definition's particles exactly (job 5903809).
 - Measured 2026-11-11: how far a capped result is from the exact one, per
-  group ("How far a capped result is from the exact one"). The cap itself
-  is not chosen yet. Not done: HBT-HERONS at the same caps, and a centre
-  refinement step, which a cap of 1,000 would need.
-- A group at least half the box wide on real data. Not started.
-- The comparison at a scale factor other than 1.
+  group ("How far a capped result is from the exact one"). **The cap is
+  10,000 (decided 2026-11-11).** Not done: HBT-HERONS at the same cap.
+- Done 2026-11-11 against the written definition only (job 5904186, "A
+  scale factor other than 1, and groups at least half the box wide"): the
+  kernel at a = 0.5 and a = 1.25, and on four inputs with groups at least
+  half the box wide, with and without the cap. Everything passes except
+  one input. Open from it:
+  - the HBT-HERONS runs on the six inputs (Mac; commands in that section).
+    Until they exist, a scale factor other than 1 and wide groups are
+    checked against `unbindspec`, not against HBT-HERONS;
+  - cube40: the kernel and `unbindspec` differ in the energies of 7
+    particles half a box from their group's frame. By the reading of the
+    source the kernel follows HBT-HERONS and `unbindspec` does not; the
+    HBT-HERONS run on cube40 decides which of the two to change;
+  - HBT-HERONS's first frame of a wide group depends on a particle the
+    input does not fix. The wide comparisons need it printed by HBT-HERONS,
+    and `--first-origin` in `unbindspec` and `unbindcheck`;
+  - which frame our own catalogues give a wide group, and whether any
+    production input has one at b = 0.2 (8m-lambb's widest group is 8% of
+    the box);
+  - a real epoch: `h34462gs.000616` (a = 0.2447) is on Frontier but needs
+    an NChilada reader in the converter; `tipsy2hbt`'s velocity convention
+    is unchecked at a below 1;
+  - marginally bound groups are where the cap and single-precision sums
+    cost most (a1.25: up to 2.9% of a sampled group; 9 groups differ when
+    summing in single precision). Real high-redshift groups may or may not
+    be like that.
 - lambb's box size in Mpc, for physical units.
 - The decision on when steps 1-2 start.

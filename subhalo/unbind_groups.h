@@ -69,6 +69,13 @@ struct Groups {
   std::vector<int64_t> pid;       // the id each particle is sampled by (Params::cap)
   bool wrap = false;       // a group is at least half the box wide in some direction
   int64_t wide_groups = 0; // how many
+  // Optional, per group: the packed particle the FIRST frame's nearest-image
+  // offsets are taken from; -1 or an empty vector = the group's first
+  // particle. It matters only for a group at least half the box wide.
+  // HBT-HERONS takes the first particle of its merged list there, before it
+  // sorts the list by id (design/subhalo-checks.md, "Groups at least half
+  // the box wide").
+  std::vector<int64_t> first_origin;
   int ng() const { return (int)id.size(); }
   int64_t n() const { return off.empty() ? 0 : off.back(); }
 };
@@ -186,11 +193,11 @@ struct Frame {
 
 // Mass-weighted mean position and velocity of the listed particles, the
 // position taken relative to the first of them (HBT-HERONS's
-// CentreOfMassReferenceFrame).
+// CentreOfMassReferenceFrame), or to the packed particle `origin` if given.
 inline Frame meanFrame(const Groups& G, const int64_t* list, int64_t count, bool wrap,
-                       double box) {
+                       double box, int64_t origin = -1) {
   Frame f{{0, 0, 0}, {0, 0, 0}};
-  const double* ref = &G.pos[3 * list[0]];
+  const double* ref = &G.pos[3 * (origin >= 0 ? origin : list[0])];
   double msum = 0;
   for (int64_t k = 0; k < count; k++) {
     const int64_t i = list[k];
@@ -256,7 +263,8 @@ Result unbindGroups(const Groups& G, const Params& P) {
   std::vector<Frame> frame(ng), old_frame(ng);
   for (int g = 0; g < ng; g++) {
     nb[g] = nlast[g] = G.off[g + 1] - G.off[g];
-    frame[g] = detail::meanFrame(G, &perm[G.off[g]], nb[g], wrap, P.box);
+    frame[g] = detail::meanFrame(G, &perm[G.off[g]], nb[g], wrap, P.box,
+                                 G.first_origin.empty() ? -1 : G.first_origin[g]);
     old_frame[g] = frame[g];
   }
 

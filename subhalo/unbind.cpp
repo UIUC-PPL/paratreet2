@@ -18,6 +18,12 @@
 //                         takes each potential from C sources chosen by
 //                         particle id ("Capped sampling: definition and
 //                         pass rule" in the design note). Default: no cap
+//     --first-origin <file>   lines "group id, particle id": the particle a
+//                         group's FIRST frame takes its nearest-image offsets
+//                         from (default: the group's lowest particle id). It
+//                         matters only for a group at least half the box
+//                         wide, where HBT-HERONS's own choice depends on the
+//                         order of its particle list
 //     --min-bound N       smallest sub-halo (default 20)
 //     --bound-fraction F  stop when a pass keeps this share (default 0.995)
 //
@@ -152,7 +158,7 @@ std::unordered_map<long long, Row> readTable(const std::string& path) {
 
 int main(int argc, char** argv) {
   Kokkos::ScopeGuard kokkos(argc, argv);
-  std::string snap, ref_path, out_path, dump_path, kernel = "f64";
+  std::string snap, ref_path, out_path, dump_path, origin_path, kernel = "f64";
   bool rsqrt = false, float_positions = false, open = false;
   unbind::Params P;
   for (int i = 1; i < argc; i++) {
@@ -168,6 +174,7 @@ int main(int argc, char** argv) {
     else if (a == "--rsqrt") rsqrt = true;
     else if (a == "--float-positions") float_positions = true;
     else if (a == "--open") open = true;
+    else if (a == "--first-origin") origin_path = next();
     else if (a == "--min-bound") P.min_bound = atoi(next());
     else if (a == "--cap") P.cap = atoll(next());
     else if (a == "--bound-fraction") P.bound_fraction = atof(next());
@@ -178,7 +185,8 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: unbind <snapshot.hdf5> [--ref table] [--out table] [--dump file.hdf5]\n"
             "              [--kernel f64|f32|f32f32] [--rsqrt] [--float-positions] [--open]\n"
-            "              [--cap C] [--min-bound N] [--bound-fraction F]\n");
+            "              [--cap C] [--min-bound N] [--bound-fraction F]\n"
+            "              [--first-origin file]\n");
     return 2;
   }
 
@@ -231,9 +239,34 @@ int main(int argc, char** argv) {
   const double read_s = timer.seconds();
 
   timer.reset();
-  const unbind::Groups G = unbind::makeGroups(n, pos.data(), vel.data(), mass.data(),
-                                              gid.data(), (int64_t)null_id, P.box,
-                                              (int64_t)P.min_bound, pid.data());
+  unbind::Groups G = unbind::makeGroups(n, pos.data(), vel.data(), mass.data(),
+                                        gid.data(), (int64_t)null_id, P.box,
+                                        (int64_t)P.min_bound, pid.data());
+  if (!origin_path.empty()) {
+    FILE* f = fopen(origin_path.c_str(), "r");
+    if (!f) die("cannot open " + origin_path);
+    std::unordered_map<long long, long long> want;
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+      long long g, id;
+      if (line[0] != '#' && sscanf(line, "%lld %lld", &g, &id) == 2) want[g] = id;
+    }
+    fclose(f);
+    G.first_origin.assign(G.id.size(), -1);
+    size_t found = 0;
+    for (size_t g = 0; g < G.id.size(); g++) {
+      auto it = want.find(G.id[g]);
+      if (it == want.end()) continue;
+      for (int64_t k = G.off[g]; k < G.off[g + 1]; k++)
+        if (G.pid[k] == it->second) G.first_origin[g] = k;
+      if (G.first_origin[g] < 0)
+        die("--first-origin: particle " + std::to_string(it->second) + " is not in group " +
+            std::to_string(it->first));
+      found++;
+    }
+    if (found != want.size()) die("--first-origin names a group that is not in the snapshot");
+    printf("unbind: first-frame origin given for %zu groups\n", found);
+  }
   const double group_s = timer.seconds();
   const int ng = G.ng();
   int64_t largest = 0;

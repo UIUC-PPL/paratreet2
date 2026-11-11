@@ -14,6 +14,10 @@
 //   --omega-m, --omega-l   (defaults 0.3, 0.7)
 //   --period P    box side in code units (default 1; positions are taken to
 //                 lie in [-P/2, P/2), the N-Body Shop convention)
+//   --scale-factor a   write this expansion factor instead of the Tipsy
+//                 header's time. For test inputs only: the particles are
+//                 then not at a real epoch (design/subhalo-checks.md, "A
+//                 scale factor other than 1")
 //
 // What is written. Every particle of every family goes into PartType1 (dark
 // matter), as comparison/src/nc2swift.cpp does and for the same reason: FoF3
@@ -113,7 +117,7 @@ static void dset(hid_t g, const char* name, hid_t type, int rank,
 
 int main(int argc, char** argv) {
   std::string in, lbl, out;
-  double box_mpc = 0, h = 0.7, om = 0.3, ol = 0.7, period = 1.0;
+  double box_mpc = 0, h = 0.7, om = 0.3, ol = 0.7, period = 1.0, a_given = 0;
   for (int i = 1; i < argc; i++) {
     std::string a = argv[i];
     auto next = [&]() -> const char* {
@@ -128,11 +132,13 @@ int main(int argc, char** argv) {
     else if (a == "--omega-m") om = atof(next());
     else if (a == "--omega-l") ol = atof(next());
     else if (a == "--period") period = atof(next());
+    else if (a == "--scale-factor") a_given = atof(next());
     else die("unknown option " + a);
   }
   if (in.empty() || lbl.empty() || out.empty() || box_mpc <= 0)
     die("usage: tipsy2hbt -i <tipsy> -l <label prefix> -o <out.hdf5> "
-        "--box-mpc L [--h h] [--omega-m] [--omega-l] [--period P]");
+        "--box-mpc L [--h h] [--omega-m] [--omega-l] [--period P] [--scale-factor a]");
+  if (a_given < 0) die("--scale-factor must be positive");
 
   // ---- Tipsy ---------------------------------------------------------------
   FILE* f = fopen(in.c_str(), "rb");
@@ -141,7 +147,8 @@ int main(int argc, char** argv) {
   stat(in.c_str(), &st);
   unsigned char hd[32];
   if (fread(hd, 1, 28, f) != 28) die("short header");
-  const double time = bef64(hd);
+  const double file_time = bef64(hd);
+  const double time = a_given > 0 ? a_given : file_time;
   const long n = be32(hd + 8), ndim = be32(hd + 12);
   const long ngas = be32(hd + 16), ndark = be32(hd + 20), nstar = be32(hd + 24);
   if (ndim != 3 || n != ngas + ndark + nstar) die("not a standard Tipsy header");
@@ -307,6 +314,9 @@ int main(int argc, char** argv) {
 
   printf("tipsy2hbt: %ld particles (gas %ld dark %ld star %ld), a = %g\n", n,
          ngas, ndark, nstar, time);
+  if (a_given > 0)
+    printf("tipsy2hbt: scale factor %g given on the command line; the file's time "
+           "is %g\n", a_given, file_time);
   printf("tipsy2hbt: %ld label files; %zu groups holding %ld particles, "
          "largest %ld; %ld particles in no group\n", files, groups.size(),
          n - none, groups.empty() ? 0L : groups[0].second, none);
