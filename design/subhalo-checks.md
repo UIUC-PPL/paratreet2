@@ -834,8 +834,11 @@ tau itself, with the reference's bound particles exactly. Against the
 reference their 99.9th percentiles are 5.3e-7 (`f32`), 5.0e-5 (`f32f32`,
 which matches the 4e-5 predicted above) and 5.4e-7 (`f32 --rsqrt`), so the
 allowance would have set tolerances of about 0.00142, 0.0019 and 0.00142.
-These are read from the distributions against the reference, not from a
-`--single-against` run. The allowance stays as the rule for other inputs.
+Those were read from the distributions against the reference. Measured with
+`--single-against` in Frontier job 5903660 ("Rerun with the allowance"
+below): n_k is 4.3e-7 for `f32`, 4.4e-7 for `f32 --rsqrt` and 5.0e-5 for
+`f32f32` with or without `--rsqrt`, which gives tolerances of 0.001414,
+0.001414 and 0.00191. The allowance stays as the rule for other inputs.
 
 ### Comparing `unbind` with the references
 
@@ -885,6 +888,9 @@ particles against HBT-HERONS's 4,217,367. Expected in 2: 13,256 groups and
 about 4,215,954 bound particles. Run 2 without `--float-positions`: the
 reference is the double-precision build. Run 3 only after 2 passes; repeat
 it for `--kernel f32f32` and for each with `--rsqrt`.
+`run_unbind_compare.sbatch` does all of it in one job. It measures a form
+with `--rsqrt` against the double-precision run with `--rsqrt`, the same
+kernel in double precision, which must itself pass at tau.
 
 `unbind` reads the snapshot's units, as HBT-HERONS does, so item 6 does not
 apply to it. A later kernel in code units (box 1, G = 1, H = 2.894405, the
@@ -982,16 +988,51 @@ What this says:
    bound sets. Group 2536 is the known non-unique case; groups 41 and 48 were
    not traced.
 
+#### Rerun with the allowance (2026-11-11, Frontier job 5903660)
+
+One node, 44 s, tools from 94b1018 (`unbindcheck` with `--single-against`,
+rebuilt on Frontier with the default `c++`, no source change); `unbind` is
+unchanged. Six forms of the kernel, each run until a pass removes nothing.
+The two double-precision forms are held to tau. Each single-precision form
+is checked at tau and again with the allowance, its rounding n_k measured
+against the double-precision run of the same form. The per-group result
+above was repeated and is the same.
+
+| Kernel (`unbind` option) | Bound particles (count; the reference has 4,215,954) | Groups with different bound sets (count; lower is better) | Amended rule at tau = 0.00141 (verdict) | n_k (fraction of S; lower is better) | Tolerance with the allowance (fraction of S) | Amended rule with the allowance (verdict) | Largest \|dE\|/S against the reference (fraction of S; lower is better) | Unbinding time (s; lower is better) |
+|---|---|---|---|---|---|---|---|---|
+| Double precision (default) | 4,215,954 | 0 | pass | not applicable | 0.00141 | not applicable | 1.09e-6 | 1.24 |
+| Double precision with rsqrt (`--rsqrt`) | 4,215,954 | 0 | pass | not applicable | 0.00141 | not applicable | 1.09e-6 | 0.89 |
+| `--kernel f32` | 4,215,954 | 0 | pass | 4.3e-7 | 0.001414 | pass | 1.60e-6 | 0.99 |
+| `--kernel f32 --rsqrt` | 4,215,954 | 0 | pass | 4.4e-7 | 0.001414 | pass | 1.62e-6 | 0.69 |
+| `--kernel f32f32` | 4,215,954 | 0 | pass | 5.0e-5 | 0.00191 | pass | 1.04e-4 | 0.98 |
+| `--kernel f32f32 --rsqrt` | 4,215,954 | 0 | pass | 5.0e-5 | 0.00191 | pass | 1.04e-4 | 0.68 |
+
+- All six have 13,256 groups with a sub-halo and pass the rule as first
+  written as well, at tau and with the allowance. No dump has a group with
+  between 1 and 19 bound particles.
+- Two forms are new here: double precision with rsqrt, and single precision
+  summed in single with rsqrt. The other four repeat job 5903512 with the
+  same counts and the same largest differences.
+- `unbindcheck` now prints the distribution of \|dE\|/S itself; its figures
+  equal the ones obtained through `unbindcmp` for job 5903512.
+- The allowance changes no verdict on this input: every form already
+  passes at tau. It widens the tolerance by 0.3% for the forms summed in
+  double and by 36% for the forms summed in single.
+- Summing in single precision sets the error of those forms: with and
+  without rsqrt they have the same distribution (median 1.0e-6, 99.9th
+  percentile 5.0e-5, largest 1.04e-4).
+
 Not covered by this comparison: an input whose scale factor is not 1 (the
 factors G / a and H a), more than one softening or particle type, a group
 at least half the box wide, and capped sampling.
 
 ## Open
 
-- Done 2026-11-11: the comparison of `unbind` with HBT-HERONS. All four
+- Done 2026-11-11: the comparison of `unbind` with HBT-HERONS. All six
   forms of the kernel select the exact reference's 4,215,954 particles in
-  13,256 groups and pass both rules (job 5903512). The pair-term rate is
-  measured: 2.0e11 per die.
+  13,256 groups and pass both rules at tau (jobs 5903512 and 5903660); the
+  single-precision allowance was measured and changes no verdict. The
+  pair-term rate is measured: 2.0e11 per die.
 - Capped sampling in `unbind_groups.h`, and a group at least half the box
   wide on real data. Not started.
 - The comparison at a scale factor other than 1.

@@ -2,6 +2,10 @@
 # unbind against the HBT-HERONS references on the 8M lambb sub-sample
 # (design/subhalo-checks.md, "Comparing `unbind` with the references").
 # One node: unbind on one MI250X die, unbindcheck on the node's cores.
+# Six kernel forms: the two double-precision ones are held to tau; each
+# single-precision one is checked at tau and again with the allowance
+# measured against the double-precision run of the same form
+# (unbindcheck --single-against).
 #
 #   make -C subhalo all compare
 #   SNAPDIR=<directory holding snap_0000.hdf5> sbatch subhalo/run_unbind_compare.sbatch
@@ -95,15 +99,40 @@ gpu $SNAP --ref $REF_TABLE --float-positions > $OUT/pergroup.log 2>&1
 echo "  exit $? (3 = some group differs)"
 sed -n '/^groups with a self-bound/,$p' $OUT/pergroup.log
 
-for v in f64: f32:--kernel_f32 f32f32:--kernel_f32f32 f32_rsqrt:--kernel_f32_--rsqrt; do
-  name=${v%%:*}; flags=${v#*:}; flags=${flags//_/ }
-  echo "=== per particle, kernel $name ($flags)"
-  gpu $SNAP --bound-fraction 1 --dump $OUT/kernel_$name.hdf5 $flags > $OUT/unbind_$name.log 2>&1
+# One kernel form run to the end, with its dump checked.
+run_kernel() {   # name, unbind options...
+  local name=$1; shift
+  echo "=== per particle, kernel $name ($*)"
+  gpu $SNAP --bound-fraction 1 --dump $OUT/kernel_$name.hdf5 "$@" > $OUT/unbind_$name.log 2>&1
   echo "  unbind exit $?"
   grep -E '^unbind: kernel|^groups with a self-bound|^bound particles|^unbinding passes|^groups where|^pair terms|^time:|^rate:' $OUT/unbind_$name.log | sed 's/^/  /'
   dumpcheck $OUT/kernel_$name.hdf5 | sed 's/^/  /'
-  cpu $SNAP $REF_EXACT $OUT/kernel_$name.hdf5 --tau $TAU > $OUT/unbindcheck_$name.log 2>&1
-  echo "  unbindcheck exit $? (0 = pass, 1 = fail, 2 = input error)"
-  cat $OUT/unbindcheck_$name.log
+}
+# The dump against the exact reference at tau. Sets RC.
+at_tau() {   # name
+  cpu $SNAP $REF_EXACT $OUT/kernel_$1.hdf5 --tau $TAU > $OUT/unbindcheck_$1.log 2>&1
+  RC=$?
+  echo "  unbindcheck at tau: exit $RC (0 = pass, 1 = fail, 2 = input error)"
+  cat $OUT/unbindcheck_$1.log
+}
+# A single-precision form with the allowance of "Tolerance for
+# single-precision kernels": its rounding is measured against the same
+# kernel in double precision, which must have passed at tau.
+allowance() {   # name, name of the double-precision run, that run's exit status
+  if [ "$3" != 0 ]; then
+    echo "  allowance not applied: the double-precision kernel $2 did not pass at tau"
+    return
+  fi
+  cpu $SNAP $REF_EXACT $OUT/kernel_$1.hdf5 --tau $TAU \
+      --single-against $OUT/kernel_$2.hdf5 > $OUT/unbindcheck_allowance_$1.log 2>&1
+  echo "  unbindcheck with the single-precision allowance, against $2: exit $?"
+  cat $OUT/unbindcheck_allowance_$1.log
+}
+
+run_kernel f64;                             at_tau f64;        F64=$RC
+run_kernel f64_rsqrt --kernel f64 --rsqrt;  at_tau f64_rsqrt;  F64R=$RC
+for k in f32 f32f32; do
+  run_kernel $k --kernel $k;                  at_tau $k;          allowance $k f64 $F64
+  run_kernel ${k}_rsqrt --kernel $k --rsqrt;  at_tau ${k}_rsqrt;  allowance ${k}_rsqrt f64_rsqrt $F64R
 done
 sacct -j $J -X -n -o state,elapsed
