@@ -1198,6 +1198,78 @@ Seen but not judged by this rule:
   constant) differ in 4,545 bound particles, 0.11%: 2,233 only in one and
   2,312 only in the other.
 
+### How far a capped result is from the exact one (measurement, 2026-11-11)
+
+Decided 2026-11-11: the cap is chosen from a measurement, not from a pass
+rule. No new run: `subhalo/capdistance.py` on the dumps of job 5903809
+(double-precision kernel). The reference is the run without a cap, whose
+bound particles are the exact HBT-HERONS reference's. Only the groups above
+a cap are sampled and can differ; every group at or below it is identical.
+
+Per sampled group, N is the exact bound count. "Count" is the difference in
+bound count over N; "members" is the number of particles bound in exactly
+one of the two results over N; \|dE\|/S is over the particles bound in both.
+The most bound particle is the one of lowest energy; its shift is the
+distance between the exact one and the capped one. Lower is better in every
+column except the last but one.
+
+| Cap (sources per particle) | Groups sampled (count) | Bound only in the exact result / only in the capped one (particles) | Count per group: median, 99th percentile, largest (%) | Members per group: median, 99th percentile, largest (%) | \|dE\|/S: median, 99th percentile (fraction of S) | Same most bound particle (% of sampled groups; higher is better) | Shift of the most bound particle: 99th percentile, largest (softening lengths) |
+|---|---|---|---|---|---|---|---|
+| 1,000 | 449 | 2,190 / 1,228 | 0.009, 0.52, 1.85 | 0.033, 0.70, 1.99 | 0.020, 0.20 | 61.5 | 3.1, 218 |
+| 1,000, a second sample | 449 | 2,105 / 1,222 | 0.013, 0.59, 1.64 | 0.033, 0.78, 1.64 | 0.019, 0.23 | 62.6 | 4.1, 218 |
+| 10,000 | 60 | 297 / 222 | 0.009, 0.060, 0.082 | 0.019, 0.13, 0.18 | 0.0051, 0.063 | 81.7 | 1.4, 1.5 |
+| 100,000 | 3 | 4 / 5 | 0.001, 0.002, 0.002 | 0.002, 0.004, 0.004 | 0.0014, 0.013 | 66.7 (2 of 3) | 0.9, 0.9 |
+
+The second sample is the same method with another constant in the hash
+(the last of the broken kernels above, which is a valid sample). The two
+samples at 1,000 differ from each other by 0.054% of a group's members at
+the median and 1.24% at most, and have the same most bound particle in
+49% of the sampled groups.
+
+The most bound particle at a cap of 1,000, by group size:
+
+| Particles in group | Groups (count) | Same most bound particle (%; higher is better) | Shift: median, 99th percentile, largest (softening lengths; lower is better) |
+|---|---|---|---|
+| 1,001 to 10,000 | 389 | 65.6 | 0.0, 2.2, 109 |
+| 10,001 to 100,000 | 57 | 36.8 | 0.9, 98, 218 |
+| above 100,000 | 3 | 0 | 3.3, 4.4, 4.4 |
+
+What this says:
+
+1. **Bound sets hardly depend on the cap.** At 1,000 a typical sampled group
+   differs from the exact result in 0.03% of its particles and the worst in
+   2%. At 10,000 the worst is 0.18%. No group gains or loses its sub-halo at
+   any cap.
+2. **Energies are noisy, as they must be.** The median error is 2% of S at
+   1,000, 0.5% at 10,000 and 0.14% at 100,000: it falls by 3.8 to 4.0 per
+   decade, a little faster than the square root of the cap. Even 100,000 is
+   at tau, so no capped result can pass the exact rule.
+3. **The most bound particle is not reliable at a cap of 1,000.** It is a
+   different particle in 38% of the sampled groups, and in the worst groups
+   it lies in another part of the group: up to 218 softening lengths away
+   (2.2 Mpc in the stand-in units). At 10,000 it differs in 18% of the
+   groups but is never more than 1.5 softening lengths away. HBT-HERONS
+   orders the most bound particles again after unbinding for this reason
+   (`RefineMostBoundParticle`); `unbind` has no such step.
+4. **Two samples are as far from each other as each is from the exact
+   result**, so the distances above are sampling noise of the expected size.
+   The mean count difference is slightly negative in all three sampled runs
+   (-0.008%, -0.012%, -0.005%); two samples do not show whether that is a
+   bias.
+
+Cost, for the choice: one pass on cosmo2b at 64 nodes is 0.010 s at a cap of
+1,000, 0.092 s at 10,000 and 0.83 s at 100,000 ("The cap table in seconds").
+
+Limits of this measurement: one input with 3 groups above 100,000 particles
+and none above 153,804, where the targets have groups a thousand times
+larger; one or two samples per cap; scale factor 1; HBT-HERONS at the same
+caps was not run.
+
+The cap is not chosen yet. On these numbers 10,000 gives bound sets within
+0.2% and centres within 1.5 softening lengths at a tenth of the cost of
+FoF; 1,000 gives bound sets within 2% but needs a centre refinement step
+before its most bound particles can be used.
+
 ## Open
 
 - Done 2026-11-11: the comparison of `unbind` with HBT-HERONS. All six
@@ -1208,8 +1280,10 @@ Seen but not judged by this rule:
 - Done 2026-11-11: capped sampling in `unbind_groups.h` (`unbind --cap`),
   held to a written definition: 18 runs at three caps pass at tau with the
   definition's particles exactly (job 5903809).
-- How accurate a capped result is against the exact one, per group and per
-  particle, and against HBT-HERONS at the same cap. Not started.
+- Measured 2026-11-11: how far a capped result is from the exact one, per
+  group ("How far a capped result is from the exact one"). The cap itself
+  is not chosen yet. Not done: HBT-HERONS at the same caps, and a centre
+  refinement step, which a cap of 1,000 would need.
 - A group at least half the box wide on real data. Not started.
 - The comparison at a scale factor other than 1.
 - lambb's box size in Mpc, for physical units.
