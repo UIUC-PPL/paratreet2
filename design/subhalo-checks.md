@@ -121,6 +121,8 @@ What this says:
   about as much as FoF itself, and beyond that unbinding sets the time per
   output. HBT-HERONS does better than these counts at cap 1,000 because it
   walks a tree over its sources.
+  **Measured 2026-11-11: 2.0e11 pair terms per second per die, so these
+  times are 20 times too long; see "The cap table in seconds" in step 1.**
 - Proposal for step 1, from these numbers: three cases, which FoF3 can
   already tell apart. A group wholly inside one process is unbound in place
   on that process's GPU. A group that spans processes but is small is
@@ -348,9 +350,207 @@ HBT-HERONS built there, NChilada velocities in the converter, and cosmo2b's
 box size, to confirm a number the Mac already bounds. Do it only if a
 measured Frontier figure is needed for a paper.
 
+## Step 1: the standalone unbinding kernel (2026-11-11)
+
+Written and run on Frontier. It is not yet compared group by group with
+HBT-HERONS: that needs an HBT-HERONS run with sampling off (below).
+
+Files, all in `subhalo/`:
+
+| File | What it is |
+|---|---|
+| `unbind_kernel.h` | The pair-term kernel in Kokkos. Targets and sources are separate lists and many groups go in one launch, so one kernel does the all-pairs first pass, the subtraction of removed particles, and a capped sample |
+| `unbind_groups.h` | Unbinds every group by HBT-HERONS's rules with sampling off; all groups advance together, at most two launches per pass |
+| `unbind.cpp` | Reads the file `tipsy2hbt` writes, unbinds every group, compares bound counts with `hbtstat`'s table (`--ref`), writes its own (`--out`, `--dump`) |
+| `unbind_rate.cpp` | Self-checks and pair-term rates on synthetic particles |
+| `Makefile`, `run_unbind_rate.sbatch` | Build (hipcc on Frontier; any compiler with a Kokkos install elsewhere) and the one-die rate job |
+| `subsample_tipsy.py` | Every tenth particle, masses times ten: rebuilds `8m-lambb.tipsy` from `lambb.00500` |
+
+### The rules, read from HBT-HERONS (c728ee0)
+
+From `src/subhalo_unbind.cpp`, `src/gravity_tree.cpp`, `src/snapshot.h`,
+`src/subhalo_tracking.cpp` and `src/io/swiftsim_io/swiftsim_io.cpp`:
+
+| Item | What HBT-HERONS does |
+|---|---|
+| First frame | mass-weighted mean position and velocity of all the group's particles |
+| Later frames | the same means over the particles still bound |
+| Energy | 0.5 \|v - v_frame + H a (x - x_frame)\|^2 + (G / a) phi, x comoving, v physical |
+| Potential | Gadget spline reaching h = 2.8 softening lengths, -m / r outside; a particle's own term is excluded |
+| Periodic box | nearest image for every pair; centre of mass taken relative to the first bound particle |
+| Bound | energy below zero |
+| Stop | dead below 20 bound particles (checked first); otherwise stop when a pass keeps at least 99.5%, compared in single precision |
+| Next pass | if the pass removed fewer particles than it kept, subtract the removed particles' potential and move the kinetic term to the new frame; otherwise compute in full |
+| Constants | G = 43.0071 (km/s)^2 Mpc/h per 1e10 Msun/h, scaled to the file's units; H from the file |
+| Precision | positions, velocities, masses and energies in single precision (built without `HBT_REAL8`) |
+
+Its defaults do not give an all-pairs answer, so `hbt_reference.txt` from
+Check 2 is not an exact target:
+
+- groups above 1,000 particles get 1,000 randomly chosen sources
+  (`MaxSampleSizeOfPotentialEstimate`), about 450 of the 15,181 groups;
+- every potential is a tree walk with opening angle 0.45
+  (`TreeNodeOpenAngle`).
+
+One difference is kept on purpose. Once HBT-HERONS has switched to
+subtraction it never switches back, and a later pass that removes more than
+it keeps then moves the kinetic term from a frame two passes old. Here that
+pass is computed in full, and the groups it happens to are counted: none on
+the 8M input, 6 of 1,000 synthetic groups.
+
+### Checks
+
+`unbind_rate` (job 5902364, one die, all pass; also on the login node's CPUs
+with Kokkos OpenMP):
+
+| Check | Result |
+|---|---|
+| Kernel against a double-precision direct sum on the host: all pairs, targets apart from sources, nearest image in a small box; softening 0.02 and 2 | largest relative error 1.5e-14 in double, 9.5e-7 in single summed in double, 9.3e-6 in single summed in single |
+| Unbinding loop against a separate serial implementation (absolute positions, self pair skipped, every pass in full): 1,000 synthetic groups, 348,373 particles, 690 groups with more than 2 passes | same particles selected, same pass counts, in double; also in single on this set |
+| The same with nearest-image separations forced on | same particles |
+| Eight targets of every rate case recomputed on the host | agree: to 3.9e-15 in double, 2.1e-8 in single summed in double |
+
+The checks were tried against deliberately broken code. Ten changes were
+caught (kinetic shift, old frame, self term, both spline branches, the
+branch boundary, one nearest-image axis, the Hubble term, the stop rule,
+the sign of the subtraction). The first version of the kernel check missed
+a wrong spline coefficient, because at softening 0.02 no pair fell inside
+the spline; the softening-2 cases were added for that and the check now
+requires 1% of the pairs in each spline branch.
+
+### Pair-term rate of one MI250X die
+
+Job 5902364 (the same rates in job 5902340), each case sized to about 2 s
+and timed three times, best time. Higher is better.
+
+| Kernel form | Pair terms per second, 10,000 sources per group |
+|---|---|
+| Single precision pair terms, summed in double, HBT-HERONS's arithmetic | 2.07e11 |
+| The same, nearest image per pair | 1.64e11 |
+| The same, `-m * rsqrt(r2)` instead of `-m / sqrt(r2)` | 3.75e11 |
+| Single precision, summed in single | 2.11e11 |
+| Double precision | 1.61e11 |
+| Double precision, rsqrt | 2.71e11 |
+
+By problem shape (single precision summed in double / double precision):
+
+| Shape | Pair terms per second |
+|---|---|
+| 1,000 sources per target, 1e8 targets | 2.07e11 / 1.62e11 |
+| 10,000 sources | 2.07e11 / 1.61e11 |
+| 100,000 sources | 2.04e11 / 1.56e11 |
+| 1,000,000 sources | 1.49e11 / 1.10e11 |
+| Groups of 32, all pairs, 3,125,000 groups in one launch | 1.57e11 |
+| Groups of 128 | 1.81e11 |
+| Groups of 1,024 | 2.04e11 / 1.59e11 |
+| Groups of 8,192 | 2.07e11 |
+| Groups of 65,536 | 2.01e11 |
+| Groups of 262,144 | 1.90e11 |
+
+What this says:
+
+- One die does 2.0e11 pair terms per second, 20 times the 1e10 assumed in
+  Check 0.
+- The rate holds from groups of 1,000 to 100,000 sources. It falls by a
+  quarter at 1,000,000 sources (16 MB of sources) and by a quarter for
+  groups of 32. Rates beyond 1,000,000 sources per group are not measured.
+- Double precision costs 22%. Nearest-image separations, needed when a
+  group is at least half the box wide, cost 21%. The rsqrt form is 1.8
+  times faster and changed no bound count on the 8M input.
+- The kernel is the plain one: one thread per target, sources read in
+  order. No tiling or shared-memory blocking was tried.
+
+### The cap table in seconds
+
+Pair terms from Check 0 divided by the measured rate (single precision
+summed in double; 2.07e11, 2.07e11, 2.04e11 and 1.49e11 for the four caps).
+Lower is better.
+
+| Input | Cap 1,000 | Cap 10,000 | Cap 100,000 | Cap 1,000,000 |
+|---|---|---|---|---|
+| cosmo2b, die-seconds per pass | 5.3 | 47 | 426 | 4,900 |
+| cosmo2b on 512 dies (64 nodes), seconds | 0.010 | 0.092 | 0.83 | 9.6 |
+| cosmo25, die-seconds per pass | 73 | 676 | 6,370 | 80,500 |
+| romulus25, die-seconds per pass | 63 | 580 | 4,410 | 39,600 |
+
+- These replace the estimate in Check 0 (0.2 s, 1.9 s and 17 s for cosmo2b).
+  Against the 1.06 s GPU FoF iteration at 64 nodes, a cap of 100,000 costs
+  about as much as FoF, and a cap of 10,000 costs a tenth of it.
+- The seconds assume the work spreads evenly over the dies, and count one
+  pass. On the 8M input all later passes together cost 0.2% of the first.
+- With no cap cosmo2b needs about 3e5 die-seconds (10 minutes on 512 dies)
+  at the 1,000,000-source rate, which is an extrapolation. Exact potentials
+  in the largest groups still need a tree.
+- Full lambb, every group of 20 or more, all pairs (1.4e13 pair terms): 70 to
+  95 seconds on one die, by the same division. Not run.
+
+### The 8M lambb sub-sample on one die
+
+Job 5902394. `subsample_tipsy.py` on `lambb.00500` gives the Mac's input:
+FoF3 on it (one node, `-K -m 20 -P 1 -L`) prints `label_digest`
+c4f41054eacf794c, 15,181 groups holding 4,343,999 particles, largest
+153,804, catalogue digest 57c1e840e74a8aae, all equal to the Mac's values
+above. The label files hold 8,062,157 records with that digest and
+3,718,158 written as -1, which is the first Frontier run of the `-K -m`
+rule of `-L`. Then `tipsy2hbt --box-mpc 100 --h 0.7` and `unbind`.
+
+| Quantity | `unbind`, all pairs, one die | HBT-HERONS on the Mac, defaults (Check 2) |
+|---|---|---|
+| Groups with a self-bound sub-halo | 13,256 of 15,181 | 13,257 of 15,181 |
+| Bound particles | 4,217,368 (97.1%) | 4,216,629 (97.1%) |
+| Passes per sub-halo | mean 1.52, largest 24 | mean 1.52, largest 24 |
+| Largest group: bound of 153,804 | 153,524 (99.8%) | 153,390 (99.7%) |
+| Sub-haloes in groups of 20-63 / 64-1,023 / 1,024-16,383 / 16,384 and up | 8,415 / 4,397 / 407 / 37 | 8,416 / 4,397 / 407 / 37 |
+| Unbinding (s) | 1.07 in double (kernel 0.86), 0.86 in single (kernel 0.68) | 1.97 wall on 2 processes x 4 threads |
+
+| Quantity | Value |
+|---|---|
+| Pair terms, first pass | 1.381e11 (93% of it in the 37 largest groups) |
+| Pair terms, all later passes | 3.4e8 = 0.2% of the first, nearly all by subtraction |
+| Rate in the first pass (pair terms per second) | 1.61e11 in double, 2.04e11 in single |
+| Single against double precision | the same bound count and pass count in all 15,181 groups; also with rsqrt, and with positions rounded to single precision first |
+| Open boundaries instead of periodic | 137 groups differ, 87 lose their sub-halo, 3.1% fewer bound particles |
+
+What this says:
+
+- The totals agree with HBT-HERONS's default run to 1 group in 15,181 and
+  0.02% of the bound particles, with the same pass statistics. An error in
+  the frame, the Hubble term or the periodic handling moves hundreds of
+  groups (the broken-code runs above, and the open-boundary row), so these
+  rules are very likely right. It is not the per-group comparison: the
+  default run sampled its large groups, and its per-group table is on the
+  Mac.
+- Single precision is enough on this input.
+- The timing column is not a speed claim: different machines, and
+  HBT-HERONS samples and walks a tree where this is exact.
+
+### Not done
+
+- The per-group comparison. On the Mac, add to `hbt_8m_lambb.conf`
+
+  ```
+  MaxSampleSizeOfPotentialEstimate    0
+  TreeNodeOpenAngle                   0.1
+  SaveBoundParticleBindingEnergies    1
+  ```
+
+  rerun HBT-HERONS and `hbtstat`, then either copy the table to Frontier or
+  build `unbind` there (`make` line in `subhalo/Makefile`; it needs a
+  Kokkos install with OpenMP) and run
+  `unbind snap_0000.hdf5 --ref <table> --float-positions`. Decide the pass
+  rule before the run. Expect a few particles of difference in some groups:
+  HBT-HERONS stores energies in single precision and its tree is still an
+  approximation at opening angle 0.1.
+- A particle-by-particle comparison. `unbind --dump` writes every grouped
+  particle's ID, group, bound flag and energy; nothing reads HBT-HERONS's
+  `SubhaloParticles` and `BindingEnergies` yet.
+- Capped sampling in `unbind_groups.h`, and groups at least half the box
+  wide on real data (the nearest-image kernel is checked on synthetic
+  particles only; the 8M input has no such group).
+
 ## Open
 
-- The pair-term rate of one MI250X die for the potential kernel, which
-  turns the cap table into seconds.
+- The per-group comparison of `unbind` with HBT-HERONS run with sampling
+  off (step 1, "Not done"). The pair-term rate is measured: 2.0e11 per die.
 - lambb's box size in Mpc, for physical units.
 - The decision on when steps 1-2 start.

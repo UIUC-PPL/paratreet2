@@ -48,3 +48,5 @@ tests/nchilada/nchilada-fixture/
 # Sub-halo tools (built from subhalo/*.cpp)
 subhalo/tipsy2hbt
 subhalo/hbtstat
+subhalo/unbind
+subhalo/unbind_rate
