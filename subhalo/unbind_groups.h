@@ -29,6 +29,18 @@
 // then moves the kinetic term from a frame two passes old. Here that pass is
 // computed in full. The groups this happens to are counted (stale_frame).
 //
+// Capped sampling (Params::cap, design/subhalo-checks.md "Capped sampling:
+// definition and pass rule"). With a cap C, a pass whose bound set has more
+// than C particles takes each particle's potential from the first C bound
+// particles in the order of sampleKey(id), their masses times
+// f = M(bound) / M(sample); a sampled particle's own term is left out. The
+// energies of a pass depend only on its bound set. Here each particle's sum
+// over the sample is kept without f; after a pass the removed sample members
+// are taken out of it and the particles that replace them added (one launch
+// with the removed members' masses negated), or it is computed again when
+// half the sample changed. A group at or below the cap goes by the rules
+// above.
+//
 // Host code is serial. Needs unbind_kernel.h; no HDF5, no Charm header.
 
 #ifndef SUBHALO_UNBIND_GROUPS_H_
@@ -54,6 +66,7 @@ struct Groups {
   std::vector<double> pos;        // 3 per particle
   std::vector<double> vel;        // 3 per particle, physical
   std::vector<double> mass;
+  std::vector<int64_t> pid;       // the id each particle is sampled by (Params::cap)
   bool wrap = false;       // a group is at least half the box wide in some direction
   int64_t wide_groups = 0; // how many
   int ng() const { return (int)id.size(); }
@@ -68,6 +81,7 @@ struct Params {
   double box = 0;    // comoving periodic box side; 0 = open
   double bound_fraction = 0.995;
   int min_bound = 20;
+  int64_t cap = 0;   // most sources per particle; 0 = no cap (all pairs)
 };
 
 struct Stats {
@@ -75,6 +89,8 @@ struct Stats {
   int64_t pairs_first = 0;       // pair terms of the first pass (all pairs)
   int64_t pairs_full_later = 0;  // later passes computed in full
   int64_t pairs_subtract = 0;    // later passes done by subtraction
+  int64_t pairs_sample_update = 0;  // later passes of sampled groups: the sample's change
+  int64_t sampled_groups = 0;    // groups above the cap
   double kernel_s_first = 0, kernel_s_later = 0;
   double host_s = 0;             // packing, copies to and from the device, removal
 };
@@ -96,10 +112,12 @@ inline double nearestImage(double d, double box) {
 // Pack particles into groups. gid[i] < 0 or == null_id means "no group";
 // groups smaller than min_size are dropped. pos is 3 doubles per particle,
 // comoving, anywhere within one box length of each other; vel and mass are
-// any arithmetic type.
+// any arithmetic type. pid, if given, is each particle's id for sampling;
+// otherwise the particle's index is used.
 template <class V, class M>
 Groups makeGroups(int64_t n, const double* pos, const V* vel, const M* mass,
-                  const int64_t* gid, int64_t null_id, double box, int64_t min_size) {
+                  const int64_t* gid, int64_t null_id, double box, int64_t min_size,
+                  const int64_t* pid = nullptr) {
   std::vector<int64_t> order;
   order.reserve((size_t)n);
   for (int64_t i = 0; i < n; i++)
@@ -127,6 +145,7 @@ Groups makeGroups(int64_t n, const double* pos, const V* vel, const M* mass,
           G.vel.push_back((double)vel[3 * i + d]);
         }
         G.mass.push_back((double)mass[i]);
+        G.pid.push_back(pid ? pid[i] : i);
       }
       if (box > 0 && (hi[0] - lo[0] >= 0.5 * box || hi[1] - lo[1] >= 0.5 * box ||
                       hi[2] - lo[2] >= 0.5 * box)) {
@@ -141,7 +160,25 @@ Groups makeGroups(int64_t n, const double* pos, const V* vel, const M* mass,
   return G;
 }
 
+// The order of a group's particles for sampling: by this hash of the
+// particle id, ties by id (the same function as ubs::sampleKey).
+inline uint64_t sampleKey(int64_t id) {
+  uint64_t z = (uint64_t)id + 0x9e3779b97f4a7c15ull;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  return z ^ (z >> 31);
+}
+
 namespace detail {
+
+// A sampled group's bookkeeping.
+struct Sampled {
+  std::vector<int64_t> order;           // its packed particles in sampling order
+  std::vector<int64_t> sample;          // the sample of the current bound set
+  std::vector<int64_t> added, dropped;  // how the last removal changed the sample
+  int64_t next = 0;                     // first position of `order` not yet looked at
+  double f = 1;                         // M(bound) / M(sample)
+};
 
 struct Frame {
   double x[3], v[3];
@@ -214,7 +251,7 @@ Result unbindGroups(const Groups& G, const Params& P) {
   // bound, the next nlast[g] - nb[g] those the last pass removed.
   std::vector<int64_t> perm((size_t)n), nb(ng), nlast(ng);
   std::iota(perm.begin(), perm.end(), (int64_t)0);
-  enum : uint8_t { Done, Full, Subtract };
+  enum : uint8_t { Done, Full, Subtract, SampleFull, SampleUpdate };
   std::vector<uint8_t> state(ng, Full), subtracted(ng, 0);
   std::vector<Frame> frame(ng), old_frame(ng);
   for (int g = 0; g < ng; g++) {
@@ -223,19 +260,181 @@ Result unbindGroups(const Groups& G, const Params& P) {
     old_frame[g] = frame[g];
   }
 
-  std::vector<int> full, sub;
+  // Capped sampling. Per packed particle: alive = still bound; in_sample =
+  // 1 for a member of its group's sample, 2 for one that joined at the last
+  // removal; phi_s = its sum over the sample, true masses, without f.
+  const bool capped = P.cap > 0;
+  std::vector<detail::Sampled> samp(capped ? ng : 0);
+  std::vector<uint8_t> alive(capped ? (size_t)n : 0, 1), in_sample(capped ? (size_t)n : 0, 0);
+  std::vector<double> phi_s(capped ? (size_t)n : 0, 0.0);
+  if (capped) {
+    for (int g = 0; g < ng; g++) {
+      if (nb[g] <= P.cap) continue;
+      detail::Sampled& S = samp[g];
+      S.order.resize((size_t)nb[g]);
+      std::iota(S.order.begin(), S.order.end(), G.off[g]);
+      std::sort(S.order.begin(), S.order.end(), [&](int64_t x, int64_t y) {
+        const uint64_t kx = sampleKey(G.pid[x]), ky = sampleKey(G.pid[y]);
+        return kx != ky ? kx < ky : G.pid[x] < G.pid[y];
+      });
+      S.sample.assign(S.order.begin(), S.order.begin() + P.cap);
+      S.next = P.cap;
+      double mb = 0, ms = 0;
+      for (int64_t i = G.off[g]; i < G.off[g + 1]; i++) mb += G.mass[i];
+      for (int64_t i : S.sample) {
+        ms += G.mass[i];
+        in_sample[i] = 1;
+      }
+      S.f = mb / ms;
+      state[g] = SampleFull;
+      R.stats.sampled_groups++;
+    }
+  }
+
+  // One launch from host rows (x, y, z, w per particle): targets with w =
+  // the mass of their own term among the sources (0 if they are not a
+  // source), sources with w = mass. Fills out[] with each target's sum and
+  // returns the kernel's seconds.
+  auto launch = [&](const std::vector<Real>& tgt, const std::vector<int>& grp,
+                    const std::vector<Real>& src, const std::vector<int64_t>& off,
+                    std::vector<double>& out) {
+    using Kokkos::view_alloc;
+    using Kokkos::WithoutInitializing;
+    using HostRows = Kokkos::View<const Real* [4], Kokkos::LayoutRight, Kokkos::HostSpace,
+                                  Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
+    const size_t nt = grp.size(), ns = src.size() / 4;
+    ParticleView<Real> d_tgt(view_alloc(WithoutInitializing, "unbind_tgt"), nt);
+    ParticleView<Real> d_src(view_alloc(WithoutInitializing, "unbind_src"), ns);
+    GroupView d_grp(view_alloc(WithoutInitializing, "unbind_group"), nt);
+    OffsetView d_off(view_alloc(WithoutInitializing, "unbind_off"), off.size());
+    PotentialView d_phi(view_alloc(WithoutInitializing, "unbind_phi"), nt);
+    Kokkos::deep_copy(d_tgt, HostRows(tgt.data(), nt));
+    Kokkos::deep_copy(d_src, HostRows(src.data(), ns));
+    Kokkos::deep_copy(d_grp, Kokkos::View<const int*, Kokkos::HostSpace,
+                                          Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+                                 grp.data(), nt));
+    Kokkos::deep_copy(d_off, Kokkos::View<const int64_t*, Kokkos::HostSpace,
+                                          Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
+                                 off.data(), off.size()));
+    const double ks =
+        potential<Real, Acc, Fast>(d_tgt, d_grp, d_src, d_off, d_phi, P.eps, kernel_box, true);
+    out.resize(nt);
+    Kokkos::deep_copy(Kokkos::View<double*, Kokkos::HostSpace,
+                                   Kokkos::MemoryTraits<Kokkos::Unmanaged>>(out.data(), nt),
+                      d_phi);
+    return ks;
+  };
+  auto row = [&](std::vector<Real>& rows, int64_t i, double w) {
+    rows.push_back(Real(G.pos[3 * i]));
+    rows.push_back(Real(G.pos[3 * i + 1]));
+    rows.push_back(Real(G.pos[3 * i + 2]));
+    rows.push_back(Real(w));
+  };
+
+  std::vector<int> full, sub, sfull, supd;
   std::vector<int64_t> scratch;
   Kokkos::Timer host_timer;
   double kernel_total = 0;
   for (int pass = 0;; pass++) {
     full.clear();
     sub.clear();
+    sfull.clear();
+    supd.clear();
     for (int g = 0; g < ng; g++) {
       if (state[g] == Full) full.push_back(g);
       if (state[g] == Subtract) sub.push_back(g);
+      if (state[g] == SampleFull) sfull.push_back(g);
+      if (state[g] == SampleUpdate) supd.push_back(g);
     }
-    if (full.empty() && sub.empty()) break;
+    if (full.empty() && sub.empty() && sfull.empty() && supd.empty()) break;
     R.stats.passes++;
+
+    // Sampled groups, in full: every bound particle against the sample.
+    if (!sfull.empty()) {
+      std::vector<Real> tgt, src;
+      std::vector<int> grp;
+      std::vector<int64_t> off;
+      std::vector<double> out;
+      int64_t pairs = 0;
+      for (size_t b = 0; b < sfull.size(); b++) {
+        const int g = sfull[b];
+        off.push_back((int64_t)src.size() / 4);
+        for (int64_t k = 0; k < nb[g]; k++) {
+          const int64_t i = perm[G.off[g] + k];
+          row(tgt, i, in_sample[i] ? G.mass[i] : 0.0);
+          grp.push_back((int)b);
+        }
+        for (int64_t i : samp[g].sample) row(src, i, G.mass[i]);
+        pairs += nb[g] * (int64_t)samp[g].sample.size();
+      }
+      off.push_back((int64_t)src.size() / 4);
+      const double ks = launch(tgt, grp, src, off, out);
+      kernel_total += ks;
+      if (pass == 0) {
+        R.stats.pairs_first += pairs;
+        R.stats.kernel_s_first += ks;
+      } else {
+        R.stats.pairs_full_later += pairs;
+        R.stats.kernel_s_later += ks;
+      }
+      size_t t = 0;
+      for (int g : sfull)
+        for (int64_t k = 0; k < nb[g]; k++) phi_s[perm[G.off[g] + k]] = out[t++];
+    }
+
+    // Sampled groups, by the sample's change: the members that joined (their
+    // own term cancelled for themselves) and, with negated masses, the
+    // members that were removed.
+    if (!supd.empty()) {
+      std::vector<Real> tgt, src;
+      std::vector<int> grp;
+      std::vector<int64_t> off;
+      std::vector<double> out;
+      std::vector<int> changed;
+      int64_t pairs = 0;
+      for (int g : supd) {
+        detail::Sampled& S = samp[g];
+        if (S.added.empty() && S.dropped.empty()) continue;
+        off.push_back((int64_t)src.size() / 4);
+        for (int64_t k = 0; k < nb[g]; k++) {
+          const int64_t i = perm[G.off[g] + k];
+          row(tgt, i, in_sample[i] == 2 ? G.mass[i] : 0.0);
+          grp.push_back((int)changed.size());
+        }
+        for (int64_t i : S.added) {
+          row(src, i, G.mass[i]);
+          in_sample[i] = 1;
+        }
+        for (int64_t i : S.dropped) row(src, i, -G.mass[i]);
+        pairs += nb[g] * (int64_t)(S.added.size() + S.dropped.size());
+        changed.push_back(g);
+      }
+      if (!changed.empty()) {
+        off.push_back((int64_t)src.size() / 4);
+        const double ks = launch(tgt, grp, src, off, out);
+        kernel_total += ks;
+        R.stats.pairs_sample_update += pairs;
+        R.stats.kernel_s_later += ks;
+        size_t t = 0;
+        for (int g : changed)
+          for (int64_t k = 0; k < nb[g]; k++) phi_s[perm[G.off[g] + k]] += out[t++];
+      }
+    }
+
+    // Energies of the sampled groups from their sums, in the current frame.
+    for (const std::vector<int>* list : {&sfull, &supd}) {
+      for (int g : *list) {
+        const double scale = Ga * samp[g].f;
+        for (int64_t k = 0; k < nb[g]; k++) {
+          const int64_t i = perm[G.off[g] + k];
+          double dv[3];
+          detail::relativeVelocity(&G.pos[3 * i], &G.vel[3 * i], frame[g], Ha, wrap, P.box,
+                                   dv);
+          R.energy[i] =
+              0.5 * (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]) + scale * phi_s[i];
+        }
+      }
+    }
 
     // Full passes: the bound particles are both targets and sources.
     if (!full.empty()) {
@@ -372,6 +571,8 @@ Result unbindGroups(const Groups& G, const Params& P) {
       }
       std::copy(scratch.begin(), scratch.end(), p + kept);
       nb[g] = kept;
+      if (capped)
+        for (int64_t i : scratch) alive[i] = 0;
       if (nb[g] < P.min_bound || nb[g] == 0) {
         nb[g] = 0;
         state[g] = Done;
@@ -383,6 +584,45 @@ Result unbindGroups(const Groups& G, const Params& P) {
       frame[g] = detail::meanFrame(G, p, nb[g], wrap, P.box);
       if ((float)nb[g] >= (float)nlast[g] * keep) {
         state[g] = Done;
+        continue;
+      }
+      if (state[g] == SampleFull || state[g] == SampleUpdate) {
+        if (nb[g] <= P.cap) {
+          state[g] = Full;   // at or below the cap: the exact rules from here on
+          continue;
+        }
+        // The sample of the new bound set: without the removed members, with
+        // the next bound particles in the order.
+        detail::Sampled& S = samp[g];
+        S.added.clear();
+        S.dropped.clear();
+        size_t w = 0;
+        for (int64_t i : S.sample) {
+          if (alive[i]) {
+            S.sample[w++] = i;
+          } else {
+            S.dropped.push_back(i);
+            in_sample[i] = 0;
+          }
+        }
+        S.sample.resize(w);
+        while ((int64_t)S.sample.size() < P.cap) {
+          const int64_t i = S.order[S.next++];
+          if (!alive[i]) continue;
+          S.sample.push_back(i);
+          S.added.push_back(i);
+          in_sample[i] = 2;
+        }
+        double mb = 0, ms = 0;
+        for (int64_t k = 0; k < nb[g]; k++) mb += G.mass[p[k]];
+        for (int64_t i : S.sample) ms += G.mass[i];
+        S.f = mb / ms;
+        if (2 * (int64_t)S.dropped.size() < P.cap) {
+          state[g] = SampleUpdate;
+        } else {
+          state[g] = SampleFull;
+          for (int64_t i : S.added) in_sample[i] = 1;
+        }
         continue;
       }
       if (!subtract_next && subtracted[g]) R.stale_frame[g] = 1;

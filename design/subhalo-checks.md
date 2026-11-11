@@ -559,8 +559,9 @@ third is not started.
 - A particle-by-particle comparison. `unbind --dump` writes every grouped
   particle's ID, group, bound flag and energy; nothing reads HBT-HERONS's
   `SubhaloParticles` and `BindingEnergies` yet.
-- Capped sampling in `unbind_groups.h`, and groups at least half the box
-  wide on real data (the nearest-image kernel is checked on synthetic
+- Capped sampling in `unbind_groups.h`: done 2026-11-11, see "Capped
+  sampling: definition and pass rule". Still not done: groups at least half
+  the box wide on real data (the nearest-image kernel is checked on synthetic
   particles only; the 8M input has no such group).
 
 ## Exact reference for the unbinding kernel (2026-11-11)
@@ -1108,6 +1109,95 @@ Two conditions hold exactly and are checked as well:
 Not shown by this rule: how far a capped result is from the exact one, and
 whether that distance matches HBT-HERONS's at the same cap.
 
+### Results (2026-11-11, Frontier job 5903809)
+
+One node, 5 min 51 s (`subhalo/run_unbind_cap.sbatch`): `unbind` on one
+MI250X die, `unbindspec` and `unbindcheck` on 56 threads. The 8M lambb
+snapshot of job 5902394. Six forms of the kernel at each of three caps, all
+run until a pass removes nothing.
+
+**Every one of the 18 runs passes at tau = 0.00141**, under the rule as
+first written and under the amended rule, with the definition's bound
+particles exactly: no group has a different bound set. The 12
+single-precision runs also pass with the allowance, which was not needed.
+
+Per cap, double-precision kernel (pair terms and times: lower is better):
+
+| Cap (sources per particle) | Groups sampled (count) | Bound particles, kernel and definition (count) | Groups with different bound sets (count; lower is better) | Largest \|dE\|/S, kernel against definition (fraction of S) | Pair terms, first pass | Pair terms, all later passes | Kernel time, double / single with rsqrt (s) | Unbinding time, double / single with rsqrt (s) |
+|---|---|---|---|---|---|---|---|---|
+| 1,000 | 449 | 4,214,992 | 0 | 6.2e-9 | 3.45e9 | 7.3e7 | 0.028 / 0.016 | 0.81 / 0.70 |
+| 10,000 | 60 | 4,215,879 | 0 | 6.2e-9 | 2.53e10 | 5.4e8 | 0.176 / 0.086 | 0.88 / 0.68 |
+| 100,000 | 3 | 4,215,955 | 0 | 6.2e-9 | 1.19e11 | 8.0e8 | 0.747 / 0.346 | 1.20 / 0.71 |
+| none | 0 | 4,215,954 | 0 (against HBT-HERONS) | 1.1e-6 (against HBT-HERONS) | 1.38e11 | 7.2e8 | 0.850 / 0.382 | 1.23 / 0.69 |
+
+Largest \|dE\|/S against the definition, by form (fraction of S; lower is
+better; tau is 0.00141):
+
+| Kernel (`unbind` option) | Cap 1,000 | Cap 10,000 | Cap 100,000 |
+|---|---|---|---|
+| Double precision | 6.2e-9 | 6.2e-9 | 6.2e-9 |
+| Double precision, `--rsqrt` | 6.2e-9 | 6.2e-9 | 6.2e-9 |
+| `--kernel f32` | 1.7e-6 | 1.3e-6 | 1.3e-6 |
+| `--kernel f32 --rsqrt` | 1.7e-6 | 1.3e-6 | 1.3e-6 |
+| `--kernel f32f32` | 7.6e-6 | 2.4e-5 | 6.5e-5 |
+| `--kernel f32f32 --rsqrt` | 8.1e-6 | 2.4e-5 | 6.5e-5 |
+
+The two exact conditions:
+
+| Condition | Result |
+|---|---|
+| A cap above the largest group (200,000) | the dump is identical to the dump without a cap (`h5diff`) |
+| Groups at or below a cap of 1,000 (14,732 groups, 1,232,469 particles) | kernel: `Bound` and `Energy` equal bit for bit to the run without a cap; `unbindspec`: records identical |
+| The same at 10,000 (15,121 groups, 2,325,779 particles) | equal bit for bit; identical |
+| The same at 100,000 (15,178 groups, 3,912,340 particles) | equal bit for bit; identical |
+
+Without a cap the tools behave as before the change: `unbindspec` against
+the exact reference passes with the largest difference 1.09e-6 of S, and
+the double-precision kernel passes against the exact reference.
+
+The check was tried against deliberately broken kernels, built for the
+host and run at cap 1,000 on the node's cores. All seven fail; the unbroken
+kernel on the same backend passes.
+
+| Change to the kernel | Bound particles (count; the definition has 4,214,992) | Groups with different bound sets (count) | of which fail part 2 (count) | Energies within tau (%) | Verdict |
+|---|---|---|---|---|---|
+| none (control) | 4,214,992 | 0 | 0 | 100 | pass |
+| the factor f left out | 1,843,072 | 438 | 335 | 62.4 | fail |
+| a sampled particle's own term kept | 4,216,688 | 286 | 283 | 89.7 | fail |
+| sample in order of particle ID, no hash | 4,066,878 | 352 | 342 | 29.0 | fail |
+| removed sample members not taken out | 4,220,051 | 210 | 195 | 49.2 | fail |
+| f not recomputed after a removal | 4,218,689 | 201 | 173 | 37.7 | fail |
+| own term kept for a particle that joins the sample | 4,215,031 | 18 | 17 | 99.85 | fail |
+| another constant in the hash (a different, equally valid sample) | 4,215,071 | 285 | 264 | 29.7 | fail |
+
+What this says:
+
+1. **The kernel computes the written sampled method.** At three caps and in
+   six forms it selects the definition's particles exactly, and in double
+   precision its energies agree to 6e-9 of S. The definition recomputes every
+   pass from its sample; the kernel updates its sums by the sample's change.
+   The agreement checks that update.
+2. **Later passes stay cheap with a cap.** They cost 2% of the first pass at
+   caps of 1,000 and 10,000 and under 1% at 100,000. Recomputing every pass,
+   as `unbindspec` does, costs about four times the kernel's total pair terms
+   in the sampled groups (1.20e10 against 3.2e9 at a cap of 1,000).
+3. **With a cap the kernel is no longer where the time goes in `unbind`.** At
+   a cap of 1,000 the kernel takes 0.02 to 0.03 s of the 0.7 to 0.8 s; the
+   rest is the program's serial host work and copies.
+4. **The sample must not be taken in order of particle ID.** That order ends
+   148,114 bound particles below the hashed order, which is itself within 962
+   of the exact result.
+
+Seen but not judged by this rule:
+
+- Distance from the exact result, in total bound particles: 962 fewer at a
+  cap of 1,000 (0.023%), 75 fewer at 10,000, 1 more at 100,000. All 13,256
+  groups keep a sub-halo at every cap. Per group and per particle this is
+  not measured.
+- Two equally valid samples at a cap of 1,000 (the hash with another
+  constant) differ in 4,545 bound particles, 0.11%: 2,233 only in one and
+  2,312 only in the other.
+
 ## Open
 
 - Done 2026-11-11: the comparison of `unbind` with HBT-HERONS. All six
@@ -1115,8 +1205,12 @@ whether that distance matches HBT-HERONS's at the same cap.
   13,256 groups and pass both rules at tau (jobs 5903512 and 5903660); the
   single-precision allowance was measured and changes no verdict. The
   pair-term rate is measured: 2.0e11 per die.
-- Capped sampling in `unbind_groups.h`, and a group at least half the box
-  wide on real data. Not started.
+- Done 2026-11-11: capped sampling in `unbind_groups.h` (`unbind --cap`),
+  held to a written definition: 18 runs at three caps pass at tau with the
+  definition's particles exactly (job 5903809).
+- How accurate a capped result is against the exact one, per group and per
+  particle, and against HBT-HERONS at the same cap. Not started.
+- A group at least half the box wide on real data. Not started.
 - The comparison at a scale factor other than 1.
 - lambb's box size in Mpc, for physical units.
 - The decision on when steps 1-2 start.

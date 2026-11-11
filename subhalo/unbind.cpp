@@ -14,6 +14,10 @@
 //     --float-positions   round positions to single precision first, as
 //                         HBT-HERONS built without HBT_REAL8 stores them
 //     --open              ignore the periodic box
+//     --cap C             capped sampling: a group of more than C particles
+//                         takes each potential from C sources chosen by
+//                         particle id ("Capped sampling: definition and
+//                         pass rule" in the design note). Default: no cap
 //     --min-bound N       smallest sub-halo (default 20)
 //     --bound-fraction F  stop when a pass keeps this share (default 0.995)
 //
@@ -165,6 +169,7 @@ int main(int argc, char** argv) {
     else if (a == "--float-positions") float_positions = true;
     else if (a == "--open") open = true;
     else if (a == "--min-bound") P.min_bound = atoi(next());
+    else if (a == "--cap") P.cap = atoll(next());
     else if (a == "--bound-fraction") P.bound_fraction = atof(next());
     else if (a[0] != '-' && snap.empty()) snap = a;
     else die("unknown argument " + a);
@@ -173,7 +178,7 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: unbind <snapshot.hdf5> [--ref table] [--out table] [--dump file.hdf5]\n"
             "              [--kernel f64|f32|f32f32] [--rsqrt] [--float-positions] [--open]\n"
-            "              [--min-bound N] [--bound-fraction F]\n");
+            "              [--cap C] [--min-bound N] [--bound-fraction F]\n");
     return 2;
   }
 
@@ -228,7 +233,7 @@ int main(int argc, char** argv) {
   timer.reset();
   const unbind::Groups G = unbind::makeGroups(n, pos.data(), vel.data(), mass.data(),
                                               gid.data(), (int64_t)null_id, P.box,
-                                              (int64_t)P.min_bound);
+                                              (int64_t)P.min_bound, pid.data());
   const double group_s = timer.seconds();
   const int ng = G.ng();
   int64_t largest = 0;
@@ -243,6 +248,13 @@ int main(int argc, char** argv) {
   printf("unbind: kernel %s%s on %s; positions %s; read %.2f s, grouping %.2f s\n",
          kernel.c_str(), rsqrt ? " rsqrt" : "", unbind::Exec().name(),
          float_positions ? "rounded to single precision" : "as stored", read_s, group_s);
+  if (P.cap < 0) die("--cap must not be negative");
+  if (P.cap > 0) {
+    long long above = 0;
+    for (int g = 0; g < ng; g++) above += G.off[g + 1] - G.off[g] > P.cap;
+    printf("unbind: cap %lld sources per particle, chosen by particle id; %lld groups are "
+           "above it\n", (long long)P.cap, above);
+  }
   if (ng == 0) die("no groups");
 
   // ---- unbind --------------------------------------------------------------
@@ -279,11 +291,16 @@ int main(int argc, char** argv) {
          alive ? (double)passes / alive : 0.0, max_passes);
   printf("groups where HBT-HERONS would move the kinetic term from a stale frame: %lld\n",
          stale);
-  const double later = (double)(S.pairs_full_later + S.pairs_subtract);
+  const double later =
+      (double)(S.pairs_full_later + S.pairs_subtract + S.pairs_sample_update);
   printf("pair terms: first pass %.4g, later passes %.4g (in full %.4g, by subtraction "
          "%.4g) = %.1f%% of the first\n",
          (double)S.pairs_first, later, (double)S.pairs_full_later, (double)S.pairs_subtract,
          100.0 * later / (double)S.pairs_first);
+  if (P.cap > 0)
+    printf("capped sampling: %lld groups sampled; %.4g pair terms spent on changes of "
+           "their samples in later passes\n", (long long)S.sampled_groups,
+           (double)S.pairs_sample_update);
   const double kernel_s = S.kernel_s_first + S.kernel_s_later;
   printf("time: unbinding %.3f s = kernel %.3f s (first pass %.3f, later %.3f) + host and "
          "copies %.3f s, in %d rounds\n",
