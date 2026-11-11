@@ -8,7 +8,7 @@
 // correct kernel can pass too.
 //
 //   unbindspec <snapshot.hdf5> <out.particles.bin> [--g G] [--no-hubble] [--trace ID]
-//              [--potential-ratio]
+//              [--potential-ratio] [--cap C]
 //
 // <snapshot.hdf5> is the file tipsy2hbt wrote. The output has one 24-byte
 // record per bound particle (unbindrec.h), the layout unbindcmp and
@@ -23,6 +23,11 @@
 // group's median |E|: a relative error eps in a kernel's potential moves an
 // energy by eps * |U| / S in the units of the pass rule.
 //
+// --cap C applies the capped-sampling definition ("Capped sampling:
+// definition and pass rule"): a group of more than C particles takes each
+// pass's potential from a sample of C bound particles chosen by particle id.
+// Groups of at most C particles go through the same code as without --cap.
+//
 // Build: make unbindspec (subhalo/Makefile; HDF5 and OpenMP).
 
 #include "unbindrec.h"
@@ -33,16 +38,17 @@
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: unbindspec <snapshot.hdf5> <out.particles.bin> "
-                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio]\n");
+                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio] [--cap C]\n");
     return 2;
   }
-  long long trace_id = -1;
+  long long trace_id = -1, cap = 0;
   bool potential_ratio = false;
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--g") && i + 1 < argc) ubs::G = atof(argv[++i]);
     else if (!strcmp(argv[i], "--trace") && i + 1 < argc) trace_id = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--no-hubble")) ubs::hubble_factor = 0;
     else if (!strcmp(argv[i], "--potential-ratio")) potential_ratio = true;
+    else if (!strcmp(argv[i], "--cap") && i + 1 < argc) cap = atoll(argv[++i]);
     else { fprintf(stderr, "unbindspec: unknown option %s\n", argv[i]); return 2; }
   }
   const ubs::Snapshot s = ubs::readSnapshot(argv[1], "unbindspec");
@@ -51,6 +57,7 @@ int main(int argc, char** argv) {
   std::vector<std::vector<Rec>> out(ng);
   std::vector<std::vector<double>> ratio(ng);     // --potential-ratio: |U| / S
   std::vector<long> passes(ng, 0);
+  std::vector<double> capped_terms(ng, 0.0);      // --cap: pair terms of a sampled group
 
   // One group. `inner` = parallelize over its particles (large groups).
   auto solve = [&](size_t gi, bool inner) {
@@ -59,20 +66,28 @@ int main(int argc, char** argv) {
     const size_t* idx = s.order.data() + g.begin;
     std::vector<double> pot, e(n, 0.0);
     std::vector<char> alive(n, 1);
-    ubs::potentialAll(s, idx, n, pot, inner);
     size_t traced = n;                        // local index of --trace, or n
     if (trace_id >= 0)
       for (size_t i = 0; i < n; i++)
         if (s.ID[idx[i]] == trace_id) traced = i;
-    passes[gi] = ubs::unbind(
-        s, idx, n, alive, pot, e, inner,
-        [&](long pass, size_t entering, const std::vector<char>& al,
-            const std::vector<double>& en, const std::vector<size_t>& removed) {
-          if (traced < n && al[traced])
-            printf("trace: particle %lld group %lld pass %ld: %zu bound entering, "
-                   "%zu removed, E = %.9g\n", trace_id, g.id, pass, entering,
-                   removed.size(), en[traced]);
-        });
+    const bool sampled = cap > 0 && n > (size_t)cap;
+    auto observe = [&](long pass, size_t entering, const std::vector<char>& al,
+                       const std::vector<double>& en, const std::vector<size_t>& removed) {
+      if (sampled)
+        capped_terms[gi] += (double)entering * (double)std::min(entering, (size_t)cap);
+      if (traced < n && al[traced])
+        printf("trace: particle %lld group %lld pass %ld: %zu bound entering, "
+               "%zu removed, E = %.9g\n", trace_id, g.id, pass, entering,
+               removed.size(), en[traced]);
+    };
+    if (sampled) {
+      const std::vector<size_t> order = ubs::sampleOrder(s, idx, n);
+      passes[gi] = ubs::unbindCapped(s, idx, n, alive, pot, e, inner, (size_t)cap, order,
+                                     observe);
+    } else {
+      ubs::potentialAll(s, idx, n, pot, inner);
+      passes[gi] = ubs::unbind(s, idx, n, alive, pot, e, inner, observe);
+    }
     for (size_t i = 0; i < n; i++)
       if (alive[i]) out[gi].push_back({s.ID[idx[i]], g.id, e[i]});
     if (potential_ratio && !out[gi].empty()) {
@@ -94,9 +109,15 @@ int main(int argc, char** argv) {
   if (!o) { fprintf(stderr, "unbindspec: cannot write %s\n", argv[2]); return 2; }
   long long bound = 0, with_sub = 0, total_passes = 0;
   long max_passes = 0;
-  double pair_terms = 0;
+  double pair_terms = 0, sampled_terms = 0;
+  long long sampled_groups = 0;
   for (size_t gi = 0; gi < ng; gi++) {
-    pair_terms += (double)s.groups[gi].n * (double)s.groups[gi].n;
+    if (cap > 0 && s.groups[gi].n > (size_t)cap) {
+      sampled_groups++;
+      sampled_terms += capped_terms[gi];
+    } else {
+      pair_terms += (double)s.groups[gi].n * (double)s.groups[gi].n;
+    }
     total_passes += passes[gi];
     max_passes = std::max(max_passes, passes[gi]);
     if (out[gi].empty()) continue;
@@ -105,8 +126,11 @@ int main(int argc, char** argv) {
     fwrite(out[gi].data(), sizeof(Rec), out[gi].size(), o);
   }
   fclose(o);
-  printf("unbindspec: %zu groups, %zu grouped particles, %.3e pair terms in the first pass\n",
-         ng, s.order.size(), pair_terms);
+  printf("unbindspec: %zu groups, %zu grouped particles, %.3e pair terms in the first pass"
+         "%s\n", ng, s.order.size(), pair_terms, cap > 0 ? " of the groups not sampled" : "");
+  if (cap > 0)
+    printf("unbindspec: cap %lld: %lld groups sampled, %.3e pair terms in all their passes\n",
+           cap, sampled_groups, sampled_terms);
   printf("unbindspec: %lld groups with a sub-halo, %lld bound particles (%.2f%%)\n",
          with_sub, bound, 100.0 * bound / (double)s.order.size());
   printf("unbindspec: passes per group: mean %.2f, largest %ld\n",

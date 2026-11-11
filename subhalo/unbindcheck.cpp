@@ -3,7 +3,7 @@
 // ("Pass rule, amended").
 //
 //   unbindcheck <snapshot.hdf5> <reference.particles.bin> <candidate> --tau T
-//               [--single-against <double result>] [--list N]
+//               [--single-against <double result>] [--cap C] [--list N]
 //
 //   <snapshot.hdf5>            the file tipsy2hbt wrote, which both sides read
 //   <reference.particles.bin>  hbtref's output for the exact HBT-HERONS run,
@@ -18,6 +18,12 @@
 //                              min(T + 10 n, 10 T), n being the 99.9th
 //                              percentile of |E_single - E_double| / S over
 //                              the particles bound in both.
+//   --cap C                    both results used capped sampling with cap C
+//                              ("Capped sampling: definition and pass rule"):
+//                              wherever the rule evaluates or replays the
+//                              definition in a group of more than C
+//                              particles, it uses the capped definition.
+//                              The rule itself is unchanged.
 //   --list N                   print at most N differing groups (default 20)
 //
 // Both sides must have run until a pass removes nothing: HBT-HERONS with
@@ -121,17 +127,19 @@ struct GroupResult {
 int main(int argc, char** argv) {
   double tau = -1;
   long list = 20;
+  long long cap = 0;
   const char* single_against = nullptr;
   for (int i = 4; i < argc; i++) {
     if (!strcmp(argv[i], "--tau") && i + 1 < argc) tau = atof(argv[++i]);
     else if (!strcmp(argv[i], "--single-against") && i + 1 < argc) single_against = argv[++i];
     else if (!strcmp(argv[i], "--list") && i + 1 < argc) list = atol(argv[++i]);
+    else if (!strcmp(argv[i], "--cap") && i + 1 < argc) cap = atoll(argv[++i]);
     else { fprintf(stderr, "%s: unknown option %s\n", TOOL, argv[i]); return 2; }
   }
   if (argc < 4 || tau <= 0) {
     fprintf(stderr, "usage: unbindcheck <snapshot.hdf5> <reference.particles.bin> "
                     "<candidate: unbind --dump file or .particles.bin> --tau T "
-                    "[--single-against <double-precision result>] [--list N]\n");
+                    "[--single-against <double-precision result>] [--cap C] [--list N]\n");
     return 2;
   }
 
@@ -303,24 +311,32 @@ int main(int argc, char** argv) {
         eCand[i] = r.e;
       }
 
+      // With --cap, a group of more than `cap` particles is evaluated and
+      // replayed by the capped definition; every other group as before.
+      const bool sampled = cap > 0 && n > (size_t)cap;
+      std::vector<size_t> order;
       std::vector<double> pot0;
-      ubs::potentialAll(s, idx, n, pot0, par);
+      if (sampled) order = ubs::sampleOrder(s, idx, n);
+      else ubs::potentialAll(s, idx, n, pot0, par);
 
       // 2b: replay the definition from the whole group.
       std::vector<double> pot = pot0, e(n, 0.0), rem_e(n, 0.0), marg_e(n, 0.0);
       std::vector<char> alive(n, 1);
       std::vector<long> rem_pass(n, 0), marg_pass(n, 0);
-      ubs::unbind(s, idx, n, alive, pot, e, par,
-                  [&](long pass, size_t, const std::vector<char>& al,
-                      const std::vector<double>& en, const std::vector<size_t>& removed) {
-                    for (size_t r : removed) { rem_pass[r] = pass; rem_e[r] = en[r]; }
-                    for (size_t i = 0; i < n; i++)
-                      if (al[i] && inRef[i] && !inCand[i] && marg_pass[i] == 0 &&
-                          en[i] < 0 && -en[i] <= tau * S) {
-                        marg_pass[i] = pass;
-                        marg_e[i] = en[i];
-                      }
-                  });
+      auto watch = [&](long pass, size_t, const std::vector<char>& al,
+                       const std::vector<double>& en, const std::vector<size_t>& removed) {
+        for (size_t r : removed) { rem_pass[r] = pass; rem_e[r] = en[r]; }
+        for (size_t i = 0; i < n; i++)
+          if (al[i] && inRef[i] && !inCand[i] && marg_pass[i] == 0 &&
+              en[i] < 0 && -en[i] <= tau * S) {
+            marg_pass[i] = pass;
+            marg_e[i] = en[i];
+          }
+      };
+      if (sampled)
+        ubs::unbindCapped(s, idx, n, alive, pot, e, par, (size_t)cap, order, watch);
+      else
+        ubs::unbind(s, idx, n, alive, pot, e, par, watch);
       R.replay_ok = true;
       for (size_t i = 0; i < n; i++)
         if ((alive[i] != 0) != (inRef[i] != 0)) R.replay_ok = false;
@@ -348,7 +364,10 @@ int main(int argc, char** argv) {
       std::vector<size_t> outside;
       for (size_t i = 0; i < n; i++) if (!inCand[i]) outside.push_back(i);
       std::vector<double> potk = pot0, estar(n, 0.0);
-      ubs::subtractPotential(s, idx, n, inCand, outside, potk, par);
+      if (sampled)
+        ubs::potentialCapped(s, idx, n, inCand, order, (size_t)cap, potk, par);
+      else
+        ubs::subtractPotential(s, idx, n, inCand, outside, potk, par);
       ubs::energies(s, idx, n, inCand, potk, estar);
       for (size_t i = 0; i < n; i++) {
         if (!inCand[i]) continue;

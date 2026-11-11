@@ -1026,6 +1026,88 @@ Not covered by this comparison: an input whose scale factor is not 1 (the
 factors G / a and H a), more than one softening or particle type, a group
 at least half the box wide, and capped sampling.
 
+## Capped sampling: definition and pass rule (2026-11-11)
+
+Decided 2026-11-11, before any capped kernel output existed:
+
+- the sample is chosen by particle ID;
+- the pass rule is that the kernel is held to a written definition of the
+  sampled method, under the existing tau (0.00141) and the amended rule,
+  unchanged.
+
+HBT-HERONS's own sampled output cannot be a per-particle target, because its
+sample is a random shuffle. Other rules were considered and not adopted
+here: a statistical comparison with the exact result limited by
+HBT-HERONS's own sampling error, a fixed accuracy requirement, and a test
+for bias over several samples. They answer a different question, how
+accurate a capped result is, which this rule does not.
+
+### Definition
+
+C is the cap: the most sources that enter one particle's potential. No cap
+(C = 0) is the definition of "What HBT-HERONS computes".
+
+- Order. key(ID) is the 64-bit value z computed, with unsigned wrap-around,
+  as z = ID + 0x9e3779b97f4a7c15; z = (z xor (z >> 30)) * 0xbf58476d1ce4e5b9;
+  z = (z xor (z >> 27)) * 0x94d049bb133111eb; z = z xor (z >> 31). A group's
+  particles are ordered by increasing key, ties by ID. ID is the snapshot's
+  `ParticleIDs` value (FoF3's particle order plus 1).
+- A pass with bound set B of N_b particles:
+  - N_b <= C: nothing changes. The sources are all of B.
+  - N_b > C: the sample S is the first C particles of B in the order, and
+    f = M(B) / M(S), the ratio of the summed masses. The potential is
+    U_i = (G / a) * f * sum over j in S, j not i, of m_j * phi(r_ij).
+- Everything else is as before: the frame is the mass-weighted mean over
+  all of B with the true masses, K_i, E_i = K_i + U_i, bound means E_i < 0,
+  no sub-halo below 20 bound particles, and the passes end when one removes
+  nothing.
+
+So the energies at a pass depend only on B. Whether a set is an end state
+is then well defined, which the amended rule needs (2a).
+
+What is HBT-HERONS's (read from c728ee0) and what is not:
+
+| Item | HBT-HERONS with `MaxSampleSizeOfPotentialEstimate` C | This definition |
+|---|---|---|
+| When a pass samples | N_b >= C (at N_b = C the sample is all of B) | N_b > C: the same |
+| Factor on the sample's masses | M(B) / M(S) | the same |
+| A sampled particle's own term | excluded | the same |
+| Frame | all bound particles, true masses | the same |
+| Order of the sample | one random shuffle of the group | by key(ID) |
+| Later passes | if a pass removed fewer than C particles and fewer than it kept, the removed particles' exact potential is subtracted from the sampled estimate, and no pass is computed from a sample again | every pass is defined from the current sample |
+| Centre refinement after the last pass | reorders the most bound particles | not part of the bound set; not defined here |
+
+The sixth row is the one real difference in method. HBT-HERONS's energies
+after the first pass depend on the path taken; here they do not.
+
+### How it may be computed
+
+The definition says what a pass's energies are, not how to get them.
+`unbindspec --cap C` recomputes every pass from its sample: N_b * C pair
+terms per pass. `unbind --cap C` keeps each particle's sum over the sample
+without the factor. After a pass it takes out the sample members that were
+removed and adds the particles that replace them: N_b * 2d pair terms when d
+members were replaced. It recomputes in full when 2d >= C, and goes over to
+the exact method once N_b <= C.
+
+### Pass rule
+
+`unbind --cap C` against `unbindspec --cap C`, both run until a pass removes
+nothing, judged by `unbindcheck --cap C --tau 0.00141`: the amended rule as
+it stands, with the capped definition wherever the rule evaluates or
+replays the definition. A single-precision form gets the allowance of
+"Tolerance for single-precision kernels", measured against the
+double-precision kernel at the same cap.
+
+Two conditions hold exactly and are checked as well:
+
+- a group at or below the cap is not sampled, so its result equals the
+  result without a cap;
+- a cap above the largest group changes nothing.
+
+Not shown by this rule: how far a capped result is from the exact one, and
+whether that distance matches HBT-HERONS's at the same cap.
+
 ## Open
 
 - Done 2026-11-11: the comparison of `unbind` with HBT-HERONS. All six

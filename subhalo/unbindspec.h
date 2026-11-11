@@ -1,5 +1,7 @@
 // unbindspec.h -- the unbinding definition of design/subhalo-checks.md
 // ("What HBT-HERONS computes") in plain double-precision C++ with all pairs.
+// The last part of the file adds the capped-sampling definition ("Capped
+// sampling: definition and pass rule"); without a cap nothing changes.
 // Shared by unbindspec, which runs it on every group, and unbindcheck, which
 // replays it on the groups where a kernel and the reference differ.
 //
@@ -255,6 +257,90 @@ inline long unbind(const Snapshot& s, const size_t* idx, size_t n, std::vector<c
       break;
     }
     subtractPotential(s, idx, n, alive, removed, pot, parallel);
+  }
+  return npass;
+}
+
+// ---- capped sampling -------------------------------------------------------
+// design/subhalo-checks.md, "Capped sampling: definition and pass rule". With
+// a cap C, a pass whose bound set has more than C particles takes each
+// particle's potential from the first C bound particles in the order below,
+// their masses multiplied by f = M(bound) / M(sample).
+
+// The order of a group's particles for sampling: by this hash of the
+// particle id, ties by id.
+inline unsigned long long sampleKey(long long id) {
+  unsigned long long z = (unsigned long long)id + 0x9e3779b97f4a7c15ull;
+  z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+  z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+  return z ^ (z >> 31);
+}
+// Local indices 0..n of the group's particles in that order.
+inline std::vector<size_t> sampleOrder(const Snapshot& s, const size_t* idx, size_t n) {
+  std::vector<size_t> o(n);
+  for (size_t i = 0; i < n; i++) o[i] = i;
+  std::sort(o.begin(), o.end(), [&](size_t p, size_t q) {
+    const unsigned long long kp = sampleKey(s.ID[idx[p]]), kq = sampleKey(s.ID[idx[q]]);
+    return kp != kq ? kp < kq : s.ID[idx[p]] < s.ID[idx[q]];
+  });
+  return o;
+}
+
+// Potential (without G) at each particle with alive[i], by the capped
+// definition applied to the alive set: from all the other alive particles if
+// there are at most `cap` of them, otherwise from the sample, scaled by f.
+inline void potentialCapped(const Snapshot& s, const size_t* idx, size_t n,
+                            const std::vector<char>& alive, const std::vector<size_t>& order,
+                            size_t cap, std::vector<double>& pot, bool parallel) {
+  size_t nalive = 0;
+  double mall = 0;
+  for (size_t i = 0; i < n; i++)
+    if (alive[i]) { nalive++; mall += s.M[idx[i]]; }
+  const size_t want = nalive <= cap ? nalive : cap;
+  std::vector<size_t> src;
+  double msrc = 0;
+  for (size_t k = 0; k < n && src.size() < want; k++)
+    if (alive[order[k]]) { src.push_back(order[k]); msrc += s.M[idx[order[k]]]; }
+  const double f = nalive <= cap ? 1.0 : mall / msrc;
+  pot.assign(n, 0.0);
+#pragma omp parallel for schedule(dynamic, 64) if (parallel)
+  for (size_t i = 0; i < n; i++) {
+    if (!alive[i]) continue;
+    double sum = 0;
+    for (size_t r : src)
+      if (r != i) sum += s.M[idx[r]] * s.phi(s.dist(idx[i], idx[r]));
+    pot[i] = f * sum;
+  }
+}
+
+// The passes with a cap: as unbind() above, but every pass takes its
+// potential from potentialCapped on the current bound set, so nothing is
+// carried from one pass to the next. pot[] need not be set on entry; on
+// return it holds the last pass's potential.
+template <class Observer>
+inline long unbindCapped(const Snapshot& s, const size_t* idx, size_t n,
+                         std::vector<char>& alive, std::vector<double>& pot,
+                         std::vector<double>& e, bool parallel, size_t cap,
+                         const std::vector<size_t>& order, Observer&& obs) {
+  size_t nalive = 0;
+  for (size_t i = 0; i < n; i++) nalive += alive[i] ? 1 : 0;
+  long npass = 0;
+  std::vector<size_t> removed;
+  for (;;) {
+    potentialCapped(s, idx, n, alive, order, cap, pot, parallel);
+    energies(s, idx, n, alive, pot, e);
+    removed.clear();
+    for (size_t i = 0; i < n; i++)
+      if (alive[i] && !(e[i] < 0)) removed.push_back(i);
+    npass++;
+    obs(npass, nalive, alive, e, removed);
+    if (removed.empty()) break;
+    for (size_t r : removed) alive[r] = 0;
+    nalive -= removed.size();
+    if ((long)nalive < MIN_BOUND) {
+      std::fill(alive.begin(), alive.end(), 0);
+      break;
+    }
   }
   return npass;
 }
