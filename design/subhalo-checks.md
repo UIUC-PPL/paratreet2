@@ -49,13 +49,83 @@ What this says:
   particles can be done exactly.
 - cosmo25's largest group does not fit on one MI250X die (64 GB), so it has
   to stay spread over processes. The others fit on one die.
-- Still missing: the middle of the cosmo2b histogram and all of cosmo25's.
-  They are in the job logs on Frontier, so this needs a `grep` on a login
-  node, not a job:
+- The full histograms of the three large inputs are in the next section.
 
-  ```sh
-  grep -rh "FOF3STAT components" /ccs/proj/csc710/rrao/fof-sc26w-archive | sort -u
-  ```
+### The three large inputs, from the full histograms (2026-11-11)
+
+Source: the archived job logs on Frontier,
+
+```sh
+grep -rh "FOF3STAT components" /ccs/proj/csc710/rrao/fof-sc26w-archive | sort -u
+```
+
+The lines used are the ones whose counts match
+`design/fof3-bigscale-2026-08-23.md`. The archive also holds lines with more
+groups and a smaller largest group; those are runs from before the
+under-merge fix of 2026-08-23.
+
+```
+cosmo2b    424897832 max_size 185317566 log2_histogram: 0:252506722 1:133305669 2:28366023 3:7115322 4:2181027 5:804120 6:329325 7:146123 8:69435 9:35009 10:18332 11:9655 12:5161 13:2751 14:1475 15:722 16:428 17:243 18:130 19:72 20:39 21:21 22:17 23:5 24:2 25:3 27:1
+cosmo25    6730729617 max_size 2214117459 log2_histogram: 0:5656191482 1:839258563 2:169042958 3:43356737 4:13723347 5:4740789 6:2040175 7:1076708 8:597050 9:326443 10:175668 11:93708 12:49934 13:26176 14:13916 15:7398 16:4070 17:2037 18:1094 19:673 20:338 21:171 22:86 23:44 24:17 25:12 26:11 27:3 28:5 29:3 31:1
+romulus25  29193922694 max_size 125856955 log2_histogram: 0:18490411374 1:9831237299 2:719366122 3:114168066 4:25047105 5:7044789 6:2901934 7:1540955 8:829182 9:543668 10:348716 11:211575 12:123892 13:69803 14:37636 15:20059 16:10390 17:5144 18:2561 19:1310 20:598 21:291 22:132 23:55 24:28 25:8 26:2
+```
+
+All numbers below are for groups of 32 or more particles, with group sizes
+taken at the mid-point of each log2 bin and the exact size for the largest
+group. Particle totals are good to a few percent.
+
+| Input | Particles in input | Groups of 32+ | Particles in them (share of input) |
+|---|---|---|---|
+| cosmo2b | 1.98e9 | 1,423,069 | 1.17e9 (59%) |
+| cosmo25 | 2.45e10 | 9,156,530 | 1.55e10 (63%) |
+| romulus25 | 5.8e10 | 13,692,728 | 1.43e10 (25%) |
+
+Where those particles sit, by group size. Each cell is the share of the
+grouped particles and the number of groups holding it:
+
+| Input | 32 to 1,023 particles | 1,024 to 65,535 | 65,536 to 1,048,575 | 1,048,576 and up |
+|---|---|---|---|---|
+| cosmo2b | 12% in 1,384,012 | 16% in 38,096 | 16% in 873 | 56% in 88 |
+| cosmo25 | 7% in 8,781,165 | 12% in 366,800 | 11% in 7,874 | 71% in 691 |
+| romulus25 | 11% in 12,860,528 | 31% in 811,681 | 27% in 19,405 | 31% in 1,114 |
+
+Pair terms for one full pass over all of those groups, by the cap on
+sources per particle. A group smaller than the cap is done exactly. Lower is
+cheaper:
+
+| Input | Cap 1,000 | Cap 10,000 | Cap 100,000 | Cap 1,000,000 | No cap |
+|---|---|---|---|---|---|
+| cosmo2b | 1.1e12 | 9.7e12 | 8.7e13 | 7.3e14 | 4.4e16 |
+| cosmo25 | 1.5e13 | 1.4e14 | 1.3e15 | 1.2e16 | 7.6e18 |
+| romulus25 | 1.3e13 | 1.2e14 | 9.0e14 | 5.9e15 | 7.6e16 |
+
+What this says:
+
+- On the clustered inputs most grouped particles sit in very few groups: 88
+  groups hold 56% of them on cosmo2b, and 691 hold 71% on cosmo25. The path
+  where a large group stays spread over processes therefore carries most of
+  the particles. It is the main path, not a special case. Gathering small
+  groups to an owner covers nearly all of the groups but a minority of the
+  particles.
+- Cost rises almost in proportion to the cap, because most particles are in
+  groups larger than any practical cap: going from 1,000 to 100,000 sources
+  costs about 85 times more on every input.
+- No cap at all is out of reach on cosmo2b and cosmo25, where the largest
+  group alone is 78% and 64% of the work. Exact potentials in the largest
+  groups need a tree.
+- Only cosmo25's largest group (74 GiB) is too large for one die.
+- For scale, cosmo2b at 64 nodes (512 dies), where the GPU FoF iteration
+  takes 1.06 s. At 1e10 pair terms per second per die, which is an
+  assumption to be measured in step 1, one pass costs 0.2 s with a cap of
+  1,000, 1.9 s with 10,000 and 17 s with 100,000. So a cap near 10,000 costs
+  about as much as FoF itself, and beyond that unbinding sets the time per
+  output. HBT-HERONS does better than these counts at cap 1,000 because it
+  walks a tree over its sources.
+- Proposal for step 1, from these numbers: three cases, which FoF3 can
+  already tell apart. A group wholly inside one process is unbound in place
+  on that process's GPU. A group that spans processes but is small is
+  gathered to one owner. A large group stays spread, and its sources are sent
+  to every process holding part of it.
 
 ## The Mac as the no-cluster machine (verified 2026-11-10)
 
@@ -280,7 +350,7 @@ measured Frontier figure is needed for a paper.
 
 ## Open
 
-- Check 0: the rest of the cosmo2b and cosmo25 histograms, from the logs on
-  Frontier (the `grep` above).
+- The pair-term rate of one MI250X die for the potential kernel, which
+  turns the cap table into seconds.
 - lambb's box size in Mpc, for physical units.
 - The decision on when steps 1-2 start.
