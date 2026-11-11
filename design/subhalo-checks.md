@@ -536,8 +536,10 @@ Update, 2026-11-11: the HBT-HERONS reruns of the first two items are done
 on the Mac and `hbtref` reads `SubhaloParticles` and `BindingEnergies`. The
 three settings alone turned out not to be enough for a per-particle target
 (the default early stop). Results, the pass rule and the commands for
-Frontier are in "Exact reference for the unbinding kernel" below. What is
-left of the first two items is to run `unbind` against those files.
+Frontier are in "Exact reference for the unbinding kernel" below. The two
+`unbind` runs against those files are done as well (job 5903512, "Results"
+at the end of that section): the first two items below are complete, the
+third is not started.
 
 - The per-group comparison. On the Mac, add to `hbt_8m_lambb.conf`
 
@@ -845,11 +847,102 @@ For scale: `unbindspec` does the 1.381e11 pair terms of this input's first
 pass at about 1.0e9 pair terms/s on the Mac's 10 cores in double precision,
 against 1.6e11 per second on one MI250X die (step 1).
 
+#### Results (2026-11-11, Frontier job 5903512)
+
+One node, 33 s: `unbind` on one MI250X die and `unbindcheck` on 56 threads,
+both inside the job (`subhalo/run_unbind_compare.sbatch`). Binaries from
+12158ce. `make compare` built with the default `c++` (GCC 7.5.0) and no
+source change. The snapshot is the one of job 5902394; `hbt_reference.txt`
+and `exact-double.particles.bin` were copied from the Mac.
+
+Per group, both sides stopping early at 0.995
+(`unbind snap_0000.hdf5 --ref hbt_reference.txt --float-positions`,
+double-precision kernel):
+
+| Quantity | `unbind` | HBT-HERONS rerun (angle 0.1) |
+|---|---|---|
+| Groups with a sub-halo (count) | 13,256 | 13,256 |
+| Bound particles (count) | 4,217,368 | 4,217,367 |
+| Groups with the same bound count (count; higher is better) | 15,178 of 15,181 | |
+| Sub-haloes with a different pass count (count; lower is better) | 0 | |
+
+The three groups that differ do so by one particle each:
+
+| Group | Particles in group (count) | Bound, `unbind` (count) | Bound, rerun (count) |
+|---|---|---|---|
+| 41 | 15,406 | 15,311 | 15,310 |
+| 48 | 12,936 | 12,825 | 12,824 |
+| 2536 | 136 | 129 | 130 |
+
+Group 2536 is the group of item 4 above: `unbind` ends on the exact
+reference's 129, the angle-0.1 run on 130.
+
+Per particle, both sides running until a pass removes nothing
+(`unbind --bound-fraction 1 --dump`, without `--float-positions`, then
+`unbindcheck --tau 0.00141` against `exact-double.particles.bin`):
+
+| Kernel (`unbind` option) | Groups with a sub-halo (count; the reference has 13,256) | Bound particles (count; the reference has 4,215,954) | Rule as first written (verdict) | Amended rule (verdict) | Groups with different bound sets (count; lower is better) | Largest \|dE\|/S (fraction of S; lower is better; tau is 0.00141) | Unbinding time (s; lower is better) |
+|---|---|---|---|---|---|---|---|
+| Double precision (default) | 13,256 | 4,215,954 | pass | pass | 0 | 1.09e-6 | 1.23 |
+| Single precision pair terms, summed in double (`--kernel f32`) | 13,256 | 4,215,954 | pass | pass | 0 | 1.60e-6 | 0.99 |
+| Single precision, summed in single (`--kernel f32f32`) | 13,256 | 4,215,954 | pass | pass | 0 | 1.04e-4 | 0.98 |
+| Single precision with rsqrt (`--kernel f32 --rsqrt`) | 13,256 | 4,215,954 | pass | pass | 0 | 1.62e-6 | 0.69 |
+
+- Every variant selects exactly the reference's particles: none bound only
+  in the reference, none only in the kernel, in all 13,256 groups. Part 2 of
+  the amended rule therefore had no group to judge, and all energies are
+  within tau * S.
+- Unbinding time is `unbind`'s own figure for the whole unbinding (kernel,
+  host work and copies to and from the die; not reading or grouping, 1.1 s).
+  The kernel part is 0.85, 0.68, 0.67 and 0.38 s, in table order.
+- `unbindcheck` does not print the largest difference. It comes from
+  `unbindcmp` on the bound particles of each dump, written as a
+  `.particles.bin` file with `h5dump` and numpy (no tool in the repo does
+  that conversion). The rest of the distribution of \|dE\|/S, lower is
+  better:
+
+  | Kernel | Median (fraction of S) | 99.9th percentile (fraction of S) |
+  |---|---|---|
+  | Double precision | 2.6e-8 | 4.0e-7 |
+  | `--kernel f32` | 3.2e-8 | 5.3e-7 |
+  | `--kernel f32f32` | 1.0e-6 | 5.0e-5 |
+  | `--kernel f32 --rsqrt` | 3.4e-8 | 5.4e-7 |
+
+- In every dump, no group has between 1 and 19 bound particles: the 1,925
+  groups that end below 20 have `Bound` = 0 for all their particles, and no
+  bound particle has an energy of zero or above.
+- Running to the end instead of stopping at 0.995: 1,414 fewer bound
+  particles, passes per sub-halo mean 1.61 and largest 27 (1.52 and 24), and
+  later passes cost 0.5% of the first pass's pair terms (0.2%).
+
+What this says:
+
+1. **`unbind` reproduces HBT-HERONS's exact result particle for particle**
+   on this input, in all four forms of the kernel. The double-precision
+   kernel is as close to the reference as `unbindspec` (largest difference
+   1.1e-6 of S for both).
+2. **Precision is not the limit at this tolerance.** Summing in single
+   precision is the only form that moves the energies visibly, and its
+   largest difference is 13 times below tau. The rsqrt form with single
+   precision pair terms summed in double changes nothing that the rule
+   measures and is the fastest, 0.69 s.
+3. **The three per-group differences at the early stop are not kernel
+   errors.** With both sides run to the end those groups have the reference's
+   bound sets. Group 2536 is the known non-unique case; groups 41 and 48 were
+   not traced.
+
+Not covered by this comparison: an input whose scale factor is not 1 (the
+factors G / a and H a), more than one softening or particle type, a group
+at least half the box wide, and capped sampling.
+
 ## Open
 
-- The comparison of `unbind` with HBT-HERONS. The HBT-HERONS side is done
-  ("Exact reference for the unbinding kernel"); the two `unbind` runs on
-  Frontier are not ("Comparing `unbind` with the references"). The pair-term
-  rate is measured: 2.0e11 per die.
+- Done 2026-11-11: the comparison of `unbind` with HBT-HERONS. All four
+  forms of the kernel select the exact reference's 4,215,954 particles in
+  13,256 groups and pass both rules (job 5903512). The pair-term rate is
+  measured: 2.0e11 per die.
+- Capped sampling in `unbind_groups.h`, and a group at least half the box
+  wide on real data. Not started.
+- The comparison at a scale factor other than 1.
 - lambb's box size in Mpc, for physical units.
 - The decision on when steps 1-2 start.
