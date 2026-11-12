@@ -4,6 +4,7 @@ first frame depends on the particle its periodic offsets are taken from.
 
   wideorigins.py list <snapshot.hdf5> [--write PREFIX]
   wideorigins.py compare <snapshot.hdf5> <dump A> <dump B>
+  wideorigins.py hbt <snapshot.hdf5> <HBT-HERONS log> <out.txt>
 
 A group's frame position is the mass-weighted mean of nearest-image offsets
 from one of its particles, the origin. For a group narrower than half the
@@ -20,6 +21,12 @@ list     prints each wide group and, for several origins, how far the first
          `unbind --first-origin` (lines: group id, particle id).
 compare  per wide group, two `unbind --dump` results: bound counts and the
          particles bound in exactly one of them.
+
+hbt      reads the FIRSTPARTICLE lines of an HBT-HERONS run built with the
+         one-line diagnostic of the design note (group size, id of the
+         particle its first frame started from), finds each particle's group
+         and writes the file for `unbind --first-origin`. For the wide
+         groups it prints how far that frame is from the lowest-id one.
 
 Needs numpy and HDF5's h5dump (through capdistance.py's readers).
 """
@@ -127,10 +134,52 @@ def cmd_compare(snap, dump_a, dump_b):
     print(f"all other groups: {int((a['b'][other] != b['b'][other]).sum())} particles differ")
 
 
+def cmd_hbt(snap, log, out):
+    s = read(snap)
+    g_all = cd.raw(H5DUMP, snap, "/PartType1/FOFGroupIDs", "<i8")
+    id_all = cd.raw(H5DUMP, snap, "/PartType1/ParticleIDs", "<i8")
+    if not np.array_equal(id_all, np.arange(1, len(id_all) + 1)):
+        sys.exit("wideorigins: the snapshot's ParticleIDs are not 1..N")
+    size = dict(zip(s["g"][s["start"]].tolist(), (s["end"] - s["start"]).tolist()))
+    first = {}
+    for line in open(log, errors="replace"):
+        w = line.split()
+        if len(w) == 3 and w[0] == "FIRSTPARTICLE":
+            n, pid = int(w[1]), int(w[2])
+            g = int(g_all[pid - 1])
+            if size.get(g) != n:
+                sys.exit(f"wideorigins: particle {pid} is in group {g} of {size.get(g)} "
+                         f"particles, HBT-HERONS printed {n}")
+            if g in first:
+                sys.exit(f"wideorigins: group {g} is printed twice")
+            first[g] = pid
+    want = [g for g, n in size.items() if n >= 20]
+    missing = [g for g in want if g not in first]
+    if missing:
+        sys.exit(f"wideorigins: {len(missing)} groups of 20 or more particles have no "
+                 f"FIRSTPARTICLE line, e.g. group {missing[0]}")
+    with open(out, "w") as f:
+        f.write("# group id, particle id: HBT-HERONS's first particle (wideorigins.py hbt)\n")
+        for g in sorted(first):
+            f.write(f"{g} {first[g]}\n")
+    lowest = sum(1 for b in s["start"] if first.get(int(s["g"][b])) == int(s["id"][b]))
+    print(f"{len(first)} groups; HBT-HERONS's first particle is the lowest id in {lowest}")
+    for b, e, ext in wide_groups(s):
+        g = int(s["g"][b])
+        k = int(np.flatnonzero(s["id"][b:e] == first[g])[0])
+        shift = near(frame(s, b, e, k) - frame(s, b, e, int(np.argmin(s["id"][b:e]))), s["box"])
+        dist = float(np.sqrt((shift ** 2).sum()))
+        print(f"wide group {g}: {e - b} particles; HBT-HERONS's first particle {first[g]} "
+              f"(lowest id {int(s['id'][b:e].min())}); its first frame is {dist / s['box']:.4f} "
+              f"box lengths from the lowest-id one, Hubble term {s['H'] * s['a'] * dist:.1f} km/s")
+
+
 if __name__ == "__main__":
     if len(sys.argv) >= 3 and sys.argv[1] == "list":
         cmd_list(sys.argv[2], sys.argv[4] if len(sys.argv) > 4 and sys.argv[3] == "--write" else None)
     elif len(sys.argv) == 5 and sys.argv[1] == "compare":
         cmd_compare(*sys.argv[2:5])
+    elif len(sys.argv) == 5 and sys.argv[1] == "hbt":
+        cmd_hbt(*sys.argv[2:5])
     else:
         sys.exit(__doc__)

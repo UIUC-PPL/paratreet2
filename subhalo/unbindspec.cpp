@@ -8,7 +8,7 @@
 // correct kernel can pass too.
 //
 //   unbindspec <snapshot.hdf5> <out.particles.bin> [--g G] [--no-hubble] [--trace ID]
-//              [--potential-ratio] [--cap C]
+//              [--potential-ratio] [--cap C] [--first-origin FILE]
 //
 // <snapshot.hdf5> is the file tipsy2hbt wrote. The output has one 24-byte
 // record per bound particle (unbindrec.h), the layout unbindcmp and
@@ -28,6 +28,10 @@
 // pass's potential from a sample of C bound particles chosen by particle id.
 // Groups of at most C particles go through the same code as without --cap.
 //
+// --first-origin FILE names, per group, the particle the first frame takes
+// its periodic offsets from (lines "group id, particle id"; default: the
+// group's lowest id). It matters only in a group at least half the box wide.
+//
 // Build: make unbindspec (subhalo/Makefile; HDF5 and OpenMP).
 
 #include "unbindrec.h"
@@ -38,20 +42,28 @@
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: unbindspec <snapshot.hdf5> <out.particles.bin> "
-                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio] [--cap C]\n");
+                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio] [--cap C] "
+                    "[--first-origin FILE]\n");
     return 2;
   }
   long long trace_id = -1, cap = 0;
   bool potential_ratio = false;
+  const char* origin_path = nullptr;
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--g") && i + 1 < argc) ubs::G = atof(argv[++i]);
     else if (!strcmp(argv[i], "--trace") && i + 1 < argc) trace_id = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--no-hubble")) ubs::hubble_factor = 0;
     else if (!strcmp(argv[i], "--potential-ratio")) potential_ratio = true;
     else if (!strcmp(argv[i], "--cap") && i + 1 < argc) cap = atoll(argv[++i]);
+    else if (!strcmp(argv[i], "--first-origin") && i + 1 < argc) origin_path = argv[++i];
     else { fprintf(stderr, "unbindspec: unknown option %s\n", argv[i]); return 2; }
   }
   const ubs::Snapshot s = ubs::readSnapshot(argv[1], "unbindspec");
+  std::unordered_map<long long, long long> origins;
+  if (origin_path) {
+    origins = ubs::readFirstOrigins(origin_path, "unbindspec");
+    printf("unbindspec: first-frame origin given for %zu groups\n", origins.size());
+  }
   const size_t ng = s.groups.size();
 
   std::vector<std::vector<Rec>> out(ng);
@@ -71,6 +83,7 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < n; i++)
         if (s.ID[idx[i]] == trace_id) traced = i;
     const bool sampled = cap > 0 && n > (size_t)cap;
+    const long first_origin = ubs::firstOrigin(s, g, origins, "unbindspec");
     auto observe = [&](long pass, size_t entering, const std::vector<char>& al,
                        const std::vector<double>& en, const std::vector<size_t>& removed) {
       if (sampled)
@@ -83,10 +96,10 @@ int main(int argc, char** argv) {
     if (sampled) {
       const std::vector<size_t> order = ubs::sampleOrder(s, idx, n);
       passes[gi] = ubs::unbindCapped(s, idx, n, alive, pot, e, inner, (size_t)cap, order,
-                                     observe);
+                                     observe, first_origin);
     } else {
       ubs::potentialAll(s, idx, n, pot, inner);
-      passes[gi] = ubs::unbind(s, idx, n, alive, pot, e, inner, observe);
+      passes[gi] = ubs::unbind(s, idx, n, alive, pot, e, inner, observe, first_origin);
     }
     for (size_t i = 0; i < n; i++)
       if (alive[i]) out[gi].push_back({s.ID[idx[i]], g.id, e[i]});

@@ -1288,6 +1288,10 @@ these inputs, and records what was read from HBT-HERONS's source. It does
 not show that the definition is what HBT-HERONS computes at a scale factor
 other than 1 or on wide groups. The HBT-HERONS runs are listed at the end.
 
+Update, 2026-11-11: HBT-HERONS was then built on Frontier and run on these
+inputs, see "HBT-HERONS on Frontier". The text of this section is kept as
+written before those runs.
+
 ### Where the scale factor enters (read from HBT-HERONS c728ee0, not run)
 
 | Quantity | HBT-HERONS | `unbind` and `unbindspec` |
@@ -1446,6 +1450,11 @@ Nothing was changed to make it pass: tau, the rule, `unbindcheck` and
   run. HBT-HERONS's own result on cube40 decides it: if its energies for
   these 7 particles are the kernel's, `unbindspec.h` needs the correction
   form for later passes; if they are `unbindspec`'s, the kernel is wrong.
+- **Run on Frontier, 2026-11-11.** With HBT-HERONS's first particle the
+  kernel has HBT-HERONS's bound particles on cube40 exactly, with energies
+  to 6.6e-7 of S; the definition with the same first particle differs from
+  it in 65 particles. So the kernel is right here and the definition is
+  not ("HBT-HERONS on Frontier").
 - With the cap of 10,000 this group is sampled, a sampled pass is always
   computed in full by both the kernel and the capped definition, and the
   same input passes. The corner is reachable only by a wide group at or
@@ -1527,12 +1536,17 @@ What this says:
    small against the velocities and the choice moves under 100 particles.
 3. For the comparison with HBT-HERONS on wide groups, HBT-HERONS has to
    print the id of that particle (below). `unbind --first-origin` takes it;
-   `unbindspec` and `unbindcheck` do not have the option yet.
+   `unbindspec` and `unbindcheck` do not have the option yet. (They have it
+   since "HBT-HERONS on Frontier".)
 4. For our own catalogues the frame of a wide group is our choice, and none
    is made yet. Whether any production input has such a group at b = 0.2 is
    not known.
 
 ### Not done: the HBT-HERONS runs
+
+Update, 2026-11-11: made on Frontier instead, with the build and the
+added line described in "HBT-HERONS on Frontier". The text below is kept
+as written before the runs.
 
 On the Mac, per input X of a0.5, a1.25, w565, w580, cube45, cube40, with
 the snapshot copied from Frontier to `~/hbt-test/X/snap/snap_0000.hdf5`
@@ -1570,6 +1584,206 @@ on the kernel dumps of job 5904186 (same directory as the snapshots).
   above. w580's group has 191,492 particles and 35 passes.
 - The single-precision build's run on each input, to measure tau there.
 
+## HBT-HERONS on Frontier: exact references at two scale factors and on the wide inputs (2026-11-11)
+
+HBT-HERONS built on Frontier (permission given 2026-11-11) and run on the
+six inputs of the section above with all pairs (tree opening angle 0) and
+no sampling, as the exact reference at a = 1 was. Frontier jobs 5904424
+(one node, 33 min, 0.55 node-hours) and 5904769 (two nodes, 1 h 38 min,
+3.3 node-hours), script `subhalo/run_hbt_compare.sbatch`. The kernel was
+rerun only with `--first-origin`; all other kernel results are the dumps of
+job 5904186.
+
+In short:
+
+- **The Frontier build reproduces the Mac's exact reference on
+  8m-lambb**: the same 4,215,954 bound particles in 13,256 groups and the
+  same energies to the last bit (largest \|dE\|/S 0). The two files differ
+  only in the order of their records. The Mac's file was not regenerated;
+  Frontier's run is written beside it.
+- **At a = 0.5 and a = 1.25 HBT-HERONS selects exactly the definition's
+  particles** (4,294,867 and 2,536,941), with energies within 6.2e-7 and
+  4.2e-6 of S. The kernel passes against both references in all six forms.
+  Where a enters, the kernel computes what HBT-HERONS computes.
+- **On wide groups the kernel computes what HBT-HERONS computes once it
+  starts from HBT-HERONS's first particle**: on cube45, cube40 and w565 it
+  has HBT-HERONS's bound sets in all six forms, with energies within 6.6e-7
+  of S in double precision (1.7e-6 on w565). The written definition with
+  the same first particle does not: on the cubes it differs from
+  HBT-HERONS in 14 and 65 particles. The cube40 failure of job 5904186 is
+  in the definition, not in the kernel.
+- **The group that spans the box in w580 is not reproduced**: the kernel
+  has 16,800 bound particles there and HBT-HERONS 6,351, from the same
+  first particle. The other 1,521 groups of w580 are identical.
+- **tau measured on each input** from HBT-HERONS's single-precision build
+  runs from the floor of 1e-4 (the cubes) to 0.0263 (a1.25); on 8m-lambb it
+  is again 0.00141. tau was not changed.
+
+### Builds and runs
+
+HBT-HERONS c728ee0, the commit the Mac uses. PrgEnv-gnu 8.6.0, GCC 13.2
+(`gcc-native/13.2`), cray-mpich 8.1.31, CMake 3.31.11, serial HDF5
+1.14.3.9 (`HDF5_PREFER_PARALLEL=OFF`), with `HBT_DM_ONLY=ON` and
+`HBT_MEASURE_UNBINDING_TIME=ON`. Four builds: double (`HBT_REAL8=ON`) and
+single, each also on a copy of the source with these lines added right
+after `h.AverageCoordinates();` in `MergeHalos`
+(`io/comms/exchange_and_merge.cpp`):
+
+```cpp
+if (h.Particles.size() >= 20)
+  std::cout << "FIRSTPARTICLE " << h.Particles.size() << " " << h.Particles[0].Id << std::endl;
+```
+
+They print the particle each group's first frame takes its nearest-image
+offsets from, and change no result: on cube45 the build without them gives
+the same records, compared sorted by particle id (`hbtref`'s record order
+changes from run to run, so `cmp` of the two files is not the test). The
+builds are in `/lustre/orion/csc710/scratch/rrao/hbt-herons-2026-11-11/`
+(`build.sh`), the unchanged source in
+`/lustre/orion/csc710/scratch/rrao/hbt-herons-src-2026-11-11/src`. The
+settings are those of `subhalo/hbt_8m_lambb_exact.conf` with the paths
+changed.
+
+| Input | Build | Processes x threads | Wall time of the run (s; lower is better) | Groups with a sub-halo (count) | Bound particles (count) |
+|---|---|---|---|---|---|
+| 8m-lambb (a = 1) | double | 8 x 7 | 1,435 | 13,256 | 4,215,954 |
+| a0.5 | double | 8 x 7 | 1,391 | 13,930 | 4,294,867 |
+| a1.25 | double | 8 x 7 | 1,574 | 10,385 | 2,536,941 |
+| w565 | double, with the lines | 1 x 56 | 213 | 1,561 | 514,690 |
+| w580 | double, with the lines | 1 x 56 | 1,458 | 1,522 | 360,863 |
+| cube45 | double, with the lines | 1 x 56 | 192 | 11 | 79,551 |
+| cube45 | double, without the lines | 1 x 56 | 195 | 11 | 79,551 |
+| cube40 | double, with the lines | 1 x 56 | 196 | 9 | 79,084 |
+
+- The ranks' unbinding times on the 8M inputs differ by a factor of 3.1 to
+  3.4 (HBT-HERONS's "maximum imbalance"); the largest groups set the time.
+  With one rank of 56 threads a group of 79,000 particles still takes over
+  three minutes. All pairs is not what HBT-HERONS's tree is built for, so
+  these times are not a comparison with the kernel.
+- w580 was stopped at 19 minutes in job 5904424 (the time the script gave
+  it) and rerun in job 5904769, where it took 24 minutes.
+
+### A scale factor other than 1, against HBT-HERONS
+
+The kernel dumps of job 5904186 held to HBT-HERONS's exact references by
+`unbindcheck --tau 0.00141`; the single-precision forms also with the
+allowance against the double-precision kernel.
+
+| Input | HBT-HERONS against the definition: bound sets | Largest \|dE\|/S, HBT-HERONS against the definition (lower is better) | Kernel forms that pass (of 6; higher is better) | Kernel forms with HBT-HERONS's bound sets exactly (of 6; higher is better) | Largest \|dE\|/S, kernel against HBT-HERONS: double / single summed in double / single summed in single (lower is better) |
+|---|---|---|---|---|---|
+| a0.5 | identical | 6.2e-7 | 6 | 6 | 6.2e-7 / 1.7e-6 / 7.6e-5 |
+| a1.25 | identical | 4.2e-6 | 6 | 4 | 4.2e-6 / 5.1e-6 / 0.018 |
+
+- At a = 1.25 the two forms that sum in single precision differ from
+  HBT-HERONS in the same 9 groups, by 11 and 9 particles, as they do from
+  the definition, since the two references hold the same sets. They pass
+  the amended rule and fail the rule as first written, as before.
+- At a = 1 the double-precision kernel passes against the Frontier
+  reference as it does against the Mac's (the same figures: largest
+  \|dE\|/S 1.1e-6).
+
+### Wide groups, against HBT-HERONS
+
+HBT-HERONS's first particles are read from the `FIRSTPARTICLE` lines
+(`wideorigins.py hbt`) and passed to `unbind`, `unbindspec` and
+`unbindcheck` with `--first-origin`. "Differ" counts the particles bound in
+exactly one of the two results; the energy figure is the largest
+\|dE\|/S in double precision; "passes" and "fails" are `unbindcheck`'s
+amended rule at tau = 0.00141.
+
+| Input | HBT-HERONS's first particle of the wide group (lowest id); its first frame's distance from the lowest-id one (box lengths) | HBT-HERONS: bound particles | Kernel, lowest-id first frame (job 5904186) | Kernel, HBT-HERONS's first particle | Definition, HBT-HERONS's first particle |
+|---|---|---|---|---|---|
+| cube45 | 54437 (1); 0.097 | 79,551 | 79,559 bound; 36 differ; fails | 79,551; identical in all 6 forms; 5.9e-7; passes | 79,537; 14 differ; fails |
+| cube40 | 53797 (1); 0.238 | 79,084 | 79,066; 100 differ; fails | 79,084; identical in all 6 forms; 6.6e-7; passes | 79,031; 65 differ; fails |
+| w565 | 586271 (241) and 622713 (758); 0.0000 | 514,690 | identical; passes | identical in all 6 forms; 1.7e-6; passes | identical; 1.7e-6; passes |
+| w580 | 139141 (2); 0.463 | 360,863 | 389,629; 34,858 differ; fails | 371,312; 18,201 differ, all in the spanning group; fails in all 6 forms | 362,991; 10,886 differ; fails |
+
+What this says:
+
+1. **Given the same first particle, the kernel is HBT-HERONS on wide
+   groups that do not span a real box.** On cube40, where it failed against
+   the definition in job 5904186, it has HBT-HERONS's bound particles
+   exactly, the 7 particles half a box from the frame included.
+2. **The written definition is not what HBT-HERONS computes on a wide
+   group.** With the same first particle it still differs on both cubes,
+   and `unbindcheck` fails the group because its replay of the definition
+   does not end on HBT-HERONS's set. That is the difference read from the
+   source under "The failure on cube40": HBT-HERONS and the kernel correct
+   the energies from pass to pass and keep the old frame's nearest image;
+   the definition computes every pass afresh. On narrower groups the two
+   are the same (8m-lambb, a0.5, a1.25 and w565 above).
+3. **The group that spans the box in w580 is reproduced by neither.**
+   HBT-HERONS keeps 6,351 of its 191,492 particles, starting from a frame
+   0.46 box lengths (3,242 km/s of Hubble term) from the lowest-id one; the
+   kernel keeps 16,800 and the definition 8,479. Why the kernel and
+   HBT-HERONS part there was not looked into in these jobs.
+4. HBT-HERONS's first particle is the lowest id in 2 of 47 groups on
+   cube45, 1 of 36 on cube40, 38 of 1,844 on w565 and 39 of 1,804 on w580.
+   The single-precision build printed the same first particles as the
+   double one on all four inputs (with the same number of ranks).
+
+### tau on each input
+
+n is the 99.9th percentile of \|dE\|/S between HBT-HERONS's single- and
+double-precision builds over particles bound in both, and tau = max(1e-4,
+10 n) as in "Pass rule, written before any of these runs".
+
+| Input | Bound particles: double / single build | n (fraction of S; lower is better) | tau from this input |
+|---|---|---|---|
+| 8m-lambb | 4,215,954 / 4,215,954 | 1.41e-4 | 0.00141 |
+| a0.5 | 4,294,867 / 4,294,867 | 1.04e-4 | 0.00104 |
+| a1.25 | 2,536,941 / 2,536,960, with one more group (10,386) | 2.63e-3 | 0.0263 |
+| w565 | 514,690 / 514,690 | 1.81e-4 | 0.00181 |
+| w580 | 360,863 / 360,863 | 2.07e-4 | 0.00207 |
+| cube45 | 79,551 / 79,551 | 1.95e-6 | 1e-4 (the floor) |
+| cube40 | 79,084 / 79,084 | 1.66e-6 | 1e-4 (the floor) |
+
+- On 8m-lambb Frontier's two builds give the value the Mac's gave.
+- **tau was not changed**: every verdict in this section is at 0.00141.
+  What the verdicts would be at each input's own value was not computed.
+- HBT-HERONS's single-precision build is 19 times further from its double
+  one on a1.25 than on 8m-lambb, and finds a sub-halo the double one does
+  not. Marginally bound groups magnify rounding. The kernel's own
+  single-precision forms are far closer to the double-precision kernel
+  there (n = 8.8e-7 summed in double, 1.6e-3 summed in single).
+- Whether tau should be one number or be set per input is open.
+
+### Tools changed
+
+- `unbindspec --first-origin FILE`: the first frame of each named group
+  takes its offsets from the named particle (lines "group id, particle
+  id", the format of `unbind --first-origin`). Without the option it
+  writes the same bytes as before (cube45, cube40, w565).
+- `unbindcheck --first-origin FILE`: its replay of the definition and the
+  definition's energies of a candidate's set start the first frame from
+  the named particle. The rule is unchanged.
+- `wideorigins.py hbt <snapshot> <log> <out>`: the `FIRSTPARTICLE` lines of
+  an HBT-HERONS log as a `--first-origin` file. It checks each printed
+  size against the group's and that every group of 20 or more is named
+  once, and prints, per wide group, how far HBT-HERONS's first frame is
+  from the lowest-id one.
+- `run_hbt_compare.sbatch`: the two jobs. Inputs are listed per node in
+  `LANES`; usage in its header.
+
+### Files (Frontier scratch, not in the repo)
+
+`/lustre/orion/csc710/scratch/rrao/unbind-2026-11-11/scalewide/hbt.5904424/`
+(cube45, cube40, w565) and `hbt.5904769/` (all seven; 8m-lambb under
+`val/`), one directory per input: `exact-double.particles.bin` and
+`exact-single.particles.bin` (`hbtref`), `hbt_origin.txt` (the first
+particles, for `--first-origin`), HBT-HERONS's configurations and logs,
+`kernel_<input>_hbtorigin_<form>.hdf5` (the kernel from HBT-HERONS's first
+particles) and the `unbindcheck` logs. The jobs' output is
+`hbt_compare.5904424.out` and `hbt_compare.5904769.out` one level up.
+
+### Not done
+
+- Why the kernel and HBT-HERONS part on the spanning group of w580.
+- A reference for wide groups that a kernel can be held to without
+  HBT-HERONS's first particle: the definition with the correction passes
+  of the source.
+- tau per input, or a reason to keep one value.
+
 ## Open
 
 - Done 2026-11-11: the comparison of `unbind` with HBT-HERONS. All six
@@ -1588,16 +1802,21 @@ on the kernel dumps of job 5904186 (same directory as the snapshots).
   kernel at a = 0.5 and a = 1.25, and on four inputs with groups at least
   half the box wide, with and without the cap. Everything passes except
   one input. Open from it:
-  - the HBT-HERONS runs on the six inputs (Mac; commands in that section).
-    Until they exist, a scale factor other than 1 and wide groups are
-    checked against `unbindspec`, not against HBT-HERONS;
-  - cube40: the kernel and `unbindspec` differ in the energies of 7
-    particles half a box from their group's frame. By the reading of the
-    source the kernel follows HBT-HERONS and `unbindspec` does not; the
-    HBT-HERONS run on cube40 decides which of the two to change;
+  - the HBT-HERONS runs on the six inputs: done 2026-11-11 on Frontier,
+    all pairs ("HBT-HERONS on Frontier"). At a = 0.5 and 1.25 HBT-HERONS
+    has the definition's particles exactly and the kernel passes in all
+    six forms; the Frontier build reproduces the Mac's exact reference;
+  - cube40: settled. With HBT-HERONS's first particle the kernel has its
+    bound sets exactly and the definition does not, so the definition is
+    the one to change for wide groups;
   - HBT-HERONS's first frame of a wide group depends on a particle the
-    input does not fix. The wide comparisons need it printed by HBT-HERONS,
-    and `--first-origin` in `unbindspec` and `unbindcheck`;
+    input does not fix. It is printed now, and `unbindspec` and
+    `unbindcheck` take it (`--first-origin`);
+  - the group that spans the box in w580: the kernel keeps 16,800
+    particles and HBT-HERONS 6,351 from the same first particle. Not
+    looked into;
+  - tau measured per input runs from 1e-4 to 0.0263; whether to keep one
+    value is open;
   - which frame our own catalogues give a wide group, and whether any
     production input has one at b = 0.2 (8m-lambb's widest group is 8% of
     the box);

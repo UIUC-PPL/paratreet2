@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ubs {
@@ -191,12 +192,16 @@ inline void subtractPotential(const Snapshot& s, const size_t* idx, size_t n,
 // Energy of every particle with keep[i], in the frame of those particles:
 // mass-weighted mean position (nearest-image offsets from the first of them)
 // and velocity. pot[] must be the potential from exactly those particles.
+// origin >= 0 takes the offsets from that particle of the group instead: it
+// is how HBT-HERONS's first frame is reproduced in a group at least half the
+// box wide, where the choice matters (firstOrigin below).
 inline void energies(const Snapshot& s, const size_t* idx, size_t n,
                      const std::vector<char>& keep, const std::vector<double>& pot,
-                     std::vector<double>& e) {
+                     std::vector<double>& e, long origin = -1) {
   size_t first = 0;
   while (first < n && !keep[first]) first++;
   if (first == n) return;
+  if (origin >= 0) first = (size_t)origin;
   double ms = 0, xs[3] = {0, 0, 0}, vs[3] = {0, 0, 0};
   for (size_t i = 0; i < n; i++) {
     if (!keep[i]) continue;
@@ -234,16 +239,19 @@ inline void energies(const Snapshot& s, const size_t* idx, size_t n,
 // obs(pass, bound_entering, alive, e, removed) is called once per pass,
 // after the energies are known and before the removal: alive[] is the set
 // entering the pass, e[] its energies, removed the particles about to go.
+//
+// first_origin >= 0: the first pass takes its frame's offsets from that
+// particle of the group (see energies); later passes are not affected.
 template <class Observer>
 inline long unbind(const Snapshot& s, const size_t* idx, size_t n, std::vector<char>& alive,
                    std::vector<double>& pot, std::vector<double>& e, bool parallel,
-                   Observer&& obs) {
+                   Observer&& obs, long first_origin = -1) {
   size_t nalive = 0;
   for (size_t i = 0; i < n; i++) nalive += alive[i] ? 1 : 0;
   long npass = 0;
   std::vector<size_t> removed;
   for (;;) {
-    energies(s, idx, n, alive, pot, e);
+    energies(s, idx, n, alive, pot, e, npass == 0 ? first_origin : -1);
     removed.clear();
     for (size_t i = 0; i < n; i++)
       if (alive[i] && !(e[i] < 0)) removed.push_back(i);
@@ -321,14 +329,15 @@ template <class Observer>
 inline long unbindCapped(const Snapshot& s, const size_t* idx, size_t n,
                          std::vector<char>& alive, std::vector<double>& pot,
                          std::vector<double>& e, bool parallel, size_t cap,
-                         const std::vector<size_t>& order, Observer&& obs) {
+                         const std::vector<size_t>& order, Observer&& obs,
+                         long first_origin = -1) {
   size_t nalive = 0;
   for (size_t i = 0; i < n; i++) nalive += alive[i] ? 1 : 0;
   long npass = 0;
   std::vector<size_t> removed;
   for (;;) {
     potentialCapped(s, idx, n, alive, order, cap, pot, parallel);
-    energies(s, idx, n, alive, pot, e);
+    energies(s, idx, n, alive, pot, e, npass == 0 ? first_origin : -1);
     removed.clear();
     for (size_t i = 0; i < n; i++)
       if (alive[i] && !(e[i] < 0)) removed.push_back(i);
@@ -343,6 +352,39 @@ inline long unbindCapped(const Snapshot& s, const size_t* idx, size_t n,
     }
   }
   return npass;
+}
+
+// ---- the first frame's origin ------------------------------------------------
+// design/subhalo-checks.md, "The first frame of a wide group depends on its
+// first particle". A file of lines "group id, particle id" (the file `unbind
+// --first-origin` takes, written by wideorigins.py from an HBT-HERONS run)
+// names, per group, the particle the first frame's offsets are taken from.
+
+inline std::unordered_map<long long, long long> readFirstOrigins(const char* path,
+                                                                 const char* tool) {
+  std::unordered_map<long long, long long> m;
+  FILE* f = fopen(path, "r");
+  if (!f) { fprintf(stderr, "%s: cannot open %s\n", tool, path); exit(2); }
+  char line[256];
+  while (fgets(line, sizeof line, f)) {
+    long long g, id;
+    if (line[0] != '#' && sscanf(line, "%lld %lld", &g, &id) == 2) m[g] = id;
+  }
+  fclose(f);
+  return m;
+}
+// The named particle's position in its group, or -1 if the group is not named.
+inline long firstOrigin(const Snapshot& s, const Group& g,
+                        const std::unordered_map<long long, long long>& origins,
+                        const char* tool) {
+  auto it = origins.find(g.id);
+  if (it == origins.end()) return -1;
+  const size_t* idx = s.order.data() + g.begin;
+  for (size_t i = 0; i < g.n; i++)
+    if (s.ID[idx[i]] == it->second) return (long)i;
+  fprintf(stderr, "%s: --first-origin: particle %lld is not in group %lld\n", tool,
+          it->second, g.id);
+  exit(2);
 }
 
 }  // namespace ubs

@@ -4,6 +4,7 @@
 //
 //   unbindcheck <snapshot.hdf5> <reference.particles.bin> <candidate> --tau T
 //               [--single-against <double result>] [--cap C] [--list N]
+//               [--first-origin FILE]
 //
 //   <snapshot.hdf5>            the file tipsy2hbt wrote, which both sides read
 //   <reference.particles.bin>  hbtref's output for the exact HBT-HERONS run,
@@ -25,6 +26,13 @@
 //                              particles, it uses the capped definition.
 //                              The rule itself is unchanged.
 //   --list N                   print at most N differing groups (default 20)
+//   --first-origin FILE        both results took each group's first frame
+//                              from the particle FILE names (lines "group
+//                              id, particle id"; HBT-HERONS's first
+//                              particle, see wideorigins.py). Wherever the
+//                              rule evaluates or replays the definition's
+//                              first pass, it uses that particle. The rule
+//                              itself is unchanged.
 //
 // Both sides must have run until a pass removes nothing: HBT-HERONS with
 // BoundMassPrecision 1, `unbind --bound-fraction 1`. A result that stopped
@@ -129,17 +137,20 @@ int main(int argc, char** argv) {
   long list = 20;
   long long cap = 0;
   const char* single_against = nullptr;
+  const char* origin_path = nullptr;
   for (int i = 4; i < argc; i++) {
     if (!strcmp(argv[i], "--tau") && i + 1 < argc) tau = atof(argv[++i]);
     else if (!strcmp(argv[i], "--single-against") && i + 1 < argc) single_against = argv[++i];
     else if (!strcmp(argv[i], "--list") && i + 1 < argc) list = atol(argv[++i]);
     else if (!strcmp(argv[i], "--cap") && i + 1 < argc) cap = atoll(argv[++i]);
+    else if (!strcmp(argv[i], "--first-origin") && i + 1 < argc) origin_path = argv[++i];
     else { fprintf(stderr, "%s: unknown option %s\n", TOOL, argv[i]); return 2; }
   }
   if (argc < 4 || tau <= 0) {
     fprintf(stderr, "usage: unbindcheck <snapshot.hdf5> <reference.particles.bin> "
                     "<candidate: unbind --dump file or .particles.bin> --tau T "
-                    "[--single-against <double-precision result>] [--cap C] [--list N]\n");
+                    "[--single-against <double-precision result>] [--cap C] [--list N] "
+                    "[--first-origin FILE]\n");
     return 2;
   }
 
@@ -260,6 +271,8 @@ int main(int argc, char** argv) {
   std::vector<GroupResult> res;
   if (g_differ > 0) {
     const ubs::Snapshot s = ubs::readSnapshot(argv[1], TOOL);
+    std::unordered_map<long long, long long> origins;
+    if (origin_path) origins = ubs::readFirstOrigins(origin_path, TOOL);
     std::unordered_map<long long, size_t> gindex;
     for (size_t gi = 0; gi < s.groups.size(); gi++) gindex[s.groups[gi].id] = gi;
     std::unordered_map<long long, std::vector<Rec>> refRecs, candRecs;
@@ -289,6 +302,8 @@ int main(int argc, char** argv) {
       R.only_ref = diff.at(g.id).only_ref;
       R.only_cand = diff.at(g.id).only_cand;
       const double S = sref.at(g.id);
+      // --first-origin: the particle this group's first frame starts from.
+      const long first_origin = ubs::firstOrigin(s, g, origins, TOOL);
 
       std::unordered_map<long long, size_t> local;
       local.reserve(2 * n);
@@ -334,9 +349,10 @@ int main(int argc, char** argv) {
           }
       };
       if (sampled)
-        ubs::unbindCapped(s, idx, n, alive, pot, e, par, (size_t)cap, order, watch);
+        ubs::unbindCapped(s, idx, n, alive, pot, e, par, (size_t)cap, order, watch,
+                          first_origin);
       else
-        ubs::unbind(s, idx, n, alive, pot, e, par, watch);
+        ubs::unbind(s, idx, n, alive, pot, e, par, watch, first_origin);
       R.replay_ok = true;
       for (size_t i = 0; i < n; i++)
         if ((alive[i] != 0) != (inRef[i] != 0)) R.replay_ok = false;
@@ -368,7 +384,8 @@ int main(int argc, char** argv) {
         ubs::potentialCapped(s, idx, n, inCand, order, (size_t)cap, potk, par);
       else
         ubs::subtractPotential(s, idx, n, inCand, outside, potk, par);
-      ubs::energies(s, idx, n, inCand, potk, estar);
+      // A candidate that kept the whole group is still in its first frame.
+      ubs::energies(s, idx, n, inCand, potk, estar, outside.empty() ? first_origin : -1);
       for (size_t i = 0; i < n; i++) {
         if (!inCand[i]) continue;
         const double d = std::fabs(eCand[i] - estar[i]) / S;
