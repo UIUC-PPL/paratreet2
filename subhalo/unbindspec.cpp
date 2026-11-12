@@ -8,7 +8,8 @@
 // correct kernel can pass too.
 //
 //   unbindspec <snapshot.hdf5> <out.particles.bin> [--g G] [--no-hubble] [--trace ID]
-//              [--potential-ratio] [--cap C]
+//              [--potential-ratio] [--cap C] [--first-origin file]
+//              [--carried | --carried-kernel]
 //
 // <snapshot.hdf5> is the file tipsy2hbt wrote. The output has one 24-byte
 // record per bound particle (unbindrec.h), the layout unbindcmp and
@@ -28,31 +29,67 @@
 // pass's potential from a sample of C bound particles chosen by particle id.
 // Groups of at most C particles go through the same code as without --cap.
 //
+// --first-origin <file> has lines "group id, particle id" (the format of
+// unbind --first-origin): the particle a group's FIRST frame takes its
+// nearest-image offsets from, instead of the group's lowest particle id. It
+// matters only for a group at least half the box wide. HBT-HERONS's own
+// choice is the first particle of a list it has not sorted yet.
+//
+// --carried runs the passes as HBT-HERONS's source carries them
+// (ubs::unbindCarried): after the first pass that removes fewer particles
+// than it keeps, energies are corrected from pass to pass instead of computed
+// afresh. Not with --cap. --carried-kernel is the same with the one
+// difference the kernel keeps on purpose: after a pass that removes at least
+// as many particles as it keeps, the next pass is computed in full, where
+// HBT-HERONS corrects from a frame two passes old.
+//
 // Build: make unbindspec (subhalo/Makefile; HDF5 and OpenMP).
 
 #include "unbindrec.h"
 #include "unbindspec.h"
 
 #include <cstring>
+#include <unordered_map>
 
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: unbindspec <snapshot.hdf5> <out.particles.bin> "
-                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio] [--cap C]\n");
+                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio] [--cap C] "
+                    "[--first-origin file] [--carried | --carried-kernel]\n");
     return 2;
   }
   long long trace_id = -1, cap = 0;
-  bool potential_ratio = false;
+  bool potential_ratio = false, carried = false, kernel_rule = false;
+  const char* origin_path = nullptr;
   for (int i = 3; i < argc; i++) {
     if (!strcmp(argv[i], "--g") && i + 1 < argc) ubs::G = atof(argv[++i]);
     else if (!strcmp(argv[i], "--trace") && i + 1 < argc) trace_id = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--no-hubble")) ubs::hubble_factor = 0;
     else if (!strcmp(argv[i], "--potential-ratio")) potential_ratio = true;
     else if (!strcmp(argv[i], "--cap") && i + 1 < argc) cap = atoll(argv[++i]);
+    else if (!strcmp(argv[i], "--first-origin") && i + 1 < argc) origin_path = argv[++i];
+    else if (!strcmp(argv[i], "--carried")) carried = true;
+    else if (!strcmp(argv[i], "--carried-kernel")) carried = kernel_rule = true;
     else { fprintf(stderr, "unbindspec: unknown option %s\n", argv[i]); return 2; }
+  }
+  if (carried && cap > 0) {
+    fprintf(stderr, "unbindspec: --carried is not defined with --cap\n");
+    return 2;
   }
   const ubs::Snapshot s = ubs::readSnapshot(argv[1], "unbindspec");
   const size_t ng = s.groups.size();
+  std::unordered_map<long long, long long> origin_of;   // group id -> particle id
+  if (origin_path) {
+    FILE* f = fopen(origin_path, "r");
+    if (!f) { fprintf(stderr, "unbindspec: cannot open %s\n", origin_path); return 2; }
+    char line[256];
+    while (fgets(line, sizeof line, f)) {
+      long long g, id;
+      if (line[0] != '#' && sscanf(line, "%lld %lld", &g, &id) == 2) origin_of[g] = id;
+    }
+    fclose(f);
+  }
+  std::vector<char> origin_found(ng, 0), stale(ng, 0);
 
   std::vector<std::vector<Rec>> out(ng);
   std::vector<std::vector<double>> ratio(ng);     // --potential-ratio: |U| / S
@@ -71,6 +108,12 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < n; i++)
         if (s.ID[idx[i]] == trace_id) traced = i;
     const bool sampled = cap > 0 && n > (size_t)cap;
+    size_t origin = ubs::NO_ORIGIN;
+    if (auto it = origin_of.find(g.id); it != origin_of.end()) {
+      for (size_t i = 0; i < n; i++)
+        if (s.ID[idx[i]] == it->second) origin = i;
+      origin_found[gi] = origin != ubs::NO_ORIGIN;
+    }
     auto observe = [&](long pass, size_t entering, const std::vector<char>& al,
                        const std::vector<double>& en, const std::vector<size_t>& removed) {
       if (sampled)
@@ -82,11 +125,20 @@ int main(int argc, char** argv) {
     };
     if (sampled) {
       const std::vector<size_t> order = ubs::sampleOrder(s, idx, n);
+      if (origin != ubs::NO_ORIGIN) {
+        fprintf(stderr, "unbindspec: --first-origin is not defined for a sampled group\n");
+        exit(2);
+      }
       passes[gi] = ubs::unbindCapped(s, idx, n, alive, pot, e, inner, (size_t)cap, order,
                                      observe);
     } else {
       ubs::potentialAll(s, idx, n, pot, inner);
-      passes[gi] = ubs::unbind(s, idx, n, alive, pot, e, inner, observe);
+      bool st = false;
+      passes[gi] = carried
+          ? ubs::unbindCarried(s, idx, n, alive, pot, e, inner, observe, origin, &st,
+                               kernel_rule)
+          : ubs::unbind(s, idx, n, alive, pot, e, inner, observe, origin);
+      stale[gi] = st;
     }
     for (size_t i = 0; i < n; i++)
       if (alive[i]) out[gi].push_back({s.ID[idx[i]], g.id, e[i]});
@@ -105,6 +157,32 @@ int main(int argc, char** argv) {
 #pragma omp parallel for schedule(dynamic, 8)
   for (size_t gi = nbig; gi < ng; gi++) solve(gi, false);
 
+  if (origin_path) {
+    size_t found = 0;
+    for (char c : origin_found) found += c;
+    if (found != origin_of.size()) {
+      fprintf(stderr, "unbindspec: --first-origin names %zu groups, %zu found with that "
+                      "particle\n", origin_of.size(), found);
+      return 2;
+    }
+    printf("unbindspec: first-frame origin given for %zu groups\n", found);
+  }
+  if (carried) {
+    size_t nstale = 0;
+    for (char c : stale) nstale += c;
+    printf("unbindspec: passes carried as in %s; groups where a pass removed at least as "
+           "many particles as it kept after a correction: %zu\n",
+           kernel_rule ? "the kernel (--carried-kernel: the next pass in full)"
+                       : "HBT-HERONS's source (--carried: the next correction starts from "
+                         "a frame two passes old)", nstale);
+    size_t shown = 0;
+    for (size_t gi = 0; gi < ng && shown < 10; gi++)
+      if (stale[gi]) {
+        printf("unbindspec:   group %lld (%zu particles, %zu bound at the end)\n",
+               s.groups[gi].id, s.groups[gi].n, out[gi].size());
+        shown++;
+      }
+  }
   FILE* o = fopen(argv[2], "wb");
   if (!o) { fprintf(stderr, "unbindspec: cannot write %s\n", argv[2]); return 2; }
   long long bound = 0, with_sub = 0, total_passes = 0;
