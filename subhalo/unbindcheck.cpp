@@ -32,7 +32,10 @@
 //                              particle, see wideorigins.py). Wherever the
 //                              rule evaluates or replays the definition's
 //                              first pass, it uses that particle. The rule
-//                              itself is unchanged.
+//                              itself is unchanged. The passes are the
+//                              definition's (every pass afresh), not
+//                              unbindspec --carried. Not defined for a
+//                              group sampled under --cap.
 //
 // Both sides must have run until a pass removes nothing: HBT-HERONS with
 // BoundMassPrecision 1, `unbind --bound-fraction 1`. A result that stopped
@@ -303,7 +306,7 @@ int main(int argc, char** argv) {
       R.only_cand = diff.at(g.id).only_cand;
       const double S = sref.at(g.id);
       // --first-origin: the particle this group's first frame starts from.
-      const long first_origin = ubs::firstOrigin(s, g, origins, TOOL);
+      const size_t first_origin = ubs::firstOrigin(s, g, origins, TOOL);
 
       std::unordered_map<long long, size_t> local;
       local.reserve(2 * n);
@@ -348,9 +351,14 @@ int main(int argc, char** argv) {
             marg_e[i] = en[i];
           }
       };
+      if (sampled && first_origin != ubs::NO_ORIGIN) {
+        // As in unbindspec: the capped definition has no first-frame origin.
+        fprintf(stderr, "%s: --first-origin is not defined for a sampled group (%lld)\n",
+                TOOL, g.id);
+        exit(2);
+      }
       if (sampled)
-        ubs::unbindCapped(s, idx, n, alive, pot, e, par, (size_t)cap, order, watch,
-                          first_origin);
+        ubs::unbindCapped(s, idx, n, alive, pot, e, par, (size_t)cap, order, watch);
       else
         ubs::unbind(s, idx, n, alive, pot, e, par, watch, first_origin);
       R.replay_ok = true;
@@ -385,7 +393,8 @@ int main(int argc, char** argv) {
       else
         ubs::subtractPotential(s, idx, n, inCand, outside, potk, par);
       // A candidate that kept the whole group is still in its first frame.
-      ubs::energies(s, idx, n, inCand, potk, estar, outside.empty() ? first_origin : -1);
+      ubs::energies(s, idx, n, inCand, potk, estar,
+                    outside.empty() ? first_origin : ubs::NO_ORIGIN);
       for (size_t i = 0; i < n; i++) {
         if (!inCand[i]) continue;
         const double d = std::fabs(eCand[i] - estar[i]) / S;

@@ -1,0 +1,19 @@
+diff --git a/src/io/comms/exchange_and_merge.cpp b/src/io/comms/exchange_and_merge.cpp
+index 8ddf6fe..059d5eb 100644
+--- a/src/io/comms/exchange_and_merge.cpp
++++ b/src/io/comms/exchange_and_merge.cpp
+@@ -229,6 +229,14 @@ static void MergeHalos(std::vector<Halo_t> &Halos)
+   for (auto &h : Halos)
+   {
+     h.AverageCoordinates();
++    /* Local diagnostic (not upstream): the particle the group's first frame is
++     * measured from, before the sort by id below. Changes no result. */
++    if (!h.Particles.empty())
++    {
++      std::ostringstream first_line;
++      first_line << "FIRSTPARTICLE " << h.Particles.size() << " " << h.Particles[0].Id << "\n";
++      std::cout << first_line.str() << std::flush;
++    }
+ 
+     /* Sort particles by ID to get reproducible Particle vectors regardless of
+      * the number of MPI ranks that we use. Important because Halos.Particles is

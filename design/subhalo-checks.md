@@ -1445,6 +1445,12 @@ Nothing was changed to make it pass: tau, the rule, `unbindcheck` and
   a particle's nearest image changes when the frame moves, which needs the
   particle to be within the frame's movement of that half-box plane. That
   can only happen in a group that reaches half a box from its own centre.
+- **Settled, 2026-11-11.** HBT-HERONS's own run on cube40 has 79,094 bound
+  particles. With its first particle and carried passes the definition
+  gives the same sets, with energies to 7e-7 of S; computing every pass
+  afresh does not. The kernel is right here, and `unbindspec --carried` is
+  the reference for wide groups ("HBT-HERONS on the Mac", "Groups at
+  least half the box wide").
 - **What it means.** In this corner the kernel does what HBT-HERONS's
   source does and the written definition does not. That is a reading, not a
   run. HBT-HERONS's own result on cube40 decides it: if its energies for
@@ -1544,9 +1550,14 @@ What this says:
 
 ### Not done: the HBT-HERONS runs
 
-Update, 2026-11-11: made on Frontier instead, with the build and the
-added line described in "HBT-HERONS on Frontier". The text below is kept
-as written before the runs.
+Update, 2026-11-11: these runs are made, twice. On the Mac (see
+"HBT-HERONS on the Mac: the cap, the scale factors and the wide groups")
+the inputs were rebuilt instead of copied, a0.5, a1.25 and w580 were run at
+opening angle 0.1 instead of 0, and the single-precision runs were not
+made. On Frontier (see "HBT-HERONS on Frontier") all six were run at
+opening angle 0 with both builds, on the inputs of job 5904186, with the
+added line on the wide inputs. The text below is kept as written before
+the runs.
 
 On the Mac, per input X of a0.5, a1.25, w565, w580, cube45, cube40, with
 the snapshot copied from Frontier to `~/hbt-test/X/snap/snap_0000.hdf5`
@@ -1584,11 +1595,345 @@ on the kernel dumps of job 5904186 (same directory as the snapshots).
   above. w580's group has 191,492 particles and 35 passes.
 - The single-precision build's run on each input, to measure tau there.
 
+## HBT-HERONS on the Mac: the cap, the scale factors and the wide groups (2026-11-11)
+
+The HBT-HERONS runs the two sections above list as not done, made on the
+Mac. HBT-HERONS c728ee0, the `HBT_REAL8=ON` build (GCC 16.2, Open MPI,
+`HBT_DM_ONLY=ON`), 2 MPI ranks of 4 threads, the settings of
+`subhalo/hbt_8m_lambb_exact.conf` (no sampling unless a cap is given,
+`BoundMassPrecision 1`, energies saved). The kernel was not run here: Kokkos
+is not installed on the Mac. Everything below compares HBT-HERONS with
+`unbindspec`.
+
+What it shows, in short:
+
+- At the same cap our capped definition is as close to the exact result as
+  HBT-HERONS's own sampled result.
+- At a = 0.5 HBT-HERONS selects exactly the definition's particles. At
+  a = 1.25 it agrees under the amended rule; that run used a tree, so it is
+  agreement within tau and not an identity.
+- On a group at least half the box wide HBT-HERONS computes what its source
+  says: the first frame from the first particle of its list, and energies
+  carried from pass to pass. With both, the definition reproduces it
+  exactly on the two cubes. The cube40 failure is settled: the kernel is
+  right there and `unbindspec`, as it was, is not.
+- On the group that spans the box in w580, HBT-HERONS's result also depends
+  on the stale-frame case that the kernel leaves out on purpose. The
+  kernel's rule gives 17,597 bound particles where HBT-HERONS has 6,815.
+
+### Runs
+
+`subhalo/hbt_mac_run.sh <input> <tag> <cap>` writes the configuration from
+`hbt_8m_lambb_exact.conf`, runs HBT-HERONS and then `hbtref`. The patched
+build is the same commit with `subhalo/hbt_firstparticle.patch`, which
+prints the particle each group's first frame starts from and changes no
+result.
+
+| Input | Run (tag) | Cap (sources per particle) | Tree opening angle | Build | Unbinding (s; lower is better) | Groups with a sub-halo (count) | Bound particles (count) |
+|---|---|---|---|---|---|---|---|
+| 8m-lambb | cap1000 | 1,000 | 0 | as cloned | 13.4 | 13,256 | 4,215,523 |
+| 8m-lambb | cap1000b | 1,000 | 0 | as cloned | 12.5 | 13,255 | 4,215,188 |
+| 8m-lambb | cap1000c | 1,000 | 0 | as cloned | 8.2 | 13,256 | 4,215,502 |
+| 8m-lambb | cap10000 | 10,000 | 0 | as cloned | 84.1 | 13,256 | 4,216,006 |
+| 8m-lambb | cap100000-open0.1 | 100,000 | 0.1 | as cloned | 538.6 | 13,256 | 4,215,958 |
+| a0.5 | open0.1-double | none | 0.1 | as cloned | 939.8 | 13,930 | 4,294,867 |
+| a1.25 | open0.1-double | none | 0.1 | as cloned | 899.5 | 10,386 | 2,536,961 |
+| w565 | exact-double | none | 0 | patched | 922.0 | 1,561 | 514,690 |
+| w580 | open0.1-double | none | 0.1 | patched | 335.5 | 1,522 | 361,326 |
+| cube45 | exact-double | none | 0 | patched | 697.7 | 11 | 79,552 |
+| cube40 | exact-double | none | 0 | patched | 668.4 | 9 | 79,094 |
+
+- The times are not timing measurements. All but cap1000c shared the Mac
+  with another run or with `unbindspec`.
+- Opening angle 0 makes the tree walk visit every particle: all pairs.
+  HBT-HERONS gives each group to one thread, at about 1e7 pair terms per
+  second here (cube40's group of 78,823 particles: 6.2e9 pair terms in
+  668 s), so the largest group sets the run time. The angle-0 runs of
+  a0.5, a1.25 and w580 were estimated at 35, 50 to 60 and over 70 minutes.
+  The a0.5 one was stopped 41 minutes in and those three inputs, and the
+  cap of 100,000, were run at opening angle 0.1 instead (decided
+  2026-11-11). At equal precision that angle is 4.4 times faster on
+  8m-lambb (430 s against 1,886 s, single-precision build).
+- What opening angle 0.1 costs is known at a = 1 ("Results", item 2 of the
+  exact reference): energies within 1.5e-4 of S at the 99.9th percentile,
+  and one group of 13,256 with one particle more. Such a run is not an
+  exact reference; it is judged by the amended rule.
+- `MaxSampleSizeOfPotentialEstimate` shuffles each group at random, so two
+  capped runs of the same input differ. cap1000, cap1000b and cap1000c are
+  three samples.
+
+### Inputs
+
+`subhalo/hbt_mac_inputs.sh` rebuilds the six inputs on the Mac with the
+commands of `run_unbind_scale_wide.sbatch` (FoF3 in one process with 8
+threads). Nothing was copied from Frontier.
+
+- FoF3's `label_digest` equals Frontier's on all four FoF3 runs (w565,
+  w580, cube45, cube40), and so do the group counts and largest groups.
+- `unbindspec` gives Frontier's counts on all six: a0.5 13,930 groups and
+  4,294,867 bound particles, a1.25 10,385 and 2,536,941, w565 1,561 and
+  514,690, w580 1,522 and 389,629, cube45 11 and 79,559, cube40 9 and
+  79,066.
+- The snapshots' md5 values do not equal the ones recorded above, and
+  cannot: the same input built twice on the Mac has two md5 values and
+  `h5diff` finds no difference. `tipsy2hbt`'s files are not byte-for-byte
+  reproducible, so the md5 is not a check of the input. The digests and
+  `h5diff` are.
+
+### Tools added
+
+| File in `subhalo/` | What it does |
+|---|---|
+| `unbindspec --first-origin <file>` | lines "group id, particle id": the particle a group's first frame takes its nearest-image offsets from (the format of `unbind --first-origin`) |
+| `unbindspec --carried` | the passes as HBT-HERONS's source carries them (`ubs::unbindCarried` in `unbindspec.h`): after the first pass that removes fewer particles than it keeps, every pass corrects the stored energies, and the stale-frame case is kept as the source has it. It prints the groups that case happens in |
+| `unbindspec --carried-kernel` | the same with the kernel's one difference: the pass after one that removed at least as many particles as it kept is computed in full |
+| `hbt_firstparticle.patch` | the print added to HBT-HERONS's `MergeHalos` |
+| `first_origins.py` | the `FIRSTPARTICLE` lines of a log as a `--first-origin` file |
+| `capdist_bin.py` | the measures of `capdistance.py` on two `.particles.bin` files; `--first` also judges the particle HBT-HERONS reports as most bound (a group's first record) |
+| `centre_rank.py`, `group_diff.py` | the rank of the exact most bound particle in a capped energy order; the groups in which two results differ |
+| `hbt_mac_run.sh`, `hbt_mac_inputs.sh`, `hbt_mac_compare.sh` | the runs, the inputs and the comparisons of this section |
+
+- Without the new options `unbindspec` writes the same bytes as before on
+  8m-lambb. `unbindcheck` has none of them: it replays the definition as
+  written. So a wide input is judged here by `unbindcmp` (the rule as first
+  written) and listed group by group.
+- `--carried` on 8m-lambb at a = 1 gives the exact reference's bound sets
+  with the largest \|dE\|/S 1.09e-6, the same as without it, and the
+  stale-frame case in no group.
+- `capdist_bin.py` gives the table of `capdistance.py` for our definition
+  at a cap of 10,000, figure for figure.
+- mpirun prints the two ranks' `FIRSTPARTICLE` lines into each other now
+  and then. `first_origins.py` uses a line only if it is complete and the
+  particle's group has the printed size. On w565 that left 19 groups of at
+  most 307 particles without an origin, on w580 one of 33 particles, on the
+  cubes none. Those groups then start from their lowest id; every form
+  agrees with HBT-HERONS on w565, so it made no difference there.
+
+### HBT-HERONS with a cap, against the exact result
+
+The exact HBT-HERONS reference is the same program with the same settings
+and no cap, so every difference is the cap's (and, at 100,000, the opening
+angle's: one particle in group 2536). Groups at or below the cap are
+identical to the exact result in every run. The columns are those of "How
+far a capped result is from the exact one", per sampled group, with the
+rows of our capped definition repeated for comparison. Lower is better
+except in the columns marked.
+
+| Result | Cap | Bound only in the exact result / only in the capped one (particles) | Members per group: median, 99th percentile, largest (%) | \|dE\|/S: median, 99th percentile (fraction of S) | Lowest capped energy is the exact most bound particle (% of sampled groups; higher is better) | Its largest shift (softening lengths) | Reported most bound particle is the exact one (%; higher is better) | Its largest shift (softening lengths) |
+|---|---|---|---|---|---|---|---|---|
+| HBT-HERONS, run 1 | 1,000 | 1,878 / 1,447 | 0.037, 1.13, 3.77 | 0.019, 0.21 | 60.1 | 217 | 94.7 | 2.4 |
+| HBT-HERONS, run 2 | 1,000 | 2,197 / 1,431 | 0.041, 1.39, 100 | 0.020, 0.23 | 58.9 | 148 | 93.5 | 2.4 |
+| HBT-HERONS, run 3 | 1,000 | 1,980 / 1,528 | 0.036, 1.40, 5.98 | 0.019, 0.23 | 64.1 | 218 | 93.5 | 217 |
+| Our definition | 1,000 | 2,190 / 1,228 | 0.033, 0.70, 1.99 | 0.020, 0.20 | 61.5 | 218 | no such step | no such step |
+| Our definition, second sample | 1,000 | 2,105 / 1,222 | 0.033, 0.78, 1.64 | 0.019, 0.23 | 62.6 | 218 | no such step | no such step |
+| HBT-HERONS | 10,000 | 278 / 330 | 0.019, 0.24, 0.27 | 0.0056, 0.066 | 75.0 | 1.5 | 98.3 | 1.5 |
+| Our definition | 10,000 | 297 / 222 | 0.019, 0.13, 0.18 | 0.0051, 0.063 | 81.7 | 1.5 | no such step | no such step |
+| HBT-HERONS, opening angle 0.1 | 100,000 | 4 / 8 | 0.003, 0.003, 0.003 | 0.0013, 0.012 | 33.3 (1 of 3) | 0.9 | 100 (3 of 3) | 0 |
+| Our definition | 100,000 | 4 / 5 | 0.002, 0.004, 0.004 | 0.0014, 0.013 | 66.7 (2 of 3) | 0.9 | no such step | no such step |
+
+The "reported most bound particle" is HBT-HERONS's own, after its centre
+refinement (`RefineBindingEnergyOrder`, `subhalo_unbind.cpp:395-425` and
+`715-733`), read from the source: after the last pass the bound particles
+are sorted by their sampled energies; the max(cap, 10% of the bound count)
+lowest of them get a new energy from a tree of those particles alone, in
+the same frame, and are sorted again. The saved energies are not updated.
+
+Where the exact most bound particle ranks in a capped result's energy order
+(rank 0 is the lowest capped energy; lower is better):
+
+| Result | Cap | Sampled groups (bound count above the cap) | Rank 0 (% of groups; higher is better) | Below rank 10 (%) | Largest rank |
+|---|---|---|---|---|---|
+| HBT-HERONS, runs 1, 2, 3 | 1,000 | 439 | 59.7, 59.0, 63.3 | 96.1, 96.8, 97.0 | 46, 54, 109 |
+| Our definition | 1,000 | 439 | 60.6 | 97.0 | 66 |
+| HBT-HERONS | 10,000 | 58 | 74.1 | 100 | 4 |
+| Our definition | 10,000 | 58 | 81.0 | 100 | 6 |
+| HBT-HERONS / our definition | 100,000 | 3 | 33.3 / 66.7 | 100 / 100 | 1 / 1 |
+
+What this says:
+
+1. **Our capped result is as close to the exact one as HBT-HERONS's.** At
+   10,000 the worst sampled group differs in 0.18% of its particles with our
+   sample and 0.27% with HBT-HERONS's; the energy errors are the same size
+   (median 0.5% of S). At 1,000 ours is the closer of the two in the worst
+   groups. A sample chosen by a hash of the particle id costs nothing in
+   accuracy against HBT-HERONS's shuffle, and it is the same on every run.
+2. **HBT-HERONS's result at its default cap changes from run to run.** The
+   three runs at 1,000 differ from the exact result by 3,325, 3,628 and
+   3,508 particles, and in run 2 one group (395: 1,183 particles, 24 bound
+   in the exact result) has no sub-halo. Runs 1 and 2 differ from each
+   other in 0.06% of a sampled group's particles at the median and 2.3% at
+   the 99th percentile.
+3. **The centre needs the refinement, and the refinement is not always
+   enough.** Without it the lowest capped energy is the exact most bound
+   particle in about 60% of the sampled groups at 1,000, for HBT-HERONS as
+   for us, and it can lie in another part of the group. With it HBT-HERONS
+   has the exact particle in 94 to 95%, and in runs 1 and 2 it is never more
+   than 2.4 softening lengths away. In run 3 two groups (11 and 25, of
+   54,350 and 25,246 particles) have it 165 and 217 softening lengths away.
+   Both groups have a second density peak whose most bound particle is at
+   rank 8 and rank 20 of the exact energy order, 0.08 and 0.13 of S above
+   the lowest, and the refinement took that one. Its energies come from the
+   inner 10% alone, so they are not the energies the exact order is in.
+   The refined centres of two runs agree in 96 to 97% of the groups. At
+   10,000 the refined centre is the exact one in 59 of 60 groups and within
+   1.5 softening lengths in the other.
+4. **The exact most bound particle is always near the top of the capped
+   order**: among the lowest 110 capped energies at 1,000 in all four
+   results, and among the lowest 7 at 10,000. A refinement that gives the
+   few hundred lowest particles their energy from all the bound particles
+   would find it on this input, at (bound count) times (a few hundred) pair
+   terms: for a group of 185 million particles and 1,000 candidates, 1.9e11,
+   about one die-second. HBT-HERONS's step on that group is a tree of 18.5
+   million particles; by all pairs it would be 3.4e14 pair terms. This is a
+   proposal read off these files. It is not built or tested.
+
+Limits: one input whose largest group has 153,804 particles; one to three
+samples per cap; scale factor 1; the 100,000 run used a tree.
+
+### A scale factor other than 1
+
+HBT-HERONS at opening angle 0.1 against the definition
+(`hbt_mac_compare.sh a0.5 open0.1-double`, the same for a1.25). The
+definition is the reference and HBT-HERONS the candidate, so the amended
+rule replays the definition.
+
+| Input | Bound particles: HBT-HERONS / definition | Groups with different bound sets (count; lower is better) | Particles bound only in the definition / only in HBT-HERONS | \|dE\|/S over particles bound in both: 99.9th percentile, largest | Rule as first written | Amended rule |
+|---|---|---|---|---|---|---|
+| a0.5 | 4,294,867 / 4,294,867 | 0 of 13,930 | 0 / 0 | 4.6e-5, 3.8e-4 | pass | pass |
+| a1.25 | 2,536,961 / 2,536,941 | 18 of 10,385, and one group with a sub-halo only in HBT-HERONS | 39 / 59 | 0.0042, 0.106 | fail | pass |
+
+- **a = 0.5: HBT-HERONS selects the definition's particles, all 4,294,867
+  of them, group by group.** The energy differences are the tree's.
+- **a = 1.25: 18 groups differ**, by 1 to 24 particles, in groups of 70 to
+  37,305 bound particles. Each starts from a particle within tau S of zero
+  at the pass where the two part, the definition's own energies on
+  HBT-HERONS's sets are all within tau S, and every one of HBT-HERONS's
+  sets is an end state. The group on one side only (11994) has 21 bound
+  particles in HBT-HERONS and none in the definition, inside the allowance
+  of 2 above the minimum. It fails the rule as first written, as the
+  opening-angle-0.1 run at a = 1 did with its one group. Marginally bound
+  groups have many particles near zero energy, so the tree's error moves
+  more of them.
+- The carried passes equal the fresh ones on both inputs (largest
+  difference 1.7e-14 of S, the same bound sets), and the stale-frame case
+  happens in no group.
+- So where a enters (G / a, H a, the softening, the velocities), the
+  definition is what HBT-HERONS computes: exactly in the bound sets at 0.5,
+  and to within the amended rule at 1.25. An identity at 1.25, of the kind
+  shown at a = 1, needs the opening-angle-0 run (about an hour on the Mac).
+- tau was not measured again on these inputs.
+
+### Groups at least half the box wide
+
+`hbt_mac_compare.sh <input> <tag> wide` runs the definition four ways and
+compares each with HBT-HERONS. "First particle" is the one HBT-HERONS
+printed for the group.
+
+| Input (HBT-HERONS's bound particles) | As written: lowest id, every pass afresh | First particle, every pass afresh | First particle, carried as in HBT-HERONS (`--carried`) | First particle, carried with the kernel's rule (`--carried-kernel`) |
+|---|---|---|---|---|
+| cube40 (79,094) | 79,066 bound; 84 particles differ; fails | 79,038; 56 differ; fails | 79,094; identical sets; largest \|dE\|/S 6.8e-7; passes | the same as `--carried` |
+| cube45 (79,552) | 79,559; 35 differ; fails | 79,538; 14 differ; fails | 79,552; identical sets; 5.9e-7; passes | the same as `--carried` |
+| w565 (514,690) | 514,690; identical sets; 1.7e-6; passes | the same | the same | the same |
+| w580 (361,326; opening angle 0.1) | 389,629; 34,431 differ; fails | 365,414; 13,458 differ; fails | 361,328; 2 differ; fails on the 24 energies of one group of 29 | 372,109; 19,601 differ; fails |
+
+"Differ" counts the particles bound in exactly one of the two results.
+"Fails" and "passes" are the rule as first written at tau = 0.00141.
+
+The group that spans the box in w580 (191,492 particles; HBT-HERONS's first
+particle is id 90774):
+
+| How its passes are computed | Bound particles |
+|---|---|
+| HBT-HERONS (opening angle 0.1) | 6,815 |
+| First particle, carried as in HBT-HERONS's source | 6,816 |
+| First particle, carried with the kernel's rule | 17,597 |
+| First particle, every pass afresh | 10,902 |
+| The definition as written (lowest id, every pass afresh) | 35,117 |
+
+What this says:
+
+1. **HBT-HERONS computes what its source says on wide groups.** With its
+   first particle and its carried passes the definition gives its bound
+   sets exactly on cube40, cube45 and w565, with energies to 7e-7 of S, and
+   on w580 to two particles: one in the spanning group (6,816 against
+   6,815) and one in a group of 29 (group 1073, where 24 energies are then
+   beyond 10 tau). Both are single particles at the boundary in a run that
+   used a tree.
+2. **The cube40 failure is settled.** The kernel carries energies as
+   HBT-HERONS does, and that is what HBT-HERONS's own result on cube40
+   agrees with. `unbindspec` as written, which computes every pass afresh,
+   is not what HBT-HERONS computes on a wide group. On narrow groups the
+   two forms are the same (a = 1, 0.5, 1.25 and w565 above). For wide groups
+   the reference to hold a kernel to is `unbindspec --carried` with
+   HBT-HERONS's first particles, not the plain `unbindspec` of job 5904186.
+3. **cube45 is affected too.** With the lowest id as the first particle the
+   kernel and the definition agreed there. With HBT-HERONS's first particle
+   (id 29658) the fresh and the carried passes differ in 14 particles.
+4. **The kernel's rule equals HBT-HERONS's on the cubes and on w565**: the
+   stale-frame case happens in none of their groups. So `unbind
+   --first-origin` should pass against these three references. That is a
+   prediction from the CPU form of the rule; the kernel has not been run
+   against them.
+5. **On the spanning group of w580 the stale-frame case decides the
+   answer.** It happens in that group and in no other. HBT-HERONS, which
+   corrects from a frame two passes old there, ends with 6,815 bound
+   particles; the kernel's rule, which computes that pass in full, ends
+   with 17,597. The kernel cannot reproduce HBT-HERONS on this group unless
+   it copies that case. Whether it should is not decided. The group's
+   result is not stable in any case: the five ways above run from 6,815 to
+   35,117.
+6. A reference and its first particles belong together. The first particle
+   depends on the number of ranks and on the C++ library, so an HBT-HERONS
+   run on Frontier prints its own.
+
+First particles of the wide groups in these runs: cube40's group of 78,823
+particles id 71505, cube45's of 79,096 id 29658, w565's of 82,206 id 577276
+and of 61,195 id 72138, w580's of 191,492 id 90774.
+
+### Files (on the Mac, not in the repo)
+
+In `~/hbt-test/<input>/`:
+
+| File | What it is |
+|---|---|
+| `snap/snap_0000.hdf5` | the input, rebuilt here |
+| `<tag>.particles.bin`, `<tag>.fof3.particles.bin`, `<tag>.groups.txt` | HBT-HERONS's result for the run `<tag>` of the table of runs, in `hbtref`'s layouts |
+| `hbt_<tag>.conf`, `hbt_<tag>.log` | its configuration and log; on the wide inputs the log has the `FIRSTPARTICLE` lines |
+| `origins-<tag>.txt` | the first particles of that run, for `--first-origin` |
+| `spec*.particles.bin` | the definition's results |
+| `compare-<tag>.log` | the output of `hbt_mac_compare.sh` |
+
+`~/hbt-test/8m-lambb/` also has the capped definition's results
+(`spec-cap1000`, `spec-cap10000`, `spec-cap100000`), which equal the
+kernel's bound sets of job 5903809 in count.
+
+To hold the kernel to these on Frontier, copy an input's
+`<tag>.particles.bin` and `origins-<tag>.txt`, run `unbind --first-origin
+origins-<tag>.txt --bound-fraction 1 --dump`, then `unbindcheck` on the
+dump. On a wide input its verdict holds as long as no group's bound set
+differs: only differing groups are replayed, and the replay is the
+definition as written.
+
+### Not done
+
+- The opening-angle-0 runs of a0.5, a1.25 and w580, and tau measured again
+  on the six inputs (the single-precision build's runs).
+- The kernel against these references. It needs Frontier.
+- `--first-origin` and the carried passes in `unbindcheck`, so that a wide
+  input can be judged by the amended rule.
+- A decision on the stale-frame case: copy HBT-HERONS there or keep the
+  full pass, and whether to report the case to HBT-HERONS's authors.
+- A centre refinement step in `unbind`, and the test of item 4 under the
+  cap.
+
 ## HBT-HERONS on Frontier: exact references at two scale factors and on the wide inputs (2026-11-11)
 
 HBT-HERONS built on Frontier (permission given 2026-11-11) and run on the
-six inputs of the section above with all pairs (tree opening angle 0) and
-no sampling, as the exact reference at a = 1 was. Frontier jobs 5904424
+six inputs of "A scale factor other than 1, and groups at least half the
+box wide" (the files of job 5904186, not the Mac's rebuilt ones) with all
+pairs (tree opening angle 0) and no sampling, as the exact reference at
+a = 1 was. This section was written in parallel with "HBT-HERONS on the
+Mac", before that section was seen. Frontier jobs 5904424
 (one node, 33 min, 0.55 node-hours) and 5904769 (two nodes, 1 h 38 min,
 3.3 node-hours), script `subhalo/run_hbt_compare.sbatch`. The kernel was
 rerun only with `--first-origin`; all other kernel results are the dumps of
@@ -1796,27 +2141,43 @@ particles) and the `unbindcheck` logs. The jobs' output is
   definition's particles exactly (job 5903809).
 - Measured 2026-11-11: how far a capped result is from the exact one, per
   group ("How far a capped result is from the exact one"). **The cap is
-  10,000 (decided 2026-11-11).** Not done: HBT-HERONS at the same cap.
+  10,000 (decided 2026-11-11).** HBT-HERONS at the same caps: done
+  2026-11-11 on the Mac. Our capped result is as close to the exact one
+  as HBT-HERONS's own, and its centre refinement gives the exact most
+  bound particle in 59 of 60 sampled groups at 10,000 ("HBT-HERONS with a
+  cap, against the exact result"). Not done: a refinement step in
+  `unbind`.
 - Done 2026-11-11 against the written definition only (job 5904186, "A
   scale factor other than 1, and groups at least half the box wide"): the
   kernel at a = 0.5 and a = 1.25, and on four inputs with groups at least
   half the box wide, with and without the cap. Everything passes except
   one input. Open from it:
-  - the HBT-HERONS runs on the six inputs: done 2026-11-11 on Frontier,
-    all pairs ("HBT-HERONS on Frontier"). At a = 0.5 and 1.25 HBT-HERONS
-    has the definition's particles exactly and the kernel passes in all
-    six forms; the Frontier build reproduces the Mac's exact reference;
-  - cube40: settled. With HBT-HERONS's first particle the kernel has its
-    bound sets exactly and the definition does not, so the definition is
-    the one to change for wide groups;
+  - the HBT-HERONS runs on the six inputs: done 2026-11-11, on the Mac
+    ("HBT-HERONS on the Mac"; a0.5, a1.25 and w580 with a tree) and on
+    Frontier with all pairs and both builds ("HBT-HERONS on Frontier").
+    At a = 0.5 and 1.25 the all-pairs runs have the definition's
+    particles exactly, so the 18 groups that differ in the Mac's tree run
+    at 1.25 come from the tree, and the kernel passes against them in all
+    six forms. The Frontier build reproduces the Mac's exact reference on
+    8m-lambb;
+  - cube40: settled. HBT-HERONS's own result is the carried form's, so
+    the kernel is right and the reference for wide groups is `unbindspec
+    --first-origin --carried` (Mac). On Frontier, from HBT-HERONS's first
+    particles, the kernel has its bound sets exactly on cube45, cube40 and
+    w565 in all six forms, and the definition computed afresh does not;
   - HBT-HERONS's first frame of a wide group depends on a particle the
-    input does not fix. It is printed now, and `unbindspec` and
-    `unbindcheck` take it (`--first-origin`);
-  - the group that spans the box in w580: the kernel keeps 16,800
-    particles and HBT-HERONS 6,351 from the same first particle. Not
-    looked into;
-  - tau measured per input runs from 1e-4 to 0.0263; whether to keep one
-    value is open;
+    input does not fix, and the Mac and Frontier pick different ones. It
+    is printed now (`hbt_firstparticle.patch`), and `unbindspec` and
+    `unbindcheck` take it (`--first-origin`). Not done: the carried
+    passes in `unbindcheck`;
+  - the group that spans the box in w580: HBT-HERONS keeps 6,815
+    particles on the Mac (a tree run) and 6,351 on Frontier (all pairs),
+    from different first particles. On the Mac its difference from the
+    kernel's rule (17,597) is its stale-frame case; on Frontier the
+    kernel keeps 16,800. Whether the kernel copies that case, and whether
+    it is reported to HBT-HERONS's authors, is not decided;
+  - tau measured on each input on Frontier runs from 1e-4 to 0.0263;
+    whether to keep one value is open;
   - which frame our own catalogues give a wide group, and whether any
     production input has one at b = 0.2 (8m-lambb's widest group is 8% of
     the box);
