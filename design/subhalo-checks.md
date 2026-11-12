@@ -1460,7 +1460,9 @@ Nothing was changed to make it pass: tau, the rule, `unbindcheck` and
   kernel has HBT-HERONS's bound particles on cube40 exactly, with energies
   to 6.6e-7 of S; the definition with the same first particle differs from
   it in 65 particles. So the kernel is right here and the definition is
-  not ("HBT-HERONS on Frontier").
+  not ("HBT-HERONS on Frontier"). HBT-HERONS keeps 79,084 particles on
+  Frontier and 79,094 on the Mac because it started from a different
+  particle on each machine (53797 and 71505).
 - With the cap of 10,000 this group is sampled, a sampled pass is always
   computed in full by both the kernel and the capped definition, and the
   same input passes. The corner is reachable only by a wide group at or
@@ -1959,7 +1961,10 @@ In short:
   in the definition, not in the kernel.
 - **The group that spans the box in w580 is not reproduced**: the kernel
   has 16,800 bound particles there and HBT-HERONS 6,351, from the same
-  first particle. The other 1,521 groups of w580 are identical.
+  first particle. The other 1,521 groups of w580 are identical. The whole
+  difference is HBT-HERONS's stale-frame case: `unbindspec --carried`
+  gives HBT-HERONS's result exactly and `--carried-kernel` the kernel's
+  (job 5910905, "The carried passes against these references").
 - **tau measured on each input** from HBT-HERONS's single-precision build
   runs from the floor of 1e-4 (the cubes) to 0.0263 (a1.25); on 8m-lambb it
   is again 0.00141. tau was not changed.
@@ -2061,11 +2066,86 @@ What this says:
    HBT-HERONS keeps 6,351 of its 191,492 particles, starting from a frame
    0.46 box lengths (3,242 km/s of Hubble term) from the lowest-id one; the
    kernel keeps 16,800 and the definition 8,479. Why the kernel and
-   HBT-HERONS part there was not looked into in these jobs.
+   HBT-HERONS part there was not looked into in these jobs; job 5910905
+   (next subsection) shows it.
 4. HBT-HERONS's first particle is the lowest id in 2 of 47 groups on
    cube45, 1 of 36 on cube40, 38 of 1,844 on w565 and 39 of 1,804 on w580.
    The single-precision build printed the same first particles as the
    double one on all four inputs (with the same number of ranks).
+
+### The carried passes against these references (2026-11-12, job 5910905)
+
+`unbindspec --first-origin --carried` and `--carried-kernel` (the Mac's
+options, "HBT-HERONS on the Mac") from HBT-HERONS's Frontier first
+particles, against the all-pairs references above. One node, 1 min 28 s,
+0.02 node-hours (`subhalo/run_carried_check.sbatch`, paratreet2 726a072).
+
+| Input | HBT-HERONS, all pairs: bound particles | `--carried` against HBT-HERONS: bound sets; largest \|dE\|/S (fraction of S; lower is better); rule as first written | `--carried-kernel`: bound particles | The kernel (double precision) against `--carried-kernel`: bound sets; largest \|dE\|/S (lower is better) | Groups with the stale-frame case (count) |
+|---|---|---|---|---|---|
+| cube45 | 79,551 | identical; 5.9e-7; passes | 79,551 | identical; 2.2e-9 | 0 |
+| cube40 | 79,084 | identical; 6.6e-7; passes | 79,084 | identical; 2.2e-9 | 0 |
+| w565 | 514,690 | identical; 1.7e-6; passes | 514,690 | identical; 1.3e-8 | 0 |
+| w580 | 360,863 | identical; 1.8e-6; passes | 371,312 | identical; 2.0e-8 | 1, the spanning group: 6,351 bound by HBT-HERONS's rule, 16,800 by the kernel's |
+
+What this says:
+
+1. **With all pairs, HBT-HERONS is the source's carried form exactly** on
+   all four wide inputs, w580 included. (The Mac's w580 run used a tree and
+   was two particles off.)
+2. **The kernel is `--carried-kernel` exactly** on all four, with energies
+   to 2e-8 of S. That is the reference that holds the kernel to its own
+   rule on wide groups.
+3. **So the whole w580 difference is the stale-frame case**, and it occurs
+   in that one group only. On 8m-lambb at a = 1, 0.5 and 1.25 it occurs in
+   no group ("HBT-HERONS on the Mac", "A scale factor other than 1").
+4. **What the case is**, read from `subhalo_unbind.cpp` (c728ee0), not run.
+   The frame moves after every pass (line 687). The old frame that a
+   correction starts from is saved only after a pass that removes fewer
+   particles than it keeps (lines 675-683). The switch to corrections
+   (line 679) is never undone. After a later pass that removes at least as
+   many particles as it keeps, the stored energies are in that pass's
+   frame. The next correction (lines 563-589) still starts from the frame
+   saved before it. The comment there (lines 565-566) describes the
+   correction as going from the old centre-of-mass frame to the new one.
+   This reading says the case does not follow that description.
+5. With sampling (`MaxSampleSize` above 0), line 677 gives a second way
+   into the case: a correction pass that removes at least `MaxSampleSize`
+   particles also leaves the old frame in place. Read from the source, not
+   run. `--carried` models only the unsampled condition, and the kernel
+   computes every sampled pass in full.
+
+Checks of the merged programs in the same job: `unbindspec` without
+options writes the files of job 5904186 byte for byte on all four inputs.
+With `--first-origin` (the Mac's version since the merge) it writes the
+files of job 5904769 (this section's version) byte for byte. `unbindcheck`
+gives the kernel the verdicts of jobs 5904424 and 5904769 again.
+
+### How this section fits with "HBT-HERONS on the Mac"
+
+- On 8m-lambb the two machines' exact references are the same bit for bit.
+- At a = 1.25 the Mac's tree run differs from the definition in 18 groups;
+  the all-pairs run here does not, so those differences come from the
+  tree.
+- HBT-HERONS picks a different first particle on each machine, so its
+  results on the wide groups differ:
+
+  | Input | First particle of the wide group: Mac / Frontier | HBT-HERONS bound particles: Mac / Frontier (count) |
+  |---|---|---|
+  | cube45 | 29658 / 54437 | 79,552 / 79,551 |
+  | cube40 | 71505 / 53797 | 79,094 / 79,084 |
+  | w565 | 577276 and 72138 / 586271 and 622713 | 514,690 / 514,690 |
+  | w580 | 90774 / 139141 | 361,326 (tree) / 360,863; spanning group 6,815 / 6,351 |
+
+  The conclusions are the same on both machines: HBT-HERONS is the carried
+  form from its own first particle, and the kernel is the carried form
+  with its own rule after a large removal. The Mac section's prediction
+  that `unbind --first-origin` passes on the cubes and on w565 holds here,
+  against Frontier's references.
+- Of the Mac section's "Not done" list: the opening-angle-0 runs of a0.5,
+  a1.25 and w580, tau on these inputs, the kernel against references of
+  these inputs, and `--first-origin` in `unbindcheck` are done here. The
+  carried passes in `unbindcheck`, the stale-frame decision and a centre
+  refinement step are not.
 
 ### tau on each input
 
@@ -2091,7 +2171,8 @@ double-precision builds over particles bound in both, and tau = max(1e-4,
   not. Marginally bound groups magnify rounding. The kernel's own
   single-precision forms are far closer to the double-precision kernel
   there (n = 8.8e-7 summed in double, 1.6e-3 summed in single).
-- Whether tau should be one number or be set per input is open.
+- **One tau for every input: 0.00141 (decided 2026-11-12).** The values
+  above are recorded as measurements; no input gets its own tau.
 
 ### Tools changed
 
@@ -2109,6 +2190,10 @@ double-precision builds over particles bound in both, and tau = max(1e-4,
   from the lowest-id one.
 - `run_hbt_compare.sbatch`: the two jobs. Inputs are listed per node in
   `LANES`; usage in its header.
+- `run_carried_check.sbatch`: job 5910905.
+- Since the merge with the Mac's commit (726a072), `unbindspec
+  --first-origin` is the Mac's version. `unbindcheck --first-origin`
+  refuses a group sampled under `--cap`, as `unbindspec` does.
 
 ### Files (Frontier scratch, not in the repo)
 
@@ -2119,15 +2204,15 @@ double-precision builds over particles bound in both, and tau = max(1e-4,
 particles, for `--first-origin`), HBT-HERONS's configurations and logs,
 `kernel_<input>_hbtorigin_<form>.hdf5` (the kernel from HBT-HERONS's first
 particles) and the `unbindcheck` logs. The jobs' output is
-`hbt_compare.5904424.out` and `hbt_compare.5904769.out` one level up.
+`hbt_compare.5904424.out` and `hbt_compare.5904769.out` one level up. Job
+5910905 wrote `carried.5910905/<input>/` (the `--carried` and
+`--carried-kernel` results and logs) and `carried.5910905.out`.
 
 ### Not done
 
-- Why the kernel and HBT-HERONS part on the spanning group of w580.
-- A reference for wide groups that a kernel can be held to without
-  HBT-HERONS's first particle: the definition with the correction passes
-  of the source.
-- tau per input, or a reason to keep one value.
+- The carried passes in `unbindcheck`, so that a wide group whose bound
+  set differs is replayed by the form it is held to.
+- The decision on the stale-frame case (see "Open").
 
 ## Open
 
@@ -2172,12 +2257,15 @@ particles) and the `unbindcheck` logs. The jobs' output is
     passes in `unbindcheck`;
   - the group that spans the box in w580: HBT-HERONS keeps 6,815
     particles on the Mac (a tree run) and 6,351 on Frontier (all pairs),
-    from different first particles. On the Mac its difference from the
-    kernel's rule (17,597) is its stale-frame case; on Frontier the
-    kernel keeps 16,800. Whether the kernel copies that case, and whether
-    it is reported to HBT-HERONS's authors, is not decided;
-  - tau measured on each input on Frontier runs from 1e-4 to 0.0263;
-    whether to keep one value is open;
+    from different first particles. On both machines the whole difference
+    from the kernel's rule (17,597 on the Mac, 16,800 on Frontier) is
+    HBT-HERONS's stale-frame case. On Frontier, with all pairs,
+    `--carried` gives HBT-HERONS's set exactly and `--carried-kernel` the
+    kernel's, and this is the only group where the case occurs (job
+    5910905). Whether the kernel copies that case, and whether it is
+    reported to HBT-HERONS's authors, is not decided;
+  - tau measured on each input on Frontier runs from 1e-4 to 0.0263.
+    **One tau, 0.00141, for every input (decided 2026-11-12)**;
   - which frame our own catalogues give a wide group, and whether any
     production input has one at b = 0.2 (8m-lambb's widest group is 8% of
     the box);
