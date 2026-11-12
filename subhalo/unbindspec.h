@@ -1,7 +1,8 @@
 // unbindspec.h -- the unbinding definition of design/subhalo-checks.md
 // ("What HBT-HERONS computes") in plain double-precision C++ with all pairs.
 // The last part of the file adds the capped-sampling definition ("Capped
-// sampling: definition and pass rule"); without a cap nothing changes.
+// sampling: definition and pass rule") and the centre refinement of a
+// sampled group ("Centre refinement"); without a cap nothing changes.
 // Shared by unbindspec, which runs it on every group, and unbindcheck, which
 // replays it on the groups where a kernel and the reference differ.
 //
@@ -478,6 +479,67 @@ inline long unbindCarried(const Snapshot& s, const size_t* idx, size_t n,
     meanFrame(s, idx, n, alive, NO_ORIGIN, ref_x, ref_v);
   }
   return npass;
+}
+
+// ---- centre refinement --------------------------------------------------------
+// design/subhalo-checks.md, "Centre refinement". A sampled group's energies
+// are estimates, so its particle of lowest energy need not be the most bound
+// one. After the last pass of a group whose bound set has more than the cap,
+// the k bound particles of lowest energy (ties by particle id; all of them if
+// there are fewer) get their energy again, from ALL the bound particles with
+// their true masses, own term excluded, in the frame of the bound set (the
+// frame of energies(): mass-weighted means, offsets from the first bound
+// particle). The most bound particle is the one of lowest such energy, ties
+// by id.
+//
+// alive[] is the final bound set and e[] the last pass's energies. On return
+// cand[] holds the k particles (local indices) in the order of their new
+// energies, ecand[] those energies and rank[] each one's position in the
+// order of e[] (0 = lowest). k * (bound count) pair terms.
+inline void refineCentre(const Snapshot& s, const size_t* idx, size_t n,
+                         const std::vector<char>& alive, const std::vector<double>& e,
+                         size_t k, std::vector<size_t>& cand, std::vector<double>& ecand,
+                         std::vector<size_t>& rank, bool parallel) {
+  std::vector<size_t> b;
+  for (size_t i = 0; i < n; i++)
+    if (alive[i]) b.push_back(i);
+  const size_t m = std::min(k, b.size());
+  std::partial_sort(b.begin(), b.begin() + m, b.end(), [&](size_t p, size_t q) {
+    return e[p] != e[q] ? e[p] < e[q] : s.ID[idx[p]] < s.ID[idx[q]];
+  });
+  std::vector<size_t> bound;
+  for (size_t i = 0; i < n; i++)
+    if (alive[i]) bound.push_back(i);
+  double xc[3] = {0, 0, 0}, vc[3] = {0, 0, 0};
+  meanFrame(s, idx, n, alive, NO_ORIGIN, xc, vc);
+  const double Ha = s.H * s.a * hubble_factor;
+  std::vector<double> er(m);
+#pragma omp parallel for schedule(dynamic, 1) if (parallel)
+  for (size_t c = 0; c < m; c++) {
+    const size_t i = b[c];
+    double sum = 0;
+    for (size_t j : bound)
+      if (j != i) sum += s.M[idx[j]] * s.phi(s.dist(idx[i], idx[j]));
+    double k2 = 0;
+    for (int d = 0; d < 3; d++) {
+      const double dv = s.V[3 * idx[i] + d] - vc[d] + Ha * s.nearest(s.X[3 * idx[i] + d] - xc[d]);
+      k2 += dv * dv;
+    }
+    er[c] = 0.5 * k2 + sum * G / s.a;
+  }
+  std::vector<size_t> o(m);
+  for (size_t c = 0; c < m; c++) o[c] = c;
+  std::sort(o.begin(), o.end(), [&](size_t p, size_t q) {
+    return er[p] != er[q] ? er[p] < er[q] : s.ID[idx[b[p]]] < s.ID[idx[b[q]]];
+  });
+  cand.resize(m);
+  ecand.resize(m);
+  rank.resize(m);
+  for (size_t r = 0; r < m; r++) {
+    cand[r] = b[o[r]];
+    ecand[r] = er[o[r]];
+    rank[r] = o[r];
+  }
 }
 
 // ---- the first frame's origin, for unbindcheck ------------------------------

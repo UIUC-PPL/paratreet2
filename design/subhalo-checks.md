@@ -402,7 +402,8 @@ One difference is kept on purpose. Once HBT-HERONS has switched to
 subtraction it never switches back, and a later pass that removes more than
 it keeps then moves the kinetic term from a frame two passes old. Here that
 pass is computed in full, and the groups it happens to are counted: none on
-the 8M input, 6 of 1,000 synthetic groups.
+the 8M input, 6 of 1,000 synthetic groups. **Decided 2026-11-12: the kernel
+keeps the full pass and does not copy HBT-HERONS's case** (see "Open").
 
 ### Checks
 
@@ -1077,7 +1078,7 @@ What is HBT-HERONS's (read from c728ee0) and what is not:
 | Frame | all bound particles, true masses | the same |
 | Order of the sample | one random shuffle of the group | by key(ID) |
 | Later passes | if a pass removed fewer than C particles and fewer than it kept, the removed particles' exact potential is subtracted from the sampled estimate, and no pass is computed from a sample again | every pass is defined from the current sample |
-| Centre refinement after the last pass | reorders the most bound particles | not part of the bound set; not defined here |
+| Centre refinement after the last pass | reorders the most bound particles | not part of the bound set; defined separately in "Centre refinement" (2026-11-12) |
 
 The sixth row is the one real difference in method. HBT-HERONS's energies
 after the first pass depend on the path taken; here they do not.
@@ -1926,7 +1927,7 @@ definition as written.
 - A decision on the stale-frame case: copy HBT-HERONS there or keep the
   full pass, and whether to report the case to HBT-HERONS's authors.
 - A centre refinement step in `unbind`, and the test of item 4 under the
-  cap.
+  cap. Done 2026-11-12 on the Mac, see "Centre refinement".
 
 ## HBT-HERONS on Frontier: exact references at two scale factors and on the wide inputs (2026-11-11)
 
@@ -2257,7 +2258,207 @@ and the `unbindcheck` logs) and `widecheck.5911041.out`.
 
 - The carried passes in `unbindcheck`, so that a wide group whose bound
   set differs is replayed by the form it is held to.
-- The decision on the stale-frame case (see "Open").
+- The decision on the stale-frame case: made 2026-11-12, the kernel keeps
+  its full pass (see "Open").
+
+## Centre refinement (2026-11-12)
+
+Decided 2026-11-12: build the refinement proposed in "HBT-HERONS with a
+cap, against the exact result" (item 4). Done and checked on the Mac. The
+kernel's GPU run is `subhalo/run_unbind_refine.sbatch` and has not run yet.
+
+### Definition
+
+A sampled group's energies are estimates, so its particle of lowest energy
+need not be its most bound particle: at a cap of 1,000 it is not in 38% of
+the sampled groups of 8m-lambb, and can lie in another part of the group.
+After the last pass of a group whose bound set B still has more than C
+particles:
+
+1. Candidates: the K particles of B with the lowest energy in the last pass
+   (ties by particle ID); all of B if it has K or fewer.
+2. Each candidate gets its energy again: the kinetic term in the frame of B
+   (the frame every pass uses), and the potential from **all** of B with
+   true masses, its own term excluded. K N_b pair terms.
+3. The most bound particle is the candidate of lowest new energy, ties by
+   ID.
+
+A group at or below the cap at the end has exact energies already; its most
+bound particle is its particle of lowest energy. The stored energies stay
+the last pass's, as in HBT-HERONS.
+
+How this differs from HBT-HERONS's step (`RefineBindingEnergyOrder`, read
+from c728ee0): HBT-HERONS takes max(C, 0.1 N_b) candidates and gives each
+the potential of the candidates alone (a tree over them). Those are not the
+group's energies, which is how two groups of its third run at a cap of
+1,000 got a centre 165 and 217 softening lengths from the exact one. Here
+the candidates are ranked by the group's own energies, so whenever the
+exact minimum is among them, it is found. The cost is K N_b pair terms:
+linear in the group's size.
+
+### How many candidates
+
+`unbindspec --cap C --refine K` against the exact result (`unbindspec`
+without a cap). On 8m-lambb, the share of sampled groups whose reported
+most bound particle is the exact one (higher is better):
+
+| Cap (sources per particle) | Sampled groups with a sub-halo (count) | No refinement (%) | K = 10 (%) | K = 100 (%) | K = 1,000 (%) | Largest rank of the result in the last pass's order (lower needs fewer candidates) |
+|---|---|---|---|---|---|---|
+| 1,000 | 449 | 61.5 | 97.1 | 100 | 100 | 66 |
+| 10,000 | 60 | 81.7 | 100 | 100 | 100 | 6 |
+
+All seven inputs at K = 1,000. "Refined" groups are those whose bound set
+ends above the cap; the others end with exact energies. Shifts are the
+distance from the exact most bound particle in softening lengths (lower is
+better):
+
+| Input | Cap | Sampled groups with a sub-halo (count) | Refined groups (count) | Largest rank of the result in the last pass's order | No refinement: exact particle (%), largest shift | Refined: exact particle (%; higher is better), largest shift |
+|---|---|---|---|---|---|---|
+| 8m-lambb | 1,000 | 449 | 439 | 66 | 61.5, 218 | 100, 0 |
+| 8m-lambb | 10,000 | 60 | 58 | 6 | 81.7, 1.5 | 100, 0 |
+| a0.5 | 1,000 | 449 | 449 | 142 | 41.2, 218 | 100, 0 |
+| a0.5 | 10,000 | 60 | 60 | 23 | 56.7, 1.5 | 100, 0 |
+| a1.25 | 1,000 | 447 | 294 | 29 | 77.0, 272 | 96.4, 3.2 |
+| a1.25 | 10,000 | 59 | 31 | 11 | 78.0, 2.2 | 98.3, 1.2 |
+| w565 | 1,000 | 66 | 63 | 21 | 53.0, 386 | 100, 0 |
+| w565 | 10,000 | 9 | 8 | 5 | 66.7, 2.1 | 100, 0 |
+| w580 | 1,000 | 61 | 58 | 20 | 60.7, 4,859 | 95.1, 4,856 |
+| w580 | 10,000 | 7 | 6 | 1 | 42.9, 3.2 | 85.7, 0.35 |
+| cube45 | 1,000 | 1 | 1 | 25 | 0, 2.1 | 100, 0 |
+| cube45 | 10,000 | 1 | 1 | 1 | 0, 0.79 | 100, 0 |
+| cube40 | 1,000 | 1 | 1 | 9 | 0, 1.4 | 100, 0 |
+| cube40 | 10,000 | 1 | 1 | 0 | 100, 0 | 100, 0 |
+
+What this says:
+
+1. **With K = 1,000 the refinement finds the exact most bound particle of
+   every sampled group whose bound set is the exact one's**, at both caps,
+   on all seven inputs. HBT-HERONS's own refinement on 8m-lambb: 93.5 to
+   94.7% at 1,000 and 98.3% at 10,000.
+2. **The misses on a1.25 and w580 come from the bound set, not the
+   refinement.** All 21 groups whose reported centre is not the exact one
+   (16 and 1 on a1.25, 3 and 1 on w580) have a capped bound set that
+   differs from the exact one. Refining every bound particle instead of
+   1,000 (`--refine 1000000000`) gives the same most bound particle in
+   every group of all seven inputs at both caps (14 runs). So with K =
+   1,000 the result is the exact most bound particle of the capped bound
+   set, and what remains is the cap's distance in the bound set itself:
+   marginally bound groups (a1.25) and the group that spans the box (w580,
+   whose capped set has 92% more particles than the exact one).
+3. **K = 1,000 has room.** The result's rank in the last pass's order is
+   at most 142 at a cap of 1,000 (a0.5) and 23 at 10,000: 7 and 43 times
+   below K. The rank does not grow with the group's size on these inputs:
+   on 8m-lambb at 1,000 the largest rank is 6 in groups of 1,001 to 3,000
+   particles, 66 in groups of 10,001 to 30,000 and 26 in the three groups
+   above 100,000. Groups a thousand times larger are not measured. The
+   logs print the largest rank and how many groups have it in the upper
+   half of the candidates, so a run on a larger input shows whether K was
+   enough.
+
+### Cost
+
+K N_b pair terms per refined group. On 8m-lambb with K = 1,000: 3.1e9 at a
+cap of 1,000 (89% of the first pass) and 2.0e9 at 10,000 (7.8%); 3.5 to 10%
+on the other inputs at 10,000. On cosmo2b at the chosen cap the sampled
+part of a pass is C times the particles in sampled groups, so the
+refinement costs at most K / C = a tenth of a pass: at most 4.7
+die-seconds, 0.009 s on 512 dies if spread evenly. Its largest group alone
+is 1.85e11 pair terms, about one die-second, so for the stage inside FoF3
+it has to be split like the passes: the K lowest energies of a group found
+across the processes that hold it, the K candidates sent to each of them,
+and the K partial sums reduced. The kernel gives each candidate one thread,
+which suits many groups in one launch (58,000 threads on 8m-lambb at
+10,000). One very large group alone gives only K threads to a die, so there
+each candidate's sum over the bound particles must also be split across
+threads. Not done.
+
+### The kernel
+
+`unbind --cap C --refine K` does the refinement in one launch after the
+last pass, for all refined groups together: the candidates are the
+targets and all bound particles the sources, the form the kernel already
+has. The dump gains `MostBound` (one particle per group with a sub-halo)
+and `RefinedEnergy` (the new energy of each candidate, NaN elsewhere); the
+log gives the groups, pair terms, the largest rank and the time.
+`unbindspec --cap C --refine K` writes each group's most bound particle as
+its first record, as HBT-HERONS orders its own (so `capdist_bin.py
+--first` reads it), and a `.centre.bin` file with the candidates' new
+energies. Without `--refine` both programs behave as before.
+
+### Pass rule (written before any GPU output)
+
+`centrecheck.py <reference.particles.bin> <reference.centre.bin> <dump>
+--tau 0.00141`, reference `unbindspec --cap C --refine K`, both run until a
+pass removes nothing. In every group refined in either result:
+
+1. it is refined in both;
+2. the kernel's most bound particle is the reference's, or is one of the
+   reference's candidates with a reference energy within tau S of the
+   reference's lowest;
+3. every particle refined in both has its new energy within tau S of the
+   reference's.
+
+The dump must also be consistent: one `MostBound` particle per group with
+a sub-halo, bound, the lowest new energy in a refined group and the lowest
+energy otherwise; none in a group without one. A single-precision form gets
+the allowance of "Tolerance for single-precision kernels" with
+`--single-against` its double-precision form. The bound sets are judged by
+`unbindcheck --cap C` as before.
+
+### Results on the Mac
+
+`unbind` was built on the Mac against a stand-in header for the part of
+Kokkos it uses (host memory, OpenMP), since Kokkos is not installed there.
+The stand-in is not in the repository. Its `rsqrt` is 1/sqrt, so the
+`--rsqrt` forms here test nothing beyond the plain ones.
+
+- Without `--refine`, the new `unbind` writes the same dump as the old one
+  (`h5diff`, 8m-lambb at a cap of 1,000) and `unbindspec` the same bytes
+  (`spec-cap1000.particles.bin`).
+- With `--refine 1000`, every form passes `unbindcheck --cap` and
+  `centrecheck.py` (largest new-energy difference in fractions of S; lower
+  is better):
+
+  | Input | Cap | Forms run | Refined groups with the same most bound particle | Largest \|dE\|/S: f64 / f32 / f32f32 |
+  |---|---|---|---|---|
+  | 8m-lambb | 1,000 | f64, f32, f32f32 (and the rsqrt forms) | 439 of 439 | 1.7e-9 / 1.3e-6 / 1.0e-4 |
+  | 8m-lambb | 10,000 | the same | 58 of 58 | 1.0e-9 / 1.2e-6 / 1.1e-4 |
+  | a0.5 | 10,000 | f64, f32f32 | 60 of 60 | 7.4e-10 / - / 7.6e-5 |
+  | a1.25 | 10,000 | f64, f32f32 | 31 of 31 | 1.0e-9 / - / 1.3e-3 |
+  | w565 | 10,000 | f64, f32f32 | 8 of 8 | 6.3e-10 / - / 1.3e-4 |
+  | w580 | 10,000 | f64, f32f32 | 6 of 6 | 6.3e-10 / - / 6.0e-4 |
+  | cube45 | 10,000 | f64, f32 rsqrt, f32f32 | 1 of 1 | 3.1e-10 / 3.6e-7 / 4.5e-5 |
+  | cube40 | 10,000 | f64, f32f32 | 1 of 1 | 3.0e-10 / - / 4.2e-5 |
+
+  The f32f32 form on a1.25 is at 0.93 tau without the allowance (two of
+  its groups have bound sets that differ from the reference's by a
+  boundary particle); with it the tolerance is 0.0062.
+- Seven deliberately broken refinements, each one change in
+  `unbind_groups.h`, all fail `centrecheck.py` on 8m-lambb at a cap of
+  1,000:
+
+  | Broken refinement | Groups failing rule 2, the centre (of 439) | Groups failing rule 3, the energies (of 439) | Largest \|dE\|/S |
+  |---|---|---|---|
+  | none: the last pass's energies kept | 167 | 439 | 0.64 |
+  | own term left in | 0 | 436 | 0.046 |
+  | Hubble term left out | 18 | 439 | 0.22 |
+  | frame of the whole FoF group | 10 | 370 | 1.2 |
+  | candidates of highest energy | 439 | 0 | 1.6e-9 |
+  | potential from the candidates alone (HBT-HERONS's choice) | 13 | 439 | 3.7 |
+  | potential 0.1% too large | 0 | 439 | 0.0046 |
+
+  So rule 3 catches an error in the new energies of 0.1% of the
+  potential, and rule 2 a wrong choice of candidates.
+
+### Not done
+
+- The GPU run: `CHECK_ONLY=1 bash subhalo/run_unbind_refine.sbatch`, then
+  `sbatch`. It repeats the above in all six forms on one die and times the
+  refinement against the first pass. Expected values are in its header.
+- Whether `--refine 1000` becomes the default with a cap. It is off by
+  default so that every earlier run reproduces.
+- The refinement of a group spread over processes, for the stage inside
+  FoF3.
 
 ## Open
 
@@ -2275,8 +2476,10 @@ and the `unbindcheck` logs) and `widecheck.5911041.out`.
   2026-11-11 on the Mac. Our capped result is as close to the exact one
   as HBT-HERONS's own, and its centre refinement gives the exact most
   bound particle in 59 of 60 sampled groups at 10,000 ("HBT-HERONS with a
-  cap, against the exact result"). Not done: a refinement step in
-  `unbind`.
+  cap, against the exact result"). Done 2026-11-12 on the Mac: a
+  refinement step in `unbind` (`--refine K`), which gives the exact most
+  bound particle in every sampled group of 8m-lambb at both caps ("Centre
+  refinement"). Not done: its run on the GPU (`run_unbind_refine.sbatch`).
 - Done 2026-11-11 against the written definition only (job 5904186, "A
   scale factor other than 1, and groups at least half the box wide"): the
   kernel at a = 0.5 and a = 1.25, and on four inputs with groups at least
@@ -2310,8 +2513,11 @@ and the `unbindcheck` logs) and `widecheck.5911041.out`.
     HBT-HERONS's stale-frame case. On Frontier, with all pairs,
     `--carried` gives HBT-HERONS's set exactly and `--carried-kernel` the
     kernel's, and this is the only group where the case occurs (job
-    5910905). Whether the kernel copies that case, and whether it is
-    reported to HBT-HERONS's authors, is not decided;
+    5910905). **The kernel keeps its full pass there and does not copy the
+    case (decided 2026-11-12).** HBT-HERONS's correction starts from a
+    frame two passes old, which reads as an oversight in its source, and
+    the case occurs only in a group that spans the box. Whether it is
+    reported to HBT-HERONS's authors is not decided;
   - tau measured on each input on Frontier runs from 1e-4 to 0.0263.
     **One tau, 0.00141, for every input (decided 2026-11-12)**;
   - which frame our own catalogues give a wide group, and whether any

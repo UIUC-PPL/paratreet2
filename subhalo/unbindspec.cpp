@@ -8,7 +8,7 @@
 // correct kernel can pass too.
 //
 //   unbindspec <snapshot.hdf5> <out.particles.bin> [--g G] [--no-hubble] [--trace ID]
-//              [--potential-ratio] [--cap C] [--first-origin file]
+//              [--potential-ratio] [--cap C [--refine K]] [--first-origin file]
 //              [--carried | --carried-kernel]
 //
 // <snapshot.hdf5> is the file tipsy2hbt wrote. The output has one 24-byte
@@ -35,6 +35,17 @@
 // matters only for a group at least half the box wide. HBT-HERONS's own
 // choice is the first particle of a list it has not sorted yet.
 //
+// --refine K (with --cap) adds the centre refinement ("Centre refinement"):
+// in each group whose bound set ends above the cap, the K bound particles of
+// lowest energy get their energy again from all the bound particles, and the
+// lowest of those is the most bound particle. The output then has each
+// group's most bound particle as the group's first record (every group: the
+// particle of lowest energy where nothing was refined), as HBT-HERONS orders
+// its own; the energies written are still the last pass's. A second file,
+// the output's name with .particles.bin replaced by .centre.bin, holds the
+// K refined particles of each refined group, 24-byte records with the new
+// energies, most bound first.
+//
 // --carried runs the passes as HBT-HERONS's source carries them
 // (ubs::unbindCarried): after the first pass that removes fewer particles
 // than it keeps, energies are corrected from pass to pass instead of computed
@@ -54,11 +65,11 @@
 int main(int argc, char** argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: unbindspec <snapshot.hdf5> <out.particles.bin> "
-                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio] [--cap C] "
-                    "[--first-origin file] [--carried | --carried-kernel]\n");
+                    "[--g G] [--no-hubble] [--trace ID] [--potential-ratio] [--cap C "
+                    "[--refine K]] [--first-origin file] [--carried | --carried-kernel]\n");
     return 2;
   }
-  long long trace_id = -1, cap = 0;
+  long long trace_id = -1, cap = 0, refine = 0;
   bool potential_ratio = false, carried = false, kernel_rule = false;
   const char* origin_path = nullptr;
   for (int i = 3; i < argc; i++) {
@@ -67,6 +78,7 @@ int main(int argc, char** argv) {
     else if (!strcmp(argv[i], "--no-hubble")) ubs::hubble_factor = 0;
     else if (!strcmp(argv[i], "--potential-ratio")) potential_ratio = true;
     else if (!strcmp(argv[i], "--cap") && i + 1 < argc) cap = atoll(argv[++i]);
+    else if (!strcmp(argv[i], "--refine") && i + 1 < argc) refine = atoll(argv[++i]);
     else if (!strcmp(argv[i], "--first-origin") && i + 1 < argc) origin_path = argv[++i];
     else if (!strcmp(argv[i], "--carried")) carried = true;
     else if (!strcmp(argv[i], "--carried-kernel")) carried = kernel_rule = true;
@@ -75,6 +87,19 @@ int main(int argc, char** argv) {
   if (carried && cap > 0) {
     fprintf(stderr, "unbindspec: --carried is not defined with --cap\n");
     return 2;
+  }
+  if (refine < 0 || (refine > 0 && cap <= 0)) {
+    fprintf(stderr, "unbindspec: --refine needs a positive K and --cap\n");
+    return 2;
+  }
+  std::string centre_path;
+  if (refine > 0) {
+    centre_path = argv[2];
+    const std::string suffix = ".particles.bin";
+    if (centre_path.size() > suffix.size() &&
+        centre_path.compare(centre_path.size() - suffix.size(), suffix.size(), suffix) == 0)
+      centre_path.resize(centre_path.size() - suffix.size());
+    centre_path += ".centre.bin";
   }
   const ubs::Snapshot s = ubs::readSnapshot(argv[1], "unbindspec");
   const size_t ng = s.groups.size();
@@ -95,6 +120,8 @@ int main(int argc, char** argv) {
   std::vector<std::vector<double>> ratio(ng);     // --potential-ratio: |U| / S
   std::vector<long> passes(ng, 0);
   std::vector<double> capped_terms(ng, 0.0);      // --cap: pair terms of a sampled group
+  std::vector<std::vector<Rec>> centre(ng);       // --refine: the refined particles
+  std::vector<long> centre_rank(ng, -1);          // --refine: the winner's rank in e[]
 
   // One group. `inner` = parallelize over its particles (large groups).
   auto solve = [&](size_t gi, bool inner) {
@@ -140,8 +167,25 @@ int main(int argc, char** argv) {
           : ubs::unbind(s, idx, n, alive, pot, e, inner, observe, origin);
       stale[gi] = st;
     }
+    size_t nalive = 0, first = n;   // first: the most bound particle (--refine)
+    for (size_t i = 0; i < n; i++) nalive += alive[i] ? 1 : 0;
+    if (refine > 0 && nalive > (size_t)cap) {
+      std::vector<size_t> cand, rank;
+      std::vector<double> ecand;
+      ubs::refineCentre(s, idx, n, alive, e, (size_t)refine, cand, ecand, rank, inner);
+      for (size_t r = 0; r < cand.size(); r++)
+        centre[gi].push_back({s.ID[idx[cand[r]]], g.id, ecand[r]});
+      centre_rank[gi] = (long)rank[0];
+      first = cand[0];
+    } else if (refine > 0) {
+      for (size_t i = 0; i < n; i++)
+        if (alive[i] && (first == n || e[i] < e[first] ||
+                         (e[i] == e[first] && s.ID[idx[i]] < s.ID[idx[first]])))
+          first = i;
+    }
+    if (first < n) out[gi].push_back({s.ID[idx[first]], g.id, e[first]});
     for (size_t i = 0; i < n; i++)
-      if (alive[i]) out[gi].push_back({s.ID[idx[i]], g.id, e[i]});
+      if (alive[i] && i != first) out[gi].push_back({s.ID[idx[i]], g.id, e[i]});
     if (potential_ratio && !out[gi].empty()) {
       std::vector<double> ae;
       for (const Rec& r : out[gi]) ae.push_back(std::fabs(r.e));
@@ -204,6 +248,28 @@ int main(int argc, char** argv) {
     fwrite(out[gi].data(), sizeof(Rec), out[gi].size(), o);
   }
   fclose(o);
+  if (refine > 0) {
+    FILE* c = fopen(centre_path.c_str(), "wb");
+    if (!c) { fprintf(stderr, "unbindspec: cannot write %s\n", centre_path.c_str()); return 2; }
+    long long refined = 0, moved = 0, upper = 0;
+    long top = 0;
+    double terms = 0;
+    for (size_t gi = 0; gi < ng; gi++) {
+      if (centre[gi].empty()) continue;
+      refined++;
+      terms += (double)centre[gi].size() * (double)out[gi].size();
+      top = std::max(top, centre_rank[gi]);
+      moved += centre_rank[gi] > 0;
+      upper += 2 * centre_rank[gi] >= (long)centre[gi].size();
+      fwrite(centre[gi].data(), sizeof(Rec), centre[gi].size(), c);
+    }
+    fclose(c);
+    printf("unbindspec: centre refinement of %lld candidates: %lld groups, %.3e pair terms; "
+           "the most bound particle is not the last pass's lowest energy in %lld of them; "
+           "its rank in the last pass's order: largest %ld, in the upper half of the "
+           "candidates in %lld groups; wrote %s\n",
+           refine, refined, terms, moved, top, upper, centre_path.c_str());
+  }
   printf("unbindspec: %zu groups, %zu grouped particles, %.3e pair terms in the first pass"
          "%s\n", ng, s.order.size(), pair_terms, cap > 0 ? " of the groups not sampled" : "");
   if (cap > 0)

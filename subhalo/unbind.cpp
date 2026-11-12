@@ -18,6 +18,14 @@
 //                         takes each potential from C sources chosen by
 //                         particle id ("Capped sampling: definition and
 //                         pass rule" in the design note). Default: no cap
+//     --refine K          with --cap: centre refinement. In each group whose
+//                         bound set ends above the cap, the K bound particles
+//                         of lowest energy get their energy again from all
+//                         the bound particles; the lowest of those is the most
+//                         bound particle ("Centre refinement" in the design
+//                         note). The dump then also has MostBound (0/1, one
+//                         per group with a sub-halo) and RefinedEnergy (the
+//                         new energy of a refined particle, NaN otherwise)
 //     --first-origin <file>   lines "group id, particle id": the particle a
 //                         group's FIRST frame takes its nearest-image offsets
 //                         from (default: the group's lowest particle id). It
@@ -177,6 +185,7 @@ int main(int argc, char** argv) {
     else if (a == "--first-origin") origin_path = next();
     else if (a == "--min-bound") P.min_bound = atoi(next());
     else if (a == "--cap") P.cap = atoll(next());
+    else if (a == "--refine") P.refine = atoll(next());
     else if (a == "--bound-fraction") P.bound_fraction = atof(next());
     else if (a[0] != '-' && snap.empty()) snap = a;
     else die("unknown argument " + a);
@@ -185,7 +194,7 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: unbind <snapshot.hdf5> [--ref table] [--out table] [--dump file.hdf5]\n"
             "              [--kernel f64|f32|f32f32] [--rsqrt] [--float-positions] [--open]\n"
-            "              [--cap C] [--min-bound N] [--bound-fraction F]\n"
+            "              [--cap C [--refine K]] [--min-bound N] [--bound-fraction F]\n"
             "              [--first-origin file]\n");
     return 2;
   }
@@ -282,6 +291,10 @@ int main(int argc, char** argv) {
          kernel.c_str(), rsqrt ? " rsqrt" : "", unbind::Exec().name(),
          float_positions ? "rounded to single precision" : "as stored", read_s, group_s);
   if (P.cap < 0) die("--cap must not be negative");
+  if (P.refine < 0 || (P.refine > 0 && P.cap == 0)) die("--refine needs a positive K and --cap");
+  if (P.refine > 0)
+    printf("unbind: centre refinement of the %lld lowest energies in each group whose bound "
+           "set ends above the cap\n", (long long)P.refine);
   if (P.cap > 0) {
     long long above = 0;
     for (int g = 0; g < ng; g++) above += G.off[g + 1] - G.off[g] > P.cap;
@@ -334,13 +347,31 @@ int main(int argc, char** argv) {
     printf("capped sampling: %lld groups sampled; %.4g pair terms spent on changes of "
            "their samples in later passes\n", (long long)S.sampled_groups,
            (double)S.pairs_sample_update);
-  const double kernel_s = S.kernel_s_first + S.kernel_s_later;
+  if (P.refine > 0) {
+    long long moved = 0, upper = 0, top = 0;
+    for (int g = 0; g < ng; g++) {
+      if (!R.refined_group[g]) continue;
+      const long long k = std::min<long long>(P.refine, R.nbound[g]);
+      top = std::max<long long>(top, R.centre_rank[g]);
+      moved += R.centre_rank[g] > 0;
+      upper += 2 * R.centre_rank[g] >= k;
+    }
+    printf("centre refinement: %lld groups, %.4g pair terms = %.1f%% of the first pass; the "
+           "most bound particle is not the last pass's lowest energy in %lld of them; its "
+           "rank in the last pass's order: largest %lld, in the upper half of the candidates "
+           "in %lld groups\n", (long long)S.refined_groups, (double)S.pairs_refine,
+           100.0 * (double)S.pairs_refine / (double)S.pairs_first, moved, top, upper);
+  }
+  const double kernel_s = S.kernel_s_first + S.kernel_s_later + S.kernel_s_refine;
   printf("time: unbinding %.3f s = kernel %.3f s (first pass %.3f, later %.3f) + host and "
          "copies %.3f s, in %d rounds\n",
-         unbind_s, kernel_s, S.kernel_s_first, S.kernel_s_later, S.host_s, S.passes);
+         unbind_s, kernel_s, S.kernel_s_first, S.kernel_s_later + S.kernel_s_refine, S.host_s,
+         S.passes);
+  if (P.refine > 0)
+    printf("time: of the later kernel time, centre refinement %.3f s\n", S.kernel_s_refine);
   printf("rate: %.4g pair terms per second in the first pass, %.4g overall\n",
          (double)S.pairs_first / S.kernel_s_first,
-         ((double)S.pairs_first + later) / kernel_s);
+         ((double)S.pairs_first + later + (double)S.pairs_refine) / kernel_s);
 
   // By group size.
   const long long edges[5] = {0, 64, 1024, 16384, 1LL << 62};
@@ -477,6 +508,13 @@ int main(int argc, char** argv) {
     put("GroupIDs", H5T_NATIVE_LLONG, grp.data());
     put("Bound", H5T_NATIVE_UINT8, R.bound.data());
     put("Energy", H5T_NATIVE_DOUBLE, R.energy.data());
+    if (P.refine > 0) {
+      std::vector<uint8_t> most(m, 0);
+      for (int g = 0; g < ng; g++)
+        if (R.centre[g] >= 0) most[R.centre[g]] = 1;
+      put("MostBound", H5T_NATIVE_UINT8, most.data());
+      put("RefinedEnergy", H5T_NATIVE_DOUBLE, R.refined.data());
+    }
     H5Sclose(sp);
     H5Fclose(f);
     printf("wrote %s (%llu particles)\n", dump_path.c_str(), (unsigned long long)m);

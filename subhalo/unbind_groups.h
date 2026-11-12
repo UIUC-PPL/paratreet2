@@ -27,7 +27,9 @@
 // One known difference from HBT-HERONS: once it has switched to subtraction
 // it never switches back, and a later pass that removes more than it keeps
 // then moves the kinetic term from a frame two passes old. Here that pass is
-// computed in full. The groups this happens to are counted (stale_frame).
+// computed in full; this is kept on purpose (decided 2026-11-12,
+// design/subhalo-checks.md "Open"). The groups this happens to are counted
+// (stale_frame).
 //
 // Capped sampling (Params::cap, design/subhalo-checks.md "Capped sampling:
 // definition and pass rule"). With a cap C, a pass whose bound set has more
@@ -41,6 +43,17 @@
 // half the sample changed. A group at or below the cap goes by the rules
 // above.
 //
+// Centre refinement (Params::refine, design/subhalo-checks.md "Centre
+// refinement"). A sampled group's energies are estimates, so its particle of
+// lowest energy need not be the most bound one. After the last pass of a
+// group whose bound set is still above the cap, the K bound particles of
+// lowest energy (ties by id) get their energy again from ALL the bound
+// particles, true masses, in the frame of the bound set: one launch for all
+// such groups, K times the bound count pair terms each. The most bound
+// particle is the one of lowest such energy, ties by id. Every other group
+// with a sub-halo reports its particle of lowest energy. Result::energy keeps
+// the last pass's energies, as HBT-HERONS keeps its own.
+//
 // Host code is serial. Needs unbind_kernel.h; no HDF5, no Charm header.
 
 #ifndef SUBHALO_UNBIND_GROUPS_H_
@@ -52,6 +65,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -89,6 +103,7 @@ struct Params {
   double bound_fraction = 0.995;
   int min_bound = 20;
   int64_t cap = 0;   // most sources per particle; 0 = no cap (all pairs)
+  int64_t refine = 0;  // centre refinement: candidates per sampled group; 0 = off
 };
 
 struct Stats {
@@ -98,7 +113,9 @@ struct Stats {
   int64_t pairs_subtract = 0;    // later passes done by subtraction
   int64_t pairs_sample_update = 0;  // later passes of sampled groups: the sample's change
   int64_t sampled_groups = 0;    // groups above the cap
-  double kernel_s_first = 0, kernel_s_later = 0;
+  int64_t refined_groups = 0;    // groups whose centre was refined
+  int64_t pairs_refine = 0;      // pair terms of the centre refinement
+  double kernel_s_first = 0, kernel_s_later = 0, kernel_s_refine = 0;
   double host_s = 0;             // packing, copies to and from the device, removal
 };
 
@@ -108,6 +125,11 @@ struct Result {
   std::vector<uint8_t> stale_frame;  // per group, see the header comment
   std::vector<uint8_t> bound;   // per packed particle
   std::vector<double> energy;   // per packed particle, as last evaluated
+  // Only with Params::refine > 0:
+  std::vector<int64_t> centre;  // per group, the most bound packed particle; -1 = no sub-halo
+  std::vector<int64_t> centre_rank;  // per group, its position in the last pass's order
+  std::vector<uint8_t> refined_group;  // per group, 1 = its centre was refined
+  std::vector<double> refined;  // per packed particle, the refined energy; NaN = not refined
   Stats stats;
 };
 
@@ -636,6 +658,79 @@ Result unbindGroups(const Groups& G, const Params& P) {
       if (!subtract_next && subtracted[g]) R.stale_frame[g] = 1;
       if (subtract_next) subtracted[g] = 1;
       state[g] = subtract_next ? Subtract : Full;
+    }
+  }
+
+  // Centre refinement: targets are each refined group's K candidates, sources
+  // all its bound particles (a candidate is one of them: own term cancelled).
+  if (P.refine > 0) {
+    R.centre.assign(ng, -1);
+    R.centre_rank.assign(ng, 0);
+    R.refined_group.assign(ng, 0);
+    R.refined.assign((size_t)n, std::numeric_limits<double>::quiet_NaN());
+    auto lower = [&](const std::vector<double>& e, int64_t x, int64_t y) {
+      return e[x] != e[y] ? e[x] < e[y] : G.pid[x] < G.pid[y];
+    };
+    auto byEnergy = [&](int64_t x, int64_t y) { return lower(R.energy, x, y); };
+    std::vector<int> refine_list;
+    std::vector<std::vector<int64_t>> cand(ng);
+    for (int g = 0; g < ng; g++) {
+      if (nb[g] == 0) continue;
+      const int64_t* p = &perm[G.off[g]];
+      if (!(capped && nb[g] > P.cap)) {
+        R.centre[g] = *std::min_element(p, p + nb[g], byEnergy);
+        continue;
+      }
+      std::vector<int64_t>& c = cand[g];
+      c.assign(p, p + nb[g]);
+      const int64_t m = std::min(P.refine, nb[g]);
+      std::partial_sort(c.begin(), c.begin() + m, c.end(), byEnergy);
+      c.resize((size_t)m);
+      refine_list.push_back(g);
+    }
+    if (!refine_list.empty()) {
+      std::vector<Real> tgt, src;
+      std::vector<int> grp;
+      std::vector<int64_t> off;
+      std::vector<double> out;
+      int64_t pairs = 0;
+      for (size_t b = 0; b < refine_list.size(); b++) {
+        const int g = refine_list[b];
+        off.push_back((int64_t)src.size() / 4);
+        for (int64_t i : cand[g]) {
+          row(tgt, i, G.mass[i]);
+          grp.push_back((int)b);
+        }
+        for (int64_t k = 0; k < nb[g]; k++) {
+          const int64_t i = perm[G.off[g] + k];
+          row(src, i, G.mass[i]);
+        }
+        pairs += (int64_t)cand[g].size() * nb[g];
+      }
+      off.push_back((int64_t)src.size() / 4);
+      const double ks = launch(tgt, grp, src, off, out);
+      kernel_total += ks;
+      R.stats.pairs_refine += pairs;
+      R.stats.kernel_s_refine += ks;
+      R.stats.refined_groups += (int64_t)refine_list.size();
+      size_t t = 0;
+      for (int g : refine_list) {
+        int64_t best = -1, best_rank = 0;
+        for (size_t r = 0; r < cand[g].size(); r++, t++) {
+          const int64_t i = cand[g][r];
+          double dv[3];
+          detail::relativeVelocity(&G.pos[3 * i], &G.vel[3 * i], frame[g], Ha, wrap, P.box,
+                                   dv);
+          R.refined[i] = 0.5 * (dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]) + Ga * out[t];
+          if (best < 0 || lower(R.refined, i, best)) {
+            best = i;
+            best_rank = (int64_t)r;
+          }
+        }
+        R.centre[g] = best;
+        R.centre_rank[g] = best_rank;
+        R.refined_group[g] = 1;
+      }
     }
   }
 
