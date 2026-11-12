@@ -2120,6 +2120,48 @@ With `--first-origin` (the Mac's version since the merge) it writes the
 files of job 5904769 (this section's version) byte for byte. `unbindcheck`
 gives the kernel the verdicts of jobs 5904424 and 5904769 again.
 
+### The reference for the kernel on wide groups (2026-11-12, job 5911041)
+
+Three checks that job 5910905 did not make. One node, 45 s, 0.01
+node-hours (`subhalo/run_wide_reference_check.sbatch`, paratreet2 d370188).
+
+1. `unbindspec --carried-kernel` from the lowest id (no `--first-origin`,
+   so no HBT-HERONS run is needed), and the six kernel forms of job 5904186
+   (first frame from the lowest id) against it with `unbindcheck --tau
+   0.00141`. The four single-precision forms were judged with
+   `--single-against` the double-precision dump; their tolerance came out
+   between 0.00141 and 0.00688.
+
+   | Input | `--carried-kernel`: groups with a sub-halo / bound particles (count) | Groups with the stale-frame case (count) | Kernel forms with identical bound sets (of 6; higher is better) | Kernel forms that pass (of 6; higher is better) | Largest \|dE\|/S: double / single summed in double / single summed in single (fraction of S; lower is better) |
+   |---|---|---|---|---|---|
+   | cube45 | 11 / 79,559 | 0 | 6 | 6 | 2.2e-9 / 4.2e-7 / 5.7e-5 |
+   | cube40 | 9 / 79,066 | 0 | 6 | 6 | 2.2e-9 / 4.2e-7 / 5.7e-5 |
+   | w565 | 1,561 / 514,690 | 0 | 6 | 6 | 1.3e-8 / 2.2e-5 / 2.4e-4 |
+   | w580 | 1,522 / 389,629 | 0 | 6 | 6 | 2.0e-8 / 2.2e-5 / 8.2e-4 |
+
+   cube40 failed against plain `unbindspec` in job 5904186 (7 energies
+   apart, 6 of them beyond 10 tau). Against this form it passes in all six
+   forms: every energy, those 7 included, agrees to 2.2e-9 of S in double
+   precision.
+2. The five other kernel forms from HBT-HERONS's first particles (job
+   5910905 checked double precision only), against
+   `carried.5910905/<input>/carried-kernel.particles.bin` with
+   `--first-origin` and `--single-against` the double-precision dump:
+   identical bound sets and PASS in all 20 runs, largest \|dE\|/S 2.4e-4
+   (single summed in single, w565).
+3. The kernel's own count of the stale-frame case (its log line "groups
+   where HBT-HERONS would move the kinetic term from a stale frame"): from
+   HBT-HERONS's first particles 0 on cube45, cube40 and w565 and 1 on w580
+   in all six forms, as `unbindspec --carried` reports. From the lowest id
+   (job 5904186's logs) it is 0 on all four inputs in all six forms, as
+   `--carried-kernel` from the lowest id reports.
+
+**The reference for the kernel on wide groups is `unbindspec
+--carried-kernel` from the lowest id.** It needs no HBT-HERONS run and no
+first particle, and the kernel matches it in every form on all four wide
+inputs. To compare with a particular HBT-HERONS run, `unbindspec --carried`
+from that run's first particles reproduces it (job 5910905).
+
 ### How this section fits with "HBT-HERONS on the Mac"
 
 - On 8m-lambb the two machines' exact references are the same bit for bit.
@@ -2191,6 +2233,7 @@ double-precision builds over particles bound in both, and tau = max(1e-4,
 - `run_hbt_compare.sbatch`: the two jobs. Inputs are listed per node in
   `LANES`; usage in its header.
 - `run_carried_check.sbatch`: job 5910905.
+- `run_wide_reference_check.sbatch`: job 5911041.
 - Since the merge with the Mac's commit (726a072), `unbindspec
   --first-origin` is the Mac's version. `unbindcheck --first-origin`
   refuses a group sampled under `--cap`, as `unbindspec` does.
@@ -2206,7 +2249,9 @@ particles, for `--first-origin`), HBT-HERONS's configurations and logs,
 particles) and the `unbindcheck` logs. The jobs' output is
 `hbt_compare.5904424.out` and `hbt_compare.5904769.out` one level up. Job
 5910905 wrote `carried.5910905/<input>/` (the `--carried` and
-`--carried-kernel` results and logs) and `carried.5910905.out`.
+`--carried-kernel` results and logs) and `carried.5910905.out`; job 5911041
+wrote `widecheck.5911041/<input>/` (`lowest_carried_kernel.particles.bin`
+and the `unbindcheck` logs) and `widecheck.5911041.out`.
 
 ### Not done
 
@@ -2249,7 +2294,10 @@ particles) and the `unbindcheck` logs. The jobs' output is
     the kernel is right and the reference for wide groups is `unbindspec
     --first-origin --carried` (Mac). On Frontier, from HBT-HERONS's first
     particles, the kernel has its bound sets exactly on cube45, cube40 and
-    w565 in all six forms, and the definition computed afresh does not;
+    w565 in all six forms, and the definition computed afresh does not.
+    The reference for the kernel itself on wide groups is `unbindspec
+    --carried-kernel` from the lowest id: all six forms match it on all
+    four wide inputs (job 5911041);
   - HBT-HERONS's first frame of a wide group depends on a particle the
     input does not fix, and the Mac and Frontier pick different ones. It
     is printed now (`hbt_firstparticle.patch`), and `unbindspec` and
