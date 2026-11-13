@@ -3071,14 +3071,49 @@ changes; its gathered and plug-in results are the same as below.
      4.65 s (speedup 1.03); the rest of the step (sorting, packing, writing
      the files) is the larger part at this size and is not broken down yet.
 
+### cosmo2b at 64 nodes (job 5918223, 7 min, 7.4 node-hours)
+
+`subhalo/run_fof3_unbind_cosmo2b.sbatch`, run with the user's go (estimate
+16 to 27 node-hours). cosmo25cmb.768g2_dm.001024: 1,981,808,640 particles,
+periodic box of side 1 (`-P 1`), a = 1, softening 1.38e-5; 452,984,832 of
+the particles sit in Tipsy's gas slot with zero density and 500 K and are
+treated as collisionless (decision 6). 512 processes, one per die, the CPU
+arm for FoF, production defaults (cap 10,000, refinement 1,000, `bf`
+0.995), no output files.
+
+- Both runs give the same FoF result: label digest fd3dff4594fde3de (the
+  first periodic run of cosmo2b, so there is no gold value yet), 2,633,149
+  groups of 20 or more holding 1,198,938,412 particles, largest 185,317,566
+  (catalogue digest 19aef5f707ff4c87).
+- Both give 1,662,654 sub-haloes holding 1,134,292,769 particles, with the
+  same digest_subhaloes (4ccb321c9763c258): every group's bound count and
+  most bound particle are the same whether its 94 largest groups stay
+  spread or are gathered. 4,941 groups are sampled, 4,731 refined, 5 have
+  the stale-frame case. The catalogue rows carry every sub-halo in both.
+- With the defaults 94 groups stay spread, over 365 of the 512 processes
+  (at most 3.9 M of their particles on one process), in 15 rounds.
+- First-pass pair terms: 9.8e12, as the estimate in "The three large
+  inputs" (9.7e12).
+
+Time (s; lower is better):
+
+| Run | Gather | Gathered groups' step | Slowest device call | Spread groups (slowest holder, of it kernels; driver) | Unbinding in all |
+|---|---|---|---|---|---|
+| defaults (94 spread) | 0.33 | 2.63 | 1.48 | 5.07 (1.98, 0.27; 0.19) | 8.0 |
+| gather=0 (all gathered) | 17.9 | 204.7 | 146.0 | - | 222.6 |
+
+Keeping the 94 largest groups spread gives a speedup of 27.7 on the whole
+unbinding. Gathered, the largest group puts 186 M particles on one process
+and its first pass alone takes 11.1 s of kernel time there. In the spread
+run the 5.07 s of the spread groups is mostly outside the holders' work
+(1.98 s at most) and the driver (0.19 s): the rounds' broadcasts and
+reductions (44 MB of commands, 79 MB of reports), the holders' set-up and
+the return of the flags. That is the next thing to measure.
+
 ### Not done in 2c and 2d
 
-- **cosmo2b at 64 nodes** (`subhalo/run_fof3_unbind_cosmo2b.sbatch`, two
-  FoF3 runs: the defaults, about 90 groups spread, and `gather=0`): waits
-  for the go. Estimate: 64 nodes for 15 to 25 minutes, 16 to 27
-  node-hours. cosmo2b stores 452,984,832 of its particles in Tipsy's gas
-  slot with zero density and 500 K; the run treats them as collisionless
-  (decision 6).
+- A breakdown of the spread groups' time on cosmo2b (5.07 s, of which the
+  holders' work is at most 1.98 s).
 - A breakdown of the unbinding step outside the device call (sorting,
   packing, digests, file writes), now the larger part on lambb.
 - The command of each round is broadcast to every PE. With about 90
@@ -3170,5 +3205,6 @@ changes; its gathered and plug-in results are the same as below.
   `gather` stay spread and give the gathered bound sets and most bound
   particles on 8m-lambb; the bound flags reach each particle's PE (`-L`'s
   `.sub` files, the plug-in's `subhaloLabels()`), the sub-halo fields reach
-  the catalogue rows, and the lambb gate passes. Open: cosmo2b at 64 nodes
-  (waits for the go), see "Not done in 2c and 2d".
+  the catalogue rows, and the lambb gate passes. cosmo2b at 64 nodes (job
+  5918223): the same sub-haloes spread or gathered, unbinding 8.0 s with
+  the defaults against 222.6 s all gathered. See "Not done in 2c and 2d".
