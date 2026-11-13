@@ -5,7 +5,9 @@
 //
 // 1. Kernel check. The potential from unbind_kernel.h against a plain
 //    double-precision direct sum on the host: all pairs, targets apart from
-//    sources, and nearest-image separations in a small periodic box.
+//    sources, and nearest-image separations in a small periodic box. Both
+//    forms: potential() and potentialSplit() at chunks of 1, 7, 64 and 5,000
+//    sources.
 // 2. Unbinding check. unbindGroups (unbind_groups.h) against a separate
 //    serial implementation of the same rules that works on absolute
 //    positions, skips the self pair explicitly and computes every pass in
@@ -31,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -150,7 +153,8 @@ int64_t unbindRef(const Abs& A, const std::vector<int64_t>& members,
 template <class Real, class Acc, bool Fast>
 double kernelError(const std::vector<double>& tgt, const std::vector<int>& tgt_group,
                    const std::vector<double>& src, const std::vector<int64_t>& src_off,
-                   const std::vector<double>& ref, double eps, double box, bool self) {
+                   const std::vector<double>& ref, double eps, double box, bool self,
+                   int64_t chunk = 0) {
   const int64_t nt = (int64_t)tgt_group.size(), ns = (int64_t)src.size() / 4;
   unbind::ParticleView<Real> d_tgt("tgt", nt), d_src("src", ns);
   unbind::GroupView d_group("group", nt);
@@ -172,8 +176,14 @@ double kernelError(const std::vector<double>& tgt, const std::vector<int>& tgt_g
   Kokkos::deep_copy(d_group, h_group);
   Kokkos::deep_copy(d_off, h_off);
   // self: the kernel is given one view as both targets and sources.
-  unbind::potential<Real, Acc, Fast>(d_tgt, d_group, self ? d_tgt : d_src, d_off, d_phi,
-                                     eps, box, self);
+  // chunk > 0: the split form, each target's sum in chunks of that many.
+  if (chunk > 0)
+    unbind::potentialSplit<Real, Acc, Fast>(
+        d_tgt, unbind::splitPlan(tgt_group.data(), nt, src_off.data(), chunk),
+        self ? d_tgt : d_src, d_off, d_phi, eps, box, self);
+  else
+    unbind::potential<Real, Acc, Fast>(d_tgt, d_group, self ? d_tgt : d_src, d_off, d_phi,
+                                       eps, box, self);
   auto h_phi = Kokkos::create_mirror_view(d_phi);
   Kokkos::deep_copy(h_phi, d_phi);
   double worst = 0;
@@ -248,23 +258,36 @@ bool checkKernel() {
       src.insert(src.end(), p.begin() + 4 * s0, p.end());
       src_off.push_back((int64_t)src.size() / 4);
     }
-    const double e[6] = {
-        kernelError<double, double, false>(tgt, tgt_group, src, src_off, ref, c.eps, c.box, c.self),
-        kernelError<double, double, true>(tgt, tgt_group, src, src_off, ref, c.eps, c.box, c.self),
-        kernelError<float, double, false>(tgt, tgt_group, src, src_off, ref, c.eps, c.box, c.self),
-        kernelError<float, double, true>(tgt, tgt_group, src, src_off, ref, c.eps, c.box, c.self),
-        kernelError<float, float, false>(tgt, tgt_group, src, src_off, ref, c.eps, c.box, c.self),
-        kernelError<float, float, true>(tgt, tgt_group, src, src_off, ref, c.eps, c.box, c.self)};
     const double all = branch[0] + branch[1] + branch[2];
     const bool covered = c.eps < 0.1 || (branch[0] >= 0.01 * all && branch[1] >= 0.01 * all);
-    const bool pass = covered && e[0] < tol_f64 && e[1] < tol_f64 && e[2] < tol_f32 &&
-                      e[3] < tol_f32 && e[4] < tol_f32 && e[5] < tol_f32;
-    ok = ok && pass;
-    printf("%-36s softening %.2f (pairs inside h/2: %.2f%%, h/2 to h: %.2f%%)\n"
-           "    largest relative error: f64 %.1e (rsqrt %.1e)  f32/f64 %.1e (rsqrt %.1e)"
-           "  f32/f32 %.1e (rsqrt %.1e)  %s\n",
-           c.name, c.eps, 100 * branch[0] / all, 100 * branch[1] / all, e[0], e[1], e[2],
-           e[3], e[4], e[5], pass ? "ok" : "FAIL");
+    printf("%-36s softening %.2f (pairs inside h/2: %.2f%%, h/2 to h: %.2f%%)%s\n", c.name,
+           c.eps, 100 * branch[0] / all, 100 * branch[1] / all,
+           covered ? "" : "  FAIL: too few softened pairs");
+    ok = ok && covered;
+    // chunk 0: one thread per target (potential). Otherwise the split form
+    // (potentialSplit): 1 and 7 give many chunks and a short last one, 64
+    // some, 5,000 one chunk per target (the largest group has 3,000).
+    for (const int64_t chunk : {0, 1, 7, 64, 5000}) {
+      auto err = [&](auto real, auto acc, auto fast) {
+        using R = decltype(real);
+        using A = decltype(acc);
+        return kernelError<R, A, decltype(fast)::value>(tgt, tgt_group, src, src_off, ref,
+                                                        c.eps, c.box, c.self, chunk);
+      };
+      using F = std::false_type;
+      using T = std::true_type;
+      const double e[6] = {err(0.0, 0.0, F()), err(0.0, 0.0, T()),  err(0.0f, 0.0, F()),
+                           err(0.0f, 0.0, T()), err(0.0f, 0.0f, F()), err(0.0f, 0.0f, T())};
+      const bool pass = e[0] < tol_f64 && e[1] < tol_f64 && e[2] < tol_f32 && e[3] < tol_f32 &&
+                        e[4] < tol_f32 && e[5] < tol_f32;
+      ok = ok && pass;
+      char form[32];
+      if (chunk == 0) snprintf(form, sizeof form, "one thread per target");
+      else snprintf(form, sizeof form, "split, chunks of %lld", (long long)chunk);
+      printf("    %-22s largest relative error: f64 %.1e (rsqrt %.1e)  f32/f64 %.1e "
+             "(rsqrt %.1e)  f32/f32 %.1e (rsqrt %.1e)  %s\n",
+             form, e[0], e[1], e[2], e[3], e[4], e[5], pass ? "ok" : "FAIL");
+    }
   }
   printf("CHECK kernel %s (tolerance: f64 %.0e, f32 %.0e)\n", ok ? "PASS" : "FAIL",
          tol_f64, tol_f32);

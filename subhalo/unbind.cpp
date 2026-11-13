@@ -26,6 +26,10 @@
 //                         note). The dump then also has MostBound (0/1, one
 //                         per group with a sub-halo) and RefinedEnergy (the
 //                         new energy of a refined particle, NaN otherwise)
+//     --refine-chunk S    the refinement kernel splits each candidate's sum
+//                         into chunks of S sources (default 1,024); 0 = one
+//                         thread per candidate, the kernel of job 5916562.
+//                         The chunk size changes the energies by rounding
 //     --first-origin <file>   lines "group id, particle id": the particle a
 //                         group's FIRST frame takes its nearest-image offsets
 //                         from (default: the group's lowest particle id). It
@@ -186,6 +190,7 @@ int main(int argc, char** argv) {
     else if (a == "--min-bound") P.min_bound = atoi(next());
     else if (a == "--cap") P.cap = atoll(next());
     else if (a == "--refine") P.refine = atoll(next());
+    else if (a == "--refine-chunk") P.refine_chunk = atoll(next());
     else if (a == "--bound-fraction") P.bound_fraction = atof(next());
     else if (a[0] != '-' && snap.empty()) snap = a;
     else die("unknown argument " + a);
@@ -194,7 +199,8 @@ int main(int argc, char** argv) {
     fprintf(stderr,
             "usage: unbind <snapshot.hdf5> [--ref table] [--out table] [--dump file.hdf5]\n"
             "              [--kernel f64|f32|f32f32] [--rsqrt] [--float-positions] [--open]\n"
-            "              [--cap C [--refine K]] [--min-bound N] [--bound-fraction F]\n"
+            "              [--cap C [--refine K [--refine-chunk S]]] [--min-bound N]\n"
+            "              [--bound-fraction F]\n"
             "              [--first-origin file]\n");
     return 2;
   }
@@ -292,9 +298,16 @@ int main(int argc, char** argv) {
          float_positions ? "rounded to single precision" : "as stored", read_s, group_s);
   if (P.cap < 0) die("--cap must not be negative");
   if (P.refine < 0 || (P.refine > 0 && P.cap == 0)) die("--refine needs a positive K and --cap");
-  if (P.refine > 0)
+  if (P.refine_chunk < 0) die("--refine-chunk must not be negative");
+  if (P.refine > 0) {
     printf("unbind: centre refinement of the %lld lowest energies in each group whose bound "
            "set ends above the cap\n", (long long)P.refine);
+    if (P.refine_chunk > 0)
+      printf("unbind: refinement kernel: each candidate's sum in chunks of %lld sources\n",
+             (long long)P.refine_chunk);
+    else
+      printf("unbind: refinement kernel: one thread per candidate\n");
+  }
   if (P.cap > 0) {
     long long above = 0;
     for (int g = 0; g < ng; g++) above += G.off[g + 1] - G.off[g] > P.cap;

@@ -49,7 +49,9 @@
 // group whose bound set is still above the cap, the K bound particles of
 // lowest energy (ties by id) get their energy again from ALL the bound
 // particles, true masses, in the frame of the bound set: one launch for all
-// such groups, K times the bound count pair terms each. The most bound
+// such groups, K times the bound count pair terms each, each candidate's sum
+// split into chunks of Params::refine_chunk sources (unbind_kernel.h,
+// potentialSplit) so that one large group does not set the time. The most bound
 // particle is the one of lowest such energy, ties by id. Every other group
 // with a sub-halo reports its particle of lowest energy. Result::energy keeps
 // the last pass's energies, as HBT-HERONS keeps its own.
@@ -104,6 +106,10 @@ struct Params {
   int min_bound = 20;
   int64_t cap = 0;   // most sources per particle; 0 = no cap (all pairs)
   int64_t refine = 0;  // centre refinement: candidates per sampled group; 0 = off
+  // Centre refinement kernel: each candidate's sum split into chunks of this
+  // many sources (potentialSplit); 0 = one thread per candidate (potential(),
+  // the kernel of the first GPU run, job 5916562).
+  int64_t refine_chunk = 1024;
 };
 
 struct Stats {
@@ -324,10 +330,11 @@ Result unbindGroups(const Groups& G, const Params& P) {
   // One launch from host rows (x, y, z, w per particle): targets with w =
   // the mass of their own term among the sources (0 if they are not a
   // source), sources with w = mass. Fills out[] with each target's sum and
-  // returns the kernel's seconds.
+  // returns the kernel's seconds. chunk > 0: the split form
+  // (potentialSplit), which needs each group's targets consecutive.
   auto launch = [&](const std::vector<Real>& tgt, const std::vector<int>& grp,
                     const std::vector<Real>& src, const std::vector<int64_t>& off,
-                    std::vector<double>& out) {
+                    std::vector<double>& out, int64_t chunk = 0) {
     using Kokkos::view_alloc;
     using Kokkos::WithoutInitializing;
     using HostRows = Kokkos::View<const Real* [4], Kokkos::LayoutRight, Kokkos::HostSpace,
@@ -347,7 +354,12 @@ Result unbindGroups(const Groups& G, const Params& P) {
                                           Kokkos::MemoryTraits<Kokkos::Unmanaged>>(
                                  off.data(), off.size()));
     const double ks =
-        potential<Real, Acc, Fast>(d_tgt, d_grp, d_src, d_off, d_phi, P.eps, kernel_box, true);
+        chunk > 0
+            ? potentialSplit<Real, Acc, Fast>(
+                  d_tgt, splitPlan(grp.data(), (int64_t)nt, off.data(), chunk), d_src, d_off,
+                  d_phi, P.eps, kernel_box, true)
+            : potential<Real, Acc, Fast>(d_tgt, d_grp, d_src, d_off, d_phi, P.eps, kernel_box,
+                                         true);
     out.resize(nt);
     Kokkos::deep_copy(Kokkos::View<double*, Kokkos::HostSpace,
                                    Kokkos::MemoryTraits<Kokkos::Unmanaged>>(out.data(), nt),
@@ -708,7 +720,7 @@ Result unbindGroups(const Groups& G, const Params& P) {
         pairs += (int64_t)cand[g].size() * nb[g];
       }
       off.push_back((int64_t)src.size() / 4);
-      const double ks = launch(tgt, grp, src, off, out);
+      const double ks = launch(tgt, grp, src, off, out, P.refine_chunk);
       kernel_total += ks;
       R.stats.pairs_refine += pairs;
       R.stats.kernel_s_refine += ks;

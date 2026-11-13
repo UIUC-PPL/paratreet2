@@ -2371,7 +2371,7 @@ and the K partial sums reduced. The kernel gives each candidate one thread,
 which suits many groups in one launch (58,000 threads on 8m-lambb at
 10,000). One very large group alone gives only K threads to a die, so there
 each candidate's sum over the bound particles must also be split across
-threads. Not done.
+threads. Done 2026-11-13 ("The split refinement kernel").
 
 ### The kernel
 
@@ -2556,16 +2556,116 @@ The first pass runs at 1.5e11 to 1.6e11 pair terms per second in f64 and
    group needs each candidate's sum split across threads; on one die this
    shows already for groups of 64,000 to 154,000 particles. The first
    pass of the same group does not have this problem: it has one thread
-   per bound particle, not per candidate.
+   per bound particle, not per candidate. (Fixed by the split kernel,
+   next heading.)
+
+### The split refinement kernel (2026-11-13, job 5916674)
+
+`unbind_kernel.h` gains `potentialSplit`: each candidate's sum over its
+group's bound particles is cut into chunks of S sources, one thread per
+chunk, and a second kernel adds each candidate's chunk sums in chunk order.
+The order is fixed, so a run gives the same bits every time, but it is not
+the order of one thread per candidate, so the refined energies change by
+rounding. Neighbouring threads take the same chunk for different
+candidates, so they read the same sources at the same time, as in the first
+pass. Both kernels now share one pair-term loop (`pairSum`). `unbind
+--refine-chunk S` sets S, default 1,024; `--refine-chunk 0` is the kernel of
+job 5916562. Only the refinement uses the split form.
+
+Job 5916674 (`subhalo/run_unbind_refine_split.sbatch`): one node, 7 min
+51 s, 0.13 node-hours. Nothing was changed to make a run pass.
+
+1. **Self-checks.** `unbind_rate`'s kernel check now also runs the split
+   form with chunks of 1, 7, 64 and 5,000 sources, against the same
+   double-precision host sum and tolerances. All pass (largest relative
+   error f64 1.5e-14, f32 summed in double 9.5e-7, f32 summed in single
+   9.3e-6), and so does the unbinding check.
+2. **Nothing else changed.** With `--refine-chunk 0`, `unbind` writes job
+   5916562's dumps byte for byte (`h5diff` of the whole file): 8m-lambb at
+   both caps in all six forms, the other six inputs in f64, and f64
+   without `--refine` on all eight. Moving the pair-term loop into
+   `pairSum` did not change a bit.
+3. **The split kernel passes every check of job 5916562.** On the same 36
+   runs, against the same references, every `unbindcheck --cap` and
+   `centrecheck.py` exits 0, and the 20 single-precision runs also with
+   `--single-against`. Bound, Energy and MostBound are identical to job
+   5916562's dumps in all 36: the same bound sets and the same most bound
+   particle in every refined group. Largest refined \|dE\|/S against the
+   reference (fraction of S; lower is better):
+
+   | Input | Cap | f64 | f64 rsqrt | f32 | f32 rsqrt | f32f32 (one thread per candidate) | f32f32 rsqrt (one thread per candidate) |
+   |---|---|---|---|---|---|---|---|
+   | 8m-lambb | 1,000 | 1.7e-9 | 1.7e-9 | 1.3e-6 | 1.3e-6 | 5.5e-6 (1.0e-4) | 5.2e-6 (1.0e-4) |
+   | 8m-lambb | 10,000 | 1.0e-9 | 1.0e-9 | 1.2e-6 | 1.3e-6 | 2.6e-6 (1.1e-4) | 2.6e-6 (1.1e-4) |
+   | a0.5 | 10,000 | 7.4e-10 | 7.4e-10 | not run | 9.5e-7 | 2.0e-6 (7.6e-5) | not run |
+   | a1.25 | 10,000 | 1.0e-9 | 1.0e-9 | not run | 2.1e-6 | 1.3e-3 (1.3e-3) | not run |
+   | w565 | 10,000 | 6.3e-10 | 6.3e-10 | not run | 1.9e-5 | 1.7e-5 (1.3e-4) | not run |
+   | w580 | 10,000 | 6.3e-10 | 6.3e-10 | not run | 2.0e-5 | 1.9e-5 (6.0e-4) | not run |
+   | cube45 | 10,000 | 3.1e-10 | 3.1e-10 | not run | 3.9e-7 | 1.8e-6 (4.5e-5) | not run |
+   | cube40 | 10,000 | 3.0e-10 | 3.0e-10 | not run | 3.8e-7 | 1.7e-6 (4.2e-5) | not run |
+
+   In double precision and in f32 summed in double the figures are job
+   5916562's to the digits shown. Summed in single precision (f32f32) the
+   split kernel is 8 to 40 times closer to the reference: each chunk is a
+   short sum, and the chunk sums are added separately. On a1.25 the f32f32
+   figure comes from the two refined groups whose bound sets differ from
+   the reference's, as before.
+4. **Time on one die.** The refinement's kernel time (s; lower is better)
+   by chunk size, and the first pass's for comparison. Times are printed to
+   the millisecond, so the smallest are rough.
+
+   | Input | Cap | Form | One thread per candidate | S = 256 | 512 | 1,024 | 2,048 | 4,096 | First pass |
+   |---|---|---|---|---|---|---|---|---|---|
+   | 8m-lambb | 1,000 | f64 | 0.106 | 0.020 | 0.020 | 0.020 | 0.020 | 0.020 | 0.024 |
+   | 8m-lambb | 1,000 | f32 rsqrt | 0.065 | 0.011 | 0.010 | 0.011 | 0.010 | 0.010 | 0.013 |
+   | 8m-lambb | 10,000 | f64 | 0.105 | 0.013 | 0.013 | 0.013 | 0.013 | 0.014 | 0.158 |
+   | 8m-lambb | 10,000 | f32 rsqrt | 0.066 | 0.007 | 0.006 | 0.006 | 0.007 | 0.007 | 0.075 |
+   | a1.25 | 10,000 | f64 | 0.061 | 0.006 | 0.006 | 0.006 | 0.007 | 0.008 | 0.157 |
+   | a1.25 | 10,000 | f32 rsqrt | 0.039 | 0.003 | 0.003 | 0.003 | 0.003 | 0.004 | 0.074 |
+   | w565 | 10,000 | f64 | 0.058 | 0.002 | 0.002 | 0.003 | 0.004 | 0.004 | 0.037 |
+   | w565 | 10,000 | f32 rsqrt | 0.038 | 0.001 | 0.001 | 0.002 | 0.002 | 0.003 | 0.022 |
+   | cube40 | 10,000 | f64 | 0.071 | 0.001 | 0.001 | 0.001 | 0.002 | 0.004 | 0.012 |
+   | cube40 | 10,000 | f32 rsqrt | 0.047 | 0.001 | 0.001 | 0.001 | 0.001 | 0.003 | 0.008 |
+
+   - **On 8m-lambb at 10,000 the refinement now takes 0.013 s in f64 and
+     0.006 s in f32 rsqrt: 8% of the first pass's kernel time, for 7.8% of
+     its pair terms.** That is a speedup of 8.1 (f64) and 11 (f32 rsqrt)
+     over one thread per candidate. Its rate, 1.5e11 pair terms per second
+     in f64 and 3.3e11 in f32 rsqrt, is the first pass's.
+   - At a cap of 1,000 (3.07e9 pair terms, 89% of the first pass) it takes
+     0.020 s in f64: a speedup of 5.3, and 83% of the first pass's time.
+   - **The time now follows the pair terms, not the largest group**: 0.020
+     s at a cap of 1,000 and 0.013 s at 10,000 on 8m-lambb, where one
+     thread per candidate took 0.105 s at both. On the small inputs the
+     speedup is 19 (w565) and about 70 (cube40, at the timer's
+     resolution).
+   - The chunk size matters little from 256 to 1,024. From 2,048 up the
+     smallest inputs slow down: too few chunks to fill the die. The default
+     stays at 1,024.
+5. **Three broken split kernels are caught.** Each one change in
+   `unbind_kernel.h`, built by `split-mutants/build.sh` on scratch
+   (`/lustre/orion/csc710/scratch/rrao/unbind-2026-11-11/split-mutants/`),
+   run in f64 on 8m-lambb at 1,000 and on cube40 at 10,000:
+   `centrecheck.py` fails all six runs.
+
+   | Broken split kernel | 8m-lambb, cap 1,000: failures (count), largest \|dE\|/S | cube40, cap 10,000: failures (count), largest \|dE\|/S |
+   |---|---|---|
+   | the last, short chunk of each group dropped | 488, 3.6 | 1, 0.018 |
+   | chunks overlapping by one source | 418, 0.046 | 1, 0.0041 |
+   | chunk sums read back transposed | 749, 7.2 | 2, 2.8 |
+
+For the stage inside FoF3, this is the form the third case needs: a group
+spread over processes gives each candidate one partial sum per process,
+added in a fixed order. Here the parts are chunks on one die; there they
+would be the processes' shares of the group. Not built.
 
 ### Not done
 
 - Done 2026-11-13: the GPU run (job 5916562, "Results on Frontier"). Every
   run passes, the rsqrt forms included.
-- A refinement kernel that splits each candidate's sum over its group's
-  bound particles across threads, so that its time follows its pair terms
-  and not its largest group. With the present kernel the refinement costs
-  66 to 89% of the first pass's kernel time on 8m-lambb at 10,000.
+- Done 2026-11-13: the split refinement kernel (job 5916674, "The split
+  refinement kernel"). Its time follows its pair terms: 8% of the first
+  pass's on 8m-lambb at 10,000, a speedup of 8.1 in f64.
 - Whether `--refine 1000` becomes the default with a cap. It is off by
   default so that every earlier run reproduces.
 - The refinement of a group spread over processes, for the stage inside
@@ -2592,7 +2692,9 @@ The first pass runs at 1.5e11 to 1.6e11 pair terms per second in f64 and
   bound particle in every sampled group of 8m-lambb at both caps ("Centre
   refinement"). Done 2026-11-13 on the GPU (job 5916562): every form
   passes; the refinement's kernel time follows its largest group and is 66
-  to 89% of the first pass's on 8m-lambb at 10,000.
+  to 89% of the first pass's on 8m-lambb at 10,000. Done 2026-11-13: the
+  split refinement kernel (job 5916674), 8% of the first pass's time there,
+  every check passing as before.
 - Done 2026-11-11 against the written definition only (job 5904186, "A
   scale factor other than 1, and groups at least half the box wide"): the
   kernel at a = 0.5 and a = 1.25, and on four inputs with groups at least
