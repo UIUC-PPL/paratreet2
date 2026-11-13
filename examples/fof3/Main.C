@@ -72,7 +72,7 @@ PARATREET_REGISTER_MAIN(ExMain);
     // consumed and removed from argv by Configuration::parse before this
     // runs, exactly as in examples/searchAlgos.
     int c;
-    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SCKL:")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "b:c:u:m:P:w:gG:E:D:SCKL:U:")) != -1) {
       switch (c) {
         case 'w':
           if (strcmp(optarg, "dual") == 0)            walk_mode = WalkMode::Dual;
@@ -129,6 +129,9 @@ PARATREET_REGISTER_MAIN(ExMain);
         case 'L':
           fof_label_prefix = optarg;
           break;
+        case 'U':
+          fof_unbind = optarg;
+          break;
         case 'm':
           fof_min_component_size = atoi(optarg);
           if (fof_min_component_size < 0)
@@ -161,6 +164,13 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t-L [prefix: write each particle's (order, label) as two\n");
           CkPrintf("\t    8-byte integers to <prefix>.<pe>.lbl, one file per PE;\n");
           CkPrintf("\t    with -K -m, groups below the minimum size get -1]\n");
+          CkPrintf("\t-U [unbinding after -K: key=value,... in code units:\n");
+          CkPrintf("\t    eps (comoving softening, required), epsmax, a (1),\n");
+          CkPrintf("\t    om (0.3), ol (0.7), cap (10000; 0 = all pairs),\n");
+          CkPrintf("\t    refine (1000), chunk (1024), bf (0.995), min (20),\n");
+          CkPrintf("\t    kernel (f64|f32|f32f32), rsqrt (0|1), out (prefix of\n");
+          CkPrintf("\t    per-process <prefix>.<process>.ubd files), G (1).\n");
+          CkPrintf("\t    GPU=1 builds only]\n");
           CkPrintf("\t-P [periodic box period L (cubic, all axes); default 0 = off\n");
           CkPrintf("\t    (open boundaries). Minimum-image PBC; requires b < L/2]\n");
           CkPrintf("\t-E [UF_2 mid-walk edge-batch size; 0 = classic post-walk\n");

@@ -66,6 +66,9 @@ extern CProxy_ThreadStateHolder thread_state_holder;
 // hapi_portable.h does not pull the vendor header in itself. Build with
 // -D__HIP_PLATFORM_AMD__ or hip_runtime_api.h declares nothing (trap 4).
 #include "gpu/FoFDevice.h"
+// Unbinding inside FoF3 (design/subhalo-checks.md, "Step 2"): the same
+// firewall discipline, the device side is subhalo/libsubhalodevice.a.
+#include "SubhaloDevice.h"
 #if defined(CMK_HIP)
 #include <hip/hip_runtime_api.h>
 #endif
@@ -1284,6 +1287,19 @@ public:
   // only; the driver closes this step with CkWaitQD.
   void recvTouchedCounts(const std::vector<std::pair<long, long>>& v) {
     appendTouchedIn(v);
+  }
+
+  // Unbinding inside FoF3 (design/subhalo-checks.md, "Step 2"): the
+  // particles of the groups this process unbinds. ubd_local[r] is filled by
+  // this process's PE of rank r alone (FoFPhase1::unbindGather), ubd_remote
+  // by other processes' messages under ubd_lock. Both are emptied by
+  // FoFPhase1::unbindRun on this process's first PE.
+  std::vector<std::vector<paratreet::FoFUnbindRec>> ubd_local;
+  std::mutex ubd_lock;
+  std::vector<paratreet::FoFUnbindRec> ubd_remote;
+  void unbindReceive(const std::vector<paratreet::FoFUnbindRec>& v) {
+    std::lock_guard<std::mutex> g(ubd_lock);
+    ubd_remote.insert(ubd_remote.end(), v.begin(), v.end());
   }
 
   void routeCrossEdges() {
@@ -4148,6 +4164,194 @@ public:
     cat_kept_.insert(labels.begin(), labels.end());
   }
 
+  // ---- Unbinding inside FoF3 (design/subhalo-checks.md, "Step 2"), parts
+  // 2a and 2b: every kept group is gathered onto one process and unbound
+  // there on that process's GPU. Needs the catalogue (catalogFinish) first.
+  //
+  // unbindGather: each particle of a kept label goes to the label's
+  // unbinding process: this process when no other holds the label
+  // (untouched, group_number >= 0), otherwise the process of the label's
+  // catalogue owner PE. A local particle is put in this PE's slot of the
+  // node branch; the rest go out as one message per process. The driver
+  // waits for quiescence after the contribution.
+  void unbindGather(const CkCallback& cb) {
+    auto* nb = node_proxy.ckLocalBranch();
+    {
+      std::lock_guard<std::mutex> g(nb->ubd_lock);
+      if (nb->ubd_local.size() < (size_t)CkMyNodeSize()) nb->ubd_local.resize(CkMyNodeSize());
+    }
+    auto& mine = nb->ubd_local[CkMyRank()];
+    mine.clear();
+    std::map<int, std::vector<paratreet::FoFUnbindRec>> out;
+    for (auto& s : treepieces)
+      for (int i = 0; i < s.n; i++) {
+        const Particle& p = s.parts[i];
+        const long label = paratreet::uf2MinOrderLabel(p.group_number);
+        if (label < 0) continue;
+        if (cat_min_size_ > 1 && !cat_kept_.count(label)) continue;
+        paratreet::FoFUnbindRec r;
+        r.order = p.order;
+        r.label = label;
+        r.x[0] = p.position.x; r.x[1] = p.position.y; r.x[2] = p.position.z;
+        r.v[0] = p.velocity.x; r.v[1] = p.velocity.y; r.v[2] = p.velocity.z;
+        r.m = p.mass;
+        int node = CkMyNode();
+        if (p.group_number < 0)
+          node = CkNodeOf(int(labelShardMix(label) % (uint64_t)CkNumPes()));
+        if (node == CkMyNode()) mine.push_back(r);
+        else out[node].push_back(r);
+      }
+    for (auto& kv : out) node_proxy[kv.first].unbindReceive(kv.second);
+    this->contribute(cb);
+  }
+
+  // unbindRun: on each process's first PE, sort the gathered particles by
+  // (label, id), unbind every group in one call on the process's GPU
+  // (subhalodev::unbind, i.e. unbind_groups.h), write <prefix>.<process>.ubd
+  // if a prefix is given, and contribute the totals (runFoFUnbind reads
+  // them). The other PEs contribute zeros.
+  void unbindRun(paratreet::FoFUnbindSpec spec, std::string prefix, const CkCallback& cb) {
+    // Sums (long): kept groups, groups with a sub-halo, bound particles,
+    // particles gathered, groups at least half the box wide, sampled
+    // groups, refined groups, groups with the stale-frame case, rounds.
+    long L[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    // Sums (wrapping): digest of the sub-haloes, digest of the particles.
+    unsigned long long D[2] = {0, 0};
+    // Sums (double): pair terms of the first pass, later passes, refinement.
+    double S[3] = {0, 0, 0};
+    // Maxima (double): this step's wall on the process, its device call,
+    // kernel first / later / refinement, host part of the call.
+    double M[6] = {0, 0, 0, 0, 0, 0};
+    // Maxima (long): largest group, particles on one process.
+    long X[2] = {0, 0};
+    if (CkMyPe() == CkNodeFirst(CkMyNode())) {
+      const double t0 = CkWallTimer();
+      auto* nb = node_proxy.ckLocalBranch();
+      std::vector<paratreet::FoFUnbindRec> all;
+      {
+        std::lock_guard<std::mutex> g(nb->ubd_lock);
+        size_t n = nb->ubd_remote.size();
+        for (auto& v : nb->ubd_local) n += v.size();
+        all.reserve(n);
+        for (auto& v : nb->ubd_local) {
+          all.insert(all.end(), v.begin(), v.end());
+          std::vector<paratreet::FoFUnbindRec>().swap(v);
+        }
+        all.insert(all.end(), nb->ubd_remote.begin(), nb->ubd_remote.end());
+        std::vector<paratreet::FoFUnbindRec>().swap(nb->ubd_remote);
+      }
+      std::sort(all.begin(), all.end(),
+                [](const paratreet::FoFUnbindRec& a, const paratreet::FoFUnbindRec& b) {
+                  return a.label != b.label ? a.label < b.label : a.order < b.order;
+                });
+      const int64_t n = (int64_t)all.size();
+      X[1] = n;
+      L[3] = n;
+#ifdef FOF_GPU
+      std::vector<int64_t> lab(n), id(n);
+      std::vector<double> pos(3 * (size_t)n), vel(3 * (size_t)n), mass(n);
+      for (int64_t i = 0; i < n; i++) {
+        const auto& r = all[i];
+        lab[i] = r.label;
+        id[i] = r.order + 1;   // tipsy2hbt's ParticleIDs: the capped sample's key
+        for (int k = 0; k < 3; k++) {
+          pos[3 * i + k] = r.x[k];
+          vel[3 * i + k] = r.v[k] * spec.vel_factor;
+        }
+        mass[i] = r.m;
+      }
+      if (!nb->dev_inited) deviceBind(nb);
+      subhalodev::Params P;
+      P.G = spec.G; P.a = spec.a; P.H = spec.H; P.eps = spec.eps; P.box = spec.box;
+      P.bound_fraction = spec.bound_fraction;
+      P.min_bound = spec.min_bound;
+      P.cap = spec.cap; P.refine = spec.refine; P.refine_chunk = spec.chunk;
+      P.kernel = spec.kernel; P.rsqrt = spec.rsqrt != 0;
+      subhalodev::Input in;
+      in.n = n;
+      in.label = lab.data(); in.id = id.data();
+      in.pos = pos.data(); in.vel = vel.data(); in.mass = mass.data();
+      subhalodev::Output o;
+      subhalodev::unbind(in, P, o);
+      std::vector<unsigned char> centre_of(n, 0);
+      for (size_t g = 0; g < o.label.size(); g++) {
+        L[0]++;
+        X[0] = std::max(X[0], (long)o.count[g]);
+        if (o.nbound[g] > 0) {
+          L[1]++;
+          L[2] += o.nbound[g];
+          if (o.centre[g] < 0) CkAbort("FoF unbindRun: a sub-halo without a most bound particle");
+          centre_of[o.centre[g]] = 1;
+          D[0] += unbindDigestTerm((uint64_t)o.label[g], (uint64_t)o.nbound[g],
+                                   (uint64_t)all[o.centre[g]].order);
+        }
+        L[7] += o.stale_frame[g];
+      }
+      for (int64_t i = 0; i < n; i++) {
+        uint64_t bits;
+        std::memcpy(&bits, &o.energy[i], sizeof bits);
+        D[1] += unbindDigestTerm((uint64_t)all[i].order, (uint64_t)o.bound[i], bits);
+      }
+      L[4] = o.wide_groups; L[5] = o.sampled_groups; L[6] = o.refined_groups;
+      L[8] = o.rounds;
+      S[0] = o.pairs_first; S[1] = o.pairs_later; S[2] = o.pairs_refine;
+      M[1] = o.wall_s;
+      M[2] = o.kernel_s_first; M[3] = o.kernel_s_later; M[4] = o.kernel_s_refine;
+      M[5] = o.host_s;
+      if (!prefix.empty()) {
+        // Written in the groups' order; a reader places records by order.
+        const std::string path = prefix + "." + std::to_string(CkMyNode()) + ".ubd";
+        FILE* f = fopen(path.c_str(), "wb");
+        if (!f) CkAbort("FoF unbindRun: cannot open %s", path.c_str());
+        std::vector<paratreet::FoFUnbindOut> buf((size_t)n);
+        std::vector<unsigned char> refined_of(n, 0);
+        for (size_t g = 0; g < o.label.size(); g++)
+          for (int64_t k = o.first[g]; k < o.first[g] + o.count[g]; k++)
+            refined_of[k] = o.refined_group[g];
+        for (int64_t i = 0; i < n; i++) {
+          paratreet::FoFUnbindOut& r = buf[i];
+          std::memset(&r, 0, sizeof r);
+          r.order = all[i].order;
+          r.label = all[i].label;
+          r.energy = o.energy[i];
+          r.refined = o.refined[i];
+          r.bound = o.bound[i];
+          r.most_bound = centre_of[i];
+          r.refined_group = refined_of[i];
+        }
+        if (n > 0 && fwrite(buf.data(), sizeof(paratreet::FoFUnbindOut), buf.size(), f) !=
+                         buf.size())
+          CkAbort("FoF unbindRun: short write to %s", path.c_str());
+        if (fclose(f) != 0) CkAbort("FoF unbindRun: cannot close %s", path.c_str());
+      }
+#else
+      if (n > 0) CkAbort("FoF3 -U (unbinding) needs a build with GPU=1");
+#endif
+      M[0] = CkWallTimer() - t0;
+    }
+    CkReduction::tupleElement te[] = {
+        CkReduction::tupleElement(sizeof(L), L, CkReduction::sum_long),
+        CkReduction::tupleElement(sizeof(D), D, CkReduction::sum_ulong_long),
+        CkReduction::tupleElement(sizeof(S), S, CkReduction::sum_double),
+        CkReduction::tupleElement(sizeof(M), M, CkReduction::max_double),
+        CkReduction::tupleElement(sizeof(X), X, CkReduction::max_long)};
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(te, 5);
+    msg->setCallback(cb);
+    this->contribute(msg);
+  }
+
+  // One term of the unbinding digests: splitmix64 of three values. Summed
+  // with wrap-around, so the order of the terms does not matter.
+  static uint64_t unbindDigestTerm(uint64_t a, uint64_t b, uint64_t c) {
+    auto mix = [](uint64_t z) {
+      z += 0x9E3779B97F4A7C15ull;
+      z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+      z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+      return z ^ (z >> 31);
+    };
+    return mix(mix(mix(a) ^ b) ^ c);
+  }
+
   // Hosted runs, after the results are back: free this PE's phase-1 and
   // catalog scratch (reset() keeps vector capacity), so it does not stay
   // resident through the host's own steps between FoF calls.
@@ -5382,6 +5586,104 @@ FoFCatalogStats runFoFCatalog(CProxy_FoFPhase1<Data> fof, long min_size,
   delete[] te;
   delete msg;
   CkWaitQD();  // the kept-label replies
+  return st;
+}
+
+// Unbinding inside FoF3 (design/subhalo-checks.md, "Step 2"): FoF3 -U's
+// settings, "key=value" pairs separated by commas, in code units (G = 1,
+// box side = the period, critical density 1, so H(a) = sqrt(8 pi / 3) E(a)).
+// Keys: eps (comoving softening; required), epsmax (largest physical
+// softening), a, om, ol, cap, refine, chunk, bf, min, kernel (f64, f32,
+// f32f32), rsqrt (0/1), out (file prefix), G (default 1, the code units'
+// own; any other value only to reproduce a tool whose G differs, such as
+// unbind on a tipsy2hbt snapshot, where HBT-HERONS's 43.0071 is
+// 0.99995179 in code units). Aborts on anything else.
+inline FoFUnbindSpec parseUnbindSpec(const std::string& text, double period,
+                                     std::string* prefix) {
+  FoFUnbindSpec s;
+  double eps = 0, epsmax = 0, om = 0.3, ol = 0.7, G = 1;
+  size_t at = 0;
+  while (at <= text.size()) {
+    size_t end = text.find(',', at);
+    if (end == std::string::npos) end = text.size();
+    const std::string kv = text.substr(at, end - at);
+    at = end + 1;
+    if (kv.empty()) continue;
+    const size_t eq = kv.find('=');
+    if (eq == std::string::npos) CkAbort("-U: '%s' is not key=value", kv.c_str());
+    const std::string k = kv.substr(0, eq), v = kv.substr(eq + 1);
+    if (k == "eps") eps = atof(v.c_str());
+    else if (k == "epsmax") epsmax = atof(v.c_str());
+    else if (k == "a") s.a = atof(v.c_str());
+    else if (k == "om") om = atof(v.c_str());
+    else if (k == "ol") ol = atof(v.c_str());
+    else if (k == "cap") s.cap = atol(v.c_str());
+    else if (k == "refine") s.refine = atol(v.c_str());
+    else if (k == "chunk") s.chunk = atol(v.c_str());
+    else if (k == "bf") s.bound_fraction = atof(v.c_str());
+    else if (k == "min") s.min_bound = atoi(v.c_str());
+    else if (k == "kernel") {
+      if (v == "f64") s.kernel = 0;
+      else if (v == "f32") s.kernel = 1;
+      else if (v == "f32f32") s.kernel = 2;
+      else CkAbort("-U: kernel must be f64, f32 or f32f32");
+    } else if (k == "rsqrt") s.rsqrt = atoi(v.c_str());
+    else if (k == "out") { if (prefix) *prefix = v; }
+    else if (k == "G") G = atof(v.c_str());
+    else CkAbort("-U: unknown key '%s'", k.c_str());
+  }
+  if (!(eps > 0)) CkAbort("-U needs eps=<comoving softening in code units>");
+  if (!(s.a > 0)) CkAbort("-U: a must be positive");
+  if (s.cap < 0 || s.refine < 0 || s.chunk < 0 || s.min_bound < 1)
+    CkAbort("-U: cap, refine and chunk must not be negative, min must be positive");
+  if (!(G > 0)) CkAbort("-U: G must be positive");
+  s.G = G;
+  s.H = 2.894405 * std::sqrt(om / (s.a * s.a * s.a) + ol + (1 - om - ol) / (s.a * s.a));
+  s.eps = epsmax > 0 ? std::min(eps, epsmax / s.a) : eps;
+  s.box = period;
+  s.vel_factor = s.a;   // Tipsy velocity times a = peculiar (tipsy2hbt's convention)
+  return s;
+}
+
+struct FoFUnbindStats {
+  long groups = 0, subhaloes = 0, bound = 0, particles = 0, wide = 0, sampled = 0,
+       refined = 0, stale = 0, rounds = 0, largest = 0, max_per_process = 0;
+  unsigned long long digest_subhaloes = 0, digest_particles = 0;
+  double pairs_first = 0, pairs_later = 0, pairs_refine = 0;
+  double t_gather = 0, t_run = 0, t_device_call = 0, t_kernel_first = 0, t_kernel_later = 0,
+         t_kernel_refine = 0, t_host = 0;
+};
+
+// Gather (one quiescence) and unbind. Call after runFoFCatalog.
+template <typename Data>
+FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spec,
+                            const std::string& prefix) {
+  FoFUnbindStats st;
+  const double t0 = CkWallTimer();
+  fof.unbindGather(CkCallbackResumeThread());
+  CkWaitQD();
+  const double t1 = CkWallTimer();
+  CkReductionMsg* msg = nullptr;
+  fof.unbindRun(spec, prefix, CkCallbackResumeThread((void*&)msg));
+  st.t_gather = t1 - t0;
+  st.t_run = CkWallTimer() - t1;
+  CkReduction::tupleElement* te = nullptr;
+  int nte = 0;
+  msg->toTuple(&te, &nte);
+  const long* L = (const long*)te[0].data;
+  const unsigned long long* D = (const unsigned long long*)te[1].data;
+  const double* S = (const double*)te[2].data;
+  const double* M = (const double*)te[3].data;
+  const long* X = (const long*)te[4].data;
+  st.groups = L[0]; st.subhaloes = L[1]; st.bound = L[2]; st.particles = L[3];
+  st.wide = L[4]; st.sampled = L[5]; st.refined = L[6]; st.stale = L[7]; st.rounds = L[8];
+  st.digest_subhaloes = D[0]; st.digest_particles = D[1];
+  st.pairs_first = S[0]; st.pairs_later = S[1]; st.pairs_refine = S[2];
+  st.t_device_call = M[1]; st.t_kernel_first = M[2]; st.t_kernel_later = M[3];
+  st.t_kernel_refine = M[4]; st.t_host = M[5];
+  st.largest = X[0]; st.max_per_process = X[1];
+  delete[] te;
+  delete msg;
   return st;
 }
 

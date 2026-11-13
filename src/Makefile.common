@@ -119,9 +119,13 @@ HAS_HAPI := $(wildcard $(CHARM_HOME)/include/hapi.h)
 ifneq ($(HAS_HAPI),)
 	INCLUDES := $(INCLUDES) -D__HIP_PLATFORM_AMD__
 endif
+# Unbinding inside FoF3 (design/subhalo-checks.md, "Step 2") is a second
+# hipcc library behind the same kind of firewall header: subhalo/
+# SubhaloDevice.h, built by `make -C subhalo device`.
+SUBHALO_PATH = $(BASE_PATH)/subhalo
 ifeq ($(GPU),1)
-	GPU_OPTS = -DFOF_GPU -I$(FOF_PATH)
-	FOF_GPU_LD_LIBS = -L$(FOF_GPU_PATH) -lfofdevice \
+	GPU_OPTS = -DFOF_GPU -I$(FOF_PATH) -I$(SUBHALO_PATH)
+	FOF_GPU_LD_LIBS = -L$(FOF_GPU_PATH) -lfofdevice -L$(SUBHALO_PATH) -lsubhalodevice \
 	                  -L$(KOKKOS_DIR)/lib64 -lkokkoscontainers \
 	                  -lkokkosalgorithms -lkokkoscore -ldl
 	# Name the archive as a LINK PREREQUISITE, not just as -l: without it
@@ -129,7 +133,7 @@ ifeq ($(GPU),1)
 	# is rebuilt and silently relinks nothing (the stale-.a trap
 	# design/frontier-labeling-ab.md records for libunionFind.a — it cost
 	# a wasted job here on 2026-08-12).
-	FOF_GPU_LIB = $(FOF_GPU_PATH)/libfofdevice.a
+	FOF_GPU_LIB = $(FOF_GPU_PATH)/libfofdevice.a $(SUBHALO_PATH)/libsubhalodevice.a
 else
 	GPU_OPTS =
 	FOF_GPU_LD_LIBS =

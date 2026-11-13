@@ -71,6 +71,7 @@ module fof {
     // the (label, partial_count) pairs whose component BOSS this process
     // owns. See FoFPhase1::scatterTouchedCounts for the routing rule.
     entry void recvTouchedCounts(const std::vector<std::pair<long, long> >&);
+    entry void unbindReceive(const std::vector<paratreet::FoFUnbindRec>&);
   };
 
   // Per-PE side: per-PE union-find (phaseA), cross-PE edge emission
@@ -178,5 +179,8 @@ module fof {
     // which UnionFindLib::find_components mutated in place).
     entry void collectUF2Labels(CProxy_UnionFindLib, const CkCallback&);
     entry void applyUF2Labels(const CkCallback&);
+    entry void unbindGather(const CkCallback&);
+    entry void unbindRun(paratreet::FoFUnbindSpec spec, std::string prefix,
+                         const CkCallback&);
   };
 };

@@ -5,6 +5,8 @@
 #   make convert         # tipsy2hbt and hbtstat (HDF5 only)
 #   make compare         # hbtref, unbindcmp, unbindspec, unbindcheck: the
 #                        # comparison with HBT-HERONS (HDF5; OpenMP for speed)
+#   make device          # libsubhalodevice.a: unbinding inside FoF3 (step 2),
+#                        # linked by FoF3 built with GPU=1
 #
 # Any other machine: name a C++ compiler, a Kokkos install and HDF5, e.g.
 # the Mac with Homebrew and a Kokkos built for OpenMP:
@@ -37,6 +39,18 @@ unbind_rate: unbind_rate.cpp unbind_kernel.h unbind_groups.h
 unbind: unbind.cpp unbind_kernel.h unbind_groups.h
 	$(KCXX) $(CXXFLAGS) $(HDF5_FLAGS) -o $@ unbind.cpp $(KOKKOS_LIBS) $(HDF5_LIBS)
 
+# Step 2 (design/subhalo-checks.md, "Step 2: unbinding inside FoF3"): the
+# device side FoF3 links through the firewall header SubhaloDevice.h, as it
+# links fof/gpu/libfofdevice.a. -fPIC as there.
+device: libsubhalodevice.a
+
+SubhaloDevice.o: SubhaloDevice.cpp SubhaloDevice.h unbind_kernel.h unbind_groups.h
+	$(KCXX) $(CXXFLAGS) -fPIC -c $< -o $@
+
+libsubhalodevice.a: SubhaloDevice.o
+	ar cr $@ $^
+	ranlib $@
+
 convert: tipsy2hbt hbtstat
 
 tipsy2hbt: tipsy2hbt.cpp
@@ -64,6 +78,6 @@ unbindcheck: unbindcheck.cpp unbindspec.h unbindrec.h
 	$(HOSTCXX) -O3 -std=c++17 -ffp-contract=off $(HOSTOMP) $(HDF5_FLAGS) -o $@ $< $(HDF5_LIBS)
 
 clean:
-	rm -f unbind_rate unbind tipsy2hbt hbtstat hbtref unbindcmp unbindspec unbindcheck *.o
+	rm -f unbind_rate unbind tipsy2hbt hbtstat hbtref unbindcmp unbindspec unbindcheck *.o *.a
 
-.PHONY: all convert compare clean
+.PHONY: all device convert compare clean

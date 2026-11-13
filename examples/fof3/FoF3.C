@@ -735,6 +735,32 @@ using namespace paratreet;
                cs.groups, cs.particles, cs.max_size, cs.digest,
                CkWallTimer() - tc0);
     }
+    if (!fof_unbind.empty()) {
+      // One sub-halo per kept group (design/subhalo-checks.md, "Step 2").
+      // Both digests must not change with the number of processes.
+      if (!fof_catalog) CkAbort("-U needs -K (the catalogue's kept groups)");
+      std::string prefix;
+      const auto spec = paratreet::parseUnbindSpec(fof_unbind, pbc_period, &prefix);
+      CkPrintf("FOF3STAT unbind_settings: a %g H %.6g G %.10g eps %.6g box %g cap %ld "
+               "refine %ld chunk %ld bound_fraction %g min %d kernel %s%s out %s\n",
+               spec.a, spec.H, spec.G, spec.eps, spec.box, spec.cap, spec.refine,
+               spec.chunk, spec.bound_fraction, spec.min_bound,
+               spec.kernel == 0 ? "f64" : (spec.kernel == 1 ? "f32" : "f32f32"),
+               spec.rsqrt ? " rsqrt" : "", prefix.empty() ? "-" : prefix.c_str());
+      const auto us = paratreet::runFoFUnbind(fof, spec, prefix);
+      CkPrintf("FOF3STAT unbind: groups %ld subhaloes %ld bound %ld particles %ld "
+               "largest %ld max_per_process %ld wide %ld sampled %ld refined %ld "
+               "stale_frame %ld digest_subhaloes %016llx digest_particles %016llx\n",
+               us.groups, us.subhaloes, us.bound, us.particles, us.largest,
+               us.max_per_process, us.wide, us.sampled, us.refined, us.stale,
+               us.digest_subhaloes, us.digest_particles);
+      CkPrintf("FOF3STAT unbind_time_s: gather %.3f run %.3f device_call_max %.3f "
+               "kernel_first_max %.4f kernel_later_max %.4f kernel_refine_max %.4f "
+               "host_max %.3f pair_terms first %.4g later %.4g refine %.4g\n",
+               us.t_gather, us.t_run, us.t_device_call, us.t_kernel_first,
+               us.t_kernel_later, us.t_kernel_refine, us.t_host, us.pairs_first,
+               us.pairs_later, us.pairs_refine);
+    }
     if (!fof_label_prefix.empty()) {
       // -L: one (order, label) file per PE. After the catalog, so that with
       // -K -m the groups below the minimum size are written as -1.

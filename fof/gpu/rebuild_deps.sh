@@ -80,6 +80,8 @@ if [ "${GPU:-0}" = "1" ]; then
   echo "### 4a/6 fof device library (hipcc, no Charm headers)"
   make -C "$PT/fof/gpu" clean >/dev/null 2>&1 || true
   make -C "$PT/fof/gpu" libfofdevice.a
+  echo "### 4b/6 sub-halo unbinding library (hipcc, no Charm headers)"
+  make -C "$PT/subhalo" libsubhalodevice.a
 fi
 
 echo "### 4/6 paratreet src"

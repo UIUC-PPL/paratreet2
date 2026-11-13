@@ -2666,10 +2666,184 @@ would be the processes' shares of the group. Not built.
 - Done 2026-11-13: the split refinement kernel (job 5916674, "The split
   refinement kernel"). Its time follows its pair terms: 8% of the first
   pass's on 8m-lambb at 10,000, a speedup of 8.1 in f64.
-- Whether `--refine 1000` becomes the default with a cap. It is off by
-  default so that every earlier run reproduces.
+- Decided 2026-11-13: in FoF3 (step 2) the refinement is on whenever the
+  cap is, K = 1,000. The standalone `unbind` keeps it off by default so
+  that every earlier run reproduces.
 - The refinement of a group spread over processes, for the stage inside
   FoF3.
+
+## Step 2: unbinding inside FoF3 (started 2026-11-13)
+
+Right after FoF3's halo catalogue (`-K -m 20`), every group of at least 20
+particles is unbound on the GPU of a process that holds it, from the
+particles FoF3 already holds. Each group gets one self-bound sub-halo: its
+bound particles, bound count and mass, most bound particle (after the
+centre refinement when the group is sampled), and the frame of its bound
+set. Satellites need the history of earlier outputs and come with step 3
+(tracking), which unbinds each sub-halo carried over from the last output.
+
+### Decisions (2026-11-13)
+
+1. Start step 2 now.
+2. Scope: one sub-halo per FoF group. Satellites in step 3.
+3. Same bits on any number of processes for every group that is gathered
+   onto one GPU. A group that stays spread over processes (part 2c) gives
+   the same bits on a given layout, and is held to the pass rule across
+   layouts.
+4. Stopping rule: `bound_fraction` 0.995 for production runs, as
+   HBT-HERONS's `BoundMassPrecision`; 1 (run until a pass removes nothing)
+   for every check.
+5. The centre refinement is on whenever the cap is: K = 1,000 with the cap
+   of 10,000. The standalone `unbind` keeps `--refine` off by default, so
+   its earlier runs reproduce.
+6. Dark matter only. Every input of step 2 is dark-matter-only; gas thermal
+   energy and stars wait for the collaborator's answer to question 6.
+7. Output: per group the fields above, per particle a bound flag, and a
+   printed digest that must not change with the layout.
+
+### Design
+
+- **Where.** FoF3 `-U <settings>`, after `-K` (it needs the catalogue's
+  kept labels) and before `-L`. Settings are `key=value` pairs separated by
+  commas: `eps` (comoving softening, code units; required), `epsmax`
+  (largest physical softening; default none), `a` (default 1), `om`, `ol`
+  (default 0.3, 0.7), `cap` (default 10,000; 0 = all pairs), `refine`
+  (default 1,000), `chunk` (1,024), `bf` (0.995), `min` (20), `kernel`
+  (f64, f32, f32f32), `rsqrt` (0/1), `out` (file prefix; default none),
+  `G` (default 1; see "Results of 2a and 2b" for the one other value used).
+- **Units.** FoF3's own: N-Body Shop code units, G = 1, box side `-P`,
+  critical density 1, so H(a) = sqrt(8 pi / 3) E(a), and peculiar velocity
+  = a times the Tipsy velocity, as `tipsy2hbt` takes it. FoF3 holds
+  positions, velocities and masses in single precision; the kernel's
+  arithmetic is the form chosen (f64 by default). The box size in Mpc is
+  needed only to print physical units.
+- **Gathering (parts 2a and 2b).** Each PE sends every particle of a kept
+  label to the group's unbinding process: its own process for a label no
+  other process holds (no message: a slot in the process's node branch),
+  otherwise the process of the catalogue owner of that label,
+  `labelShardMix(label) % CkNumPes()`. After quiescence one PE per process
+  sorts its records by (label, particle id), packs them with
+  `unbind::makeGroups`, and unbinds all of them in one call on the
+  process's GPU. A gathered group is then packed exactly as on one
+  process: same particles, same order, positions relative to its lowest-id
+  particle. The kernel's sums for one group do not depend on the other
+  groups in the launch, and the periodic wrap changes nothing for a group
+  narrower than half the box, so the bits do not depend on the layout.
+- **Particle id.** The sampling and tie-breaking id is the particle's
+  order plus one, which is the `ParticleIDs` `tipsy2hbt` writes, so the
+  capped sample is the standalone tools'.
+- **The device library.** `subhalo/SubhaloDevice.h` names neither Charm
+  nor Kokkos, as `fof/gpu/FoFDevice.h` does; `subhalo/SubhaloDevice.cpp`
+  (hipcc, `libsubhalodevice.a`) wraps `unbind_groups.h`. The process's
+  device is bound by FoF3's own `deviceBind`, which also initializes
+  Kokkos, on the same PE that calls the library.
+- **Output.** `FOF3STAT unbind` prints the counts, the timings and two
+  sums of hashed terms, neither of which depends on the order of the
+  terms: one over the sub-haloes (label, bound count, most bound
+  particle), one over the particles (id, bound flag, the bits of the
+  energy). With `out=`, each process writes `<prefix>.<process>.ubd`: one
+  record per particle of the groups it unbound.
+  `subhalo/fof3ubd.py` turns those into `unbindcheck`'s `.particles.bin`
+  in a snapshot's numbering (id + 1, the snapshot's group id, energy times
+  the square of the velocity unit) and compares them with an `unbind`
+  dump.
+- **Not in 2a/2b.** Results stay on the unbinding process; returning the
+  bound flag to each particle's own PE (for `-L` and the plug-in's labels)
+  is part 2d. Every kept group is gathered, so the largest group must fit
+  one GPU; lambb's largest has 1.5 million particles.
+
+### Parts and their checks
+
+- **2a, 2b.** 8m-lambb (FoF3's groups, b = 0.2, periodic), all checks run
+  until a pass removes nothing. In one process: without a cap against the
+  exact HBT-HERONS reference, and at the cap of 10,000 with the refinement
+  against `unbindspec --cap 10000 --refine 1000`, by `unbindcheck` at tau;
+  most bound particles against `unbind`'s. On 8 and 16 processes: both
+  digests equal the one-process run's, and FoF3's `label_digest` and
+  catalogue digest are unchanged.
+- **2c.** Groups above a size limit stay spread: the sample sent to every
+  process holding part of the group, the frame summed across them, the
+  refinement's candidates chosen across them and its partial sums added.
+  Check: a lowered limit on lambb against the gathered result.
+- **2d.** The bound flag back to each particle's PE, the plug-in path, the
+  2-node lambb gate, then timing on cosmo2b at 64 nodes (node-hours quoted
+  first).
+
+### Results of 2a and 2b (2026-11-13, jobs 5916950 and 5917058)
+
+`subhalo/run_fof3_unbind.sbatch`: job 5916950 (two nodes, 12 min, 0.40
+node-hours) ran parts 1 to 4, job 5917058 (one node, 8 min, 0.13
+node-hours) part 5. FoF3 on 8m-lambb, CPU arm for FoF itself, unbinding on
+the GPU, every check run until a pass removes nothing (`bf=1`). The
+`.ubd` files of the one-process runs go through `fof3ubd.py`.
+
+1. **FoF3 is unchanged.** Every run prints the label digest
+   c4f41054eacf794c and the catalogue digest 57c1e840e74a8aae of job
+   5902394.
+2. **The bits do not depend on the number of processes.** Both unbinding
+   digests are identical on 1, 8 and 16 processes for all pairs, for the
+   cap of 10,000 in f64 and for it in f32 rsqrt; the production defaults
+   (`bf` 0.995) agree on 8 and 16. On 8 processes 5,416 of 8m-lambb's
+   groups are held by more than one process, so the gathering of part 2b
+   is in these runs.
+
+   | Settings | Groups with a sub-halo (count) | Bound particles (count) | Digest of the sub-haloes | Digest of the particles |
+   |---|---|---|---|---|
+   | all pairs | 13,256 | 4,215,968 | 0d37b479e31892fb | f7ffc6fd8db43474 |
+   | cap 10,000, refine 1,000, f64 | 13,256 | 4,215,892 | e478358bcfe0e681 | b7e7a974def45be1 |
+   | the same, f32 rsqrt | 13,256 | 4,215,892 | e478358bcfe0e681 | 88eac3f19624e4b0 |
+   | the defaults (`bf` 0.995) | 13,256 | 4,217,280 | dd4e9389c2cc2b26 | eac4ff3d4463199d |
+
+3. **Against the references FoF3 differs by one constant, G.** On one
+   process with G = 1 FoF3 passes the amended rule at tau against
+   HBT-HERONS's exact reference and against `unbindspec --cap 10000
+   --refine 1000` (f64, and f32 rsqrt with and without the
+   single-precision allowance), with the most bound particle of `unbind`
+   in all 13,256 groups. But its energies are a median 7e-5 of S from the
+   references', 12 or 13 groups have one to three particles more, and the
+   rule as first written fails. That is too much for single precision.
+   - **Why.** The standalone tools and HBT-HERONS take G = 43.0071
+     (km/s)^2 Mpc / 1e10 Msun, HBT-HERONS's value, in the snapshot's
+     units. `tipsy2hbt` converts code units with the critical density
+     2.77536627e11 h^2 Msun / Mpc^3 and sqrt(8 pi / 3) = 2.894405, which
+     together mean G = 43.00917. So on a `tipsy2hbt` snapshot the
+     references compute with G = 0.99995179 in code units, 4.8e-5 below the
+     simulation's own G = 1, which FoF3 uses.
+   - **Checked.** With `G=0.9999517944622952` FoF3 gives the standalone
+     `unbind`'s bound particles exactly (4,215,954 all pairs, 4,215,879 at
+     the cap) and its most bound particle in every group; energies within
+     1.0e-6 of S (median 3e-8, the single-precision velocities and masses),
+     refined energies within 2.3e-7. Against HBT-HERONS's exact reference
+     and against `unbindspec --cap` both rules pass with identical bound
+     sets; the largest \|dE\|/S, 1.1e-6, is the standalone kernel's own.
+   - **Consequence.** No earlier result changes: HBT-HERONS, `unbind` and
+     `unbindspec` all read the same snapshot and all used 43.0071. FoF3
+     keeps G = 1, and checks of FoF3 against references made on a
+     `tipsy2hbt` snapshot pass `G=0.9999517944622952`. The snapshots and
+     references are left as they are.
+4. **Time on 8m-lambb, cap 10,000, f64** (s; lower is better):
+
+   | Processes | Gather and quiescence | Unbinding step | Slowest process's device call | of it: first pass kernel | refinement kernel |
+   |---|---|---|---|---|---|
+   | 1 | 0.09 | 2.39 | 1.33 | 0.167 | 0.013 |
+   | 8 | 0.05 | 0.78 | 0.28 | 0.041 | 0.003 |
+   | 16 | 0.02 | 0.64 | 0.20 | 0.028 | 0.002 |
+
+   The unbinding step is longer than the slowest device call by 1.06 s on
+   one process and about 0.45 s on 8 and 16. That remainder is not broken
+   down. It includes sorting and packing the gathered particles and
+   binding the GPU on first use (Kokkos initialization), which a run with
+   several outputs would pay once; not measured separately.
+
+### Not done in 2a and 2b
+
+- Returning the bound flag to each particle's own PE, and the plug-in path
+  (part 2d).
+- Groups too large for one GPU (part 2c). All of 8m-lambb's are gathered;
+  so would be all of lambb's.
+- A breakdown of the unbinding step's time outside the device call.
+- NChilada input: FoF3 sets `read_velocity_and_soft = false`, so an
+  NChilada snapshot's velocities are not read. Tipsy is not affected.
 
 ## Open
 
@@ -2746,4 +2920,9 @@ would be the processes' shares of the group. Not built.
     summing in single precision). Real high-redshift groups may or may not
     be like that.
 - lambb's box size in Mpc, for physical units.
-- The decision on when steps 1-2 start.
+- Decided 2026-11-13: step 2 (unbinding inside FoF3) started; see "Step 2".
+  Parts 2a and 2b done 2026-11-13 (jobs 5916950, 5917058): the same bits
+  on 1, 8 and 16 processes, and the standalone kernel's result once G is
+  the references' (they use 0.99995179 in code units, FoF3 1). Next: 2c
+  (groups that stay spread) and 2d (results back to each particle, the
+  plug-in, scale).

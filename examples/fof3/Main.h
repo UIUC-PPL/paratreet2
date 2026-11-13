@@ -72,6 +72,10 @@ class ExMain: public paratreet::Main<FragData> {
   // -L <prefix>: write every particle's (order, label) to <prefix>.<pe>.lbl,
   // one file per PE (FoFPhase1::writeLabels). Empty = off.
   std::string fof_label_prefix;
+  // -U <settings>: unbind every kept group after the catalogue, one
+  // sub-halo per group (design/subhalo-checks.md, "Step 2"); needs -K and a
+  // GPU=1 build. Settings: paratreet::parseUnbindSpec. Empty = off.
+  std::string fof_unbind;
   // -G <t>: occupancy threshold (expected particles per b/sqrt(6) cell at
   // a chare's root) above which phaseA solves that chare's self pair with
   // the cell grid instead of the tree walk. 0 disables the grid (the
