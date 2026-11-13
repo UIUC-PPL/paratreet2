@@ -5,6 +5,7 @@ FoF3").
 
   fof3ubd.py bin <snapshot.hdf5> <prefix> <out.particles.bin> [--period P]
   fof3ubd.py compare <snapshot.hdf5> <prefix> <unbind dump.hdf5> [--period P]
+  fof3ubd.py sub <prefix> <label prefix>
 
 The snapshot is the one tipsy2hbt wrote from the same Tipsy file and
 FoF3's label files: ParticleIDs = order + 1, FOFGroupIDs its group ids.
@@ -20,6 +21,10 @@ compare  per particle against an `unbind --dump` of the snapshot: bound
          flags, |dE|/S (S the median |E| of the dump's bound particles of
          the group), the most bound particle and, if both have them, the
          centre refinement's energies.
+sub      part 2d: FoF3 -L's <label prefix>.<pe>.sub files (order, sub-halo
+         label: the label if in the sub-halo, else -1) against the .ubd
+         files: every particle bound in a .ubd must carry its label, every
+         other particle -1, and the .lbl labels must match the .ubd's.
 
 A .ubd record is 40 bytes, native byte order: int64 order, int64 label,
 float64 energy, float64 refined energy (NaN = not refined), uint8 bound,
@@ -153,6 +158,37 @@ def cmd_compare(snap, prefix, dump, period):
             print(f"fof3ubd: refined energies: none in both, {int(mm.sum())} in one only")
 
 
+def cmd_sub(prefix, lprefix):
+    u, nfiles = read_ubd(prefix)
+    def pairs(ext):
+        files = sorted(glob.glob(lprefix + ".*." + ext))
+        if not files:
+            sys.exit(f"fof3ubd: no files {lprefix}.*.{ext}")
+        a = np.concatenate([np.fromfile(f, dtype="<i8") for f in files]).reshape(-1, 2)
+        return a, len(files)
+    sub, ns = pairs("sub")
+    lbl, nl = pairs("lbl")
+    if len(sub) != len(lbl) or len(np.unique(sub[:, 0])) != len(sub):
+        sys.exit("fof3ubd: the .sub files do not hold each particle once, as the .lbl files do")
+    so = np.argsort(sub[:, 0])
+    lo = np.argsort(lbl[:, 0])
+    if not np.array_equal(sub[so, 0], lbl[lo, 0]):
+        sys.exit("fof3ubd: the .sub and .lbl files hold different particles")
+    order, sl, ll = sub[so, 0], sub[so, 1], lbl[lo, 1]
+    k = np.searchsorted(order, u["order"])
+    if np.any(k >= len(order)) or not np.array_equal(order[k], u["order"]):
+        sys.exit("fof3ubd: a .ubd particle is not in the label files")
+    want = np.full(len(order), -1, dtype=np.int64)
+    want[k[u["bound"] == 1]] = u["label"][u["bound"] == 1]
+    label_bad = int(np.sum(ll[k] != u["label"]))
+    sub_bad = int(np.sum(sl != want))
+    print(f"fof3ubd: {nfiles} .ubd files, {ns} .sub and {nl} .lbl files; {len(order)} particles, "
+          f"{int(np.sum(sl >= 0))} in a sub-halo ({int(np.sum(u['bound']))} bound in the .ubd); "
+          f".lbl label differs from the .ubd's for {label_bad}; .sub differs from the .ubd's "
+          f"bound flags for {sub_bad}")
+    return 0 if label_bad == 0 and sub_bad == 0 else 1
+
+
 if __name__ == "__main__":
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     period = 1.0
@@ -163,5 +199,7 @@ if __name__ == "__main__":
         cmd_bin(args[1], args[2], args[3], period)
     elif len(args) == 4 and args[0] == "compare":
         cmd_compare(args[1], args[2], args[3], period)
+    elif len(args) == 3 and args[0] == "sub":
+        sys.exit(cmd_sub(args[1], args[2]))
     else:
         sys.exit(__doc__)

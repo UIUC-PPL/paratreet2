@@ -179,8 +179,15 @@ module fof {
     // which UnionFindLib::find_components mutated in place).
     entry void collectUF2Labels(CProxy_UnionFindLib, const CkCallback&);
     entry void applyUF2Labels(const CkCallback&);
-    entry void unbindGather(const CkCallback&);
+    entry void unbindLarge(long limit, const CkCallback&);
+    entry void unbindGather(const std::vector<long>& spread, const CkCallback&);
     entry void unbindRun(paratreet::FoFUnbindSpec spec, std::string prefix,
                          const CkCallback&);
+    entry void unbindSpreadInit(paratreet::FoFUnbindSpec spec, const CkCallback&);
+    entry void unbindSpreadStep(const std::vector<char>& cmd, const CkCallback&);
+    entry void unbindSpreadFinish(std::string prefix, const CkCallback&);
+    entry void unbindFlags(const std::vector<paratreet::FoFUnbindFlag>& v);
+    entry void unbindRows(const std::vector<paratreet::FoFUnbindRow>& v, bool anywhere);
+    entry void unbindRowDigest(const CkCallback&);
   };
 };

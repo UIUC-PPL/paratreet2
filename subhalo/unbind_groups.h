@@ -136,6 +136,10 @@ struct Result {
   std::vector<int64_t> centre_rank;  // per group, its position in the last pass's order
   std::vector<uint8_t> refined_group;  // per group, 1 = its centre was refined
   std::vector<double> refined;  // per packed particle, the refined energy; NaN = not refined
+  // Per group with a sub-halo, the frame of its bound set as the last pass
+  // left it (x, y, z as packed offsets, then vx, vy, vz: 6 per group) and
+  // its bound mass; zeros for a group with none. Output only.
+  std::vector<double> frame, bound_mass;
   Stats stats;
 };
 
@@ -746,9 +750,19 @@ Result unbindGroups(const Groups& G, const Params& P) {
     }
   }
 
+  R.frame.assign(6 * (size_t)ng, 0.0);
+  R.bound_mass.assign(ng, 0.0);
   for (int g = 0; g < ng; g++) {
     R.nbound[g] = nb[g];
-    for (int64_t k = 0; k < nb[g]; k++) R.bound[perm[G.off[g] + k]] = 1;
+    for (int64_t k = 0; k < nb[g]; k++) {
+      R.bound[perm[G.off[g] + k]] = 1;
+      R.bound_mass[g] += G.mass[perm[G.off[g] + k]];
+    }
+    if (nb[g] > 0)
+      for (int d = 0; d < 3; d++) {
+        R.frame[6 * g + d] = frame[g].x[d];
+        R.frame[6 * g + 3 + d] = frame[g].v[d];
+      }
   }
   R.stats.host_s = host_timer.seconds() - kernel_total;
   return R;

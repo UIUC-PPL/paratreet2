@@ -18,8 +18,16 @@
 // asks for the halo catalog and prints its summary (FOFHOST catalog),
 // comparable with FoF3's FOF3STAT catalog for the same -m.
 //
+// -U <settings> turns on unbinding (Params::unbinding; paratreet2
+// design/subhalo-checks.md "Step 2"), with FoF3 -U's keys: eps, epsmax, a,
+// om, ol, cap, refine, chunk, gather, bf, min, kernel (f64, f32, f32f32),
+// rsqrt, G. FOFHOST subhalo then prints the digest of (id, sub-halo label)
+// and of the catalog rows' sub-haloes, which must equal FoF3's FOF3STAT
+// subhalo_label_files and unbind_rows digests for the same file.
+//
 //   fofhost -f <tipsy> [-b factor | -L length] [-P period] [-l leaf]
 //           [-k pieces per PE] [-r repeats] [-c maxlevel [-s]] [-m n] [-K]
+//           [-U settings]
 
 #include "fofhost.decl.h"
 #include "FoFPluginAPI.h"
@@ -49,7 +57,7 @@ class HostMain : public CBase_HostMain {
     std::string file;
     int pieces_per_pe = 2;
     int c;
-    while ((c = getopt(m->argc, m->argv, "f:b:L:P:l:k:r:c:sm:K")) != -1) {
+    while ((c = getopt(m->argc, m->argv, "f:b:L:P:l:k:r:c:sm:KU:")) != -1) {
       switch (c) {
         case 'f': file = optarg; break;
         case 'b': params_.b_factor = atof(optarg); break;
@@ -62,6 +70,7 @@ class HostMain : public CBase_HostMain {
         case 's': scramble_ = true; break;
         case 'm': params_.min_group_size = atol(optarg); break;
         case 'K': params_.catalog = true; break;
+        case 'U': parseUnbinding(optarg); break;
         default: CkAbort("fofhost: unknown option\n");
       }
     }
@@ -88,6 +97,38 @@ class HostMain : public CBase_HostMain {
                            (int)(((long)i * 7919 + 13) % CkNumPes()));
     hostPieces.doneInserting();
     fofplugin::whenReady(CkCallback(CkIndex_HostMain::go(), thisProxy));
+  }
+
+  void parseUnbinding(const std::string& text) {
+    auto& U = params_.unbinding;
+    U.on = true;
+    size_t at = 0;
+    while (at <= text.size()) {
+      size_t end = text.find(',', at);
+      if (end == std::string::npos) end = text.size();
+      const std::string kv = text.substr(at, end - at);
+      at = end + 1;
+      if (kv.empty()) continue;
+      const size_t eq = kv.find('=');
+      if (eq == std::string::npos) CkAbort("fofhost -U: '%s' is not key=value\n", kv.c_str());
+      const std::string k = kv.substr(0, eq);
+      const char* v = kv.c_str() + eq + 1;
+      if (k == "eps") U.eps = atof(v);
+      else if (k == "epsmax") U.eps_max = atof(v);
+      else if (k == "a") U.a = atof(v);
+      else if (k == "om") U.omega_m = atof(v);
+      else if (k == "ol") U.omega_lambda = atof(v);
+      else if (k == "cap") U.cap = atol(v);
+      else if (k == "refine") U.refine = atol(v);
+      else if (k == "chunk") U.chunk = atol(v);
+      else if (k == "gather") U.gather = atol(v);
+      else if (k == "bf") U.bound_fraction = atof(v);
+      else if (k == "min") U.min_bound = atoi(v);
+      else if (k == "kernel") U.kernel = std::string(v) == "f64" ? 0 : (std::string(v) == "f32" ? 1 : 2);
+      else if (k == "rsqrt") U.rsqrt = atoi(v) != 0;
+      else if (k == "G") U.G = atof(v);
+      else CkAbort("fofhost -U: unknown key '%s'\n", k.c_str());
+    }
   }
 
   void go() {
@@ -184,6 +225,9 @@ class HostMain : public CBase_HostMain {
         CkPrintf("FOFHOST catalog: min_size %ld groups %llu particles %llu "
                  "digest %016llx (rep %d)\n", std::max(1L, params_.min_group_size),
                  d[3], d[4], d[5], rep);
+      if (params_.unbinding.on)
+        CkPrintf("FOFHOST subhalo: in_subhalo %llu label_digest %016llx rows %llu "
+                 "rows_digest %016llx (rep %d)\n", d[6], d[7], d[8], d[9], rep);
       CkPrintf("FOFHOST time_s: stage %.3f fof %.3f (rep %d)\n", t1 - t0,
                t2 - t1, rep);
       delete msg;
@@ -325,12 +369,17 @@ class HostPiece : public CBase_HostPiece {
   void digest(int rep, const CkCallback& cb) {
     size_t n = 0;
     const long* labels = fofplugin::labels(n);
-    unsigned long long v[6] = {0, 0, 0, 0, 0, 0};
+    unsigned long long v[10] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    size_t ns = 0;
+    const long* subs = fofplugin::subhaloLabels(ns);
     for (size_t i = 0; i < parts_.size(); i++) {
       const long label = labels[first_ + i];
       v[0]++;
       v[1] += fofplugin::labelDigestTerm((long)parts_[i].id, label);
       if (label < 0) v[2]++;
+      const long sub = first_ + i < ns ? subs[first_ + i] : -1;
+      v[6] += sub >= 0;
+      v[7] += fofplugin::labelDigestTerm((long)parts_[i].id, sub);
     }
     static thread_local int counted_rep = -1;
     if (counted_rep != rep) {
@@ -341,9 +390,13 @@ class HostPiece : public CBase_HostPiece {
         v[3]++;
         v[4] += g[i].n;
         v[5] += fofplugin::labelDigestTerm((long)g[i].id, (long)g[i].n);
+        if (g[i].nbound > 0) {
+          v[8]++;
+          v[9] += fofplugin::subhaloDigestTerm(g[i].id, g[i].nbound, g[i].most_bound);
+        }
       }
     }
-    contribute(6 * sizeof(unsigned long long), v, CkReduction::sum_ulong_long, cb);
+    contribute(10 * sizeof(unsigned long long), v, CkReduction::sum_ulong_long, cb);
   }
 
   void clearStaged(const CkCallback& cb) {

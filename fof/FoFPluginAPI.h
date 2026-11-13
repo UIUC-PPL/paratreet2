@@ -17,7 +17,9 @@
 //   1. on every PE holding particles: stage(...), possibly several times;
 //   2. on PE 0, from a threaded entry: run(params, done) after whenReady;
 //   3. after `done`, on each PE: labels() gives one label per staged
-//      particle, in staging order; then clear() before the next call.
+//      particle, in staging order (and, with Params::unbinding,
+//      subhaloLabels() whether each is in its group's self-bound
+//      sub-halo); then clear() before the next call.
 
 #include <cstddef>
 #include <cstdint>
@@ -56,6 +58,29 @@ struct Params {
   // lists the groups of at least min_group_size particles.
   long min_group_size = 1;
   bool catalog = false;
+  // Unbinding (paratreet2 design/subhalo-checks.md, "Step 2"): after the
+  // catalog, each group of at least min_bound particles gets one self-bound
+  // sub-halo by HBT-HERONS's rules, on the GPU (a plug-in built with GPU=1).
+  // Needs the catalog or min_group_size > 1. Units are the host's: G = 1,
+  // critical density 1 (so H(a) = sqrt(8 pi / 3) E(a)), positions comoving.
+  struct Unbinding {
+    bool on = false;
+    double eps = 0;          // comoving softening length (> 0)
+    double eps_max = 0;      // largest physical softening; 0 = none
+    double a = 1;            // scale factor
+    double omega_m = 0.3, omega_lambda = 0.7;
+    double vel_factor = -1;  // staged velocity times this = physical peculiar
+                             // velocity; < 0 = a (ChaNGa's Tipsy convention)
+    double G = 1;
+    double bound_fraction = 0.995;
+    long cap = 10000;        // most sources per particle; 0 = all pairs
+    long refine = 1000;      // centre refinement candidates; 0 = off
+    long chunk = 1024;
+    long gather = 1000000;   // larger groups stay spread over processes
+    int min_bound = 20;
+    int kernel = 0;          // 0 f64, 1 f32 summed in f64, 2 f32 summed in f32
+    bool rsqrt = false;
+  } unbinding;
 };
 
 // One halo, as groups() lists it. Under a period, x / lo / hi are in the
@@ -67,6 +92,12 @@ struct Group {
   double x[3];        // centre of mass
   double v[3];        // mass-weighted mean velocity
   double lo[3], hi[3];  // bounding box
+  // With Params::unbinding (zero otherwise, and for a group with no
+  // sub-halo): the self-bound sub-halo.
+  uint64_t nbound;      // its particles
+  uint64_t most_bound;  // id of its most bound particle
+  double bound_mass;
+  double bx[3], bv[3];  // frame of its bound set (centre of mass, velocity)
 };
 
 // Fires `cb` once the plug-in has finished startup (paratreet's
@@ -96,6 +127,10 @@ const long* labels(size_t& n);
 // row for. Every group is listed on exactly one PE.
 const Group* groups(size_t& n);
 
+// After `done`, with Params::unbinding: per staged particle, its label if
+// it is in its group's self-bound sub-halo, otherwise -1.
+const long* subhaloLabels(size_t& n);
+
 // Forget this PE's staged particles, labels and catalog rows.
 void clear();
 
@@ -108,6 +143,19 @@ inline uint64_t labelDigestTerm(long id, long label) {
   z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
   z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
   return z ^ (z >> 31);
+}
+
+// One sub-halo's term in FoF3's FOF3STAT unbind digest_subhaloes (group
+// label, bound count, id of the most bound particle), summed with
+// wrap-around over the groups with a sub-halo.
+inline uint64_t subhaloDigestTerm(uint64_t label, uint64_t nbound, uint64_t most_bound) {
+  auto mix = [](uint64_t z) {
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+  };
+  return mix(mix(mix(label) ^ nbound) ^ most_bound);
 }
 
 }  // namespace fofplugin

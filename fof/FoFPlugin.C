@@ -104,6 +104,9 @@ class FoFPluginMain : public paratreet::Main<FragData> {
 
   void postIterationFn(BoundingBox&, ProxyPack<FragData>&, int) override {
     // The catalog first: it decides which labels a size filter keeps.
+    const auto& U = params.unbinding;
+    if (U.on && !params.catalog && params.min_group_size <= 1)
+      CkAbort("fofplugin: unbinding needs the catalog or min_group_size > 1\n");
     if (params.catalog || params.min_group_size > 1) {
       auto cs = paratreet::runFoFCatalog(fof, std::max(1L, params.min_group_size),
                                          period());
@@ -111,6 +114,36 @@ class FoFPluginMain : public paratreet::Main<FragData> {
                "max_size %ld digest %016llx\n",
                std::max(1L, params.min_group_size), cs.groups, cs.particles,
                cs.max_size, cs.digest);
+    }
+    if (U.on) {
+      // One self-bound sub-halo per kept group (paratreet2
+      // design/subhalo-checks.md, "Step 2"), FoF3 -U's settings from the
+      // host's Params::Unbinding.
+      if (!(U.eps > 0) || !(U.a > 0)) CkAbort("fofplugin: unbinding needs eps > 0 and a > 0\n");
+      paratreet::FoFUnbindSpec spec;
+      spec.G = U.G;
+      spec.a = U.a;
+      spec.H = 2.894405 * std::sqrt(U.omega_m / (U.a * U.a * U.a) + U.omega_lambda +
+                                    (1 - U.omega_m - U.omega_lambda) / (U.a * U.a));
+      spec.eps = U.eps_max > 0 ? std::min(U.eps, U.eps_max / U.a) : U.eps;
+      spec.box = params.period;
+      spec.bound_fraction = U.bound_fraction;
+      spec.vel_factor = U.vel_factor < 0 ? U.a : U.vel_factor;
+      spec.cap = U.cap;
+      spec.refine = U.refine;
+      spec.chunk = U.chunk;
+      spec.gather = U.gather;
+      spec.min_bound = U.min_bound;
+      spec.kernel = U.kernel;
+      spec.rsqrt = U.rsqrt ? 1 : 0;
+      const auto us = paratreet::runFoFUnbind(fof, spec, std::string());
+      const auto rows = paratreet::finishFoFUnbind(fof);
+      CkPrintf("FOFPLUGIN unbind: groups %ld subhaloes %ld bound %ld spread %ld "
+               "digest_subhaloes %016llx digest_particles %016llx rows %llu %s time_s %.3f\n",
+               us.groups, us.subhaloes, us.bound, us.spread_groups, us.digest_subhaloes,
+               us.digest_particles, rows.first,
+               rows.second == us.digest_subhaloes ? "rows_equal" : "ROWS_DIFFER",
+               us.t_gather + us.t_run + us.t_spread);
     }
     fof.returnHostLabels(CkCallbackResumeThread());
     CkWaitQD();
@@ -151,6 +184,7 @@ static size_t stageInto(const Particle* p, size_t n, int level, uint32_t ix,
   if (cell) readers.ckLocalBranch()->stageCell(staged.data(), n, level, ix, iy, iz);
   else readers.ckLocalBranch()->stage(staged.data(), n);
   labels.resize(first + n, -1);
+  paratreet::hostSubhaloLabels().resize(first + n, -1);
   return first;
 }
 
@@ -188,6 +222,12 @@ const long* labels(size_t& n) {
   return l.data();
 }
 
+const long* subhaloLabels(size_t& n) {
+  auto& l = paratreet::hostSubhaloLabels();
+  n = l.size();
+  return l.data();
+}
+
 const Group* groups(size_t& n) {
   auto& g = paratreet::catalogGroups();
   n = g.size();
@@ -196,6 +236,7 @@ const Group* groups(size_t& n) {
 
 void clear() {
   paratreet::hostLabels().clear();
+  paratreet::hostSubhaloLabels().clear();
   paratreet::catalogGroups().clear();
 }
 

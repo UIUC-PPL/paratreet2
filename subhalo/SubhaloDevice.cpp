@@ -9,7 +9,9 @@
 #include "SubhaloDevice.h"
 
 #include "unbind_groups.h"
+#include "unbind_spread.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -37,12 +39,31 @@ unbind::Result run(const unbind::Groups& G, const unbind::Params& P, bool rsqrt)
   std::abort();
 }
 
-}  // namespace
+unbind::Params toUnbind(const Params& p) {
+  unbind::Params P;
+  P.G = p.G;
+  P.a = p.a;
+  P.H = p.H;
+  P.eps = p.eps;
+  P.box = p.box;
+  P.bound_fraction = p.bound_fraction;
+  P.min_bound = p.min_bound;
+  P.cap = p.cap;
+  P.refine = p.cap > 0 ? p.refine : 0;
+  P.refine_chunk = p.refine_chunk;
+  return P;
+}
 
-void unbind(const Input& in, const Params& p, Output& o) {
+void checkParams(const Params& p) {
   if (!Kokkos::is_initialized()) fail("Kokkos is not initialized (bind the device first)");
   if (!(p.eps > 0)) fail("the softening must be positive");
   if (p.kernel < 0 || p.kernel > 2) fail("kernel must be 0 (f64), 1 (f32) or 2 (f32f32)");
+}
+
+}  // namespace
+
+void unbind(const Input& in, const Params& p, Output& o) {
+  checkParams(p);
   Kokkos::Timer wall;
   const int64_t n = in.n;
   for (int64_t i = 1; i < n; i++)
@@ -64,6 +85,8 @@ void unbind(const Input& in, const Params& p, Output& o) {
   }
   const size_t ng_in = o.label.size();
   o.nbound.assign(ng_in, 0);
+  o.frame.assign(6 * ng_in, 0.0);
+  o.bound_mass.assign(ng_in, 0.0);
   o.centre.assign(ng_in, -1);
   o.passes.assign(ng_in, 0);
   o.refined_group.assign(ng_in, 0);
@@ -75,17 +98,7 @@ void unbind(const Input& in, const Params& p, Output& o) {
   // matches a label.
   unbind::Groups G = unbind::makeGroups(n, in.pos, in.vel, in.mass, in.label, (int64_t)-1,
                                         p.box, (int64_t)p.min_bound, in.id);
-  unbind::Params P;
-  P.G = p.G;
-  P.a = p.a;
-  P.H = p.H;
-  P.eps = p.eps;
-  P.box = p.box;
-  P.bound_fraction = p.bound_fraction;
-  P.min_bound = p.min_bound;
-  P.cap = p.cap;
-  P.refine = p.cap > 0 ? p.refine : 0;
-  P.refine_chunk = p.refine_chunk;
+  const unbind::Params P = toUnbind(p);
   unbind::Result R;
   if (G.ng() > 0) {
     switch (p.kernel) {
@@ -103,6 +116,15 @@ void unbind(const Input& in, const Params& p, Output& o) {
     if (gi == ng_in) fail("a packed group is not in the input");
     o.nbound[gi] = R.nbound[g];
     o.passes[gi] = R.passes[g];
+    if (R.nbound[g] > 0) {
+      // Offsets are from the group's first packed particle (makeGroups).
+      const double* ref = in.pos + 3 * G.particle[G.off[g]];
+      for (int d = 0; d < 3; d++) {
+        o.frame[6 * gi + d] = ref[d] + R.frame[6 * g + d];
+        o.frame[6 * gi + 3 + d] = R.frame[6 * g + 3 + d];
+      }
+      o.bound_mass[gi] = R.bound_mass[g];
+    }
     o.stale_frame[gi] = R.stale_frame[g];
     int64_t best = -1;
     for (int64_t k = G.off[g]; k < G.off[g + 1]; k++) {
@@ -138,5 +160,116 @@ void unbind(const Input& in, const Params& p, Output& o) {
   o.rounds = R.stats.passes;
   o.wall_s = wall.seconds();
 }
+
+// ---- part 2c ----------------------------------------------------------------
+
+struct SpreadHolder {
+  unbind::spread::Holder h;
+};
+struct SpreadDriver {
+  unbind::spread::Driver d;
+};
+
+SpreadHolder* spreadHolderNew(const Input& in, const Params& p) {
+  checkParams(p);
+  return new SpreadHolder{unbind::spread::Holder(in.n, in.label, in.id, in.pos, in.vel, in.mass,
+                                                 toUnbind(p),
+                                                 unbind::spread::launchFor(p.kernel, p.rsqrt))};
+}
+
+std::vector<char> spreadHolderStep(SpreadHolder* h, const char* cmd, size_t len) {
+  return h->h.step(cmd, len);
+}
+
+void spreadHolderResults(const SpreadHolder* h, Output& o) {
+  o = Output();
+  const unbind::spread::Holder& H = h->h;
+  for (const auto& g : H.results()) {
+    o.label.push_back(g.label);
+    o.first.push_back(g.first);
+    o.count.push_back(g.count);
+    o.nbound.push_back(g.nbound);
+    o.centre.push_back(g.centre);
+    o.passes.push_back(g.passes);
+    o.refined_group.push_back(g.refined_group);
+    o.stale_frame.push_back(g.stale_frame);
+  }
+  const int64_t n = H.size();
+  o.bound.resize((size_t)n);
+  o.energy.resize((size_t)n);
+  o.refined.resize((size_t)n);
+  for (int64_t i = 0; i < n; i++) {
+    o.bound[i] = H.bound(i);
+    o.energy[i] = H.energy(i);
+    o.refined[i] = H.refined(i);
+  }
+  o.kernel_s_later = H.kernel_s;
+  o.wall_s = H.step_s;
+}
+
+void spreadHolderDelete(SpreadHolder* h) { delete h; }
+
+SpreadDriver* spreadDriverNew(const Params& p) {
+  return new SpreadDriver{unbind::spread::Driver(toUnbind(p))};
+}
+
+std::vector<char> spreadDriverStart(SpreadDriver* d) { return d->d.start(); }
+
+std::vector<char> spreadDriverNext(SpreadDriver* d,
+                                   const std::vector<std::vector<char>>& reports) {
+  return d->d.next(reports);
+}
+
+bool spreadDriverDone(const SpreadDriver* d) { return d->d.done(); }
+
+SpreadStats spreadDriverStats(const SpreadDriver* d) {
+  const unbind::spread::DriverStats& s = d->d.stats;
+  SpreadStats r;
+  r.groups = s.groups;
+  r.sampled = s.sampled;
+  r.refined = s.refined;
+  r.subhaloes = s.subhaloes;
+  r.bound = s.bound;
+  r.stale = s.stale;
+  for (const auto& g : d->d.results()) {
+    r.wide += g.wide;
+    r.largest = std::max(r.largest, g.n);
+  }
+  r.rounds = s.rounds;
+  r.refetches = s.refetches;
+  r.passes_max = s.passes_max;
+  r.pairs_first = s.pairs_first;
+  r.pairs_later = s.pairs_later;
+  r.pairs_refine = s.pairs_refine;
+  r.bytes_out = s.bytes_out;
+  r.bytes_in = s.bytes_in;
+  return r;
+}
+
+std::vector<SpreadGroup> spreadDriverGroups(const SpreadDriver* d) {
+  std::vector<SpreadGroup> out;
+  for (const auto& g : d->d.results()) {
+    SpreadGroup x;
+    x.label = g.label;
+    x.n = g.n;
+    x.nbound = g.nbound;
+    x.centre = g.centre;
+    x.passes = g.passes;
+    x.holders = g.holders;
+    x.first_holder = g.first_holder;
+    x.refined_group = g.refined_group;
+    x.stale_frame = g.stale_frame;
+    x.wide = g.wide;
+    x.bound_mass = g.bound_mass;
+    for (int k = 0; k < 3; k++) {
+      x.x[k] = g.x[k];
+      x.v[k] = g.v[k];
+    }
+    out.push_back(x);
+  }
+  return out;
+}
+
+void spreadDriverDelete(SpreadDriver* d) { delete d; }
 
 }  // namespace subhalodev

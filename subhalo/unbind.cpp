@@ -38,6 +38,16 @@
 //                         order of its particle list
 //     --min-bound N       smallest sub-halo (default 20)
 //     --bound-fraction F  stop when a pass keeps this share (default 0.995)
+//     --spread H          with --cap: unbind every group above the cap again
+//                         as a group spread over H holders (unbind_spread.h,
+//                         design/subhalo-checks.md "Step 2", part 2c), the
+//                         rounds run in this process; holder = particle id
+//                         mod H. Prints how the result differs from the
+//                         gathered one, and the dump and tables are the
+//                         spread result
+//     --spread-slabs      with --spread: holder = which of H slabs in x the
+//                         particle is in, so most groups sit on one or two
+//                         holders, as on FoF3's processes
 //
 // The rules are HBT-HERONS's with sampling off (unbind_groups.h): for the
 // comparison HBT-HERONS has to be run with
@@ -59,6 +69,7 @@
 // Build: make unbind (subhalo/Makefile; Kokkos and HDF5).
 
 #include "unbind_groups.h"
+#include "unbind_spread.h"
 
 #include <hdf5.h>
 
@@ -171,7 +182,8 @@ std::unordered_map<long long, Row> readTable(const std::string& path) {
 int main(int argc, char** argv) {
   Kokkos::ScopeGuard kokkos(argc, argv);
   std::string snap, ref_path, out_path, dump_path, origin_path, kernel = "f64";
-  bool rsqrt = false, float_positions = false, open = false;
+  bool rsqrt = false, float_positions = false, open = false, spread_slabs = false;
+  int spread = 0;
   unbind::Params P;
   for (int i = 1; i < argc; i++) {
     const std::string a = argv[i];
@@ -192,6 +204,8 @@ int main(int argc, char** argv) {
     else if (a == "--refine") P.refine = atoll(next());
     else if (a == "--refine-chunk") P.refine_chunk = atoll(next());
     else if (a == "--bound-fraction") P.bound_fraction = atof(next());
+    else if (a == "--spread") spread = atoi(next());
+    else if (a == "--spread-slabs") spread_slabs = true;
     else if (a[0] != '-' && snap.empty()) snap = a;
     else die("unknown argument " + a);
   }
@@ -200,7 +214,7 @@ int main(int argc, char** argv) {
             "usage: unbind <snapshot.hdf5> [--ref table] [--out table] [--dump file.hdf5]\n"
             "              [--kernel f64|f32|f32f32] [--rsqrt] [--float-positions] [--open]\n"
             "              [--cap C [--refine K [--refine-chunk S]]] [--min-bound N]\n"
-            "              [--bound-fraction F]\n"
+            "              [--bound-fraction F] [--spread H [--spread-slabs]]\n"
             "              [--first-origin file]\n");
     return 2;
   }
@@ -330,6 +344,141 @@ int main(int argc, char** argv) {
               : unbind::unbindGroups<float, float, false>(G, P);
   const double unbind_s = timer.seconds();
   const unbind::Stats& S = R.stats;
+
+  // ---- spread (part 2c) ----------------------------------------------------
+  if (spread < 0 || (spread > 0 && P.cap <= 0)) die("--spread needs H > 0 and --cap");
+  if (spread > 0) {
+    timer.reset();
+    struct HolderInput {
+      std::vector<int64_t> label, id, k;   // k: the packed particle
+      std::vector<double> pos, vel, mass;
+    };
+    std::vector<HolderInput> hin((size_t)spread);
+    std::vector<int> sg;
+    std::vector<std::vector<int64_t>> by_id(ng);   // packed particles in id order
+    for (int g = 0; g < ng; g++) {
+      if (G.off[g + 1] - G.off[g] <= P.cap) continue;
+      sg.push_back(g);
+      std::vector<int64_t>& ks = by_id[g];
+      for (int64_t k = G.off[g]; k < G.off[g + 1]; k++) ks.push_back(k);
+      std::sort(ks.begin(), ks.end(), [&](int64_t x, int64_t y) { return G.pid[x] < G.pid[y]; });
+      for (int64_t k : ks) {
+        const int64_t i = G.particle[k];
+        int h;
+        if (spread_slabs) {
+          double x = box > 0 ? pos[3 * i] / box : 0.5;
+          x -= std::floor(x);
+          h = std::min(spread - 1, (int)(x * spread));
+        } else {
+          h = (int)(((G.pid[k] % spread) + spread) % spread);
+        }
+        HolderInput& H = hin[h];
+        H.label.push_back(G.id[g]);
+        H.id.push_back(G.pid[k]);
+        H.k.push_back(k);
+        for (int d = 0; d < 3; d++) {
+          H.pos.push_back(pos[3 * i + d]);
+          H.vel.push_back(G.vel[3 * k + d]);
+        }
+        H.mass.push_back(G.mass[k]);
+      }
+    }
+    const int kcode = kernel == "f64" ? 0 : (kernel == "f32" ? 1 : 2);
+    const unbind::spread::LaunchFn fn = unbind::spread::launchFor(kcode, rsqrt);
+    std::vector<unbind::spread::Holder> holders;
+    holders.reserve((size_t)spread);
+    for (HolderInput& H : hin)
+      holders.emplace_back((int64_t)H.mass.size(), H.label.data(), H.id.data(), H.pos.data(),
+                           H.vel.data(), H.mass.data(), P, fn);
+    std::vector<unbind::spread::Holder*> hp;
+    for (auto& h : holders) hp.push_back(&h);
+    unbind::spread::Driver D(P);
+    const unbind::spread::DriverStats DS = unbind::spread::runInProcess(D, hp);
+    const double spread_s = timer.seconds();
+
+    // Against the gathered result, then take the spread result in its place.
+    long long flags_differ = 0, both = 0, same_bits = 0, groups_differ = 0, centre_differ = 0,
+              passes_differ = 0;
+    double max_rel = 0;
+    std::vector<uint8_t> gbound = R.bound;
+    std::vector<double> genergy = R.energy;
+    for (size_t h = 0; h < holders.size(); h++) {
+      const unbind::spread::Holder& H = holders[h];
+      for (int64_t i = 0; i < H.size(); i++) {
+        const int64_t k = hin[h].k[i];
+        flags_differ += H.bound(i) != gbound[k];
+        if (H.bound(i) && gbound[k]) {
+          both++;
+          if (H.energy(i) == genergy[k]) same_bits++;
+          max_rel = std::max(max_rel, std::fabs(H.energy(i) - genergy[k]) /
+                                          std::max(std::fabs(genergy[k]), 1e-300));
+        }
+        R.bound[k] = H.bound(i);
+        R.energy[k] = H.energy(i);
+        if (P.refine > 0) R.refined[k] = H.refined(i);
+      }
+    }
+    const auto res = D.results();
+    if (res.size() != sg.size()) die("--spread: the driver's groups are not the groups above the cap");
+    for (size_t r = 0; r < res.size(); r++) {
+      const int g = sg[r];
+      if (res[r].label != G.id[g]) die("--spread: the driver's groups are not in label order");
+      groups_differ += res[r].nbound != R.nbound[g];
+      passes_differ += res[r].passes != R.passes[g];
+      R.nbound[g] = res[r].nbound;
+      R.passes[g] = res[r].passes;
+      R.stale_frame[g] = res[r].stale_frame;
+      if (P.refine > 0) {
+        int64_t c = -1;
+        if (res[r].centre >= 0) {
+          const std::vector<int64_t>& ks = by_id[g];
+          auto it = std::lower_bound(ks.begin(), ks.end(), res[r].centre,
+                                     [&](int64_t k, int64_t pid) { return G.pid[k] < pid; });
+          if (it == ks.end() || G.pid[*it] != res[r].centre) die("--spread: centre not in group");
+          c = *it;
+        }
+        centre_differ += c != R.centre[g];
+        R.centre[g] = c;
+        R.refined_group[g] = res[r].refined_group;
+      }
+    }
+    // A digest of the spread result (FoF3's unbindDigestTerm): over the
+    // spread groups' particles (id, bound flag, energy bits) and sub-haloes
+    // (group, bound count, most bound particle's id). Equal on repeated runs
+    // of one layout.
+    auto mix = [](uint64_t z) {
+      z += 0x9E3779B97F4A7C15ull;
+      z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+      z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+      return z ^ (z >> 31);
+    };
+    auto term = [&](uint64_t a, uint64_t b, uint64_t c) { return mix(mix(mix(a) ^ b) ^ c); };
+    uint64_t dig = 0;
+    for (size_t h = 0; h < holders.size(); h++)
+      for (int64_t i = 0; i < holders[h].size(); i++) {
+        uint64_t bits;
+        const double e = holders[h].energy(i);
+        std::memcpy(&bits, &e, sizeof bits);
+        dig += term((uint64_t)hin[h].id[i], holders[h].bound(i), bits);
+      }
+    for (const auto& r : res)
+      if (r.nbound > 0) dig += term((uint64_t)r.label, (uint64_t)r.nbound, (uint64_t)r.centre);
+    long long per_holder_max = 0;
+    for (auto& H : hin) per_holder_max = std::max(per_holder_max, (long long)H.mass.size());
+    printf("\nspread: %zu groups above the cap over %d holders (%s), largest holder %lld "
+           "particles; %d rounds (%lld fetches repeated), %.4g MB of commands, %.4g MB of "
+           "reports; %.2f s\n",
+           sg.size(), spread, spread_slabs ? "slabs in x" : "particle id mod H",
+           per_holder_max, DS.rounds, (long long)DS.refetches, DS.bytes_out / 1e6,
+           DS.bytes_in / 1e6, spread_s);
+    printf("spread: against the gathered result: bound flags differ for %lld particles; bound "
+           "counts differ in %lld groups, pass counts in %lld; most bound particle differs in "
+           "%lld groups\n", flags_differ, groups_differ, passes_differ, centre_differ);
+    printf("spread: energies of the %lld particles bound in both: %lld with the same bits, "
+           "largest |dE|/|E| %.3g\n", both, same_bits, max_rel);
+    printf("spread: digest %016llx\n", (unsigned long long)dig);
+    printf("spread: the dump and tables below are the spread result\n");
+  }
 
   long long alive = 0, bound = 0, passes = 0, stale = 0;
   int max_passes = 0;

@@ -131,6 +131,9 @@ PARATREET_REGISTER_MAIN(ExMain);
           break;
         case 'U':
           fof_unbind = optarg;
+          // Unbinding needs velocities: an NChilada snapshot's vel/ file is
+          // read only with this set (Tipsy carries them anyway).
+          conf.read_velocity_and_soft = true;
           break;
         case 'm':
           fof_min_component_size = atoi(optarg);
@@ -167,9 +170,12 @@ PARATREET_REGISTER_MAIN(ExMain);
           CkPrintf("\t-U [unbinding after -K: key=value,... in code units:\n");
           CkPrintf("\t    eps (comoving softening, required), epsmax, a (1),\n");
           CkPrintf("\t    om (0.3), ol (0.7), cap (10000; 0 = all pairs),\n");
-          CkPrintf("\t    refine (1000), chunk (1024), bf (0.995), min (20),\n");
-          CkPrintf("\t    kernel (f64|f32|f32f32), rsqrt (0|1), out (prefix of\n");
-          CkPrintf("\t    per-process <prefix>.<process>.ubd files), G (1).\n");
+          CkPrintf("\t    refine (1000), chunk (1024), gather (1000000: larger\n");
+          CkPrintf("\t    groups stay spread over processes; 0 = gather all),\n");
+          CkPrintf("\t    bf (0.995), min (20), kernel (f64|f32|f32f32),\n");
+          CkPrintf("\t    rsqrt (0|1), out (prefix of per-process\n");
+          CkPrintf("\t    <prefix>.<process>.ubd files), G (1). With -L, also\n");
+          CkPrintf("\t    <prefix>.<pe>.sub: the label if in the sub-halo, else -1.\n");
           CkPrintf("\t    GPU=1 builds only]\n");
           CkPrintf("\t-P [periodic box period L (cubic, all axes); default 0 = off\n");
           CkPrintf("\t    (open boundaries). Minimum-image PBC; requires b < L/2]\n");

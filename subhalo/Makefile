@@ -36,7 +36,7 @@ all: unbind_rate unbind
 unbind_rate: unbind_rate.cpp unbind_kernel.h unbind_groups.h
 	$(KCXX) $(CXXFLAGS) -o $@ unbind_rate.cpp $(KOKKOS_LIBS)
 
-unbind: unbind.cpp unbind_kernel.h unbind_groups.h
+unbind: unbind.cpp unbind_kernel.h unbind_groups.h unbind_spread.h
 	$(KCXX) $(CXXFLAGS) $(HDF5_FLAGS) -o $@ unbind.cpp $(KOKKOS_LIBS) $(HDF5_LIBS)
 
 # Step 2 (design/subhalo-checks.md, "Step 2: unbinding inside FoF3"): the
@@ -44,7 +44,7 @@ unbind: unbind.cpp unbind_kernel.h unbind_groups.h
 # links fof/gpu/libfofdevice.a. -fPIC as there.
 device: libsubhalodevice.a
 
-SubhaloDevice.o: SubhaloDevice.cpp SubhaloDevice.h unbind_kernel.h unbind_groups.h
+SubhaloDevice.o: SubhaloDevice.cpp SubhaloDevice.h unbind_kernel.h unbind_groups.h unbind_spread.h
 	$(KCXX) $(CXXFLAGS) -fPIC -c $< -o $@
 
 libsubhalodevice.a: SubhaloDevice.o

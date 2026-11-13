@@ -27,6 +27,7 @@ struct FoFCatPartial {
 struct HostLabel {
   uint64_t index;  // staging index on the receiving PE
   long label;
+  long sublabel;   // the label if the particle is in its group's sub-halo, else -1
 };
 
 // Unbinding inside FoF3 (design/subhalo-checks.md, "Step 2"): one
@@ -37,6 +38,28 @@ struct FoFUnbindRec {
   double x[3];      // comoving position, code units
   double v[3];      // velocity as read (Tipsy); times vel_factor = peculiar
   double m;
+  // Part 2d: where the particle lives, (PE << kOriginIndexBits) | its index
+  // in that PE's treepieces in order (FoFPhase1::unbindGather), and whether
+  // its group spans processes (which decides its catalogue owner).
+  unsigned long home;
+  int touched;
+  int pad;
+};
+
+// Part 2d: a particle's result on its way back to its PE.
+struct FoFUnbindFlag {
+  unsigned long index;  // in that PE's treepieces in order
+  long flags;           // 1 = bound, 2 = the most bound particle
+};
+
+// Part 2d: a sub-halo's fields on their way to its catalogue row.
+struct FoFUnbindRow {
+  long label;
+  long nbound;
+  long most_bound;      // order of the most bound particle
+  double bound_mass;
+  double x[3], v[3];    // frame of the bound set; v in the input's velocity units
+  long refined;         // 1 = the most bound particle came from the centre refinement
 };
 
 // FoF3 -U settings, in code units (G = 1); filled by parseUnbindSpec.
@@ -45,6 +68,10 @@ struct FoFUnbindSpec {
   double bound_fraction = 0.995;
   double vel_factor = 1;    // Tipsy velocity -> peculiar velocity (= a)
   long cap = 10000, refine = 1000, chunk = 1024;
+  // Part 2c: a group of more than `gather` particles is not gathered but
+  // unbound where its particles are (unbind_spread.h); 0 = gather every
+  // group. Only with a cap: without one every group is gathered.
+  long gather = 1000000;
   int min_bound = 20;
   int kernel = 0;           // 0 f64, 1 f32 (summed in f64), 2 f32f32
   int rsqrt = 0;
@@ -68,5 +95,7 @@ PUPbytes(paratreet::FoFCatPartial)
 PUPbytes(paratreet::HostLabel)
 PUPbytes(paratreet::FoFUnbindRec)
 PUPbytes(paratreet::FoFUnbindSpec)
+PUPbytes(paratreet::FoFUnbindFlag)
+PUPbytes(paratreet::FoFUnbindRow)
 
 #endif  // FOF_CATALOG_H_

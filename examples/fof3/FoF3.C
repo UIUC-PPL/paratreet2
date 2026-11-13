@@ -742,12 +742,15 @@ using namespace paratreet;
       std::string prefix;
       const auto spec = paratreet::parseUnbindSpec(fof_unbind, pbc_period, &prefix);
       CkPrintf("FOF3STAT unbind_settings: a %g H %.6g G %.10g eps %.6g box %g cap %ld "
-               "refine %ld chunk %ld bound_fraction %g min %d kernel %s%s out %s\n",
+               "refine %ld chunk %ld gather %ld bound_fraction %g min %d kernel %s%s out %s\n",
                spec.a, spec.H, spec.G, spec.eps, spec.box, spec.cap, spec.refine,
-               spec.chunk, spec.bound_fraction, spec.min_bound,
+               spec.chunk, spec.gather, spec.bound_fraction, spec.min_bound,
                spec.kernel == 0 ? "f64" : (spec.kernel == 1 ? "f32" : "f32f32"),
                spec.rsqrt ? " rsqrt" : "", prefix.empty() ? "-" : prefix.c_str());
       const auto us = paratreet::runFoFUnbind(fof, spec, prefix);
+      // Part 2d: the flags reach each particle's PE and the sub-haloes their
+      // catalogue rows; the rows' digest must equal digest_subhaloes.
+      const auto rows = paratreet::finishFoFUnbind(fof);
       CkPrintf("FOF3STAT unbind: groups %ld subhaloes %ld bound %ld particles %ld "
                "largest %ld max_per_process %ld wide %ld sampled %ld refined %ld "
                "stale_frame %ld digest_subhaloes %016llx digest_particles %016llx\n",
@@ -760,6 +763,28 @@ using namespace paratreet;
                us.t_gather, us.t_run, us.t_device_call, us.t_kernel_first,
                us.t_kernel_later, us.t_kernel_refine, us.t_host, us.pairs_first,
                us.pairs_later, us.pairs_refine);
+      // Part 2c: the groups that stayed spread (counted in the lines above;
+      // their digests are part of the totals, so the gathered groups' part is
+      // the total minus these, with wrap-around).
+      CkPrintf("FOF3STAT unbind_spread: groups %ld subhaloes %ld bound %ld particles %ld "
+               "largest %ld processes_holding %ld max_per_process %ld rounds %ld "
+               "refetches %ld passes_max %ld commands_MB %.4g reports_MB %.4g time_s %.3f "
+               "holder_max_s %.3f holder_kernel_max_s %.4f driver_s %.3f "
+               "digest_subhaloes %016llx digest_particles %016llx\n",
+               us.spread_groups, us.spread_subhaloes, us.spread_bound, us.spread_particles,
+               us.spread_largest, us.spread_holders, us.spread_max_per_holder,
+               us.spread_rounds, us.spread_refetches, us.spread_passes_max,
+               us.spread_bytes_out / 1e6,
+               us.spread_bytes_in / 1e6, us.t_spread, us.t_spread_holder,
+               us.t_spread_kernel, us.t_spread_driver, us.spread_digest_subhaloes,
+               us.spread_digest_particles);
+      CkPrintf("FOF3STAT unbind_gathered: digest_subhaloes %016llx digest_particles %016llx\n",
+               us.digest_subhaloes - us.spread_digest_subhaloes,
+               us.digest_particles - us.spread_digest_particles);
+      CkPrintf("FOF3STAT unbind_rows: subhaloes %llu digest %016llx (%s digest_subhaloes)\n",
+               rows.first, rows.second,
+               rows.second == us.digest_subhaloes && (long)rows.first == us.subhaloes
+                   ? "equals" : "DIFFERS FROM");
     }
     if (!fof_label_prefix.empty()) {
       // -L: one (order, label) file per PE. After the catalog, so that with
@@ -772,6 +797,9 @@ using namespace paratreet;
                "digest %016llx no_group %llu time_s %.3f\n",
                fof_label_prefix.c_str(), CkNumPes(), w[0], w[1], w[2],
                CkWallTimer() - tw0);
+      if (!fof_unbind.empty())   // part 2d: <prefix>.<pe>.sub, the sub-halo labels
+        CkPrintf("FOF3STAT subhalo_label_files: records %llu in_subhalo %llu digest %016llx\n",
+                 w[0], w[3], w[4]);
       delete wmsg;
     }
 

@@ -2844,6 +2844,248 @@ the GPU, every check run until a pass removes nothing (`bf=1`). The
 - A breakdown of the unbinding step's time outside the device call.
 - NChilada input: FoF3 sets `read_velocity_and_soft = false`, so an
   NChilada snapshot's velocities are not read. Tipsy is not affected.
+  (Done in 2d: `-U` turns it on.)
+
+### Part 2c: groups that stay spread (2026-11-13)
+
+**Design, as built.** A kept group of more than `gather` particles (a new
+`-U` key, default 1,000,000; 0 = gather every group; only with a cap) is
+not gathered. Each PE keeps its particles of the group on its own process,
+and the group is unbound there, in rounds, after the gathered groups.
+`subhalo/unbind_spread.h` holds the algorithm; FoF3 only carries bytes.
+
+- **Who does what.** One *driver* (host code, on FoF3's driver thread on PE
+  0) keeps each spread group's state: frame, counts, state of the pass, the
+  capped sample in unbind_groups.h's order, and, once the bound set is at or
+  below the cap, the bound set itself. One *holder* per process (on its
+  first PE, which owns the GPU) keeps that process's particles of every
+  spread group, their energies, sums over the sample and bound flags. A
+  round is one broadcast of the driver's command to every process and one
+  reduction of the processes' reports, which the driver reads in process
+  order.
+- **Rounds.** *origin*: each holder's count and lowest-id particle; the
+  group's lowest-id particle is its origin, as `makeGroups` takes it.
+  *pack*: positions become offsets from the origin (nearest image), exactly
+  as `makeGroups` makes them; holders report extents, the sums of the first
+  frame, and their first C particles in sampling order. *pass*: the driver
+  sends each active group's sources: the sample (in full), the sample's
+  change (joined and, with negated masses, removed members), the bound set
+  (at or below the cap) or the particles the last pass removed
+  (subtraction). Holders evaluate their bound particles with the same
+  kernels, remove the unbound ones, and report counts, the frame sums of
+  what they kept and which sample members (or, at or below the cap, which
+  particles) they removed. *fetch*: after a pass, the particles that join
+  the sample (the next alive ones in sampling order after the last one
+  taken), or the bound set when a group falls to the cap. *centre*: each
+  holder's K lowest energies (one for a group that is not refined).
+  *refine*: each holder's sums over its own bound particles for the K
+  candidates (the split kernel), added in process order by the driver.
+  *final*: the results go back to the holders, which write
+  `<prefix>.<process>.s.ubd` and add the digest terms.
+- **What differs from a gathered group.** Only the rounding of three sums:
+  the frame and the bound mass are sums of the holders' sums, added in
+  process order, and the frame is taken relative to the origin instead of
+  the first bound particle; the refinement's sums are the holders' sums
+  added in process order. The sample and its order, each particle's sum
+  over a list of sources, the removal, the stopping rule, the switch to the
+  exact rules at the cap, the subtraction and the stale-frame count are
+  unbind_groups.h's. So a spread group gives the same bits every time on
+  one layout (decision 3) and differs across layouts only by that
+  rounding. With one holder the sums are unbind_groups.h's own, so the bits
+  are too, except in a group whose lowest-id particle is removed during the
+  passes (the frame's reference particle then differs).
+- **Without a cap** nothing is spread: every source of every pass would
+  have to go to every holder.
+- **A check without FoF3.** `unbind --spread H` unbinds every group above
+  the cap again as a spread group over H holders (particle id mod H, or
+  `--spread-slabs`: H slabs in x, so most groups sit on one or two
+  holders), the rounds run in one process. It prints how the result
+  differs from the gathered one and a digest, and writes the spread result
+  to the dump, so `unbindcheck` and `centrecheck.py` apply unchanged.
+
+**Results (job 5917906, one node, 12 min, 0.20 node-hours;
+`subhalo/run_fof3_spread.sbatch` parts 1, 2 and 4).** 8m-lambb, cap 10,000,
+refinement 1,000, every run until a pass removes nothing. With
+`gather=10000` all 60 groups above the cap stay spread. FoF3 runs use the
+snapshot's G (0.9999517944622952 in code units), so the references apply
+directly.
+
+1. **`unbind --spread` against the gathered run, one die.** Every spread run
+   has the gathered run's bound particles in every group, and its most
+   bound particle in every group, and passes `unbindcheck --cap` and
+   `centrecheck.py` at tau against `unbindspec --cap 10000 --refine 1000`
+   (job 5916562's files). The two runs at H = 4 have the same digest
+   (4a9cd521adcacb57) and identical dumps.
+
+   | Run | Holders | Bound flags that differ from the gathered run (count) | Energies with the gathered run's bits, of 2,003,312 (count) | Largest \|dE\|/\|E\| (lower is closer) | Commands, reports (MB) |
+   |---|---|---|---|---|---|
+   | H = 1, f64 | 1 | 0 | 1,942,505 | 7.7e-13 | 28.6, 29.8 |
+   | H = 4 (id mod 4), f64 | 4 | 0 | 249,838 | 3.8e-11 | 28.6, 77.4 |
+   | H = 8 (slabs in x), f64 | 8 | 0 | 1,654,500 | 5.7e-11 | 28.6, 32.2 |
+   | H = 4, f32 rsqrt (against the gathered f32 rsqrt run) | 4 | 0 | 249,717 | 3.8e-11 | 28.6, 77.4 |
+
+   \|dE\|/\|E\| is relative to each particle's own energy, so it is
+   largest for energies near zero; every spread run takes 29 rounds. The
+   f32 rsqrt run also passes with the single-precision allowance against
+   the f64 run at H = 4.
+2. **FoF3.** FoF3's label digest (c4f41054eacf794c) and catalogue digest
+   (57c1e840e74a8aae) are unchanged in every run. `digest_subhaloes` (bound
+   count and most bound particle of every group) is 60b25ca96fb0c3a0 in
+   every capped run: gathered on one process, spread on 1 and 8 processes,
+   and spread in f32 rsqrt. `digest_particles` (energy bits) differs
+   between them, as expected, and is the same in the two 8-process spread
+   runs (1e18d903818f6e41). The defaults on 8 processes, where the gather
+   limit of 1,000,000 spreads nothing, give job 5916950's digests.
+3. **FoF3 against the references.** Gathered on one process, spread on 1
+   and 8 processes, and spread in f32 rsqrt (also with the allowance
+   against the f64 spread run): each passes `unbindcheck --cap` at tau
+   against job 5916562's reference. Against the standalone gathered
+   `unbind`, every one has the same bound particles in every group and the
+   same most bound particle in all 13,256 groups, energies within 1.0e-6 of
+   S and refined energies within 2.3e-7 of S, the same numbers as the
+   gathered FoF3 run: the single-precision inputs, not the spreading, set
+   them.
+4. **Time.** On 8 processes with the snapshot's G the 60 spread groups take
+   0.73 s (29 rounds; slowest holder 0.22 s, of it 0.04 s in kernels;
+   driver 0.11 s) after 0.50 s for the gathered groups, against 0.78 s for
+   all groups gathered (job 5916950, cap 10,000, G = 1). For groups of at
+   most 153,804 particles the rounds cost more than they save, which is
+   why the default limit is 1,000,000. The `unbind_spread` line's round
+   and pass counts were unreadable in this job (the device library was
+   built before a field was added to its header); rebuilt for the next
+   jobs, with no effect on results or digests.
+
+### Part 2d: results back to the particles, the plug-in, the lambb gate
+
+**Design, as built.**
+
+- **Back to each particle's PE.** Every record sent for unbinding carries
+  its particle's home: (PE << 40) | its index in that PE's treepieces in
+  order, and whether its group spans processes. After unbinding, the
+  unbinding process (gathered) or the holder (spread) sends each bound
+  particle's flags (1 = in the sub-halo, 2 = most bound particle) to its
+  PE; FoF3 waits for quiescence.
+- **`-L` with `-U`** also writes `<prefix>.<pe>.sub`: the `.lbl` records
+  with the sub-halo label, the group's label for a particle in its
+  sub-halo and -1 otherwise. `FOF3STAT subhalo_label_files` prints the
+  count in a sub-halo and a digest of (order, sub-halo label), which
+  depends on the bound sets alone. `fof3ubd.py sub` checks the `.sub` and
+  `.lbl` files against the `.ubd` files.
+- **The catalogue rows.** Each sub-halo's fields go to its group's
+  catalogue row (on the PE `catalogAccumulate` chose): bound count, most
+  bound particle, bound mass and the frame of the bound set (position in
+  the image of the group's first particle; velocity in the input's
+  units). `FOF3STAT unbind_rows` sums the rows' sub-haloes; the digest must
+  equal `digest_subhaloes`.
+- **The plug-in.** `fofplugin::Params::unbinding` (eps, eps_max, a,
+  omega_m, omega_lambda, vel_factor, G and FoF3 -U's other keys) runs the
+  same unbinding after the catalogue; `fofplugin::subhaloLabels()` gives
+  each staged particle's sub-halo label, and `fofplugin::Group` gains the
+  sub-halo fields. `vel_factor` defaults to a (staged velocity times a =
+  peculiar velocity, ChaNGa's Tipsy convention as `tipsy2hbt` takes it).
+  The test host `examples/fofhost` takes `-U <settings>` and prints the
+  digests of the sub-halo labels and of the rows.
+- **NChilada.** `-U` turns on `read_velocity_and_soft`, so an NChilada
+  snapshot's velocities are read.
+- **Per-group output** for FoF3 alone stays the `.ubd` files and the
+  digests; the rows are what the plug-in's host reads.
+
+**Two changes after the first two-node job (job 5918005).**
+
+- *The spread groups' rows went to the wrong PEs.* The catalogue's owner
+  PE depends on the sign of the group's labels in `catalogAccumulate`
+  ("touched"), and that is not the same as "held by more than one
+  process", which is what the driver can see. 51 of 60 rows were sent to a
+  PE without the row and the runs aborted. The few spread rows now go to
+  every PE and the one holding the row takes it; gathered groups still
+  send to the owner, from the touched flag each record carries.
+- *The sample fetch is by key threshold.* Each holder used to send its
+  next `need` candidates, so a fetch moved `need` from every holder. The
+  driver now asks for every alive particle after the frontier whose
+  sampling key is at most the key below which 1.2 need + 64 are expected
+  (keys are a hash of the id, so they are spread evenly), and asks again
+  above it if too few come back. This changes what is sent, not the
+  sample: job 5918052 part 0 gives job 5917906's digests exactly.
+
+**Results (job 5918052, two nodes, 6 min, 0.20 node-hours;
+`subhalo/run_fof3_subhalo_gate.sbatch`).** Every check passes. Job 5918005
+(two nodes, 5 min, 0.16 node-hours) ran the same parts before the two
+changes; its gathered and plug-in results are the same as below.
+
+0. **The threshold fetch.** `unbind --spread` at H = 1, H = 4 and H = 8
+   slabs gives job 5917906's digests (ab9798e1895ce025, 4a9cd521adcacb57,
+   cd125e4fd37ec9d6), no fetch had to be repeated, and the reports at H = 4
+   are 48.8 MB instead of 77.4 MB (at H = 1, 34.7 instead of 29.8: the 20%
+   margin). FoF3 with `gather=10000` on 8 processes gives job 5917906's
+   digests.
+1. **8m-lambb, FoF3 with `-L`** (cap 10,000, refinement 1,000, `bf=1`, the
+   snapshot's G). Label and catalogue digests unchanged everywhere.
+
+   | Run | Processes | digest_subhaloes | Sub-halo label digest | Catalogue rows with a sub-halo (count) | Rows' digest equals digest_subhaloes |
+   |---|---|---|---|---|---|
+   | gathered | 8 | 60b25ca96fb0c3a0 | d7d3b9ee059241dc | 13,256 | yes |
+   | gathered | 16 | 60b25ca96fb0c3a0 | d7d3b9ee059241dc | 13,256 | yes |
+   | gather=10000 (60 spread) | 8 | 60b25ca96fb0c3a0 | d7d3b9ee059241dc | 13,256 | yes |
+   | gather=10000 (60 spread) | 16 | 60b25ca96fb0c3a0 | d7d3b9ee059241dc | 13,256 | yes |
+   | defaults (G = 1) | 16 | dd4e9389c2cc2b26 | 2ea6387a082b2c6b | 13,256 | yes |
+   | defaults, gather=10000 | 16 | dd4e9389c2cc2b26 | 2ea6387a082b2c6b | 13,256 | yes |
+
+   The gathered digests on 8 and 16 processes are the same (energy bits
+   included). `fof3ubd.py sub` passes on the gathered and spread 16-process
+   runs and the spread 8-process run: every `.sub` record agrees with the
+   `.ubd` bound flags and every `.lbl` label with the `.ubd` label
+   (4,215,879 particles in a sub-halo).
+2. **The plug-in on 8m-lambb**, 16 processes, the same settings: with the
+   test host's own placement and with its host cells (`-c 6`), its
+   unbinding digests are FoF3's exactly (digest_subhaloes
+   60b25ca96fb0c3a0, digest_particles 63565f8cff5c277f, energy bits
+   included), its sub-halo label digest is FoF3's (d7d3b9ee059241dc), and
+   its catalogue rows carry all 13,256 sub-haloes with FoF3's digest.
+3. **The lambb gate.** lambb.00500, periodic (`-P 1`), production defaults.
+   With the period FoF finds 116,431 groups of 20 or more (catalogue digest
+   ad6e39e991892a89) and the largest has 1,867,618 particles; 3 groups are
+   above the gather limit and stay spread.
+   - FoF3's label digest is the periodic gold value e88625a3f5164c05 in
+     every run.
+   - 91,719 sub-haloes holding 45,159,161 particles; 440 groups sampled,
+     430 refined. The rows carry all of them (digest cfb4bdf5f3c9724c =
+     digest_subhaloes) and `fof3ubd.py sub` passes.
+   - The gathered groups' digests are the same on 8 and 16 processes. The
+     spread groups happen to have the same bits on 4 and 5 holders too: at
+     `bf` 0.995 each stopped after one pass, so only the first frame's sum
+     differs in order.
+   - The sub-halo labels are the same spread on 16, spread on 8, all
+     gathered on 16, and through the plug-in on 16 (d4b07a5fb53eb426); the
+     plug-in's rows and unbinding digests are FoF3's 16-process ones.
+   - Time on 16 processes (s; lower is better). These runs also wrote the
+     `.ubd` files (1.9 GB) inside the unbinding step, so the step times are
+     an upper bound:
+
+     | Run | Gather | Gathered groups' step | Slowest device call | Spread groups | Total |
+     |---|---|---|---|---|---|
+     | defaults (3 spread) | 0.34 | 3.07 | 1.55 | 1.24 (7 rounds) | 4.65 |
+     | gather=0 (all gathered) | 0.54 | 4.27 | 2.39 | - | 4.81 |
+
+     Spreading the three largest groups takes the slowest device call from
+     2.39 s to 1.55 s (speedup 1.54) and the whole unbinding from 4.81 s to
+     4.65 s (speedup 1.03); the rest of the step (sorting, packing, writing
+     the files) is the larger part at this size and is not broken down yet.
+
+### Not done in 2c and 2d
+
+- **cosmo2b at 64 nodes** (`subhalo/run_fof3_unbind_cosmo2b.sbatch`, two
+  FoF3 runs: the defaults, about 90 groups spread, and `gather=0`): waits
+  for the go. Estimate: 64 nodes for 15 to 25 minutes, 16 to 27
+  node-hours. cosmo2b stores 452,984,832 of its particles in Tipsy's gas
+  slot with zero density and 500 K; the run treats them as collisionless
+  (decision 6).
+- A breakdown of the unbinding step outside the device call (sorting,
+  packing, digests, file writes), now the larger part on lambb.
+- The command of each round is broadcast to every PE. With about 90
+  spread groups the first full sample is 36 MB per process; sending it
+  only to the processes that hold each group would cut that.
+- The per-group fields are on the catalogue rows only (the plug-in); FoF3
+  alone has no catalogue file to put them in.
 
 ## Open
 
@@ -2923,6 +3165,10 @@ the GPU, every check run until a pass removes nothing (`bf=1`). The
 - Decided 2026-11-13: step 2 (unbinding inside FoF3) started; see "Step 2".
   Parts 2a and 2b done 2026-11-13 (jobs 5916950, 5917058): the same bits
   on 1, 8 and 16 processes, and the standalone kernel's result once G is
-  the references' (they use 0.99995179 in code units, FoF3 1). Next: 2c
-  (groups that stay spread) and 2d (results back to each particle, the
-  plug-in, scale).
+  the references' (they use 0.99995179 in code units, FoF3 1). Parts 2c
+  and 2d done 2026-11-13 (jobs 5917906, 5918005, 5918052): groups above
+  `gather` stay spread and give the gathered bound sets and most bound
+  particles on 8m-lambb; the bound flags reach each particle's PE (`-L`'s
+  `.sub` files, the plug-in's `subhaloLabels()`), the sub-halo fields reach
+  the catalogue rows, and the lambb gate passes. Open: cosmo2b at 64 nodes
+  (waits for the go), see "Not done in 2c and 2d".
