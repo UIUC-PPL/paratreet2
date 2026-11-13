@@ -2265,7 +2265,8 @@ and the `unbindcheck` logs) and `widecheck.5911041.out`.
 
 Decided 2026-11-12: build the refinement proposed in "HBT-HERONS with a
 cap, against the exact result" (item 4). Done and checked on the Mac. The
-kernel's GPU run is `subhalo/run_unbind_refine.sbatch` and has not run yet.
+kernel's GPU run is `subhalo/run_unbind_refine.sbatch`; it ran on
+2026-11-13 ("Results on Frontier (job 5916562)").
 
 ### Definition
 
@@ -2450,11 +2451,121 @@ The stand-in is not in the repository. Its `rsqrt` is 1/sqrt, so the
   So rule 3 catches an error in the new energies of 0.1% of the
   potential, and rule 2 a wrong choice of candidates.
 
+### Results on Frontier (job 5916562)
+
+`subhalo/run_unbind_refine.sbatch` at 17c6c05 with K = 1,000, one node,
+8 min 54 s, 0.15 node-hours: `unbind` on one MI250X die (the first GPU
+build of the step; `make -C subhalo all compare` compiled every program
+without a warning), `unbindspec`, `unbindcheck` and `centrecheck.py` on
+56 cores. 8m-lambb at caps 1,000 and 10,000 in all six forms; the six
+other inputs at 10,000 in f64, f64 with rsqrt, f32 with rsqrt and f32f32.
+Nothing was changed to make a run pass.
+
+**Every run passes.** 36 runs, each with `unbindcheck --cap` exit 0 and
+`CENTRECHECK PASS`; the 20 single-precision runs also with
+`--single-against` their double-precision form (both exits 0). In every
+refined group of every run the kernel's most bound particle is the
+reference's, with no tie needed.
+
+| Input | Cap | Bound particles: reference / every form (count) | Refined groups (count) | Largest rank of the result in the last pass's order | As the script's header expects |
+|---|---|---|---|---|---|
+| 8m-lambb | 1,000 | 4,214,992 / the same | 439 | 66 | yes |
+| 8m-lambb | 10,000 | 4,215,879 / the same | 58 | 6 | yes |
+| a0.5 | 10,000 | 4,294,867 / the same | 60 | 23 | yes |
+| a1.25 | 10,000 | 2,538,527 / the same, except f32f32: 2,538,523 | 31 | 11 | yes |
+| w565 | 10,000 | 514,744 / the same | 8 | 5 | yes |
+| w580 | 10,000 | 422,173 / the same | 6 | 1 | yes |
+| cube45 | 10,000 | 79,536 / the same | 1 | 1 | yes |
+| cube40 | 10,000 | 79,053 / the same | 1 | 0 | yes |
+
+No run has the result in the upper half of the candidates.
+
+Largest \|dE\|/S of the refined energies against the reference (fraction
+of S; lower is better):
+
+| Input | Cap | f64 | f64 rsqrt | f32 | f32 rsqrt | f32f32 | f32f32 rsqrt |
+|---|---|---|---|---|---|---|---|
+| 8m-lambb | 1,000 | 1.7e-9 | 1.7e-9 | 1.3e-6 | 1.3e-6 | 1.0e-4 | 1.0e-4 |
+| 8m-lambb | 10,000 | 1.0e-9 | 1.0e-9 | 1.2e-6 | 1.3e-6 | 1.1e-4 | 1.1e-4 |
+| a0.5 | 10,000 | 7.4e-10 | 7.4e-10 | not run | 9.5e-7 | 7.6e-5 | not run |
+| a1.25 | 10,000 | 1.0e-9 | 1.0e-9 | not run | 2.1e-6 | 1.3e-3 | not run |
+| w565 | 10,000 | 6.3e-10 | 6.3e-10 | not run | 1.9e-5 | 1.3e-4 | not run |
+| w580 | 10,000 | 6.3e-10 | 6.3e-10 | not run | 2.0e-5 | 6.0e-4 | not run |
+| cube45 | 10,000 | 3.1e-10 | 3.1e-10 | not run | 3.9e-7 | 4.5e-5 | not run |
+| cube40 | 10,000 | 3.0e-10 | 3.0e-10 | not run | 3.8e-7 | 4.2e-5 | not run |
+
+- **The rsqrt forms**, which the Mac could not test, are as close to the
+  reference as the plain forms: the same figures in double precision to
+  two digits, and within 2e-8 of S of them in single precision.
+- f32 rsqrt on w565 and w580 reaches 2e-5 of S, above the 1.3e-6 the
+  script's header gives for f32. That figure came from 8m-lambb, the only
+  input the Mac ran f32 on. 2e-5 is what the single-precision forms give on
+  these two inputs without a cap too (job 5904186: 2.2e-5), and is far
+  below tau.
+- f32f32 on a1.25 is at 0.93 tau without the allowance, as on the Mac; with
+  it (n = 4.8e-4 over 30,999 refined particles) the tolerance is 0.0062 S.
+  Its bound sets differ from the reference's in 5 groups (6 particles only
+  in the reference, 2 only in the kernel), 2 of them refined. Each passes
+  the amended rule; the rule as first written fails, as the uncapped f32f32
+  run on a1.25 did in job 5904186. In those 2 groups at least 999 of the
+  1,000 candidates are the reference's, and the most bound particle is the
+  same.
+- The single-precision allowance for the refined energies: n from 3.7e-7
+  (f32 rsqrt, the cubes) to 1.6e-5 (f32 rsqrt, w580) and from 4.0e-5 to
+  5.8e-4 (f32f32); the tolerance stays at 0.00141 to 0.00157 S for f32 and
+  rises to 0.0072 S for f32f32 on w580.
+- **Without `--refine`, the f64 dump's Bound and Energy are identical** to
+  the f64 dump with it (`h5diff`) on all eight inputs and caps: the
+  refinement changes no pass.
+
+**Time on one die.** The refinement's kernel time against the first
+pass's (s; lower is better), and pair terms per second (higher is better):
+
+| Input | Cap | Refinement pair terms (% of the first pass's) | Largest refined bound set (particles) | f64: first pass / refinement (s) | f64: refinement's rate (pair terms/s) | f32 rsqrt: first pass / refinement (s) | f32 rsqrt: refinement's rate (pair terms/s) |
+|---|---|---|---|---|---|---|---|
+| 8m-lambb | 1,000 | 3.07e9 (88.9%) | 153,544 | 0.023 / 0.107 | 2.9e10 | 0.012 / 0.065 | 4.7e10 |
+| 8m-lambb | 10,000 | 1.98e9 (7.8%) | 153,505 | 0.158 / 0.105 | 1.9e10 | 0.074 / 0.066 | 3.0e10 |
+| a0.5 | 10,000 | 2.02e9 (8.0%) | 153,804 | 0.158 / 0.105 | 1.9e10 | 0.074 / 0.066 | 3.1e10 |
+| a1.25 | 10,000 | 8.97e8 (3.5%) | 91,416 | 0.157 / 0.061 | 1.5e10 | 0.073 / 0.038 | 2.4e10 |
+| w565 | 10,000 | 2.41e8 (7.2%) | 63,923 | 0.035 / 0.061 | 4.0e9 | 0.023 / 0.045 | 5.4e9 |
+| w580 | 10,000 | 1.53e8 (4.4%) | 67,703 | 0.035 / 0.065 | 2.4e9 | 0.024 / 0.048 | 3.2e9 |
+| cube45 | 10,000 | 7.89e7 (10.0%) | 78,851 | 0.012 / 0.076 | 1.0e9 | 0.009 / 0.056 | 1.4e9 |
+| cube40 | 10,000 | 7.85e7 (10.0%) | 78,515 | 0.012 / 0.076 | 1.0e9 | 0.009 / 0.056 | 1.4e9 |
+
+The first pass runs at 1.5e11 to 1.6e11 pair terms per second in f64 and
+2.9e11 to 3.5e11 in f32 rsqrt on the 8M inputs.
+
+1. **On 8m-lambb at 10,000 the refinement takes 0.105 s in f64, 66% of
+   the first pass's kernel time, and 0.066 s in f32 rsqrt, 89% of it,
+   for 7.8% of its pair terms.** It runs at an eighth (f64) and an
+   eleventh (f32 rsqrt) of the first pass's rate. The whole unbinding,
+   f64, takes 1.076 s with the refinement and 0.880 s without it (one run
+   each): 0.105 s more in the kernel, 0.090 s more in host work and
+   copies. At a cap of 1,000 the refinement takes 4.7 (f64) to 5.4
+   (f32 rsqrt) times the first pass's kernel time.
+2. **The refinement's time follows its largest group, not its pair
+   terms.** 8m-lambb at a cap of 1,000 (3.07e9 pair terms) and at 10,000
+   (1.98e9) take the same 0.105 to 0.107 s; both have a refined group of
+   153,500 bound particles. cube40 has 4.0% of the pair terms of 8m-lambb
+   at 10,000 and takes 72% of its time. The kernel gives each candidate
+   one thread, which sums over its group's bound particles alone, so the
+   1,000 threads of the largest group finish last. That is a reading of
+   `unbind_kernel.h` (`RangePolicy` over targets) and not tested.
+3. **So "at most a tenth of a pass" ("Cost") holds in pair terms and not
+   in time with this kernel.** "Cost" already says a single very large
+   group needs each candidate's sum split across threads; on one die this
+   shows already for groups of 64,000 to 154,000 particles. The first
+   pass of the same group does not have this problem: it has one thread
+   per bound particle, not per candidate.
+
 ### Not done
 
-- The GPU run: `CHECK_ONLY=1 bash subhalo/run_unbind_refine.sbatch`, then
-  `sbatch`. It repeats the above in all six forms on one die and times the
-  refinement against the first pass. Expected values are in its header.
+- Done 2026-11-13: the GPU run (job 5916562, "Results on Frontier"). Every
+  run passes, the rsqrt forms included.
+- A refinement kernel that splits each candidate's sum over its group's
+  bound particles across threads, so that its time follows its pair terms
+  and not its largest group. With the present kernel the refinement costs
+  66 to 89% of the first pass's kernel time on 8m-lambb at 10,000.
 - Whether `--refine 1000` becomes the default with a cap. It is off by
   default so that every earlier run reproduces.
 - The refinement of a group spread over processes, for the stage inside
@@ -2479,7 +2590,9 @@ The stand-in is not in the repository. Its `rsqrt` is 1/sqrt, so the
   cap, against the exact result"). Done 2026-11-12 on the Mac: a
   refinement step in `unbind` (`--refine K`), which gives the exact most
   bound particle in every sampled group of 8m-lambb at both caps ("Centre
-  refinement"). Not done: its run on the GPU (`run_unbind_refine.sbatch`).
+  refinement"). Done 2026-11-13 on the GPU (job 5916562): every form
+  passes; the refinement's kernel time follows its largest group and is 66
+  to 89% of the first pass's on 8m-lambb at 10,000.
 - Done 2026-11-11 against the written definition only (job 5904186, "A
   scale factor other than 1, and groups at least half the box wide"): the
   kernel at a = 0.5 and a = 1.25, and on four inputs with groups at least
