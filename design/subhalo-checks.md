@@ -3207,6 +3207,91 @@ The per-PE sorts moved into the gather step, which takes 0.46 s instead of
 gathered groups' step takes 2.75 s (slowest device call 1.51 s, of it 0.42
 s host work), against 1.83 s for the spread ones.
 
+### cosmo25: preparation (2026-11-14, job 5923451)
+
+cosmo25 is the input where groups have to stay spread: its largest group
+(2,214,117,459 particles, 74 GiB) does not fit one die.
+
+**The input** (`cosmo25PLK.2304g_dm.004096`, NChilada, read from the field
+headers):
+
+| Quantity | Value |
+|---|---|
+| Particles | 24,461,180,928: 12,230,590,464 in each of the dark and gas families |
+| Particle mass (code units) | dark 2.1286787e-11, gas 3.9450292e-12 |
+| Gas | 500 K everywhere: collisionless, as on cosmo2b (decision 6) |
+| Scale factor | 1 - 3.9e-13 (the runs use a = 1) |
+| Box | positions in [-0.5, 0.5]: periodic, side 1 (`-P 1`) |
+| Softening (code units) | 4.721853201772319e-06 for both families |
+| FoF, b = 0.2, open boundaries (September runs) | 6,730,729,617 groups, largest 2,214,117,459, 691 of 2^20 particles or more |
+
+**Two things nothing had tested yet:**
+
+- *A group above 2^31 particles, and particle ids above 2^32.* Every
+  count, id, offset and label on the paths a group's size or a particle's id
+  passes through is 64-bit: the records (`FoFUnbindRec`, `FoFUnbindRow`,
+  `FoFUnbindFlag`), the device library's `Input`, `Output`, `SpreadStats` and
+  `SpreadGroup`, the holder's and driver's group state (`n`, `nb`, `avail`,
+  `need`, the key threshold), `FoFUnbindStats`, the plug-in's `Group`, and
+  the prints (`%ld`). The 32-bit integers left are per-process (rows and
+  groups in one launch, at most tens of millions at 64 nodes) or small
+  (passes, holders, round kinds). The label holds the particle order in 43
+  bits. The stopping rule compares bound counts in single precision, as
+  `unbind_groups.h` and HBT-HERONS do; at 2.2e9 that is good to about 1e-7
+  of the count, which cannot change a comparison against 0.995. Nothing was
+  changed.
+- *NChilada input with velocities.* The reader reads `vel` and `soft` when
+  `-U` asks for them, but FoF3 `-U` had only read Tipsy.
+
+**What was added:** `FOF3STAT unbind_spread_largest`, the largest spread
+group's own result (label, size, bound count and share, passes, holders,
+refined and stale-frame flags). It is a print only.
+
+**Smoke test (job 5923451, two nodes, 21 s, 0.01 node-hours)**,
+`subhalo/run_fof3_unbind_nchilada_smoke.sbatch`, 16 processes:
+
+- The 100k test snapshot in Tipsy and in NChilada (the same float32 values,
+  2026-08-21) gives the same label digest (5158d147866be658), catalogue
+  digest (022e1468481dc8ef) and unbinding digests, all groups gathered and
+  with two groups spread and sampled (cap 500, gather 1,000). No group of
+  this input is bound: it is a synthetic sphere whose velocities are not
+  virialized. digest_particles still hashes every particle's energy
+  (a54764d5f35009ad and 0681b928d2e4e135), and the energies use the
+  velocities and masses, so they are read the same from both formats.
+- 8m-lambb with 60 groups spread gives job 5923267's digests exactly
+  (digest_subhaloes 60b25ca96fb0c3a0, digest_particles dbf68c1f739a5748,
+  spread f0df4f01b805bdc1 / 27f553027f64da50). The new line reads 153,804
+  particles, 153,505 bound (0.998), 4 passes, 2 holders, refined.
+
+**The 64-node run, not submitted yet** (`subhalo/run_fof3_unbind_cosmo25.sbatch`,
+512 processes, the CPU arm for FoF at leaf 12):
+
+1. `open`: FoF3 `-K -m 20`, open boundaries, no unbinding. Its group count
+   and largest group must equal the September value. It is the first run on
+   this snapshot since the min-id labels, the catalogue and the lazy
+   canopy. If it differs the job stops there.
+2. `spread`: `-P 1 -U eps=4.721853201772319e-06`, the production defaults
+   (cap 10,000, refinement 1,000, bf 0.995, gather 1,000,000, so about 690
+   groups stay spread). No gathered run: the largest group does not fit.
+
+**Estimate.** In the September run at 64 nodes (job 5512059) the step took
+94 s: loading 40 s, decomposition (counting the loading) 63 s, the FoF
+iteration 27 s; peak memory 23 GB per process of 64 GB. The spread run adds
+reading the velocities (300 GB more), the catalogue (0.75 s on cosmo2b,
+about 9 s at 12 times the particles per process) and unbinding (5.0 s on
+cosmo2b, 40 to 60 s scaled by particles per process). About 2 minutes for
+`open` and 3 for `spread`, so about 6 node-hours. That rises to 10 if the
+leaf-12 CPU arm or the unbinding takes twice as long. Each run is stopped
+after 10 minutes, so a hang costs at most about 22 node-hours (32 at the
+job's 30-minute limit).
+
+**What will be checked:** FoF's answer (open); the rows digest equal to
+digest_subhaloes; the bound count no larger than the particle count; the
+largest group's line (its size printed in full, its bound count). There is
+no reference for the bound sets on this input, since nothing else can unbind
+its largest group. The layout check of decision 3 needs a second
+process count, which is left for later.
+
 ### Not done in 2c and 2d
 
 - The rest of the spread groups' time on cosmo2b: set-up 0.47 s (the merge

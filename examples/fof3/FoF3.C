@@ -778,6 +778,11 @@ using namespace paratreet;
                us.spread_bytes_in / 1e6, us.t_spread, us.t_spread_holder,
                us.t_spread_kernel, us.t_spread_driver, us.spread_digest_subhaloes,
                us.spread_digest_particles);
+      if (us.big_n > 0)
+        CkPrintf("FOF3STAT unbind_spread_largest: label %ld n %ld nbound %ld bound_share %.6f "
+                 "passes %ld holders %ld refined %ld stale_frame %ld\n",
+                 us.big_label, us.big_n, us.big_nbound, (double)us.big_nbound / (double)us.big_n,
+                 us.big_passes, us.big_holders, us.big_refined, us.big_stale);
       CkPrintf("FOF3STAT unbind_gathered: digest_subhaloes %016llx digest_particles %016llx\n",
                us.digest_subhaloes - us.spread_digest_subhaloes,
                us.digest_particles - us.spread_digest_particles);

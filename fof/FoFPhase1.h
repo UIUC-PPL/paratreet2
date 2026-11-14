@@ -6023,6 +6023,11 @@ struct FoFUnbindStats {
   double t_holder_kind[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
   double t_spread_init = 0, t_spread_init_max = 0, t_spread_finish = 0, t_spread_finish_max = 0;
   long spread_messages = 0;
+  // The largest spread group's own result (its size, bound count, passes,
+  // holders, refined and stale-frame flags), for the cosmo25 run, whose
+  // largest group is above 2^31 particles.
+  long big_label = -1, big_n = 0, big_nbound = 0, big_passes = 0, big_holders = 0,
+       big_refined = 0, big_stale = 0;
 };
 
 // Gather (one quiescence) and unbind. Call after runFoFCatalog.
@@ -6161,6 +6166,15 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
     // one that holds the row takes it (unbind_rows checks that all arrived).
     std::vector<paratreet::FoFUnbindRow> rows;
     for (const auto& g : subhalodev::spreadDriverGroups(drv)) {
+      if (g.n > st.big_n) {
+        st.big_label = g.label;
+        st.big_n = g.n;
+        st.big_nbound = g.nbound;
+        st.big_passes = g.passes;
+        st.big_holders = g.holders;
+        st.big_refined = g.refined_group;
+        st.big_stale = g.stale_frame;
+      }
       if (g.nbound == 0) continue;
       paratreet::FoFUnbindRow r;
       r.label = g.label;
