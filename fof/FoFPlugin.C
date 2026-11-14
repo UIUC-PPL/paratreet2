@@ -141,8 +141,8 @@ class FoFPluginMain : public paratreet::Main<FragData> {
       CkPrintf("FOFPLUGIN unbind: groups %ld subhaloes %ld bound %ld spread %ld "
                "digest_subhaloes %016llx digest_particles %016llx rows %llu %s time_s %.3f\n",
                us.groups, us.subhaloes, us.bound, us.spread_groups, us.digest_subhaloes,
-               us.digest_particles, rows.first,
-               rows.second == us.digest_subhaloes ? "rows_equal" : "ROWS_DIFFER",
+               us.digest_particles, rows.subhaloes,
+               rows.digest == us.digest_subhaloes ? "rows_equal" : "ROWS_DIFFER",
                us.t_gather + us.t_run + us.t_spread);
     }
     fof.returnHostLabels(CkCallbackResumeThread());

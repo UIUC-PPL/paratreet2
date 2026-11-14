@@ -3110,15 +3110,67 @@ run the 5.07 s of the spread groups is mostly outside the holders' work
 reductions (44 MB of commands, 79 MB of reports), the holders' set-up and
 the return of the flags. That is the next thing to measure.
 
+### Targeted rounds and their times (2026-11-14, jobs 5923140 and 5923222)
+
+**Change.** After the origin round the driver knows which processes hold
+each spread group. Each later round is now one command per process that
+holds an active group, carrying only those groups, sent point to point to
+the process's first PE; the report comes back through a future. Processes
+with no spread group hear nothing after the origin round. Before, every
+command went to every PE and every PE took part in a reduction. Each
+holder already skipped groups it did not hold, so the bits cannot change.
+`FOF3STAT unbind_spread_rounds` now prints, per round kind, the rounds,
+their wall time at the driver (commands out to the last report back) and
+the slowest holder's own time, with the set-up and results steps, and
+`unbind_rows` prints the final quiescence wait.
+
+**Gate (job 5923140, two nodes, 3 min, 0.11 node-hours).** Every run of
+`run_fof3_subhalo_gate.sbatch` (8m-lambb gathered and spread on 8 and 16
+processes, the defaults with and without `gather=10000`, the plug-in in
+both placements, and the lambb gate) gives job 5918052's digests exactly,
+energy bits included, and every check passes. The spread step on 8m-lambb
+at 16 processes takes 0.36 s instead of 0.56 s.
+
+**cosmo2b at 64 nodes (job 5923222, the defaults only, 37 s, 0.7
+node-hours).** The same digests as job 5918223 (total, gathered part and
+spread part). The 94 spread groups take 4.06 s instead of 5.07 s (speedup
+1.25); the whole unbinding 7.0 s instead of 8.0 s, a speedup of 32 over
+gathering everything (222.6 s).
+
+Where the 4.06 s go (s; lower is better):
+
+| Step | Rounds (count) | Wall at the driver | Slowest holder's own time |
+|---|---|---|---|
+| set-up: sort the process's records, make the holder | - | 1.23 | 1.22 |
+| origin | 1 | 0.003 | 0.000 |
+| pack: offsets, first-frame sums, sampling order, first sample | 1 | 1.02 | 1.02 |
+| pass | 5 | 1.07 | 0.89 |
+| fetch | 4 | 0.001 | 0.000 |
+| centre | 1 | 0.018 | 0.015 |
+| refine | 1 | 0.205 | 0.202 |
+| final | 1 | 0.003 | 0.001 |
+| results: digests, flags back to the PEs | - | 0.23 | 0.23 |
+| driver between rounds | - | 0.27 | - |
+
+The rounds now cost about what the slowest holder spends in them: the
+communication is gone from the critical path. What is left is the busiest
+holder's host work on its 3.9 million particles, one thread on its
+process's first PE: sorting the records (set-up), ordering them for
+sampling with the hash computed inside the comparison (pack), and, in
+each pass, building the launch rows and the energy, removal and frame
+loops over every bound particle. Its kernels take 0.27 s of the 1.93 s.
+The commands total 193 MB in 2,106 messages, against 44 MB broadcast to
+every PE before; each process now gets only its own groups' part.
+
 ### Not done in 2c and 2d
 
-- A breakdown of the spread groups' time on cosmo2b (5.07 s, of which the
-  holders' work is at most 1.98 s).
-- A breakdown of the unbinding step outside the device call (sorting,
-  packing, digests, file writes), now the larger part on lambb.
-- The command of each round is broadcast to every PE. With about 90
-  spread groups the first full sample is 36 MB per process; sending it
-  only to the processes that hold each group would cut that.
+- The holders' host work on cosmo2b (set-up 1.2 s, pack 1.0 s, the pass
+  loops): sampling keys computed once instead of in each comparison, the
+  set-up sort and the per-pass loops spread over the process's other six
+  PEs or done on the device.
+- A breakdown of the unbinding step outside the device call for the
+  gathered groups (sorting, packing, digests, file writes), the larger
+  part on lambb.
 - The per-group fields are on the catalogue rows only (the plug-in); FoF3
   alone has no catalogue file to put them in.
 
@@ -3207,4 +3259,5 @@ the return of the flags. That is the next thing to measure.
   `.sub` files, the plug-in's `subhaloLabels()`), the sub-halo fields reach
   the catalogue rows, and the lambb gate passes. cosmo2b at 64 nodes (job
   5918223): the same sub-haloes spread or gathered, unbinding 8.0 s with
-  the defaults against 222.6 s all gathered. See "Not done in 2c and 2d".
+  the defaults against 222.6 s all gathered; 7.0 s after the rounds were
+  targeted (job 5923222). See "Not done in 2c and 2d".

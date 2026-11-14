@@ -781,10 +781,28 @@ using namespace paratreet;
       CkPrintf("FOF3STAT unbind_gathered: digest_subhaloes %016llx digest_particles %016llx\n",
                us.digest_subhaloes - us.spread_digest_subhaloes,
                us.digest_particles - us.spread_digest_particles);
-      CkPrintf("FOF3STAT unbind_rows: subhaloes %llu digest %016llx (%s digest_subhaloes)\n",
-               rows.first, rows.second,
-               rows.second == us.digest_subhaloes && (long)rows.first == us.subhaloes
-                   ? "equals" : "DIFFERS FROM");
+      CkPrintf("FOF3STAT unbind_rows: subhaloes %llu digest %016llx (%s digest_subhaloes) "
+               "flags_and_rows_qd_s %.3f\n",
+               rows.subhaloes, rows.digest,
+               rows.digest == us.digest_subhaloes && (long)rows.subhaloes == us.subhaloes
+                   ? "equals" : "DIFFERS FROM", rows.t_qd);
+      if (us.spread_groups > 0) {
+        // The spread groups' time by round kind: rounds, wall at the driver,
+        // slowest holder's own time in that kind (s).
+        static const char* kinds[9] = {"", "origin", "pack", "pass", "fetch", "centre",
+                                       "refine", "final", ""};
+        std::string line;
+        char buf[160];
+        for (int k = 1; k <= 7; k++) {
+          snprintf(buf, sizeof buf, " %s %ld %.3f %.3f", kinds[k], us.n_round[k], us.t_round[k],
+                   us.t_holder_kind[k]);
+          line += buf;
+        }
+        CkPrintf("FOF3STAT unbind_spread_rounds: init_s %.3f init_max_s %.3f results_s %.3f "
+                 "results_max_s %.3f commands %ld (kind rounds wall_s holder_max_s):%s\n",
+                 us.t_spread_init, us.t_spread_init_max, us.t_spread_finish,
+                 us.t_spread_finish_max, us.spread_messages, line.c_str());
+      }
     }
     if (!fof_label_prefix.empty()) {
       // -L: one (order, label) file per PE. After the catalog, so that with

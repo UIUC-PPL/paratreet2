@@ -207,6 +207,10 @@ void spreadHolderResults(const SpreadHolder* h, Output& o) {
   o.wall_s = H.step_s;
 }
 
+void spreadHolderStepTimes(const SpreadHolder* h, double by_kind[9]) {
+  for (int k = 0; k < 9; k++) by_kind[k] = h->h.step_kind_s[k];
+}
+
 void spreadHolderDelete(SpreadHolder* h) { delete h; }
 
 SpreadDriver* spreadDriverNew(const Params& p) {
@@ -215,8 +219,8 @@ SpreadDriver* spreadDriverNew(const Params& p) {
 
 std::vector<char> spreadDriverStart(SpreadDriver* d) { return d->d.start(); }
 
-std::vector<char> spreadDriverNext(SpreadDriver* d,
-                                   const std::vector<std::vector<char>>& reports) {
+std::vector<std::vector<char>> spreadDriverNext(SpreadDriver* d,
+                                                const std::vector<std::vector<char>>& reports) {
   return d->d.next(reports);
 }
 
@@ -237,6 +241,7 @@ SpreadStats spreadDriverStats(const SpreadDriver* d) {
   }
   r.rounds = s.rounds;
   r.refetches = s.refetches;
+  r.messages = s.messages;
   r.passes_max = s.passes_max;
   r.pairs_first = s.pairs_first;
   r.pairs_later = s.pairs_later;

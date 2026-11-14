@@ -5,11 +5,14 @@
 // particles stay where they are. One Driver keeps every spread group's
 // state: its frame, its counts, its capped sample and, once its bound set is
 // at or below the cap, the bound set itself. One Holder per process keeps
-// that process's particles of every spread group. They work in rounds: the
-// driver writes one command for all holders, every holder answers with one
-// report, and the driver reads the reports in holder order. The transport is
-// the caller's (FoF3: a broadcast and a reduction; unbind --spread: a loop
-// in one process).
+// that process's particles of every spread group. They work in rounds. The
+// first round (origin) is one command for every holder, and every holder
+// answers. After it the driver knows which holders hold each group, and each
+// later round is one command per holder that holds an active group,
+// carrying only those groups; only those holders answer, and the driver
+// reads the answers in holder order. The transport is the caller's (FoF3: a
+// broadcast and a reduction for the origin round, then point-to-point
+// messages and futures; unbind --spread: a loop in one process).
 //
 // Rounds:
 //   origin  each holder reports, per group, its count and its lowest-id
@@ -140,6 +143,8 @@ struct Cand {
 };
 
 enum Kind : int32_t { kOrigin = 1, kPack, kPass, kFetch, kCentre, kRefine, kFinal, kEnd };
+constexpr int kKinds = 9;   // array size for per-kind counters (index = Kind)
+using Commands = std::vector<std::vector<char>>;   // one per holder; empty = none
 enum State : uint8_t { Done, Full, Subtract, SampleFull, SampleUpdate };  // as unbindGroups
 enum Fetch : uint8_t { kFetchNone = 0, kFetchSample = 1, kFetchBound = 2 };
 
@@ -287,7 +292,9 @@ class Holder {
               (int)kind);
       abort();
     }
-    step_s += t.seconds();
+    const double dt = t.seconds();
+    step_s += dt;
+    if (kind >= 0 && kind < kKinds) step_kind_s[kind] += dt;
     return out.b;
   }
 
@@ -323,6 +330,7 @@ class Holder {
   int64_t groups() const { return (int64_t)g_.size(); }
 
   double kernel_s = 0, step_s = 0;
+  double step_kind_s[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};   // by Kind
   int64_t launches = 0;
 
  private:
@@ -759,6 +767,7 @@ struct DriverStats {
   int rounds = 0, passes_max = 0;
   double pairs_first = 0, pairs_later = 0, pairs_refine = 0;
   double bytes_out = 0, bytes_in = 0;   // commands sent, reports read
+  int64_t messages = 0;                 // commands sent (the origin command counts once)
   int64_t refetches = 0;                // fetches repeated because too few came back
 };
 
@@ -773,12 +782,24 @@ class Driver {
     return sent(o);
   }
 
-  // The reports of the last round, in holder order; returns the next command.
-  std::vector<char> next(const std::vector<std::vector<char>>& reports) {
+  // The reports of the last round, one per holder in holder order (empty for
+  // a holder that was not sent a command); returns the next round's
+  // commands, one per holder (empty: send nothing). The origin round's
+  // reports set the number of holders.
+  Commands next(const std::vector<std::vector<char>>& reports) {
+    if (phase_ == kOrigin) nh_ = reports.size();
+    if (reports.size() != nh_) {
+      fprintf(stderr, "unbind::spread::Driver: %zu reports for %zu holders\n", reports.size(), nh_);
+      abort();
+    }
     for (const auto& r : reports) stats.bytes_in += (double)r.size();
+    Out none;   // a holder that was not asked holds none of the round's groups
+    none.put<int32_t>(phase_);
+    none.put<int64_t>(0);
     std::vector<In> in;
     for (const auto& r : reports) {
-      in.emplace_back(r.data(), r.size());
+      if (r.empty()) in.emplace_back(none.b.data(), none.b.size());
+      else in.emplace_back(r.data(), r.size());
       const int32_t kind = in.back().get<int32_t>();
       if (kind != phase_) {
         fprintf(stderr, "unbind::spread::Driver: a report of round %d in round %d\n", (int)kind,
@@ -793,12 +814,9 @@ class Driver {
       case kFetch: readFetch(in); return afterPass();
       case kCentre: return readCentre(in);
       case kRefine: readRefine(in); return finalCmd();
-      case kFinal: {
+      case kFinal:
         phase_ = kEnd;
-        Out o;
-        o.put<int32_t>(kEnd);
-        return sent(o);
-      }
+        return Commands(nh_);
       default:
         fprintf(stderr, "unbind::spread::Driver: next() after the end\n");
         abort();
@@ -847,6 +865,7 @@ class Driver {
     int64_t label = -1, n = 0, origin_pid = std::numeric_limits<int64_t>::max();
     double origin[3] = {0, 0, 0};
     int holders = 0, first_holder = -1;
+    std::vector<int> hold;   // the holders with its particles, in holder order
     bool wrap = false;
     uint8_t state = Full;
     detail::Frame frame{}, old_frame{};
@@ -889,8 +908,59 @@ class Driver {
 
   std::vector<char> sent(Out& o) {
     stats.rounds++;
+    stats.messages++;
     stats.bytes_out += (double)o.b.size();
     return std::move(o.b);
+  }
+
+  // A command split by holder: each group's record goes to its holders
+  // only; each holder's command is (kind, number of records, records).
+  class Cmd {
+   public:
+    Cmd(int32_t kind, size_t holders) : kind_(kind), body_(holders), n_(holders, 0) {}
+    void begin(const DG& g) {
+      hold_ = &g.hold;
+      rec_.b.clear();
+    }
+    template <class T>
+    void put(const T& v) { rec_.put(v); }
+    template <class T>
+    void putVec(const std::vector<T>& v) { rec_.putVec(v); }
+    void end() {
+      for (int h : *hold_) {
+        body_[h].insert(body_[h].end(), rec_.b.begin(), rec_.b.end());
+        n_[h]++;
+      }
+    }
+    Commands take() {
+      Commands out(body_.size());
+      for (size_t h = 0; h < body_.size(); h++) {
+        if (n_[h] == 0) continue;
+        Out o;
+        o.put<int32_t>(kind_);
+        o.put<int64_t>(n_[h]);
+        o.b.insert(o.b.end(), body_[h].begin(), body_[h].end());
+        out[h] = std::move(o.b);
+      }
+      return out;
+    }
+
+   private:
+    int32_t kind_;
+    std::vector<std::vector<char>> body_;
+    std::vector<int64_t> n_;
+    const std::vector<int>* hold_ = nullptr;
+    Out rec_;
+  };
+
+  Commands sent(Cmd& c) {
+    Commands out = c.take();
+    stats.rounds++;
+    for (const auto& b : out) {
+      stats.bytes_out += (double)b.size();
+      stats.messages += !b.empty();
+    }
+    return out;
   }
 
   void readOrigin(std::vector<In>& in) {
@@ -906,6 +976,7 @@ class Driver {
         for (int d = 0; d < 3; d++) g.origin[d] = r.get<double>();
         g.holders = 1;
         g.first_holder = (int)h;
+        g.hold.assign(1, (int)h);
         seen.push_back(g);
       }
     }
@@ -919,6 +990,7 @@ class Driver {
       DG& g = g_.back();
       g.n += s.n;
       g.holders++;
+      g.hold.push_back(s.first_holder);
       if (s.origin_pid < g.origin_pid) {
         g.origin_pid = s.origin_pid;
         for (int d = 0; d < 3; d++) g.origin[d] = s.origin[d];
@@ -927,16 +999,16 @@ class Driver {
     stats.groups = (int64_t)g_.size();
   }
 
-  std::vector<char> packCmd() {
+  Commands packCmd() {
     phase_ = kPack;
-    Out o;
-    o.put<int32_t>(kPack);
-    o.put<int64_t>((int64_t)g_.size());
+    Cmd o(kPack, nh_);
     for (DG& g : g_) {
+      o.begin(g);
       o.put<int64_t>(g.label);
       for (int d = 0; d < 3; d++) o.put<double>(g.origin[d]);
       g.tkey = keyThreshold(0, g.n, fetchWant(P_.cap));
       o.put<uint64_t>(g.tkey);
+      o.end();
     }
     return sent(o);
   }
@@ -997,22 +1069,20 @@ class Driver {
 
   // After a pass (or the pack): fetch what the next pass needs, or run it,
   // or go on to the centres.
-  std::vector<char> afterPass() {
+  Commands afterPass() {
     bool any = false;
     for (const DG& g : g_) any = any || (g.active && g.fetch != kFetchNone);
     if (!any) return passOrCentre();
     phase_ = kFetch;
-    Out o;
-    o.put<int32_t>(kFetch);
-    int64_t n = 0;
-    for (const DG& g : g_) n += g.active && g.fetch != kFetchNone;
-    o.put<int64_t>(n);
+    Cmd o(kFetch, nh_);
     for (const DG& g : g_) {
       if (!(g.active && g.fetch != kFetchNone)) continue;
+      o.begin(g);
       o.put<int64_t>(g.label);
       o.put<uint8_t>(g.fetch);
       o.put<KeyPos>(g.frontier);
       o.put<uint64_t>(g.tkey);
+      o.end();
     }
     return sent(o);
   }
@@ -1095,22 +1165,19 @@ class Driver {
     g.state = 2 * (int64_t)g.dropped.size() < P_.cap ? SampleUpdate : SampleFull;
   }
 
-  std::vector<char> passOrCentre() {
+  Commands passOrCentre() {
     bool any = false;
     for (const DG& g : g_) any = any || g.active;
     if (!any) return centreCmd();
     phase_ = kPass;
-    Out o;
-    o.put<int32_t>(kPass);
-    int64_t n = 0;
-    for (const DG& g : g_) n += g.active;
-    o.put<int64_t>(n);
+    Cmd o(kPass, nh_);
     const double Ga = P_.G / P_.a;
     const bool first = !passed_;
     passed_ = true;
     static const std::vector<Src> none;
     for (const DG& g : g_) {
       if (!g.active) continue;
+      o.begin(g);
       o.put<int64_t>(g.label);
       o.put<uint8_t>(g.state);
       o.put<uint8_t>(g.wrap ? 1 : 0);
@@ -1135,6 +1202,7 @@ class Driver {
       else stats.pairs_later += pairs;
       o.putVec(*a);
       o.putVec(*b);
+      o.end();
     }
     return sent(o);
   }
@@ -1230,24 +1298,22 @@ class Driver {
     }
   }
 
-  std::vector<char> centreCmd() {
+  Commands centreCmd() {
     phase_ = kCentre;
-    Out o;
-    o.put<int32_t>(kCentre);
-    int64_t n = 0;
-    for (const DG& g : g_) n += g.nb > 0;
-    o.put<int64_t>(n);
+    Cmd o(kCentre, nh_);
     for (DG& g : g_) {
       if (g.nb == 0) continue;
       g.refined_group = P_.refine > 0 && P_.cap > 0 && g.nb > P_.cap;
       g.want = g.refined_group ? std::min(P_.refine, g.nb) : 1;
+      o.begin(g);
       o.put<int64_t>(g.label);
       o.put<int64_t>(g.want);
+      o.end();
     }
     return sent(o);
   }
 
-  std::vector<char> readCentre(std::vector<In>& in) {
+  Commands readCentre(std::vector<In>& in) {
     for (DG& g : g_) g.cand.clear();
     for (In& r : in) {
       const int64_t n = r.get<int64_t>();
@@ -1274,18 +1340,18 @@ class Driver {
     }
     if (!any) return finalCmd();
     phase_ = kRefine;
-    Out o;
-    o.put<int32_t>(kRefine);
+    Cmd o(kRefine, nh_);
     int64_t n = 0;
     for (const DG& g : g_) n += g.nb > 0 && g.refined_group;
-    o.put<int64_t>(n);
     for (DG& g : g_) {
       if (!(g.nb > 0 && g.refined_group)) continue;
+      o.begin(g);
       o.put<int64_t>(g.label);
       o.put<uint8_t>(g.wrap ? 1 : 0);
       std::vector<Src> s;
       for (const Cand& c : g.cand) s.push_back(Src{c.pid, {c.x[0], c.x[1], c.x[2]}, c.m});
       o.putVec(s);
+      o.end();
       stats.pairs_refine += (double)g.cand.size() * (double)g.nb;
     }
     stats.refined = n;
@@ -1330,12 +1396,11 @@ class Driver {
     }
   }
 
-  std::vector<char> finalCmd() {
+  Commands finalCmd() {
     phase_ = kFinal;
-    Out o;
-    o.put<int32_t>(kFinal);
-    o.put<int64_t>((int64_t)g_.size());
+    Cmd o(kFinal, nh_);
     for (const DG& g : g_) {
+      o.begin(g);
       o.put<int64_t>(g.label);
       o.put<int64_t>(g.nb);
       o.put<int32_t>(g.passes);
@@ -1344,6 +1409,7 @@ class Driver {
       o.put<int64_t>(g.nb > 0 ? g.centre : -1);
       o.putVec(g.nb > 0 && g.refined_group ? g.cpid : std::vector<int64_t>());
       o.putVec(g.nb > 0 && g.refined_group ? g.cref : std::vector<double>());
+      o.end();
       stats.subhaloes += g.nb > 0;
       stats.bound += g.nb;
       stats.stale += g.stale;
@@ -1354,6 +1420,7 @@ class Driver {
 
   Params P_;
   std::vector<DG> g_;
+  size_t nh_ = 0;   // holders (set by the origin round)
   int32_t phase_ = 0;
   bool passed_ = false;
 };
@@ -1361,13 +1428,16 @@ class Driver {
 // One process, H holders: the rounds as a loop (unbind --spread, and the
 // checks). Each holder is given its particles; returns the driver's stats.
 inline DriverStats runInProcess(Driver& D, std::vector<Holder*>& holders) {
-  std::vector<char> cmd = D.start();
-  while (!D.done()) {
-    std::vector<std::vector<char>> reports;
-    for (Holder* h : holders) reports.push_back(h->step(cmd.data(), cmd.size()));
-    cmd = D.next(reports);
+  const std::vector<char> first = D.start();
+  std::vector<std::vector<char>> reports;
+  for (Holder* h : holders) reports.push_back(h->step(first.data(), first.size()));
+  for (;;) {
+    const Commands cmds = D.next(reports);
+    if (D.done()) break;
+    reports.assign(holders.size(), std::vector<char>());
+    for (size_t h = 0; h < holders.size(); h++)
+      if (!cmds[h].empty()) reports[h] = holders[h]->step(cmds[h].data(), cmds[h].size());
   }
-  for (Holder* h : holders) h->step(cmd.data(), cmd.size());   // the end
   return D.stats;
 }
 

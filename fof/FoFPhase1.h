@@ -4356,8 +4356,11 @@ public:
   // the spread groups by (label, id) and make the process's holder from
   // them (every process has one, empty or not, so that every process
   // answers every round). The other PEs only contribute.
+  // Contributes the slowest process's time for this (max_double).
   void unbindSpreadInit(paratreet::FoFUnbindSpec spec, const CkCallback& cb) {
+    double t_init = 0;
     if (CkMyPe() == CkNodeFirst(CkMyNode())) {
+      const double t0 = CkWallTimer();
       auto* nb = node_proxy.ckLocalBranch();
       std::vector<paratreet::FoFUnbindRec>& all = nb->ubd_spread_all;
       all.clear();
@@ -4394,13 +4397,15 @@ public:
       (void)spec;
       CkAbort("FoF3 -U (unbinding) needs a build with GPU=1");
 #endif
+      t_init = CkWallTimer() - t0;
     }
-    this->contribute(cb);
+    this->contribute(sizeof t_init, &t_init, CkReduction::max_double, cb);
   }
 
-  // Part 2c: one round. The process's first PE runs its holder on the
-  // driver's command and contributes [node (int32), length (int64), report];
-  // runFoFUnbind puts the reports back in node order.
+  // Part 2c: the first (origin) round, which every process answers. The
+  // process's first PE runs its holder on the driver's command and
+  // contributes [node (int32), length (int64), report]; runFoFUnbind puts
+  // the reports back in node order.
   void unbindSpreadStep(const std::vector<char>& cmd, const CkCallback& cb) {
     std::vector<char> buf;
 #ifdef FOF_GPU
@@ -4421,6 +4426,22 @@ public:
     this->contribute(buf.size(), buf.data(), CkReduction::concat, cb);
   }
 
+  // Part 2c: a later round, sent only to the first PE of a process that
+  // holds one of the round's groups; the report goes back to the driver's
+  // future.
+  void unbindSpreadStepTo(const std::vector<char>& cmd, CkFuture f) {
+#ifdef FOF_GPU
+    auto* nb = node_proxy.ckLocalBranch();
+    if (CkMyPe() != CkNodeFirst(CkMyNode()) || !nb->ubd_holder)
+      CkAbort("FoF unbindSpreadStepTo: PE %d is not a holder's first PE", CkMyPe());
+    const std::vector<char> r = subhalodev::spreadHolderStep(nb->ubd_holder, cmd.data(), cmd.size());
+    CkSendToFuture(f, CkDataMsg::buildNew((int)r.size(), r.data()));
+#else
+    (void)cmd; (void)f;
+    CkAbort("FoF3 -U (unbinding) needs a build with GPU=1");
+#endif
+  }
+
   // Part 2c, after the final round: the holder's results. Writes
   // <prefix>.<process>.s.ubd (the records of unbindRun's .ubd) and
   // contributes the digest terms of the process's particles, the sub-halo
@@ -4430,11 +4451,13 @@ public:
     // Sums (long): particles here, 1 if any, group runs here.
     long L[3] = {0, 0, 0};
     unsigned long long D[2] = {0, 0};
-    // Maxima (double): the holder's time in its steps, its kernels' time.
-    double M[2] = {0, 0};
+    // Maxima (double): the holder's time in its steps, its kernels' time,
+    // its steps by round kind (M[2 + kind], kind 1 .. 7), this step's time.
+    double M[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     long X[1] = {0};
 #ifdef FOF_GPU
     if (CkMyPe() == CkNodeFirst(CkMyNode())) {
+      const double t_fin0 = CkWallTimer();
       auto* nb = node_proxy.ckLocalBranch();
       const std::vector<paratreet::FoFUnbindRec>& all = nb->ubd_spread_all;
       const int64_t n = (int64_t)all.size();
@@ -4446,6 +4469,7 @@ public:
       X[0] = n;
       M[0] = o.wall_s;
       M[1] = o.kernel_s_later;
+      subhalodev::spreadHolderStepTimes(nb->ubd_holder, &M[2]);
       std::vector<unsigned char> centre_of(n, 0), refined_of(n, 0);
       for (size_t g = 0; g < o.label.size(); g++) {
         for (int64_t k = o.first[g]; k < o.first[g] + o.count[g]; k++)
@@ -4485,6 +4509,7 @@ public:
       subhalodev::spreadHolderDelete(nb->ubd_holder);
       nb->ubd_holder = nullptr;
       std::vector<paratreet::FoFUnbindRec>().swap(nb->ubd_spread_all);
+      M[11] = CkWallTimer() - t_fin0;
     }
 #else
     (void)prefix;
@@ -5971,6 +5996,16 @@ struct FoFUnbindStats {
   double spread_bytes_out = 0, spread_bytes_in = 0;
   unsigned long long spread_digest_subhaloes = 0, spread_digest_particles = 0;
   double t_spread = 0, t_spread_holder = 0, t_spread_kernel = 0, t_spread_driver = 0;
+  // The spread groups' time by round kind (index 1 origin, 2 pack, 3 pass,
+  // 4 fetch, 5 centre, 6 refine, 7 final): rounds, wall time at the driver
+  // (command sent to last report back), and the slowest holder's time in
+  // that kind; set-up (wall, slowest process) and the results step (wall,
+  // slowest process); commands sent.
+  long n_round[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  double t_round[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  double t_holder_kind[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+  double t_spread_init = 0, t_spread_init_max = 0, t_spread_finish = 0, t_spread_finish_max = 0;
+  long spread_messages = 0;
 };
 
 // Gather (one quiescence) and unbind. Call after runFoFCatalog.
@@ -6021,19 +6056,27 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
   // Part 2c: the spread groups, in rounds.
   const double s0 = CkWallTimer();
 #ifdef FOF_GPU
-  fof.unbindSpreadInit(spec, CkCallbackResumeThread());
+  {
+    CkReductionMsg* im = nullptr;
+    const double ti = CkWallTimer();
+    fof.unbindSpreadInit(spec, CkCallbackResumeThread((void*&)im));
+    st.t_spread_init = CkWallTimer() - ti;
+    st.t_spread_init_max = *(const double*)im->getData();
+    delete im;
+  }
   subhalodev::SpreadDriver* drv =
       subhalodev::spreadDriverNew(FoFPhase1<Data>::unbindParams(spec));
   double t_driver = 0;
   double td = CkWallTimer();
-  std::vector<char> cmd = subhalodev::spreadDriverStart(drv);
+  const std::vector<char> first = subhalodev::spreadDriverStart(drv);
   t_driver += CkWallTimer() - td;
   const int nodes = CkNumNodes();
-  while (!subhalodev::spreadDriverDone(drv)) {
+  std::vector<std::vector<char>> reports(nodes);
+  {
+    // The origin round: every process answers (a broadcast and a reduction).
+    const double tr = CkWallTimer();
     CkReductionMsg* rm = nullptr;
-    fof.unbindSpreadStep(cmd, CkCallbackResumeThread((void*&)rm));
-    td = CkWallTimer();
-    std::vector<std::vector<char>> reports(nodes);
+    fof.unbindSpreadStep(first, CkCallbackResumeThread((void*&)rm));
     std::vector<char> seen(nodes, 0);
     const char* p = (const char*)rm->getData();
     const char* e = p + rm->getSize();
@@ -6053,8 +6096,45 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
     delete rm;
     for (int k = 0; k < nodes; k++)
       if (!seen[k]) CkAbort("FoF unbind: no spread report from process %d", k);
-    cmd = subhalodev::spreadDriverNext(drv, reports);
+    st.t_round[1] += CkWallTimer() - tr;
+    st.n_round[1]++;
+  }
+  for (;;) {
+    // Later rounds: a command to each process holding one of the round's
+    // groups, its report back through a future.
+    td = CkWallTimer();
+    std::vector<std::vector<char>> cmds = subhalodev::spreadDriverNext(drv, reports);
     t_driver += CkWallTimer() - td;
+    if (subhalodev::spreadDriverDone(drv)) break;
+    int32_t kind = 0;
+    for (const auto& c : cmds)
+      if (!c.empty()) {
+        std::memcpy(&kind, c.data(), sizeof kind);
+        break;
+      }
+    const double tr = CkWallTimer();
+    std::vector<CkFuture> fut(nodes);
+    std::vector<char> asked(nodes, 0);
+    for (int k = 0; k < nodes; k++)
+      if (!cmds[k].empty()) {
+        fut[k] = CkCreateFuture();
+        asked[k] = 1;
+        fof[CkNodeFirst(k)].unbindSpreadStepTo(cmds[k], fut[k]);
+      }
+    std::vector<std::vector<char>>().swap(cmds);
+    reports.assign(nodes, std::vector<char>());
+    for (int k = 0; k < nodes; k++)
+      if (asked[k]) {
+        CkDataMsg* m = (CkDataMsg*)CkWaitFuture(fut[k]);
+        const char* d = (const char*)m->getData();
+        reports[k].assign(d, d + m->getSize());
+        delete m;
+        CkReleaseFuture(fut[k]);
+      }
+    if (kind > 0 && kind < 9) {
+      st.t_round[kind] += CkWallTimer() - tr;
+      st.n_round[kind]++;
+    }
   }
   const subhalodev::SpreadStats ss = subhalodev::spreadDriverStats(drv);
   {
@@ -6081,7 +6161,9 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
   }
   subhalodev::spreadDriverDelete(drv);
   CkReductionMsg* fm = nullptr;
+  const double tf = CkWallTimer();
   fof.unbindSpreadFinish(prefix, CkCallbackResumeThread((void*&)fm));
+  st.t_spread_finish = CkWallTimer() - tf;
   fm->toTuple(&te, &nte);
   const long* FL = (const long*)te[0].data;
   const unsigned long long* FD = (const unsigned long long*)te[1].data;
@@ -6101,6 +6183,9 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
   st.spread_bytes_in = ss.bytes_in;
   st.t_spread_holder = FM[0];
   st.t_spread_kernel = FM[1];
+  for (int k = 0; k < 9; k++) st.t_holder_kind[k] = FM[2 + k];
+  st.t_spread_finish_max = FM[11];
+  st.spread_messages = ss.messages;
   st.t_spread_driver = t_driver;
   st.spread_digest_subhaloes = FD[0];
   st.spread_digest_particles = FD[1];
@@ -6125,13 +6210,21 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
 // Part 2d: after runFoFUnbind, wait for the flags and rows it sent, and
 // read back the catalogue rows' {sub-haloes, digest} (the digest must equal
 // digest_subhaloes).
+struct FoFUnbindRowCheck {
+  unsigned long long subhaloes = 0, digest = 0;
+  double t_qd = 0;   // the wait for the flags and rows to arrive
+};
 template <typename Data>
-std::pair<unsigned long long, unsigned long long> finishFoFUnbind(CProxy_FoFPhase1<Data> fof) {
+FoFUnbindRowCheck finishFoFUnbind(CProxy_FoFPhase1<Data> fof) {
+  FoFUnbindRowCheck r;
+  const double t0 = CkWallTimer();
   CkWaitQD();
+  r.t_qd = CkWallTimer() - t0;
   CkReductionMsg* m = nullptr;
   fof.unbindRowDigest(CkCallbackResumeThread((void*&)m));
   const auto* v = (const unsigned long long*)m->getData();
-  std::pair<unsigned long long, unsigned long long> r(v[0], v[1]);
+  r.subhaloes = v[0];
+  r.digest = v[1];
   delete m;
   return r;
 }

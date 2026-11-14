@@ -466,11 +466,11 @@ int main(int argc, char** argv) {
     long long per_holder_max = 0;
     for (auto& H : hin) per_holder_max = std::max(per_holder_max, (long long)H.mass.size());
     printf("\nspread: %zu groups above the cap over %d holders (%s), largest holder %lld "
-           "particles; %d rounds (%lld fetches repeated), %.4g MB of commands, %.4g MB of "
-           "reports; %.2f s\n",
+           "particles; %d rounds (%lld fetches repeated), %lld commands, %.4g MB of commands, "
+           "%.4g MB of reports; %.2f s\n",
            sg.size(), spread, spread_slabs ? "slabs in x" : "particle id mod H",
-           per_holder_max, DS.rounds, (long long)DS.refetches, DS.bytes_out / 1e6,
-           DS.bytes_in / 1e6, spread_s);
+           per_holder_max, DS.rounds, (long long)DS.refetches, (long long)DS.messages,
+           DS.bytes_out / 1e6, DS.bytes_in / 1e6, spread_s);
     printf("spread: against the gathered result: bound flags differ for %lld particles; bound "
            "counts differ in %lld groups, pass counts in %lld; most bound particle differs in "
            "%lld groups\n", flags_differ, groups_differ, passes_differ, centre_differ);

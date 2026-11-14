@@ -77,10 +77,12 @@ void unbind(const Input& in, const Params& p, Output& out);
 // ---- Groups that stay spread over processes (part 2c; unbind_spread.h) ----
 // One holder per process keeps that process's particles of every spread
 // group; one driver, on one process, keeps the groups' state. They work in
-// rounds: the driver's command goes to every holder, and every holder's
-// report comes back to the driver, which reads them in a fixed holder
-// order. The caller carries the bytes. The holder needs the device; the
-// driver is host code.
+// rounds. The first (spreadDriverStart) goes to every holder and every
+// holder reports. Each later round (spreadDriverNext) is one command per
+// holder, empty for a holder with nothing to do that round; only the
+// holders sent a command report, and the driver reads the reports in holder
+// order (an empty report for the others). The caller carries the bytes.
+// The holder needs the device; the driver is host code.
 struct SpreadHolder;
 struct SpreadDriver;
 
@@ -94,6 +96,9 @@ std::vector<char> spreadHolderStep(SpreadHolder* h, const char* cmd, size_t len)
 // Per particle: bound, energy, refined. wall_s is the holder's time in its
 // steps, kernel_s_later its kernels' time.
 void spreadHolderResults(const SpreadHolder* h, Output& o);
+// The holder's time in its steps by round kind (index 1 origin, 2 pack,
+// 3 pass, 4 fetch, 5 centre, 6 refine, 7 final; 9 entries).
+void spreadHolderStepTimes(const SpreadHolder* h, double by_kind[9]);
 void spreadHolderDelete(SpreadHolder* h);
 
 struct SpreadStats {
@@ -102,11 +107,16 @@ struct SpreadStats {
   int rounds = 0, passes_max = 0;
   double pairs_first = 0, pairs_later = 0, pairs_refine = 0;
   double bytes_out = 0, bytes_in = 0;  // commands written, reports read
+  int64_t messages = 0;                // commands written (the first counts once)
 };
 SpreadDriver* spreadDriverNew(const Params& p);
 std::vector<char> spreadDriverStart(SpreadDriver* d);
-// reports: the last round's, one per holder, always in the same holder order.
-std::vector<char> spreadDriverNext(SpreadDriver* d, const std::vector<std::vector<char>>& reports);
+// reports: the last round's, one per holder in holder order, empty for a
+// holder that was not sent a command. Returns one command per holder; an
+// empty one means send nothing. After the final round it returns all empty
+// and spreadDriverDone is true.
+std::vector<std::vector<char>> spreadDriverNext(SpreadDriver* d,
+                                                const std::vector<std::vector<char>>& reports);
 bool spreadDriverDone(const SpreadDriver* d);  // true once the final round's reports are read
 SpreadStats spreadDriverStats(const SpreadDriver* d);
 // After the end, per spread group in label order.
