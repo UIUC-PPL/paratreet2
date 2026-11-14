@@ -3263,7 +3263,7 @@ refined and stale-frame flags). It is a print only.
   spread f0df4f01b805bdc1 / 27f553027f64da50). The new line reads 153,804
   particles, 153,505 bound (0.998), 4 passes, 2 holders, refined.
 
-**The 64-node run, not submitted yet** (`subhalo/run_fof3_unbind_cosmo25.sbatch`,
+**The 64-node run** (submitted with the user's go as job 5923504; results in the next section) (`subhalo/run_fof3_unbind_cosmo25.sbatch`,
 512 processes, the CPU arm for FoF at leaf 12):
 
 1. `open`: FoF3 `-K -m 20`, open boundaries, no unbinding. Its group count
@@ -3291,6 +3291,89 @@ largest group's line (its size printed in full, its bound count). There is
 no reference for the bound sets on this input, since nothing else can unbind
 its largest group. The layout check of decision 3 needs a second
 process count, which is left for later.
+
+### cosmo25 at 64 nodes (job 5923504, 3 min 36 s, 3.8 node-hours)
+
+Both runs finished; every check passes.
+
+**FoF.** The open run gives September's answer: 6,730,729,617 groups,
+largest 2,214,117,459, the same log2 histogram. So FoF3 at this size is
+unchanged by the min-id labels, the catalogue and the lazy canopy. New gold
+values for this snapshot:
+
+| Run | label_digest | Groups (count) | Largest (particles) | Catalogue, `-m 20`: groups, particles, digest |
+|---|---|---|---|---|
+| open boundaries | 3493631f8ae58ee4 | 6,730,729,617 | 2,214,117,459 | 16,717,525, 15,550,161,613, 13710c9af5019e54 |
+| periodic (`-P 1`) | 14661f459c514088 | 6,730,568,564 | 2,215,510,153 | 16,715,920, 15,550,338,950, 52c5cbfac2cf5fce |
+
+The periodic box joins 161,053 groups across its faces; the largest grows by
+1,392,694 particles.
+
+**Unbinding** (periodic, production defaults):
+
+| Quantity | Value |
+|---|---|
+| Groups of 20 or more (count) | 16,715,920 |
+| Sub-haloes (count) | 7,426,226 (44% of the groups; 63% on cosmo2b) |
+| Bound particles (count) | 14,722,441,291 of 15,550,338,950 (94.7%; 94.6% on cosmo2b) |
+| Sampled / refined / stale-frame groups (count) | 46,613 / 43,454 / 52 |
+| Groups at least half the box wide (count) | 0 |
+| digest_subhaloes / digest_particles | 804dde6acf44c2a6 / 680eb9597680ef74 |
+| Catalogue rows | 7,426,226 sub-haloes, digest equal to digest_subhaloes |
+| First-pass pair terms | 1.385e14 (estimate in "The three large inputs": 1.4e14) |
+| Peak memory per process (GB, of 64) | 33 |
+
+- **The group above 2^31.** The largest group, 2,215,510,153 particles,
+  stays spread over 64 processes. 2,206,971,023 of them are bound (0.996),
+  itself above 2^31, after one pass: the first pass keeps more than 0.995
+  of the group, which ends it under `bf` 0.995. Its most bound particle
+  comes from the centre refinement. Its size and bound count print in full,
+  and they enter the totals and the digests, which the catalogue rows
+  reproduce.
+- **Spread groups.** 726 groups stay spread (724 with a sub-halo),
+  holding 10,997,594,482 particles (71% of the grouped ones), over 505 of
+  the 512 processes, at most 48.3 M of them on one process. 39 rounds, the
+  longest group needing 25 passes; 652 MB of commands and 470 MB of reports;
+  no refetch. Their digests: 344d97debcf93c77 / 15346431b4ffc72f. Gathered
+  groups' digests: 4c00468c124b862f / 52da5527c1812845.
+- **No group is at least half the box wide** at b = 0.2 on this input,
+  as on cosmo2b (an open question under "Open").
+- **The smaller share of groups with a sub-halo** (44% against 63% on
+  cosmo2b) is not explained. It is not a difference in how many groups sit
+  near the 20-particle limit: groups of 20 to 31 particles are 45% of the
+  kept groups on cosmo25 and 46% on cosmo2b. The two inputs differ in
+  resolution and in the gas particles' mass share (cosmo2b has 768^3 gas
+  and 1152^3 dark particles, cosmo25 2304^3 of each). Not checked further.
+
+Time (s; lower is better):
+
+| Step | Time |
+|---|---|
+| Loading, decomposition (counting the loading) | 23.9, 37.8 |
+| Catalogue | 15.5 |
+| Gather | 6.1 |
+| Gathered groups' step (slowest device call; of it host work) | 12.3 (7.2; 2.0) |
+| Spread groups, in all | 24.4 |
+| of it: set-up | 5.5 |
+| pack | 1.8 |
+| 25 pass rounds (slowest holder) | 10.1 (7.3) |
+| centre, refine | 0.3, 2.1 |
+| results | 3.3 |
+| fetch, origin, final | 0.2 |
+| driver between rounds | 1.2 |
+| Flags and rows to their PEs | 0.08 |
+| Unbinding in all (gather + gathered + spread + rows) | 42.9 |
+| FoF iteration, catalogue and unbinding together | 93.7 |
+
+- The slowest holder spent 10.9 s in its steps, 3.5 s of it in kernels.
+  The pass rounds are the largest part of the spread time. With 25 passes
+  for the longest group, each round's fixed cost counts 25 times.
+- The catalogue takes 15.5 s, more than the gathered groups' unbinding.
+  It took 0.75 s on cosmo2b, so it grows faster than the particles per
+  process (12 times). The catalogue's cost was already listed as open in
+  the plug-in work ("needs a size pre-pass").
+- The whole job used 3.8 node-hours against the estimate of 6: loading and
+  decomposition took 38 s, not 63 s as in September.
 
 ### Not done in 2c and 2d
 
@@ -3369,7 +3452,8 @@ process count, which is left for later.
     **One tau, 0.00141, for every input (decided 2026-11-12)**;
   - which frame our own catalogues give a wide group, and whether any
     production input has one at b = 0.2 (8m-lambb's widest group is 8% of
-    the box);
+    the box; cosmo2b and cosmo25, periodic, have none: jobs 5918223 and
+    5923504);
   - a real epoch: `h34462gs.000616` (a = 0.2447) is on Frontier but needs
     an NChilada reader in the converter; `tipsy2hbt`'s velocity convention
     is unchecked at a below 1;
@@ -3390,4 +3474,7 @@ process count, which is left for later.
   5918223): the same sub-haloes spread or gathered, unbinding 8.0 s with
   the defaults against 222.6 s all gathered; 7.0 s after the rounds were
   targeted (job 5923222) and 5.0 s after the holders' host work was cut
-  (job 5923294). See "Not done in 2c and 2d".
+  (job 5923294). cosmo25 at 64 nodes (job 5923504): FoF unchanged at 24
+  billion particles; 7,426,226 sub-haloes, the largest group (2.2 billion
+  particles, above 2^31) unbound spread over 64 processes; unbinding 42.9
+  s, the catalogue 15.5 s. See "Not done in 2c and 2d".
