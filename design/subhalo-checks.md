@@ -3162,12 +3162,56 @@ loops over every bound particle. Its kernels take 0.27 s of the 1.93 s.
 The commands total 193 MB in 2,106 messages, against 44 MB broadcast to
 every PE before; each process now gets only its own groups' part.
 
+### The holders' host work (2026-11-14, jobs 5923267 and 5923294)
+
+**Changes**, none of which changes an operation or the order of a sum:
+
+- *Set-up.* Each PE sorts its own spread records by (label, id) while
+  gathering, so the seven PEs of a process sort in parallel; the first PE
+  merges the seven sorted runs in one pass and hands the arrays to the
+  holder without a copy.
+- *Pack.* Each particle's sampling key is computed once. The sampling
+  order is a counting sort into buckets of about 64 by the key's top bits;
+  a bucket is sorted by (key, id) only when a scan first reaches it, which
+  for the sample and its replacements is a small prefix. The order is the
+  full sort's.
+- *Passes.* The holder keeps its launch rows and the device buffers from
+  launch to launch (before, every launch allocated and first touched about
+  100 MB on the host and the device); the bound list is compacted in place,
+  and the sampled energies, the removal and the frame sums are one sweep.
+- *Driver.* Each holder's command is written once, in place.
+
+**Gate (job 5923267, two nodes, 3 min, 0.11 node-hours).** All twelve runs
+give job 5923140's digests exactly and every check passes. lambb's spread
+step: 0.73 s instead of 1.19 s (pack 0.03 s instead of 0.36 s, set-up 0.15 s
+instead of 0.39 s).
+
+**cosmo2b at 64 nodes (job 5923294, 40 s, 0.7 node-hours).** The same
+digests as jobs 5918223 and 5923222. The 94 spread groups take 1.83 s
+instead of 4.06 s (speedup 2.22); the whole unbinding 5.0 s, a speedup of
+44 over gathering everything (222.6 s).
+
+| Step (s; lower is better) | Job 5923222: wall | slowest holder | Job 5923294: wall | slowest holder |
+|---|---|---|---|---|
+| set-up | 1.23 | 1.22 | 0.47 | 0.47 |
+| pack | 1.02 | 1.02 | 0.10 | 0.10 |
+| pass (5 rounds) | 1.07 | 0.89 | 0.61 | 0.53 |
+| refine | 0.21 | 0.20 | 0.14 | 0.14 |
+| centre, fetch, origin, final | 0.03 | 0.02 | 0.05 | 0.04 |
+| results | 0.23 | 0.23 | 0.25 | 0.24 |
+| driver between rounds | 0.27 | - | 0.21 | - |
+| spread groups in all | 4.06 | - | 1.83 | - |
+
+The per-PE sorts moved into the gather step, which takes 0.46 s instead of
+0.31 s. The spread groups are now the smaller part of the unbinding: the
+gathered groups' step takes 2.75 s (slowest device call 1.51 s, of it 0.42
+s host work), against 1.83 s for the spread ones.
+
 ### Not done in 2c and 2d
 
-- The holders' host work on cosmo2b (set-up 1.2 s, pack 1.0 s, the pass
-  loops): sampling keys computed once instead of in each comparison, the
-  set-up sort and the per-pass loops spread over the process's other six
-  PEs or done on the device.
+- The rest of the spread groups' time on cosmo2b: set-up 0.47 s (the merge
+  and the holder's arrays, one thread) and the passes 0.53 s on the slowest
+  holder, of which 0.27 s is kernels.
 - A breakdown of the unbinding step outside the device call for the
   gathered groups (sorting, packing, digests, file writes), the larger
   part on lambb.
@@ -3260,4 +3304,5 @@ every PE before; each process now gets only its own groups' part.
   the catalogue rows, and the lambb gate passes. cosmo2b at 64 nodes (job
   5918223): the same sub-haloes spread or gathered, unbinding 8.0 s with
   the defaults against 222.6 s all gathered; 7.0 s after the rounds were
-  targeted (job 5923222). See "Not done in 2c and 2d".
+  targeted (job 5923222) and 5.0 s after the holders' host work was cut
+  (job 5923294). See "Not done in 2c and 2d".

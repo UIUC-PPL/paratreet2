@@ -68,6 +68,9 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -177,35 +180,71 @@ inline double fetchWant(int64_t need) { return 1.2 * (double)need + 64.0; }
 
 // ---- the holder -------------------------------------------------------------
 
+// Buffers one holder's launches reuse: device arrays that only grow, and the
+// host rows in single precision. Allocating and first touching ~100 MB per
+// launch cost more than the launch on cosmo2b (2026-11-14).
+struct LaunchScratch {
+  virtual ~LaunchScratch() {}
+};
+
 // One launch from host rows (x, y, z, w per row, as unbindGroups builds
 // them). Returns the kernel's seconds; out gets one sum per target.
 using LaunchFn = double (*)(const std::vector<double>& tgt, const std::vector<int>& grp,
                             const std::vector<double>& src, const std::vector<int64_t>& off,
                             std::vector<double>& out, double eps, double box, bool self,
-                            int64_t chunk);
+                            int64_t chunk, std::unique_ptr<LaunchScratch>& scratch);
+
+template <class Real>
+struct RowScratch : LaunchScratch {
+  ParticleView<Real> tgt, src;
+  GroupView grp;
+  OffsetView off;
+  PotentialView phi;
+  std::vector<Real> htgt, hsrc;   // rows rounded to Real (not used when Real is double)
+};
+
+template <class V>
+void growView(V& v, size_t n, const char* name) {
+  if (v.extent(0) >= n) return;
+  const size_t cap = std::max(n, (size_t)v.extent(0) + (size_t)v.extent(0) / 4);
+  v = V(Kokkos::view_alloc(Kokkos::WithoutInitializing, std::string(name)), cap);
+}
 
 template <class Real, class Acc, bool Fast>
 double launchRows(const std::vector<double>& tgt, const std::vector<int>& grp,
                   const std::vector<double>& src, const std::vector<int64_t>& off,
-                  std::vector<double>& out, double eps, double box, bool self, int64_t chunk) {
-  using Kokkos::view_alloc;
-  using Kokkos::WithoutInitializing;
+                  std::vector<double>& out, double eps, double box, bool self, int64_t chunk,
+                  std::unique_ptr<LaunchScratch>& scratch) {
+  using HostRows = Kokkos::View<const Real* [4], Kokkos::LayoutRight, Kokkos::HostSpace,
+                                Kokkos::MemoryTraits<Kokkos::Unmanaged>>;
   const size_t nt = grp.size(), ns = src.size() / 4;
-  out.assign(nt, 0.0);
+  out.resize(nt);
   if (nt == 0) return 0.0;
-  ParticleView<Real> d_tgt(view_alloc(WithoutInitializing, "spread_tgt"), nt);
-  ParticleView<Real> d_src(view_alloc(WithoutInitializing, "spread_src"), ns);
-  GroupView d_grp(view_alloc(WithoutInitializing, "spread_group"), nt);
-  OffsetView d_off(view_alloc(WithoutInitializing, "spread_off"), off.size());
-  PotentialView d_phi(view_alloc(WithoutInitializing, "spread_phi"), nt);
-  auto h_tgt = Kokkos::create_mirror_view(d_tgt);
-  auto h_src = Kokkos::create_mirror_view(d_src);
-  for (size_t t = 0; t < nt; t++)
-    for (int c = 0; c < 4; c++) h_tgt(t, c) = Real(tgt[4 * t + c]);
-  for (size_t s = 0; s < ns; s++)
-    for (int c = 0; c < 4; c++) h_src(s, c) = Real(src[4 * s + c]);
-  Kokkos::deep_copy(d_tgt, h_tgt);
-  Kokkos::deep_copy(d_src, h_src);
+  if (!scratch) scratch.reset(new RowScratch<Real>());
+  RowScratch<Real>& S = static_cast<RowScratch<Real>&>(*scratch);  // one Real per holder
+  growView(S.tgt, nt, "spread_tgt");
+  growView(S.src, std::max<size_t>(ns, 1), "spread_src");
+  growView(S.grp, nt, "spread_group");
+  growView(S.off, off.size(), "spread_off");
+  growView(S.phi, nt, "spread_phi");
+  // The first rows of each buffer, as views of the kernels' types.
+  const auto rows = [](size_t n) { return std::make_pair((size_t)0, n); };
+  const ParticleView<Real> d_tgt = Kokkos::subview(S.tgt, rows(nt), Kokkos::ALL);
+  const ParticleView<Real> d_src = Kokkos::subview(S.src, rows(ns), Kokkos::ALL);
+  const GroupView d_grp = Kokkos::subview(S.grp, rows(nt));
+  const OffsetView d_off = Kokkos::subview(S.off, rows(off.size()));
+  const PotentialView d_phi = Kokkos::subview(S.phi, rows(nt));
+  if constexpr (std::is_same<Real, double>::value) {
+    Kokkos::deep_copy(d_tgt, HostRows(tgt.data(), nt));
+    Kokkos::deep_copy(d_src, HostRows(src.data(), ns));
+  } else {
+    S.htgt.resize(4 * nt);
+    S.hsrc.resize(4 * ns);
+    for (size_t k = 0; k < 4 * nt; k++) S.htgt[k] = Real(tgt[k]);
+    for (size_t k = 0; k < 4 * ns; k++) S.hsrc[k] = Real(src[k]);
+    Kokkos::deep_copy(d_tgt, HostRows(S.htgt.data(), nt));
+    Kokkos::deep_copy(d_src, HostRows(S.hsrc.data(), ns));
+  }
   Kokkos::deep_copy(d_grp, Kokkos::View<const int*, Kokkos::HostSpace,
                                         Kokkos::MemoryTraits<Kokkos::Unmanaged>>(grp.data(), nt));
   Kokkos::deep_copy(d_off, Kokkos::View<const int64_t*, Kokkos::HostSpace,
@@ -238,11 +277,24 @@ class Holder {
   // label and id >= 0, pos comoving (any image), vel physical peculiar.
   Holder(int64_t n, const int64_t* label, const int64_t* id, const double* pos,
          const double* vel, const double* mass, const Params& P, LaunchFn launch)
+      : Holder(std::vector<int64_t>(label, label + n), std::vector<int64_t>(id, id + n),
+               std::vector<double>(pos, pos + 3 * n), std::vector<double>(vel, vel + 3 * n),
+               std::vector<double>(mass, mass + n), P, launch) {}
+  // The same, taking the arrays over (no copy).
+  Holder(std::vector<int64_t> label, std::vector<int64_t> id, std::vector<double> pos,
+         std::vector<double> vel, std::vector<double> mass, const Params& P, LaunchFn launch)
       : P_(P), launch_(launch) {
-    pid_.assign(id, id + n);
-    pos_.assign(pos, pos + 3 * n);
-    vel_.assign(vel, vel + 3 * n);
-    m_.assign(mass, mass + n);
+    const int64_t n = (int64_t)id.size();
+    if ((int64_t)label.size() != n || (int64_t)pos.size() != 3 * n ||
+        (int64_t)vel.size() != 3 * n || (int64_t)mass.size() != n) {
+      fprintf(stderr, "unbind::spread::Holder: arrays of different lengths\n");
+      abort();
+    }
+    pid_ = std::move(id);
+    pos_ = std::move(pos);
+    vel_ = std::move(vel);
+    m_ = std::move(mass);
+    key_.assign((size_t)n, 0);
     alive_.assign((size_t)n, 1);
     in_sample_.assign((size_t)n, 0);
     phi_s_.assign((size_t)n, 0.0);
@@ -262,7 +314,7 @@ class Holder {
       b = e;
     }
     for (int64_t i = 1; i < n; i++)
-      if (label[i] < label[i - 1] || (label[i] == label[i - 1] && id[i] <= id[i - 1])) {
+      if (label[i] < label[i - 1] || (label[i] == label[i - 1] && pid_[i] <= pid_[i - 1])) {
         fprintf(stderr, "unbind::spread::Holder: the input is not sorted by (label, id)\n");
         abort();
       }
@@ -338,7 +390,12 @@ class Holder {
     int64_t label = -1, first = 0, count = 0;
     bool wrap = false;
     std::vector<int64_t> bound, removed;  // input indices, id order
-    std::vector<int64_t> korder;          // input indices in sampling order
+    // Input indices in sampling order, by buckets of the key's top bits:
+    // bucket b is korder[boff[b] .. boff[b + 1]), sorted by (key, id) when
+    // a scan first reaches it (kAt); buckets before ksorted are sorted.
+    std::vector<int64_t> korder, boff;
+    int kbits = 0;
+    size_t ksorted = 0;
     size_t kpos = 0;                      // korder before kpos: at or before the frontier
     int64_t nbound = 0, centre = -1;
     int passes = 0;
@@ -363,10 +420,25 @@ class Holder {
   void rowOf(std::vector<double>& rows, int64_t i, double w) const {
     row(rows, &pos_[3 * i], w);
   }
+  // korder[k] in sampling order, sorting the buckets up to k's first.
+  int64_t kAt(LG& g, size_t k) {
+    while (g.ksorted + 1 < g.boff.size() && (size_t)g.boff[g.ksorted] <= k) {
+      auto b = g.korder.begin() + g.boff[g.ksorted], e = g.korder.begin() + g.boff[g.ksorted + 1];
+      std::sort(b, e, [&](int64_t x, int64_t y) {
+        return key_[x] != key_[y] ? key_[x] < key_[y] : pid_[x] < pid_[y];
+      });
+      g.ksorted++;
+    }
+    return g.korder[k];
+  }
+  bool keyAtOrBefore(int64_t i, const KeyPos& f) const {
+    return key_[i] != f.key ? key_[i] < f.key : pid_[i] <= f.id;
+  }
   double run(const std::vector<double>& tgt, const std::vector<int>& grp,
              const std::vector<double>& src, const std::vector<int64_t>& off, bool wrap,
              bool self, std::vector<double>& out, int64_t chunk = 0) {
-    const double ks = launch_(tgt, grp, src, off, out, P_.eps, wrap ? P_.box : 0.0, self, chunk);
+    const double ks =
+        launch_(tgt, grp, src, off, out, P_.eps, wrap ? P_.box : 0.0, self, chunk, scratch_);
     kernel_s += ks;
     launches += grp.empty() ? 0 : 1;
     return ks;
@@ -423,14 +495,33 @@ class Holder {
       }
       g.bound.resize((size_t)g.count);
       for (int64_t k = 0; k < g.count; k++) g.bound[k] = g.first + k;
-      g.korder = g.bound;
-      std::sort(g.korder.begin(), g.korder.end(),
-                [&](int64_t x, int64_t y) { return keyLess(pid_[x], pid_[y]); });
+      // The sampling order: keys once, then a counting sort by the key's top
+      // bits into buckets of about 64; kAt sorts a bucket when a scan
+      // reaches it, so the order is the full sort's.
+      g.kbits = 0;
+      while (g.kbits < 24 && ((int64_t)64 << g.kbits) < g.count) g.kbits++;
+      const int shift = 64 - g.kbits;
+      auto bucket = [&](uint64_t key) { return g.kbits ? (size_t)(key >> shift) : (size_t)0; };
+      g.boff.assign(((size_t)1 << g.kbits) + 1, 0);
+      for (int64_t i = g.first; i < g.first + g.count; i++) {
+        key_[i] = sampleKey(pid_[i]);
+        g.boff[bucket(key_[i]) + 1]++;
+      }
+      for (size_t b = 1; b < g.boff.size(); b++) g.boff[b] += g.boff[b - 1];
+      g.korder.resize((size_t)g.count);
+      {
+        std::vector<int64_t> at(g.boff.begin(), g.boff.end() - 1);
+        for (int64_t i = g.first; i < g.first + g.count; i++) g.korder[at[bucket(key_[i])]++] = i;
+      }
+      g.ksorted = 0;
       g.kpos = 0;
       std::vector<Src> cand;   // every particle whose key is at most the threshold
       if (P_.cap > 0)
-        for (int64_t k = 0; k < g.count && sampleKey(pid_[g.korder[k]]) <= tkey[li]; k++)
-          cand.push_back(src(g.korder[k]));
+        for (int64_t k = 0; k < g.count; k++) {
+          const int64_t i = kAt(g, (size_t)k);
+          if (key_[i] > tkey[li]) break;
+          cand.push_back(src(i));
+        }
       out.put<int64_t>(g.label);
       for (int d = 0; d < 3; d++) out.put<double>(lo[d]);
       for (int d = 0; d < 3; d++) out.put<double>(hi[d]);
@@ -498,12 +589,19 @@ class Holder {
         }
       }
     }
-    // One launch per kind, as unbindGroups makes them.
+    // One launch per kind, as unbindGroups makes them; the row buffers are
+    // the holder's, kept from launch to launch.
+    std::vector<double>& tgt = tgt_;
+    std::vector<double>& srcs = srcs_;
+    std::vector<double>& res = res_;
+    std::vector<int>& grp = grp_;
+    std::vector<int64_t>& off = off_;
     for (uint8_t kind : {(uint8_t)SampleFull, (uint8_t)SampleUpdate, (uint8_t)Full,
                          (uint8_t)Subtract}) {
-      std::vector<double> tgt, srcs, res;
-      std::vector<int> grp;
-      std::vector<int64_t> off;
+      tgt.clear();
+      srcs.clear();
+      grp.clear();
+      off.clear();
       std::vector<PassItem*> used;
       bool wrap = false;
       for (PassItem& it : items) {
@@ -558,45 +656,41 @@ class Holder {
         }
       }
     }
-    // Sampled groups: energies from the sums over the sample.
-    for (PassItem& it : items) {
-      if (it.state != SampleFull && it.state != SampleUpdate) continue;
-      LG& g = *it.g;
-      for (int64_t i : g.bound) energy_[i] = kinetic(i, it.frame, it.wrap) + it.scale * phi_s_[i];
-      if (it.state == SampleUpdate)
-        for (const Src& s : it.a) {
-          const int64_t i = local(g, s.pid);
-          if (i >= 0) in_sample_[i] = 1;
-        }
-    }
-    // Removal (stable: the bound list stays in id order) and the report.
+    // Removal (stable: the bound list stays in id order, compacted in
+    // place), the sampled groups' energies from their sums over the sample,
+    // and the frame sums of what is kept, in one sweep; then the report.
     out.put<int64_t>((int64_t)items.size());
     for (PassItem& it : items) {
       LG& g = *it.g;
       g.passes++;
-      std::vector<int64_t> kept, gone;
+      const bool sampled = it.state == SampleFull || it.state == SampleUpdate;
       std::vector<int64_t> removed_pids;
-      for (int64_t i : g.bound) {
+      g.removed.clear();
+      double msum = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
+      size_t w = 0;
+      for (size_t k = 0; k < g.bound.size(); k++) {
+        const int64_t i = g.bound[k];
+        if (sampled) energy_[i] = kinetic(i, it.frame, it.wrap) + it.scale * phi_s_[i];
         if (energy_[i] < 0) {
-          kept.push_back(i);
+          g.bound[w++] = i;
+          const double m = m_[i];
+          msum += m;
+          for (int d = 0; d < 3; d++) {
+            mx[d] += pos_[3 * i + d] * m;
+            mv[d] += vel_[3 * i + d] * m;
+          }
         } else {
-          gone.push_back(i);
+          g.removed.push_back(i);
           alive_[i] = 0;
-          const bool sampled = it.state == SampleFull || it.state == SampleUpdate;
           if (!sampled || in_sample_[i]) removed_pids.push_back(pid_[i]);
         }
       }
-      g.bound.swap(kept);
-      g.removed.swap(gone);
-      double msum = 0, mx[3] = {0, 0, 0}, mv[3] = {0, 0, 0};
-      for (int64_t i : g.bound) {
-        const double m = m_[i];
-        msum += m;
-        for (int d = 0; d < 3; d++) {
-          mx[d] += pos_[3 * i + d] * m;
-          mv[d] += vel_[3 * i + d] * m;
+      g.bound.resize(w);
+      if (it.state == SampleUpdate)   // their own term is cancelled now
+        for (const Src& s : it.a) {
+          const int64_t i = local(g, s.pid);
+          if (i >= 0) in_sample_[i] = 1;
         }
-      }
       out.put<int64_t>(g.label);
       out.put<int64_t>((int64_t)g.bound.size());
       out.put<double>(msum);
@@ -618,11 +712,13 @@ class Holder {
       if (!g) continue;
       std::vector<Src> list;
       if (what == kFetchSample) {
-        while (g->kpos < g->korder.size() && atOrBefore(pid_[g->korder[g->kpos]], frontier))
+        while (g->kpos < g->korder.size() && keyAtOrBefore(kAt(*g, g->kpos), frontier))
           g->kpos++;
-        for (size_t k2 = g->kpos;
-             k2 < g->korder.size() && sampleKey(pid_[g->korder[k2]]) <= tkey; k2++)
-          if (alive_[g->korder[k2]]) list.push_back(src(g->korder[k2]));
+        for (size_t k2 = g->kpos; k2 < g->korder.size(); k2++) {
+          const int64_t i = kAt(*g, k2);
+          if (key_[i] > tkey) break;
+          if (alive_[i]) list.push_back(src(i));
+        }
       } else {
         for (int64_t i : g->bound) list.push_back(src(i));
       }
@@ -672,9 +768,15 @@ class Holder {
 
   void refine(In& in, Out& out) {
     const int64_t n = in.get<int64_t>();
-    std::vector<double> tgt, srcs, res;
-    std::vector<int> grp;
-    std::vector<int64_t> off;
+    std::vector<double>& tgt = tgt_;
+    std::vector<double>& srcs = srcs_;
+    std::vector<double>& res = res_;
+    std::vector<int>& grp = grp_;
+    std::vector<int64_t>& off = off_;
+    tgt.clear();
+    srcs.clear();
+    grp.clear();
+    off.clear();
     std::vector<std::pair<LG*, size_t>> used;  // group, candidates
     std::vector<std::pair<int64_t, size_t>> empty;  // label, candidates: no bound particle here
     bool wrap = false;
@@ -756,8 +858,14 @@ class Holder {
   LaunchFn launch_;
   std::vector<LG> g_;
   std::vector<int64_t> pid_;
+  std::vector<uint64_t> key_;   // sampling keys (set by pack)
   std::vector<double> pos_, vel_, m_, phi_s_, energy_, refined_;
   std::vector<uint8_t> alive_, in_sample_, most_;
+  // Launch rows and results, and the device buffers, kept between launches.
+  std::vector<double> tgt_, srcs_, res_;
+  std::vector<int> grp_;
+  std::vector<int64_t> off_;
+  std::unique_ptr<LaunchScratch> scratch_;
 };
 
 // ---- the driver -------------------------------------------------------------
@@ -914,7 +1022,8 @@ class Driver {
   }
 
   // A command split by holder: each group's record goes to its holders
-  // only; each holder's command is (kind, number of records, records).
+  // only; each holder's command is (kind, number of records, records),
+  // written in place (the count is filled in by take).
   class Cmd {
    public:
     Cmd(int32_t kind, size_t holders) : kind_(kind), body_(holders), n_(holders, 0) {}
@@ -928,21 +1037,19 @@ class Driver {
     void putVec(const std::vector<T>& v) { rec_.putVec(v); }
     void end() {
       for (int h : *hold_) {
-        body_[h].insert(body_[h].end(), rec_.b.begin(), rec_.b.end());
+        std::vector<char>& b = body_[h];
+        if (b.empty()) {   // header: kind, then the count, filled in by take
+          b.resize(sizeof(int32_t) + sizeof(int64_t), 0);
+          std::memcpy(b.data(), &kind_, sizeof(int32_t));
+        }
+        b.insert(b.end(), rec_.b.begin(), rec_.b.end());
         n_[h]++;
       }
     }
     Commands take() {
-      Commands out(body_.size());
-      for (size_t h = 0; h < body_.size(); h++) {
-        if (n_[h] == 0) continue;
-        Out o;
-        o.put<int32_t>(kind_);
-        o.put<int64_t>(n_[h]);
-        o.b.insert(o.b.end(), body_[h].begin(), body_[h].end());
-        out[h] = std::move(o.b);
-      }
-      return out;
+      for (size_t h = 0; h < body_.size(); h++)
+        if (n_[h] > 0) std::memcpy(body_[h].data() + sizeof(int32_t), &n_[h], sizeof(int64_t));
+      return std::move(body_);
     }
 
    private:

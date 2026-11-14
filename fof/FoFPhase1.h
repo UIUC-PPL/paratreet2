@@ -4266,6 +4266,12 @@ public:
         else out[node].push_back(r);
       }
     for (auto& kv : out) node_proxy[kv.first].unbindReceive(kv.second);
+    // Each PE sorts its own spread records by (label, id), so that the
+    // process's first PE only merges sorted runs (unbindSpreadInit).
+    std::sort(kept_here.begin(), kept_here.end(),
+              [](const paratreet::FoFUnbindRec& a, const paratreet::FoFUnbindRec& b) {
+                return a.label != b.label ? a.label < b.label : a.order < b.order;
+              });
     this->contribute(cb);
   }
 
@@ -4352,10 +4358,11 @@ public:
   }
 #endif
 
-  // Part 2c, on each process's first PE: sort this process's particles of
-  // the spread groups by (label, id) and make the process's holder from
-  // them (every process has one, empty or not, so that every process
-  // answers every round). The other PEs only contribute.
+  // Part 2c, on each process's first PE: merge this process's particles of
+  // the spread groups, which each PE sorted by (label, id), and make the
+  // process's holder from them (every process has one, empty or not, so
+  // that every process answers the origin round). The other PEs only
+  // contribute.
   // Contributes the slowest process's time for this (max_double).
   void unbindSpreadInit(paratreet::FoFUnbindSpec spec, const CkCallback& cb) {
     double t_init = 0;
@@ -4364,14 +4371,26 @@ public:
       auto* nb = node_proxy.ckLocalBranch();
       std::vector<paratreet::FoFUnbindRec>& all = nb->ubd_spread_all;
       all.clear();
-      for (auto& v : nb->ubd_spread) {
-        all.insert(all.end(), v.begin(), v.end());
-        std::vector<paratreet::FoFUnbindRec>().swap(v);
+      // Merge the PEs' runs, each sorted by (label, id) in unbindGather, and
+      // fill the holder's arrays on the way; the holder takes them over.
+      std::vector<std::vector<paratreet::FoFUnbindRec>>& runs = nb->ubd_spread;
+      size_t total = 0;
+      for (auto& v : runs) total += v.size();
+      all.reserve(total);
+      std::vector<size_t> head(runs.size(), 0);
+      auto less = [](const paratreet::FoFUnbindRec& a, const paratreet::FoFUnbindRec& b) {
+        return a.label != b.label ? a.label < b.label : a.order < b.order;
+      };
+      for (;;) {
+        int best = -1;
+        for (int r = 0; r < (int)runs.size(); r++)
+          if (head[r] < runs[r].size() &&
+              (best < 0 || less(runs[r][head[r]], runs[best][head[best]])))
+            best = r;
+        if (best < 0) break;
+        all.push_back(runs[best][head[best]++]);
       }
-      std::sort(all.begin(), all.end(),
-                [](const paratreet::FoFUnbindRec& a, const paratreet::FoFUnbindRec& b) {
-                  return a.label != b.label ? a.label < b.label : a.order < b.order;
-                });
+      for (auto& v : runs) std::vector<paratreet::FoFUnbindRec>().swap(v);
 #ifdef FOF_GPU
       const int64_t n = (int64_t)all.size();
       std::vector<int64_t> lab(n), id(n);
@@ -4387,12 +4406,10 @@ public:
         mass[i] = r.m;
       }
       if (!nb->dev_inited) deviceBind(nb);
-      subhalodev::Input in;
-      in.n = n;
-      in.label = lab.data(); in.id = id.data();
-      in.pos = pos.data(); in.vel = vel.data(); in.mass = mass.data();
       if (nb->ubd_holder) subhalodev::spreadHolderDelete(nb->ubd_holder);
-      nb->ubd_holder = subhalodev::spreadHolderNew(in, unbindParams(spec));
+      nb->ubd_holder = subhalodev::spreadHolderNew(std::move(lab), std::move(id), std::move(pos),
+                                                   std::move(vel), std::move(mass),
+                                                   unbindParams(spec));
 #else
       (void)spec;
       CkAbort("FoF3 -U (unbinding) needs a build with GPU=1");

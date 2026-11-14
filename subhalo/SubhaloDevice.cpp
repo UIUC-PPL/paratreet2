@@ -177,6 +177,15 @@ SpreadHolder* spreadHolderNew(const Input& in, const Params& p) {
                                                  unbind::spread::launchFor(p.kernel, p.rsqrt))};
 }
 
+SpreadHolder* spreadHolderNew(std::vector<int64_t>&& label, std::vector<int64_t>&& id,
+                              std::vector<double>&& pos, std::vector<double>&& vel,
+                              std::vector<double>&& mass, const Params& p) {
+  checkParams(p);
+  return new SpreadHolder{unbind::spread::Holder(
+      std::move(label), std::move(id), std::move(pos), std::move(vel), std::move(mass),
+      toUnbind(p), unbind::spread::launchFor(p.kernel, p.rsqrt))};
+}
+
 std::vector<char> spreadHolderStep(SpreadHolder* h, const char* cmd, size_t len) {
   return h->h.step(cmd, len);
 }

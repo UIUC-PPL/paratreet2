@@ -89,6 +89,11 @@ struct SpreadDriver;
 // in: this process's particles of the spread groups, sorted by (label, id),
 // as for unbind(). Copied.
 SpreadHolder* spreadHolderNew(const Input& in, const Params& p);
+// The same, taking the arrays over without a copy (the vectors are left
+// empty): label and id one per particle, pos and vel three, mass one.
+SpreadHolder* spreadHolderNew(std::vector<int64_t>&& label, std::vector<int64_t>&& id,
+                              std::vector<double>&& pos, std::vector<double>&& vel,
+                              std::vector<double>&& mass, const Params& p);
 std::vector<char> spreadHolderStep(SpreadHolder* h, const char* cmd, size_t len);
 // After the final round, in the input's order. Per group: nbound, passes,
 // refined_group and stale_frame are the whole group's; centre is the input
