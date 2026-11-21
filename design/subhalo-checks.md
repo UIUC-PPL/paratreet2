@@ -3471,7 +3471,7 @@ particles that are bound (higher is more bound):
 | 20 and up | 88 | 1.000 | 0.986 to 0.999 | 691 | 0.994 to 1.000 | 0.971 to 0.998 |
 
 The full lines are in the two job logs. The mean group size within a bin is
-the same on the two inputs to 1%.
+the same on the two inputs to within 2% in bins 4 to 19.
 
 **By family** (share of particles in groups of 20 or more that are bound):
 
