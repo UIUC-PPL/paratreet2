@@ -3375,6 +3375,61 @@ Time (s; lower is better):
 - The whole job used 3.8 node-hours against the estimate of 6: loading and
   decomposition took 38 s, not 63 s as in September.
 
+### cosmo25: the velocity check (2026-11-21, job 5965784)
+
+**Question.** cosmo25 gives a sub-halo to 44% of its groups of 20 or more,
+cosmo2b to 63% (job 5923504). cosmo25 is the first NChilada input. The
+smoke test showed that the reader gives the Tipsy file's values. It could not
+show that the cosmo25 file uses the same units as cosmo2b's. A wrong
+velocity unit would change how many groups are bound.
+
+**Method.** `subhalo/velstats.py` reads 4,096 evenly spaced runs of 16,384
+particles from each family of each file (67 M particles per family) and
+prints the total mass and the rms speed. `subhalo/run_velstats.sbatch`,
+one node, 7 min, 0.12 node-hours. On the 100k test snapshot it prints the
+same numbers from the Tipsy and the NChilada file. Both inputs are at a = 1,
+so velocity conventions that differ by a power of a give the same numbers;
+only a different unit system would show.
+
+| Input | Total mass, gas + dark (code units) | rms speed, gas / dark / all (code units) | Particle mass, gas / dark |
+|---|---|---|---|
+| cosmo2b | 0.0460 + 0.2240 = 0.2700 | 0.4363 / 0.4364 / 0.4364 | 0.693 |
+| cosmo25 | 0.0483 + 0.2603 = 0.3086 | 0.5094 / 0.5095 / 0.5094 | 0.185 |
+
+Mean velocities are below 1e-3 in all six samples.
+
+**What this says:**
+
+- **Both files use the same units.** The total masses are Omega_m and
+  Omega_b of a WMAP-like cosmology (0.27, 0.046) and of Planck 2013
+  (0.3086, 0.0483). So both files have critical density 1 and G = 1, as
+  FoF3 assumes.
+- **The speeds differ by a factor of 1.167**, which the two cosmologies
+  account for. Velocities on these scales grow about as Omega_m^0.55
+  times sigma_8: 1.076 from Omega_m, and a few percent each from the
+  higher sigma_8 and the lower H0 of Planck (H0 sets the code's velocity
+  unit, if the boxes are 25 Mpc without h). A unit error would be a factor
+  of sqrt(8 pi / 3) = 2.89 or hundreds (km/s), not 1.17.
+- **So the gap is not a unit error.** In each file the light and the heavy
+  particles have the same rms speed to 0.01%.
+
+**What could explain the gap (neither is checked).**
+
+- *Particle masses.* cosmo25's "gas" particles are 5.4 times lighter than
+  its dark ones. cosmo2b's are 1.4 times lighter. In a collisionless run,
+  two-body encounters heat the light species, and the heating is stronger
+  in small groups. That would leave small groups less bound on cosmo25.
+  The rms speeds over the whole box are the same for both species, but they
+  are set by large-scale flows, not by the inside of small groups.
+- *Resolution.* cosmo25's dark particles are 6.9 times lighter, and its
+  softening 2.9 times smaller, so a group of 20 particles is a different
+  object on the two inputs. The share of groups with 20 to 31 particles is
+  the same (45% and 46%).
+
+**Test.** Print the share of groups with a sub-halo by group size (log2
+bins), and the bound share of each family. That needs a new print in FoF3
+and one run on each input at 64 nodes. Not done yet.
+
 ### Not done in 2c and 2d
 
 - The rest of the spread groups' time on cosmo2b: set-up 0.47 s (the merge
