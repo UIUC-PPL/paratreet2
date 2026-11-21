@@ -3427,8 +3427,92 @@ Mean velocities are below 1e-3 in all six samples.
   the same (45% and 46%).
 
 **Test.** Print the share of groups with a sub-halo by group size (log2
-bins), and the bound share of each family. That needs a new print in FoF3
-and one run on each input at 64 nodes. Not done yet.
+bins), and the bound share of each family. Done the same day; see the
+next section.
+
+### cosmo25: the share of groups with a sub-halo, by size and by family (2026-11-21, jobs 5965860, 5965868, 5966019)
+
+**Prints added** (acf36a8). `FOF3STAT unbind_by_size` gives per log2 bin
+of the group's size (bin b: 2^b to 2^(b+1) - 1 particles) the groups, the
+groups with a sub-halo, the particles and the bound particles.
+`FOF3STAT unbind_by_family` gives the particles and bound particles of each
+family (the record's spare int now carries `Particle::type`). Each line
+checks that its sums equal the totals of `FOF3STAT unbind`. They are prints
+only.
+
+**Runs.**
+
+- Smoke test, job 5965860 (two nodes, 23 s, 0.01 node-hours). Every digest
+  is unchanged, including job 5923267's on 8m-lambb, and every sum equals
+  its total.
+- cosmo2b, job 5965868 (64 nodes, 37 s, 0.66 node-hours).
+- cosmo25 periodic, job 5966019 (64 nodes, 2 min 28 s, 2.6 node-hours).
+
+Both give the digests of their earlier runs exactly (jobs 5923294 and
+5923504). So the spread groups give the same bits on a repeat run at the
+same layout, on both large inputs.
+
+**By group size.** Share of groups with a sub-halo, and share of their
+particles that are bound (higher is more bound):
+
+| Bin (particles) | cosmo2b: groups | with a sub-halo | bound | cosmo25: groups | with a sub-halo | bound |
+|---|---|---|---|---|---|---|
+| 4 (20 to 31) | 1,210,254 | 0.528 | 0.526 | 7,560,648 | 0.301 | 0.300 |
+| 5 (32 to 63) | 804,091 | 0.647 | 0.630 | 4,740,369 | 0.425 | 0.412 |
+| 6 (64 to 127) | 329,282 | 0.756 | 0.722 | 2,039,885 | 0.591 | 0.563 |
+| 7 | 146,089 | 0.838 | 0.794 | 1,076,495 | 0.740 | 0.696 |
+| 8 | 69,415 | 0.895 | 0.849 | 596,947 | 0.830 | 0.780 |
+| 9 | 34,995 | 0.933 | 0.886 | 326,376 | 0.880 | 0.830 |
+| 10 | 18,320 | 0.957 | 0.914 | 175,625 | 0.912 | 0.864 |
+| 12 | 5,156 | 0.981 | 0.943 | 49,912 | 0.949 | 0.905 |
+| 14 | 1,473 | 0.990 | 0.955 | 13,901 | 0.969 | 0.927 |
+| 16 | 425 | 0.995 | 0.970 | 4,053 | 0.981 | 0.945 |
+| 18 | 128 | 1.000 | 0.981 | 1,092 | 0.995 | 0.964 |
+| 20 and up | 88 | 1.000 | 0.986 to 0.999 | 691 | 0.994 to 1.000 | 0.971 to 0.998 |
+
+The full lines are in the two job logs. The mean group size within a bin is
+the same on the two inputs to 1%.
+
+**By family** (share of particles in groups of 20 or more that are bound):
+
+| Input | Gas: in groups, bound share | Dark: in groups, bound share |
+|---|---|---|
+| cosmo2b | 273,430,840, 0.9455 | 925,507,572, 0.9463 |
+| cosmo25 | 7,710,531,281, 0.9478 | 7,839,807,669, 0.9458 |
+
+**What this says:**
+
+- **The gap is not a mix of sizes.** At every size, cosmo25 has fewer groups
+  with a sub-halo and a smaller bound share. The difference is largest for
+  the smallest groups (0.30 against 0.53 at 20 to 31 particles) and shrinks
+  with size. cosmo25 needs about 3 to 4 times as many particles per group to
+  reach cosmo2b's share: its 64 to 127-particle groups are bound about as
+  often as cosmo2b's 20 to 63, and its 256 to 511 as cosmo2b's 128 to 255.
+- **No sign that the light particles are heated out.** The two families are
+  bound in the same share on both inputs, to 0.2%. The light particles are
+  in groups in the same proportion as in the box: 49.6% of grouped
+  particles on cosmo25 (50% of the box), 22.8% on cosmo2b (22.9%). These are
+  totals, dominated by the large groups, so a deficit confined to groups of
+  a few dozen particles would not show here.
+- **At equal mass the order reverses.** cosmo25's mean particle mass is
+  10.8 times smaller (3.4 log2 bins), so a group of N particles on cosmo2b
+  has the mass of a group of 10.8 N on cosmo25. Matched by mass, cosmo25's
+  groups have a sub-halo more often: about 0.78 against 0.53 at cosmo2b's
+  20 to 31 particles, 0.85 against 0.65 at 32 to 63, and 0.94 against 0.90 at
+  256 to 511. So the share depends neither on the particle count alone nor
+  on the mass alone.
+- **No error is indicated.** The inputs' units agree (previous section).
+  The reader gives the same values as the Tipsy file. FoF gives its gold
+  answer. The kernel matched HBT-HERONS on every input it was compared on.
+  The difference is a property of the two simulations, and these runs do not
+  say which one. The candidates are the mass scale (at equal particle count,
+  cosmo25's groups are 10.8 times lighter objects), the softening relative
+  to the particle spacing (1/73 on cosmo25 and 1/58 on cosmo2b), and the
+  cosmology (Planck and WMAP-like).
+- **A check that would settle whether the shares are HBT-HERONS's too:**
+  HBT-HERONS on a sub-volume of cosmo25. That needs an NChilada reader in
+  `tipsy2hbt`, which the check at a below 1 needs anyway (h34462gs.000616
+  is NChilada). Not done.
 
 ### Not done in 2c and 2d
 
@@ -3532,4 +3616,8 @@ and one run on each input at 64 nodes. Not done yet.
   (job 5923294). cosmo25 at 64 nodes (job 5923504): FoF unchanged at 24
   billion particles; 7,426,226 sub-haloes, the largest group (2.2 billion
   particles, above 2^31) unbound spread over 64 processes; unbinding 42.9
-  s, the catalogue 15.5 s. See "Not done in 2c and 2d".
+  s, the catalogue 15.5 s. Its smaller share of groups with a sub-halo
+  (44% against 63% on cosmo2b) is not a unit error (job 5965784) and holds
+  at every group size; at equal mass the order reverses (jobs 5965868,
+  5966019). Whether HBT-HERONS gives the same shares is not checked. See
+  "Not done in 2c and 2d".
