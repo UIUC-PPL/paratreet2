@@ -74,7 +74,7 @@ for run in $RUNS; do
       +lci_ndevices 7 +backend_poll_thread 1 > $d/fof3.log 2>&1 )
   rc=$?
   echo "  exit $rc"
-  grep -E 'label_digest|FOF3STAT catalog|FOF3STAT unbind|^Iteration' $d/fof3.log | grep -v unbind_settings | cut -c1-400 | sed 's/^/  /'
+  grep -E 'label_digest|FOF3STAT catalog|FOF3STAT unbind|^Iteration' $d/fof3.log | grep -v unbind_settings | cut -c1-3000 | sed 's/^/  /'
   [ $rc = 0 ] || grep -m8 -E 'Fatal|Abort|abort|rror|subhalodev|unbind::spread' $d/fof3.log | sed 's/^/  /'
 done
 echo "=== done $(date +%T)"

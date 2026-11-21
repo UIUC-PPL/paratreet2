@@ -18,7 +18,8 @@
 # digest, both unbinding digests, the spread digests and the rows digest the
 # same on the two files, and the rows digest equal to digest_subhaloes.
 # Last, 8m-lambb with 60 groups spread (job 5923267's spr8_np16): the same
-# digests, since the binary gained only a print.
+# digests, since the binary gained only prints (unbind_spread_largest;
+# unbind_by_size and unbind_by_family, whose sums must equal the totals).
 
 #SBATCH --account=csc710
 #SBATCH --qos=debug
@@ -116,5 +117,10 @@ if [ $rc = 0 ] && [ "$new8" = "$OLD8" ]; then
 else
   echo "  spr8_np16: FAIL: $new8; job 5923267: $OLD8"; fail=1
 fi
+# FOF3STAT unbind_by_size and unbind_by_family check their sums against the
+# totals (added 2026-11-21); none may differ.
+if grep -l 'DIFFER FROM' $OUT/*/fof3.log; then echo "  a sum check DIFFERS (files above)"; fail=1
+else echo "  unbind_by_size / unbind_by_family / unbind_rows: every sum equals its total"; fi
+grep -h 'unbind_by_family' $OUT/*/fof3.log | sed 's/^/  /'
 echo "=== smoke: $([ $fail = 0 ] && echo PASS || echo FAIL) ($(date +%T))"
 sacct -j $J -X -n -o elapsed,nnodes,state

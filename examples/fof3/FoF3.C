@@ -783,6 +783,40 @@ using namespace paratreet;
                  "passes %ld holders %ld refined %ld stale_frame %ld\n",
                  us.big_label, us.big_n, us.big_nbound, (double)us.big_nbound / (double)us.big_n,
                  us.big_passes, us.big_holders, us.big_refined, us.big_stale);
+      {
+        // By group size (log2 bin: groups / with a sub-halo / particles /
+        // bound) and by particle family; each line checks its sums against
+        // the totals of FOF3STAT unbind.
+        const int B = paratreet::kUnbindTallyBins;
+        const long* T = us.tally;
+        std::string line;
+        char buf[160];
+        long sg = 0, ss = 0, sp = 0, sb = 0;
+        for (int b = 0; b < B; b++) {
+          if (T[b] == 0) continue;
+          snprintf(buf, sizeof buf, " %d:%ld/%ld/%ld/%ld", b, T[b], T[B + b], T[2 * B + b],
+                   T[3 * B + b]);
+          line += buf;
+          sg += T[b]; ss += T[B + b]; sp += T[2 * B + b]; sb += T[3 * B + b];
+        }
+        CkPrintf("FOF3STAT unbind_by_size (log2 bin:groups/subhaloes/particles/bound):%s; "
+                 "sums %s the totals\n", line.c_str(),
+                 sg == us.groups && ss == us.subhaloes && sp == us.particles && sb == us.bound
+                     ? "equal" : "DIFFER FROM");
+        static const char* fam[4] = {"other", "star", "gas", "dark"};
+        line.clear();
+        long fp = 0, fb = 0;
+        for (int f = 0; f < 4; f++) {
+          const long p = T[4 * B + 2 * f], q = T[4 * B + 2 * f + 1];
+          fp += p; fb += q;
+          if (p == 0) continue;
+          snprintf(buf, sizeof buf, " %s particles %ld bound %ld share %.6f;", fam[f], p, q,
+                   (double)q / (double)p);
+          line += buf;
+        }
+        CkPrintf("FOF3STAT unbind_by_family:%s sums %s the totals\n", line.c_str(),
+                 fp == us.particles && fb == us.bound ? "equal" : "DIFFER FROM");
+      }
       CkPrintf("FOF3STAT unbind_gathered: digest_subhaloes %016llx digest_particles %016llx\n",
                us.digest_subhaloes - us.spread_digest_subhaloes,
                us.digest_particles - us.spread_digest_particles);

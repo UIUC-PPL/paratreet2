@@ -27,7 +27,8 @@
 # There is no gathered run: the largest group (74 GiB) does not fit one die.
 # What is read: the FOF3STAT components and label_digest lines (open), and
 # the unbind, unbind_time_s, unbind_spread, unbind_spread_largest,
-# unbind_rows and unbind_spread_rounds lines (spread).
+# unbind_rows, unbind_spread_rounds, unbind_by_size and unbind_by_family
+# lines (spread).
 
 #SBATCH --account=csc710
 #SBATCH --qos=debug
@@ -84,7 +85,7 @@ for run in $RUNS; do
   rc=$?
   echo "  exit $rc ($(date +%T))"
   grep -E 'linking_length_exact|FOF3STAT components|label_digest|FOF3STAT catalog|FOF3STAT unbind|^Loading|Total Decomposition|^Iteration' $d/fof3.log \
-    | grep -v unbind_settings | cut -c1-400 | sed 's/^/  /'
+    | grep -v unbind_settings | cut -c1-3000 | sed 's/^/  /'
   [ $rc = 0 ] || grep -m8 -E 'Fatal|Abort|abort|rror|subhalodev|unbind::spread|oom|OOM' $d/fof3.log | sed 's/^/  /'
   if [ $run = open ]; then
     got=$(grep -o 'FOF3STAT components: [0-9]* max_size [0-9]*' $d/fof3.log | head -1 | cut -d' ' -f3-)

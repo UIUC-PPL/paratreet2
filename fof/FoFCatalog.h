@@ -43,7 +43,7 @@ struct FoFUnbindRec {
   // its group spans processes (which decides its catalogue owner).
   unsigned long home;
   int touched;
-  int pad;
+  int family;       // Particle::Type (1 star, 2 gas, 3 dark): FOF3STAT unbind_by_family
 };
 
 // Part 2d: a particle's result on its way back to its PE.

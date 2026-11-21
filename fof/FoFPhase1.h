@@ -197,6 +197,27 @@ inline std::vector<fofplugin::Group>& catalogGroups() {
 }
 constexpr int kOriginIndexBits = 40;
 
+// The unbinding's tallies (FOF3STAT unbind_by_size, unbind_by_family): per
+// log2 bin of a group's size (bin b holds 2^b to 2^(b+1) - 1 particles),
+// groups, groups with a sub-halo, particles and bound particles; then per
+// family (index Particle::Type: 0 other, 1 star, 2 gas, 3 dark), particles
+// and bound particles.
+constexpr int kUnbindTallyBins = 40;
+constexpr int kUnbindTally = 4 * kUnbindTallyBins + 8;
+inline void unbindTallyGroup(long* T, long n, long nbound) {
+  int b = 0;
+  while (b + 1 < kUnbindTallyBins && (n >> (b + 1)) > 0) b++;
+  T[b]++;
+  if (nbound > 0) T[kUnbindTallyBins + b]++;
+  T[2 * kUnbindTallyBins + b] += n;
+  T[3 * kUnbindTallyBins + b] += nbound;
+}
+inline void unbindTallyParticle(long* T, int family, bool bound) {
+  const int f = family >= 1 && family <= 3 ? family : 0;
+  T[4 * kUnbindTallyBins + 2 * f]++;
+  if (bound) T[4 * kUnbindTallyBins + 2 * f + 1]++;
+}
+
 // Defined in FoF.C next to the keep-alive ring: one line per process of
 // ring-message gap counters (the no-tracing stall monitor). Called from
 // phase3Stats, once per process.
@@ -4254,7 +4275,7 @@ public:
         r.m = p.mass;
         r.home = ((unsigned long)CkMyPe() << paratreet::kOriginIndexBits) | flat;
         r.touched = p.group_number < 0;
-        r.pad = 0;
+        r.family = (int)p.type;
         if (!spread.empty() && std::binary_search(spread.begin(), spread.end(), label)) {
           kept_here.push_back(r);
           continue;
@@ -4472,6 +4493,7 @@ public:
     // its steps by round kind (M[2 + kind], kind 1 .. 7), this step's time.
     double M[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     long X[1] = {0};
+    long T[paratreet::kUnbindTally] = {};   // family slots only (groups: the driver)
 #ifdef FOF_GPU
     if (CkMyPe() == CkNodeFirst(CkMyNode())) {
       const double t_fin0 = CkWallTimer();
@@ -4501,6 +4523,7 @@ public:
         uint64_t bits;
         std::memcpy(&bits, &o.energy[i], sizeof bits);
         D[1] += unbindDigestTerm((uint64_t)all[i].order, (uint64_t)o.bound[i], bits);
+        paratreet::unbindTallyParticle(T, all[i].family, o.bound[i] != 0);
       }
       if (!prefix.empty() && n > 0) {
         const std::string path = prefix + "." + std::to_string(CkMyNode()) + ".s.ubd";
@@ -4535,8 +4558,9 @@ public:
         CkReduction::tupleElement(sizeof(L), L, CkReduction::sum_long),
         CkReduction::tupleElement(sizeof(D), D, CkReduction::sum_ulong_long),
         CkReduction::tupleElement(sizeof(M), M, CkReduction::max_double),
-        CkReduction::tupleElement(sizeof(X), X, CkReduction::max_long)};
-    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(te, 4);
+        CkReduction::tupleElement(sizeof(X), X, CkReduction::max_long),
+        CkReduction::tupleElement(sizeof(T), T, CkReduction::sum_long)};
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(te, 5);
     msg->setCallback(cb);
     this->contribute(msg);
   }
@@ -4560,6 +4584,8 @@ public:
     double M[6] = {0, 0, 0, 0, 0, 0};
     // Maxima (long): largest group, particles on one process.
     long X[2] = {0, 0};
+    // Sums (long): tallies by group size and family (paratreet::kUnbindTally).
+    long T[paratreet::kUnbindTally] = {};
     if (CkMyPe() == CkNodeFirst(CkMyNode())) {
       const double t0 = CkWallTimer();
       auto* nb = node_proxy.ckLocalBranch();
@@ -4608,6 +4634,7 @@ public:
       for (size_t g = 0; g < o.label.size(); g++) {
         L[0]++;
         X[0] = std::max(X[0], (long)o.count[g]);
+        paratreet::unbindTallyGroup(T, (long)o.count[g], (long)o.nbound[g]);
         if (o.nbound[g] > 0) {
           L[1]++;
           L[2] += o.nbound[g];
@@ -4622,6 +4649,7 @@ public:
         uint64_t bits;
         std::memcpy(&bits, &o.energy[i], sizeof bits);
         D[1] += unbindDigestTerm((uint64_t)all[i].order, (uint64_t)o.bound[i], bits);
+        paratreet::unbindTallyParticle(T, all[i].family, o.bound[i] != 0);
       }
       L[4] = o.wide_groups; L[5] = o.sampled_groups; L[6] = o.refined_groups;
       L[8] = o.rounds;
@@ -4684,8 +4712,9 @@ public:
         CkReduction::tupleElement(sizeof(D), D, CkReduction::sum_ulong_long),
         CkReduction::tupleElement(sizeof(S), S, CkReduction::sum_double),
         CkReduction::tupleElement(sizeof(M), M, CkReduction::max_double),
-        CkReduction::tupleElement(sizeof(X), X, CkReduction::max_long)};
-    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(te, 5);
+        CkReduction::tupleElement(sizeof(X), X, CkReduction::max_long),
+        CkReduction::tupleElement(sizeof(T), T, CkReduction::sum_long)};
+    CkReductionMsg* msg = CkReductionMsg::buildFromTuple(te, 6);
     msg->setCallback(cb);
     this->contribute(msg);
   }
@@ -6028,6 +6057,8 @@ struct FoFUnbindStats {
   // largest group is above 2^31 particles.
   long big_label = -1, big_n = 0, big_nbound = 0, big_passes = 0, big_holders = 0,
        big_refined = 0, big_stale = 0;
+  // Tallies by group size and family, gathered and spread (kUnbindTally).
+  long tally[kUnbindTally] = {};
 };
 
 // Gather (one quiescence) and unbind. Call after runFoFCatalog.
@@ -6071,6 +6102,10 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
   st.t_device_call = M[1]; st.t_kernel_first = M[2]; st.t_kernel_later = M[3];
   st.t_kernel_refine = M[4]; st.t_host = M[5];
   st.largest = X[0]; st.max_per_process = X[1];
+  {
+    const long* T = (const long*)te[5].data;
+    for (int k = 0; k < kUnbindTally; k++) st.tally[k] = T[k];
+  }
   delete[] te;
   delete msg;
   if (spread.empty()) return st;
@@ -6166,6 +6201,7 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
     // one that holds the row takes it (unbind_rows checks that all arrived).
     std::vector<paratreet::FoFUnbindRow> rows;
     for (const auto& g : subhalodev::spreadDriverGroups(drv)) {
+      unbindTallyGroup(st.tally, (long)g.n, (long)g.nbound);
       if (g.n > st.big_n) {
         st.big_label = g.label;
         st.big_n = g.n;
@@ -6200,6 +6236,10 @@ FoFUnbindStats runFoFUnbind(CProxy_FoFPhase1<Data> fof, const FoFUnbindSpec& spe
   const unsigned long long* FD = (const unsigned long long*)te[1].data;
   const double* FM = (const double*)te[2].data;
   const long* FX = (const long*)te[3].data;
+  {
+    const long* FT = (const long*)te[4].data;
+    for (int k = 0; k < kUnbindTally; k++) st.tally[k] += FT[k];
+  }
   st.spread_groups = ss.groups;
   st.spread_subhaloes = ss.subhaloes;
   st.spread_bound = ss.bound;
