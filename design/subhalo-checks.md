@@ -3611,7 +3611,7 @@ is the same in all four runs: 642,736 groups of 20 or more, largest
   Hubble flow across a group, H(a) a dx with H(a) = 4.66 H0 here, is not
   scaled.
 - The large groups' bound share at the convention, 0.70 to 0.84, is lower
-  than at a = 1 on cosmo2b and cosmo25 (0.97 to 0.99). This is a z = 3
+  than at a = 1 on cosmo2b and cosmo25 (0.96 to 1.00 for groups of 2^18 or more). This is a z = 3
   zoom region with its gas and stars left out of the potential (decision 6).
   HBT-HERONS gives the same shares (below).
 
@@ -3623,10 +3623,10 @@ is the same in all four runs: 642,736 groups of 20 or more, largest
 |---|---|
 | Groups with a sub-halo | 309,479 (FoF3), 309,476 (HBT-HERONS) |
 | Groups where the two agree on a sub-halo | 642,663 of 642,736 (99.99%) |
-| Groups where only one finds a sub-halo | 38 FoF3 only, 35 HBT-HERONS only, all below 8,192 particles, 61 of them below 64 |
+| Groups where only one finds a sub-halo | 38 FoF3 only, 35 HBT-HERONS only, all below 8,192 particles, 59 of them below 64 |
 | Groups with the same bound count | 98.2% (99.9% at 20 to 31 particles, 91% at 512 to 1,023) |
 | Mean \|bound count difference\| / size | 1.8e-4; up to 1.5% in the largest group |
-| Bound share by size | the same in the two codes to 0.005 in every bin |
+| Bound share by size | the same in the two codes to 0.005 in every bin but the largest group (0.842 against 0.827) |
 
 - At a = 1 the two codes agreed on every group of the cosmo25 and cosmo2b
   cubes. Here 73 of 642,736 groups differ, nearly all near the 20-particle
