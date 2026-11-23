@@ -3571,6 +3571,75 @@ particles in most groups. Bound particles in all: 7,708,246 (FoF3) against
   softening, cosmology, environment), which is not a question about the
   code. Not pursued further.
 
+### The velocity convention before z = 0 (2026-11-22, job 5971242)
+
+**Question.** FoF3 `-U` and `tipsy2hbt` take peculiar velocity = a times
+the velocity in the file. Every output of a tracking series but the last is
+at a below 1, where a wrong convention changes every result.
+
+**From ChaNGa's source.** `Main::writeOutput` (`~/changa/ParallelGravity.cpp`,
+about l.3614) writes velocities times `dvFac = 1/a^2` in a comoving run.
+ChaNGa's internal velocity is the canonical a^2 dx/dt (the PKDGRAV
+convention; this premise was not traced in ChaNGa's integrator), so the file
+holds dx/dt, and the peculiar velocity is a dx/dt = a times the file's
+value: FoF3's convention.
+
+**Run** (`subhalo/run_velconv.sbatch`, one node, 31 min, 0.51 node-hours).
+Input: the dark particles of `h34462gs.000616` (a = 0.2447; a zoom run in a
+600 Mpc box, Planck cosmology). The cube is of side 0.02 at the centre, so it
+lies inside the high-resolution region: 503,676,402 particles, 99.93% of the
+high-resolution mass and the rest 32 times heavier, at one softening
+(5.86e-7) in both codes. `subbox.py --families dark` writes it, and
+`subhalo/tipsyvel.py` writes copies with the velocities scaled, so that
+FoF3's factor a makes the effective factor a^2, a, 1 or 1/a. FoF3 runs with
+`-b 0.2` (the cube's own mean spacing), `-K -m 20`, and `-U` at a = 0.2447,
+Omega_m 0.3086, Omega_Lambda 0.6914, with the references' G. The FoF result
+is the same in all four runs: 642,736 groups of 20 or more, largest
+29,893,130.
+
+| Effective factor | Groups with a sub-halo | Bound share, 20 to 31 particles | Bound share, groups of 2^19 or more |
+|---|---|---|---|
+| a^2 (velocities too small by a) | 416,442 | 0.51 | 1.00 in every group |
+| **a (the convention)** | **309,479** | **0.32** | **0.70 to 0.84** |
+| 1 | 0 | 0 | 0 |
+| 1/a | 0 | 0 | 0 |
+
+- Only the convention gives a result that is neither saturated nor empty.
+  With velocities 4.1 times larger (factor 1) nothing is bound. With
+  velocities 4.1 times smaller (a^2), every large group is bound to the
+  last particle. Small groups stay partly unbound even at a^2, because the
+  Hubble flow across a group, H(a) a dx with H(a) = 4.66 H0 here, is not
+  scaled.
+- The large groups' bound share at the convention, 0.70 to 0.84, is lower
+  than at a = 1 on cosmo2b and cosmo25 (0.97 to 0.99). This is a z = 3
+  zoom region with its gas and stars left out of the potential (decision 6).
+  HBT-HERONS gives the same shares (below).
+
+**FoF3 against HBT-HERONS at a = 0.2447** (on the convention's copy;
+`tipsy2hbt` with the same convention, HBT-HERONS with its defaults, 8 x 7,
+16 min):
+
+| | Value |
+|---|---|
+| Groups with a sub-halo | 309,479 (FoF3), 309,476 (HBT-HERONS) |
+| Groups where the two agree on a sub-halo | 642,663 of 642,736 (99.99%) |
+| Groups where only one finds a sub-halo | 38 FoF3 only, 35 HBT-HERONS only, all below 8,192 particles, 61 of them below 64 |
+| Groups with the same bound count | 98.2% (99.9% at 20 to 31 particles, 91% at 512 to 1,023) |
+| Mean \|bound count difference\| / size | 1.8e-4; up to 1.5% in the largest group |
+| Bound share by size | the same in the two codes to 0.005 in every bin |
+
+- At a = 1 the two codes agreed on every group of the cosmo25 and cosmo2b
+  cubes. Here 73 of 642,736 groups differ, nearly all near the 20-particle
+  limit, where one particle decides. The likely cause is HBT-HERONS's tree
+  (opening angle 0.45), which is not exact even below 1,000 particles.
+  Not checked group by group.
+- Above 1,024 particles HBT-HERONS samples 1,000 sources and FoF3 up to
+  10,000, so bound counts differ by a few tenths of a percent. That is more
+  than at a = 1, as expected for less relaxed groups.
+- **So the convention is right, and FoF3 computes what HBT-HERONS computes
+  at a real epoch below 1:** the scale factor, the Hubble flow and the
+  cosmology enter both codes in the same way.
+
 ### Not done in 2c and 2d
 
 - The rest of the spread groups' time on cosmo2b: set-up 0.47 s (the merge
@@ -3662,16 +3731,32 @@ did for unbinding.
      output then needs a distributed lookup from id to particle, since the
      decomposition changes from output to output.
    - (b) On the particles: each particle carries the id of the track whose
-     source it is in, and whether it is bound. A small per-track table holds
-     the rest (host, rank, depth, parent, birth, most bound particle, which
-     also places orphans). Because `CleanTracks` keeps a particle in at most
-     one source, one label per particle holds the same information as the
-     lists.
+     source it is in, and flags: bound, among the track's 10 most bound,
+     kept in the source after the cut to 3 times the bound count. A small
+     per-track table holds the rest (host, rank, depth, nest, birth, most
+     bound particle, which also places orphans).
 
-   *Recommended: (b).* In situ the particles keep their labels in memory
-   with no lookup at all. In the series path the labels are written and
-   read like FoF3's `.lbl` files: 9 bytes per particle, and no id lookup at
-   24 billion particles.
+   **Corrected 2026-11-22**, after reading the tracking rules ("HBT-HERONS's
+   tracking rules", below). A single label does *not* hold everything
+   HBT-HERONS carries. Its saved sources hold some particles twice:
+   - a satellite's unbound particles that it keeps in its source are also
+     appended to its parent's list;
+   - two tracks can share one of their 10 most bound particles;
+   - a particle in no group can sit in a hostless track and in a satellite.
+
+   HBT-HERONS resolves the first case at the start of the next output
+   (`CleanTracks`: the deepest track keeps the particle, unless the particle
+   is among another track's 10 most bound). With labels, the same rule would
+   run at the end of the output instead. The other two cases cannot be held
+   by one label. They are rare and come from unchecked cases in HBT-HERONS's
+   release build (its asserts are compiled out). The draft pass rule must
+   allow for them.
+
+   *Recommended: (b), with the end-of-output resolution, and the two rare
+   cases measured against HBT-HERONS before the pass rule is fixed.* In situ
+   the particles keep their labels in memory with no lookup at all. In the
+   series path the labels are written and read like FoF3's `.lbl` files:
+   9 bytes per particle, and no id lookup at 24 billion particles.
 4. **Which of HBT-HERONS's behaviours, in what order.**
    - 3a: tracks carried, hosts by the 10 most bound particles, satellites
      kept inside their host, centrals by phase-space distance, new tracks
@@ -3711,6 +3796,53 @@ did for unbinding.
      host stays spread.
    - Satellites are far smaller than the hosts that stay spread, so no
      satellite needs the spread path.
+
+### HBT-HERONS's tracking rules (read 2026-11-22)
+
+`design/hbt-herons-tracking-rules.md` holds the rules for each step, read
+from c728ee0 with line citations. Seven of them were checked by hand
+against the source: the host vote, the central's mass cut and kinetic
+distance, the source cut, the hand-over of a child's unbound particles, the
+shuffle, and the merger threshold. The rest are to be checked as each
+piece is built. What matters for the decisions above:
+
+- **What a track carries.** Its source, in order: the bound particles
+  sorted by energy, then the particles unbound in the last pass, then
+  those unbound earlier, cut to floor(3 Nbound). Also its nest list (as
+  track ids), most bound particle, track id, and the previous Vmax (a
+  tie-break). Everything else is recomputed at each output.
+- **The order of unbinding.** Depth first along the nest lists. A child's
+  unbound particles go to its parent at once, before the source cut.
+  - After unbinding, each track tests its whole subtree for trapped
+    satellites: |dx|/sigma_x + |dv|/sigma_v < 2 over the 20 most bound
+    particles, with 3-D dispersions and no Hubble term.
+  - A merged satellite hands over its bound particles, and the track is
+    unbound once more.
+- **Two different "centrals".** The track that receives the group's
+  particles is chosen before unbinding:
+  - among tracks of at least 0.8 of the largest bound mass;
+  - the one smallest in |v_sub - v_halo + H a dx|.
+
+  The track reported as central (Rank 0) is the most massive one after
+  unbinding, and the two can differ.
+- **Orphans.** A group whose only members are orphans gets no new track. An
+  orphan takes its particles and can come back under its old track id.
+- **New track ids.** The number of existing tracks plus the rank of the
+  host group's id among this output's new tracks. They do not depend on the
+  decomposition.
+- **What HBT-HERONS cannot reproduce exactly**, which shapes the pass rule
+  (decision 5):
+  - the sample is drawn with `std::random_shuffle` from an unseeded
+    `rand()`, so any group over 1,000 particles with sampling on differs
+    from run to run, and after a restart;
+  - ties in the host vote fall to `unordered_map` order;
+  - with more than one MPI rank, the host vote can merge two groups that
+    have the same local index on different ranks;
+  - the halo centre has last-bit rounding that depends on the order its
+    pieces arrived.
+
+  So the exact reference must be run without sampling (no shuffle), on one
+  MPI rank, and ties must be counted rather than matched.
 
 ### What waits on whom
 
@@ -3790,7 +3922,10 @@ did for unbinding.
     5923504);
   - a real epoch: `h34462gs.000616` (a = 0.2447) is on Frontier but needs
     an NChilada reader in the converter; `tipsy2hbt`'s velocity convention
-    is unchecked at a below 1;
+    is unchecked at a below 1. Done 2026-11-22 (job 5971242, "The velocity
+    convention before z = 0"): `subbox.py` writes a cube of it as Tipsy;
+    the convention is ChaNGa's, and FoF3 agrees with HBT-HERONS at that
+    epoch;
   - marginally bound groups are where the cap and single-precision sums
     cost most (a1.25: up to 2.9% of a sampled group; 9 groups differ when
     summing in single precision). Real high-redshift groups may or may not

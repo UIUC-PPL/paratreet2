@@ -4,6 +4,7 @@ big-endian Tipsy file (design/subhalo-checks.md, "cosmo25: HBT-HERONS on a
 sub-box").
 
   subbox.py <snapshot> <out.tipsy> <side> [--centre cx cy cz] [--workers W]
+            [--families gas,dark]
 
 Keeps every particle with -side/2 <= x - c < side/2 in each coordinate
 (no periodic wrap: the cube must lie inside the box). With the default
@@ -15,7 +16,8 @@ Families are kept, in file order: gas, then dark, then star. A gas record
 gets mass, position and velocity from the input, density 0, temperature
 500 (the inputs' gas is collisionless at 500 K), smoothing length and
 softening the family's softening, metals 0, potential 0. A dark record gets
-mass, position, velocity, softening, potential 0. Stars are not supported.
+mass, position, velocity, softening, potential 0. Stars are not written:
+an input with stars needs --families without star (h34462: --families dark).
 A directory is read as NChilada (field files gas/ and dark/: pos, vel, mass,
 soft), a file as Tipsy (a Tipsy gas record has no softening; the dark
 family's first value is used).
@@ -101,6 +103,11 @@ def main():
         i = args.index("--workers")
         workers = int(args[i + 1])
         del args[i:i + 2]
+    wanted = ("gas", "dark", "star")
+    if "--families" in args:
+        i = args.index("--families")
+        wanted = tuple(args[i + 1].split(","))
+        del args[i:i + 2]
     src, dst, side = args[0], args[1], float(args[2])
     half = 0.5 * side
     exact = not np.any(centre)
@@ -110,10 +117,10 @@ def main():
     if os.path.isdir(src):
         for name in ("gas", "dark", "star"):
             d = os.path.join(src, name)
-            if not os.path.isdir(d):
+            if not os.path.isdir(d) or name not in wanted:
                 continue
             if name == "star":
-                sys.exit("subbox: star family not supported")
+                sys.exit("subbox: star family not supported (use --families)")
             t, n, _, poff, _, _ = nchilada_field(os.path.join(d, "pos"))
             _, n2, _, voff, _, _ = nchilada_field(os.path.join(d, "vel"))
             _, n3, _, moff, _, _ = nchilada_field(os.path.join(d, "mass"))
@@ -128,12 +135,12 @@ def main():
     else:
         with open(src, "rb") as f:
             t, n, ndim, nsph, ndark, nstar = struct.unpack(">diiiii", f.read(28))
-        if nstar:
-            sys.exit("subbox: star family not supported")
+        if nstar and "star" in wanted:
+            sys.exit("subbox: star family not supported (use --families)")
         off = 32 if os.path.getsize(src) == 32 + nsph * GAS.itemsize + ndark * DARK.itemsize else 28
         time = t
         for name, cnt, dt in (("gas", nsph, GAS), ("dark", ndark, DARK)):
-            if cnt:
+            if cnt and name in wanted:
                 items = [("tipsy", a, min(CHUNK, cnt - a), half, centre, (src, off, name))
                          for a in range(0, cnt, CHUNK)]
                 fams.append((name, cnt, items))
@@ -148,7 +155,13 @@ def main():
             else:
                 kept[name] = None
             k = 0 if kept[name] is None else len(kept[name][0])
-            print("subbox: %s: %d of %d particles kept" % (name, k, n), flush=True)
+            mr = ""
+            if k:
+                m = kept[name][0].astype(np.float64)
+                e = kept[name][4].astype(np.float64)
+                mr = "; mass %.8g to %.8g, softening %.8g to %.8g" % (m.min(), m.max(), e.min(),
+                                                                     e.max())
+            print("subbox: %s: %d of %d particles kept%s" % (name, k, n, mr), flush=True)
 
     dark_eps = None
     if kept.get("dark") is not None:
