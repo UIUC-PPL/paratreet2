@@ -3510,9 +3510,66 @@ the same on the two inputs to within 2% in bins 4 to 19.
   to the particle spacing (1/73 on cosmo25 and 1/58 on cosmo2b), and the
   cosmology (Planck and WMAP-like).
 - **A check that would settle whether the shares are HBT-HERONS's too:**
-  HBT-HERONS on a sub-volume of cosmo25. That needs an NChilada reader in
-  `tipsy2hbt`, which the check at a below 1 needs anyway (h34462gs.000616
-  is NChilada). Not done.
+  HBT-HERONS on a sub-volume of cosmo25. Done 2026-11-22 without changing
+  `tipsy2hbt`: `subbox.py` writes the sub-volume as Tipsy ("cosmo25:
+  HBT-HERONS on a sub-box"). It settles it: the shares are HBT-HERONS's.
+
+### cosmo25: HBT-HERONS on a sub-box (2026-11-22, job 5971133)
+
+**Question.** Is cosmo25's smaller share of groups with a sub-halo a
+property of the data, or of our unbinding? Give HBT-HERONS the same groups
+and compare, group by group.
+
+**Method** (`subhalo/run_hbt_subbox.sbatch`, one node, 4 min, 0.07
+node-hours):
+
+1. `subhalo/subbox.py` cuts the cube at the box's centre, with positions
+   unchanged bit for bit and families kept: side 1/8 of cosmo25, side 1/4
+   of cosmo2b. On the 100k test snapshot it writes byte-identical files
+   from the Tipsy and the NChilada copies, and a cube larger than the
+   input reproduces the input file exactly.
+2. FoF3 on the cube at the full box's linking length. One run reads the
+   cube's volume and the `-b` factor is set from it: 6.8897746514307728e-05
+   against 6.8897746514307755e-05. Then `-K -m 20 -L -U` with the
+   production settings and the references' G (0.99995179).
+3. `tipsy2hbt`, with period 1, the full box's: no group in the cube is near
+   the box's faces.
+4. HBT-HERONS (double precision) with its own defaults:
+   `subhalo/hbt_production.conf`, 1,000 sampled sources, opening angle
+   0.45, BoundMassPrecision 0.995.
+5. `hbtref`, then `subhalo/sharecmp.py`, which compares the two codes per
+   group: FoF3's `.ubd` records against HBT-HERONS's bound particles in
+   FoF3's numbering.
+
+| Cube | Particles (count) | Density (of the mean) | Groups of 20 or more (count) | Groups where the two agree on a sub-halo | Groups with the same bound count | Mean \|bound count difference\| / size |
+|---|---|---|---|---|---|---|
+| cosmo25, side 1/8 | 17,788,634 | 0.37 | 16,326 | all (13,544 with, 2,782 without) | 98.4% | 4e-5 |
+| cosmo2b, side 1/4 | 11,357,446 | 0.37 | 21,042 | all (18,672 with, 2,370 without) | 99.1% | 2e-5 |
+
+By size, the share of groups with a sub-halo is the same in both codes in
+every bin. Bound counts are identical in 99.1% to 99.97% of the groups
+below 1,024 particles. Above that, HBT-HERONS samples 1,000 sources and
+FoF3 none (up to its cap of 10,000), so the bound counts differ by a few
+particles in most groups. Bound particles in all: 7,708,246 (FoF3) against
+7,707,289 (HBT-HERONS) on cosmo25; 4,491,290 against 4,491,551 on cosmo2b.
+
+**What this says:**
+
+- **The shares are HBT-HERONS's too.** Given the same groups, HBT-HERONS
+  finds a sub-halo in exactly the groups where FoF3 does, on both inputs.
+  The difference between cosmo25 and cosmo2b is in the data, not in our
+  unbinding.
+- **The share depends on environment.** Both cubes are underdense: they hold
+  0.37 of the mean density, so each is in a void. That both come out at 0.37
+  suggests the two runs share initial phases (not checked). In the cubes,
+  more groups have a sub-halo than in the whole box: 0.70 against 0.30 for
+  cosmo25's 20 to 31-particle groups, 0.82 against 0.53 for cosmo2b's. So
+  these cubes are not samples of the whole box, and the two inputs' cubes
+  (of different volumes) are not a like-for-like comparison of the inputs.
+  The FoF3 against HBT-HERONS comparison does not need them to be.
+- **What is left open** is only the physics of the gap (mass scale,
+  softening, cosmology, environment), which is not a question about the
+  code. Not pursued further.
 
 ### Not done in 2c and 2d
 
@@ -3524,6 +3581,144 @@ the same on the two inputs to within 2% in bins 4 to 19.
   part on lambb.
 - The per-group fields are on the catalogue rows only (the plug-in); FoF3
   alone has no catalogue file to put them in.
+
+## Step 3: tracking, decisions to make (draft, 2026-11-22)
+
+Not decided. This section lists what has to be decided before step 3
+starts, with a recommendation for each. Step 2 gives each FoF group one
+self-bound sub-halo. Satellites (sub-haloes inside a larger group) need the
+history of earlier outputs: a sub-halo found at one output is followed to
+the next and unbound again inside its new host.
+
+### What HBT-HERONS does at each output (read from c728ee0: `HBT.cpp`'s main loop, `src/config_parser.h`)
+
+1. Read the particles and the FoF groups of the output.
+2. Move every sub-halo of the last output (a *track*) to the new output.
+   A track carries its particles by id: its bound particles and its
+   *source*, the particles it may bind again.
+3. `CleanTracks`: a particle stays in at most one track's source.
+4. `AssignHosts`: each track takes the FoF group that holds its 10 most
+   bound particles (`NumTracerHostFinding`). `ConstrainToSingleHost`
+   drops a satellite's particles that are not in that group.
+5. `PrepareCentrals`: in each group, the central is the track closest in
+   phase space to the group's centre among the most massive ones
+   (`MajorProgenitorMassRatio` 0.8). The central's source is every
+   particle of the group not in a satellite. A group with no track gets a
+   new one.
+6. `RefineParticles`: unbinding, depth first, satellites before their
+   host. A satellite whose core overlaps its host's in phase space is
+   merged into it (`MergeTrappedSubhalos`, on by default). After
+   unbinding, a source is cut to 3 times the bound count
+   (`SourceSubRelaxFactor`). A track with fewer than 20 bound particles is
+   disrupted: it becomes an *orphan* with no particles that follows its
+   most bound particle.
+7. `UpdateTracks`: new track ids, depth, nesting, properties (Vmax and
+   others).
+8. `FindDescendants`: the merger tree, from each track's 10 most bound
+   particles of the last output.
+9. Write the catalogue.
+
+Gas reassignment (`ReassignParticles`) is the one step that does not apply,
+since decision 6 of step 2 (dark matter only) stands. The details of steps
+2 to 8 will be read from the source before each piece is built, as step 1
+did for unbinding.
+
+### Decisions
+
+1. **Where tracking runs first.**
+   - (a) In ChaNGa through the plug-in, with the tracks kept in memory
+     from output to output. This is the plan's aim, but it waits on the
+     ChaNGa hooks (Kale and Tom Quinn).
+   - (b) In FoF3 over a series of snapshot files: one run reads output after
+     output and keeps the tracks in memory, and can write them out to
+     continue in a later run.
+
+   *Recommended: (b) first.* Write tracking as one library step (tracks of
+   the last output, particles, groups) to (tracks of this output), which the
+   plug-in later calls unchanged. HBT-HERONS reads the same snapshot
+   series, so the comparison is direct, and nothing waits on the hooks.
+2. **The snapshot series.** Step 3 cannot be checked without one, and
+   there is none on Frontier: lambb, cosmo2b, cosmo25, romulus25 and h34462
+   are one output each. What it needs:
+   - one collisionless run;
+   - 30 or more outputs down to z = 0;
+   - particle ids (`iord`) that persist from output to output;
+   - its parameter file (box in Mpc, cosmology, softening);
+   - few enough particles (tens of millions, largest group about 10^5)
+     that HBT-HERONS's exact reference runs in hours. It is all pairs on
+     CPUs: 8m-lambb took 24 minutes on one node.
+
+   The options:
+   - (a) ask Tom Quinn's group for one (collaborator questions 2 and 3 ask
+     the same thing);
+   - (b) run ChaNGa on a small box ourselves (`~/changa` has five builds
+     on Frontier; initial conditions are still needed);
+   - (c) a SWIFT example box (HBT-HERONS's own format, but not the
+     collaborator's code, and FoF3 would need a SWIFT reader).
+
+   *Recommended: ask for (a) now, with (b) as the fallback.*
+3. **How a track's particles are carried.**
+   - (a) As HBT-HERONS does: each track lists its particles' ids. Every
+     output then needs a distributed lookup from id to particle, since the
+     decomposition changes from output to output.
+   - (b) On the particles: each particle carries the id of the track whose
+     source it is in, and whether it is bound. A small per-track table holds
+     the rest (host, rank, depth, parent, birth, most bound particle, which
+     also places orphans). Because `CleanTracks` keeps a particle in at most
+     one source, one label per particle holds the same information as the
+     lists.
+
+   *Recommended: (b).* In situ the particles keep their labels in memory
+   with no lookup at all. In the series path the labels are written and
+   read like FoF3's `.lbl` files: 9 bytes per particle, and no id lookup at
+   24 billion particles.
+4. **Which of HBT-HERONS's behaviours, in what order.**
+   - 3a: tracks carried, hosts by the 10 most bound particles, satellites
+     kept inside their host, centrals by phase-space distance, new tracks
+     for new groups, depth-first unbinding with sources cut to 3 times the
+     bound count, orphans.
+   - 3b: merging of trapped satellites.
+   - 3c: the merger tree, and the properties the collaborator asks for
+     (question 5).
+
+   *Recommended: follow HBT-HERONS's rules exactly, in that order,* as step
+   1 did, so that its catalogue is the reference.
+5. **What counts as right.** Per output and per track: the bound set
+   against HBT-HERONS's by step 1's amended rule at tau. Also the track's
+   identity (a mapping between the two codes' track ids), host, rank
+   (central or satellite), and the merger events.
+   - The exact reference (no sampling, opening angle 0) on the small
+     series.
+   - HBT-HERONS's production settings against ours, by group and track
+     statistics, on a larger series.
+   - The pass rule is written before the first comparison, as before.
+
+   *Recommended: that.*
+6. **Output.**
+   - Per track: track id, host group label, rank, depth, parent, bound
+     count and mass, most bound particle, frame, output of birth and of
+     disruption, and the track merged into.
+   - Per particle: track id and bound flag.
+   - The file format depends on what the collaborator reads (question 5).
+
+   *Recommended: flat binary files for the checks now* (like `.lbl` and
+   `.ubd`); the catalogue format to be chosen with the collaborator.
+7. **Where satellites are unbound** (a design choice; it will be made as
+   follows unless decided otherwise).
+   - A satellite is gathered onto one process, as step 2 gathers a group.
+   - Its host is unbound after its satellites, from the source they leave:
+     gathered with them if the host is gathered, in spread rounds if the
+     host stays spread.
+   - Satellites are far smaller than the hosts that stay spread, so no
+     satellite needs the spread path.
+
+### What waits on whom
+
+- The series (decision 2): Tom Quinn's group, or initial conditions for our
+  own run.
+- The collaborator's answers to questions 2, 3 and 5 (outputs and spacing,
+  persistent ids, catalogue fields and reader) settle decisions 2 and 6.
+- Nothing above waits on the ChaNGa hooks if decision 1 is (b).
 
 ## Open
 
@@ -3619,5 +3814,6 @@ the same on the two inputs to within 2% in bins 4 to 19.
   s, the catalogue 15.5 s. Its smaller share of groups with a sub-halo
   (44% against 63% on cosmo2b) is not a unit error (job 5965784) and holds
   at every group size; at equal mass the order reverses (jobs 5965868,
-  5966019). Whether HBT-HERONS gives the same shares is not checked. See
-  "Not done in 2c and 2d".
+  5966019). HBT-HERONS, given the same groups in a sub-box, finds a
+  sub-halo in exactly the same groups as FoF3 (job 5971133): the gap is in
+  the data. See "Not done in 2c and 2d".
